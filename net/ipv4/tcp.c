@@ -1539,7 +1539,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		size_t len, int nonblock, int flags, int *addr_len)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	int copied = 0;
+	int copied = 0;  //记录从套接字接收队列中成功复制到用户缓冲区的数据量
 	u32 peek_seq;
 	u32 *seq;
 	unsigned long used;
@@ -1584,7 +1584,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		seq = &peek_seq;
 	}
 
-	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len); //获得最低水位， 如果读到数据的话 到达最低水位就让出cpu
 
 #ifdef CONFIG_NET_DMA
 	tp->ucopy.dma_chan = NULL;
@@ -1623,7 +1623,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 
 		/* Next get a buffer. */
 
-		skb_queue_walk(&sk->sk_receive_queue, skb) {
+		skb_queue_walk(&sk->sk_receive_queue, skb) { //遍历接收队列接收数据
 			/* Now that we have two receive queues this
 			 * shouldn't happen.
 			 */
@@ -1633,12 +1633,12 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 				 flags))
 				break;
 
-			offset = *seq - TCP_SKB_CB(skb)->seq;
-			if (tcp_hdr(skb)->syn)
+			offset = *seq - TCP_SKB_CB(skb)->seq;  //计算偏移量
+			if (tcp_hdr(skb)->syn)	//如果数据包有syn标记  偏移量-1
 				offset--;
-			if (offset < skb->len)
+			if (offset < skb->len)	//如果偏移量小于数据包长度，进入 found_ok_skb 标签处理数据包
 				goto found_ok_skb;
-			if (tcp_hdr(skb)->fin)
+			if (tcp_hdr(skb)->fin)  //如果数据包包含 FIN 标志，进入 found_fin_ok 标签处理 FIN 数据包。
 				goto found_fin_ok;
 			WARN(!(flags & MSG_PEEK),
 			     "recvmsg bug 2: copied %X seq %X rcvnxt %X fl %X\n",
@@ -1753,7 +1753,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 			release_sock(sk);
 			lock_sock(sk);
 		} else
-			sk_wait_data(sk, &timeo);
+			sk_wait_data(sk, &timeo); //没有收到足够数据 sk_wait_data 阻塞当前进程
 
 #ifdef CONFIG_NET_DMA
 		tcp_service_net_dma(sk, false);  /* Don't block */
@@ -1794,12 +1794,12 @@ do_prequeue:
 
 	found_ok_skb:
 		/* Ok so how much can we use? */
-		used = skb->len - offset;
+		used = skb->len - offset; //可以读取的数据量
 		if (len < used)
 			used = len;
 
 		/* Do we have urgent data here? */
-		if (tp->urg_data) {
+		if (tp->urg_data) {	//是否紧急数据
 			u32 urg_offset = tp->urg_seq - *seq;
 			if (urg_offset < used) {
 				if (!urg_offset) {
@@ -1847,7 +1847,7 @@ do_prequeue:
 #endif
 			{
 				err = skb_copy_datagram_iovec(skb, offset,
-						msg->msg_iov, used);
+						msg->msg_iov, used); //数据内存拷贝到用户缓存区
 				if (err) {
 					/* Exception. Bailout! */
 					if (!copied)
@@ -1857,9 +1857,9 @@ do_prequeue:
 			}
 		}
 
-		*seq += used;
-		copied += used;
-		len -= used;
+		*seq += used;	//读取seq指针
+		copied += used; //更新copied
+		len -= used;	//更新窗口大小
 
 		tcp_rcv_space_adjust(sk);
 
@@ -1871,7 +1871,7 @@ skip_copy:
 		if (used + offset < skb->len)
 			continue;
 
-		if (tcp_hdr(skb)->fin)
+		if (tcp_hdr(skb)->fin) //fin标识
 			goto found_fin_ok;
 		if (!(flags & MSG_PEEK)) {
 			sk_eat_skb(sk, skb, copied_early);
@@ -1881,9 +1881,9 @@ skip_copy:
 
 	found_fin_ok:
 		/* Process the FIN. */
-		++*seq;
-		if (!(flags & MSG_PEEK)) {
-			sk_eat_skb(sk, skb, copied_early);
+		++*seq;  //更新seq
+		if (!(flags & MSG_PEEK)) { //如果不是 MSG_PEEK，从队列中移除数据包。
+			sk_eat_skb(sk, skb, copied_early); 
 			copied_early = false;
 		}
 		break;

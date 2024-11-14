@@ -342,8 +342,9 @@ lookup_protocol:
 	    !ns_capable(net->user_ns, CAP_NET_RAW))
 		goto out_rcu_unlock;
 
-	sock->ops = answer->ops;
-	answer_prot = answer->prot;
+	sock->ops = answer->ops;    //将inet_stream_ops (net/af_inet.c) 赋到socket->ops上
+	answer_prot = answer->prot; //获得tcp_prot（net/tcp_ipv4.c)
+
 	answer_no_check = answer->no_check;
 	answer_flags = answer->flags;
 	rcu_read_unlock();
@@ -351,7 +352,7 @@ lookup_protocol:
 	WARN_ON(answer_prot->slab == NULL);
 
 	err = -ENOBUFS;
-	sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot);
+	sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot); //分配sock对象并把tcp_prot赋到sk_prot上   
 	if (sk == NULL)
 		goto out;
 
@@ -378,7 +379,7 @@ lookup_protocol:
 
 	inet->inet_id = 0;
 
-	sock_init_data(sock, sk);
+	sock_init_data(sock, sk); //对sock对象进行初始化 sk_data_ready = sock_def_readable
 
 	sk->sk_destruct	   = inet_sock_destruct;
 	sk->sk_protocol	   = protocol;
@@ -801,7 +802,7 @@ int inet_recvmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
 	sock_rps_record_flow(sk);
 
 	err = sk->sk_prot->recvmsg(iocb, sk, msg, size, flags & MSG_DONTWAIT,
-				   flags & ~MSG_DONTWAIT, &addr_len);
+				   flags & ~MSG_DONTWAIT, &addr_len); //调用 tcp_recvmsg
 	if (err >= 0)
 		msg->msg_namelen = addr_len;
 	return err;

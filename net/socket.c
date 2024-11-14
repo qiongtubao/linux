@@ -1271,7 +1271,7 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 	 *	the protocol is 0, the family is instructed to select an appropriate
 	 *	default.
 	 */
-	sock = sock_alloc();
+	sock = sock_alloc(); //分配socket对象
 	if (!sock) {
 		net_warn_ratelimited("socket: no more sockets\n");
 		return -ENFILE;	/* Not exactly a match, but its the
@@ -1292,7 +1292,7 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 #endif
 
 	rcu_read_lock();
-	pf = rcu_dereference(net_families[family]);
+	pf = rcu_dereference(net_families[family]);//获得每个协议族的操作表
 	err = -EAFNOSUPPORT;
 	if (!pf)
 		goto out_release;
@@ -1307,7 +1307,7 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 	/* Now protected by module ref count */
 	rcu_read_unlock();
 
-	err = pf->create(net, sock, protocol, kern);
+	err = pf->create(net, sock, protocol, kern); //调用指定协议族的创建函数，对AF_INET对应的是inet_create
 	if (err < 0)
 		goto out_module_put;
 
@@ -1377,7 +1377,7 @@ SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
 
-	retval = sock_create(family, type, protocol, &sock);
+	retval = sock_create(family, type, protocol, &sock); //创建sock
 	if (retval < 0)
 		goto out;
 
@@ -1822,7 +1822,7 @@ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
 
 	if (size > INT_MAX)
 		size = INT_MAX;
-	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+	sock = sockfd_lookup_light(fd, &err, &fput_needed); //根据用户传入的fd获得socket
 	if (!sock)
 		goto out;
 
@@ -1836,7 +1836,7 @@ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
 	msg.msg_namelen = sizeof(address);
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
-	err = sock_recvmsg(sock, &msg, size, flags);
+	err = sock_recvmsg(sock, &msg, size, flags); //调用inet_recvmsg -> tcp_recvmsg
 
 	if (err >= 0 && addr != NULL) {
 		err2 = move_addr_to_user(&address,

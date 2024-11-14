@@ -1323,7 +1323,7 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		 * See comment in struct sock definition to understand
 		 * why we need sk_prot_creator -acme
 		 */
-		sk->sk_prot = sk->sk_prot_creator = prot;
+		sk->sk_prot = sk->sk_prot_creator = prot; //设置sk_prot
 		sock_lock_init(sk);
 		sock_net_set(sk, get_net(net));
 		atomic_set(&sk->sk_wmem_alloc, 1);
@@ -1899,11 +1899,11 @@ static void __release_sock(struct sock *sk)
 int sk_wait_data(struct sock *sk, long *timeo)
 {
 	int rc;
-	DEFINE_WAIT(wait);
+	DEFINE_WAIT(wait); //当前进程（current) 关联到所定义的等待队列项上， 定义了一个等待队列
 
-	prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
-	set_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags);
-	rc = sk_wait_event(sk, timeo, !skb_queue_empty(&sk->sk_receive_queue));
+	prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE); //调用sk_sleep获得sock对象下的wait 并准备挂起，将进程状态设置为可打断（TASK_INTERRUPTIBLE）
+	set_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags); 
+	rc = sk_wait_event(sk, timeo, !skb_queue_empty(&sk->sk_receive_queue)); //调用schedule_timeout让出cpu，然后进行睡眠）
 	clear_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags);
 	finish_wait(sk_sleep(sk), &wait);
 	return rc;
@@ -2232,8 +2232,8 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	init_timer(&sk->sk_timer);
 
 	sk->sk_allocation	=	GFP_KERNEL;
-	sk->sk_rcvbuf		=	sysctl_rmem_default;
-	sk->sk_sndbuf		=	sysctl_wmem_default;
+	sk->sk_rcvbuf		=	sysctl_rmem_default;	//系统参数 net.ipv4.tcp_rmem
+	sk->sk_sndbuf		=	sysctl_wmem_default;	//系统参数 net.ipv4.tcp_wmem
 	sk->sk_state		=	TCP_CLOSE;
 	sk_set_socket(sk, sock);
 
@@ -2253,7 +2253,7 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 			af_family_clock_key_strings[sk->sk_family]);
 
 	sk->sk_state_change	=	sock_def_wakeup;
-	sk->sk_data_ready	=	sock_def_readable;
+	sk->sk_data_ready	=	sock_def_readable; //当软中断上收到数据包时 会通过调用sk_data_ready函数指针（实际被设置成了sock_def_readable())来唤醒在sock上等待的进程
 	sk->sk_write_space	=	sock_def_write_space;
 	sk->sk_error_report	=	sock_def_error_report;
 	sk->sk_destruct		=	sock_def_destruct;
