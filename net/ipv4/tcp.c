@@ -1136,7 +1136,7 @@ static inline struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off)
 }
 
 /*
- * This routine provides an alternative to tcp_recvmsg() for routines
+ * This routine provides an alternative to tcp_recvmsg() for routines        此例程为想要以 'sendfile' 方式直接处理从 skbuffs 复制的例程提供了 tcp_recvmsg() 的替代方案。
  * that would like to handle copying from skbuffs directly in 'sendfile'
  * fashion.
  * Note:
@@ -1199,18 +1199,18 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 }
 
 /*
- *	This routine copies from a sock struct into the user buffer.
+ *	This routine copies from a sock struct into the user buffer.    此例程将 sock 结构复制到用户缓冲区
  *
- *	Technical note: in 2.3 we work on _locked_ socket, so that
- *	tricks with *seq access order and skb->users are not required.
- *	Probably, code can be easily improved even more.
+ *	Technical note: in 2.3 we work on _locked_ socket, so that		技术说明：在 2.3 中，我们处理 _locked_ 套接字，因此
+ *	tricks with *seq access order and skb->users are not required.  不需要使用 *seq 访问顺序和 skb->users 技巧
+ *	Probably, code can be easily improved even more.				代码可能更容易进一步改进。
  */
 
 int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		size_t len, int nonblock, int flags, int *addr_len)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	int copied = 0;
+	int copied = 0;  //copied 记录从套接字接收队列中成功复制到用户缓冲区的数据量。
 	u32 peek_seq;
 	u32 *seq;
 	unsigned long used;
@@ -1239,9 +1239,9 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		seq = &peek_seq;
 	}
 
-	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);  //获得等待的最低水位
 
-	do {
+	do { //主循环
 		struct sk_buff *skb;
 		u32 offset;
 
@@ -1257,9 +1257,9 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 
 		/* Next get a buffer. */
 
-		skb = skb_peek(&sk->sk_receive_queue);
+		skb = skb_peek(&sk->sk_receive_queue); //获得数据包
 		do {
-			if (!skb)
+			if (!skb)  //数据包为空 跳出循环
 				break;
 
 			/* Now that we have two receive queues this
@@ -1270,16 +1270,16 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 				       "seq %X\n", *seq, TCP_SKB_CB(skb)->seq);
 				break;
 			}
-			offset = *seq - TCP_SKB_CB(skb)->seq;
-			if (skb->h.th->syn)
+			offset = *seq - TCP_SKB_CB(skb)->seq; //计算偏移量
+			if (skb->h.th->syn) //如果数据包包含 SYN 标志，偏移量减 1。
 				offset--;
-			if (offset < skb->len)
+			if (offset < skb->len)	//正常数据包 如果偏移量小于数据包长度，进入 found_ok_skb 标签处理数据包。
 				goto found_ok_skb;
-			if (skb->h.th->fin)
+			if (skb->h.th->fin)		// 如果数据包包含 FIN 标志，进入 found_fin_ok 标签处理 FIN 数据包。
 				goto found_fin_ok;
 			BUG_TRAP(flags & MSG_PEEK);
 			skb = skb->next;
-		} while (skb != (struct sk_buff *)&sk->sk_receive_queue);
+		} while (skb != (struct sk_buff *)&sk->sk_receive_queue); 
 
 		/* Well, if we have backlog, try to process it now yet. */
 
@@ -1380,7 +1380,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 			release_sock(sk);
 			lock_sock(sk);
 		} else
-			sk_wait_data(sk, &timeo);
+			sk_wait_data(sk, &timeo); //没有收到足够数据，启动sk_wait_data阻塞当前进程
 
 		if (user_recv) {
 			int chunk;
@@ -1415,12 +1415,12 @@ do_prequeue:
 
 	found_ok_skb:
 		/* Ok so how much can we use? */
-		used = skb->len - offset;
+		used = skb->len - offset;	//计算可以使用的长度
 		if (len < used)
 			used = len;
 
 		/* Do we have urgent data here? */
-		if (tp->urg_data) {
+		if (tp->urg_data) { //是否有紧急数据 处理紧急数据。
 			u32 urg_offset = tp->urg_seq - *seq;
 			if (urg_offset < used) {
 				if (!urg_offset) {
@@ -1438,7 +1438,7 @@ do_prequeue:
 
 		if (!(flags & MSG_TRUNC)) {
 			err = skb_copy_datagram_iovec(skb, offset,
-						      msg->msg_iov, used);
+						      msg->msg_iov, used); //将数据复制到用户缓冲区。
 			if (err) {
 				/* Exception. Bailout! */
 				if (!copied)
@@ -1447,9 +1447,9 @@ do_prequeue:
 			}
 		}
 
-		*seq += used;
-		copied += used;
-		len -= used;
+		*seq += used;   //更新 seq 
+		copied += used; //更新 copied，
+		len -= used;	//调整接收窗口。
 
 		tcp_rcv_space_adjust(sk);
 
@@ -1463,13 +1463,13 @@ skip_copy:
 
 		if (skb->h.th->fin)
 			goto found_fin_ok;
-		if (!(flags & MSG_PEEK))
+		if (!(flags & MSG_PEEK))  //如果不是 MSG_PEEK，从队列中移除数据包。
 			sk_eat_skb(sk, skb);
 		continue;
 
 	found_fin_ok:
 		/* Process the FIN. */
-		++*seq;
+		++*seq;  //更新 seq
 		if (!(flags & MSG_PEEK))
 			sk_eat_skb(sk, skb);
 		break;

@@ -242,7 +242,7 @@ static int inet_create(struct socket *sock, int protocol)
 	/* Look for the requested type/protocol pair. */
 	answer = NULL;
 	rcu_read_lock();
-	list_for_each_rcu(p, &inetsw[sock->type]) {
+	list_for_each_rcu(p, &inetsw[sock->type]) {  //是个宏  for (pos = (head)->next; prefetch(pos->next), pos != (head); pos = rcu_dereference(pos->next))
 		answer = list_entry(p, struct inet_protosw, list);
 
 		/* Check the non-wild match. */
@@ -271,8 +271,8 @@ static int inet_create(struct socket *sock, int protocol)
 	if (!protocol)
 		goto out_rcu_unlock;
 
-	sock->ops = answer->ops;
-	answer_prot = answer->prot;
+	sock->ops = answer->ops; 	//将inet_stream_ops 赋到socket->ops上,举例 tcp协议 accept=inet_accept,sendmsg = inet_msg,recvmsg=inet_recvmsg,connect=tcp_v4_connect,recvmsg=tcp_recvmsg,sendmsg=tcp_sendmsg
+	answer_prot = answer->prot; //获得tcp_prot
 	answer_no_check = answer->no_check;
 	answer_flags = answer->flags;
 	rcu_read_unlock();
@@ -280,7 +280,7 @@ static int inet_create(struct socket *sock, int protocol)
 	BUG_TRAP(answer_prot->slab != NULL);
 
 	err = -ENOBUFS;
-	sk = sk_alloc(PF_INET, GFP_KERNEL, answer_prot, 1);
+	sk = sk_alloc(PF_INET, GFP_KERNEL, answer_prot, 1);//分配sock对象 并把tcp_prot 赋到sock->sk_port 上
 	if (sk == NULL)
 		goto out;
 
@@ -304,7 +304,7 @@ static int inet_create(struct socket *sock, int protocol)
 
 	inet->id = 0;
 
-	sock_init_data(sock, sk);
+	sock_init_data(sock, sk); //对 sock对象进行初始化 ，将sk_data_ready函数指针进行初始化  设置为默认的sock_def_readable
 
 	sk->sk_destruct	   = inet_sock_destruct;
 	sk->sk_family	   = PF_INET;
@@ -842,11 +842,10 @@ static struct proto_ops inet_sockraw_ops = {
 };
 
 static struct net_proto_family inet_family_ops = {
-	.family = PF_INET,
+	.family = PF_INET,  //通过这个表示注册到net_proto_family[AF_INET]
 	.create = inet_create,
 	.owner	= THIS_MODULE,
-};
-
+}; //存在net_families数组里的net_proto_family， 通过sock_register注册进去
 
 extern void tcp_init(void);
 extern void tcp_v4_init(struct net_proto_family *);

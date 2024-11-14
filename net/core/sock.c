@@ -1189,8 +1189,8 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	init_timer(&sk->sk_timer);
 	
 	sk->sk_allocation	=	GFP_KERNEL;
-	sk->sk_rcvbuf		=	sysctl_rmem_default;
-	sk->sk_sndbuf		=	sysctl_wmem_default;
+	sk->sk_rcvbuf		=	sysctl_rmem_default; //[latte][todo] 系统指标 sysctl net.smc.rmem
+	sk->sk_sndbuf		=	sysctl_wmem_default; //[latte][todo] 系统指标 sysctl net.smc.wmem
 	sk->sk_state		=	TCP_CLOSE;
 	sk->sk_socket		=	sock;
 
@@ -1208,7 +1208,7 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	rwlock_init(&sk->sk_callback_lock);
 
 	sk->sk_state_change	=	sock_def_wakeup;
-	sk->sk_data_ready	=	sock_def_readable;
+	sk->sk_data_ready	=	sock_def_readable; //当软中断上受到数据包时会通过调用sk_data_ready函数指针（sock_def_readable）来唤醒在sock上等待的进程
 	sk->sk_write_space	=	sock_def_write_space;
 	sk->sk_error_report	=	sock_def_error_report;
 	sk->sk_destruct		=	sock_def_destruct;

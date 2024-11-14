@@ -592,7 +592,7 @@ static inline int __sock_recvmsg(struct kiocb *iocb, struct socket *sock,
 	if (err)
 		return err;
 
-	return sock->ops->recvmsg(iocb, sock, msg, size, flags);
+	return sock->ops->recvmsg(iocb, sock, msg, size, flags); //inet_recvmsg
 }
 
 int sock_recvmsg(struct socket *sock, struct msghdr *msg, 
@@ -1122,7 +1122,7 @@ static int __sock_create(int family, int type, int protocol, struct socket **res
  *	default.
  */
 
-	if (!(sock = sock_alloc())) {
+	if (!(sock = sock_alloc())) { //分配socket对象
 		printk(KERN_WARNING "socket: no more sockets\n");
 		err = -ENFILE;		/* Not exactly a match, but its the
 					   closest posix thing */
@@ -1132,14 +1132,14 @@ static int __sock_create(int family, int type, int protocol, struct socket **res
 	sock->type  = type;
 
 	/*
-	 * We will call the ->create function, that possibly is in a loadable
-	 * module, so we have to bump that loadable module refcnt first.
+	 * We will call the ->create function, that possibly is in a loadable	我们将调用 ->create 函数，该函数可能位于可加载模块中
+	 * module, so we have to bump that loadable module refcnt first.		因此我们必须先触发该可加载模块 refcnt
 	 */
 	err = -EAFNOSUPPORT;
-	if (!try_module_get(net_families[family]->owner))
+	if (!try_module_get(net_families[family]->owner)) //尝试加载协议
 		goto out_release;
 
-	if ((err = net_families[family]->create(sock, protocol)) < 0)
+	if ((err = net_families[family]->create(sock, protocol)) < 0) //调用指定协议族的创建函数，对于AF_INET对应的是inet_create
 		goto out_module_put;
 	/*
 	 * Now to bump the refcnt of the [loadable] module that owns this
@@ -1177,12 +1177,12 @@ int sock_create_kern(int family, int type, int protocol, struct socket **res)
 	return __sock_create(family, type, protocol, res, 1);
 }
 
-asmlinkage long sys_socket(int family, int type, int protocol)
+asmlinkage long sys_socket(int family, int type, int protocol) //对外提供socket方法
 {
 	int retval;
 	struct socket *sock;
 
-	retval = sock_create(family, type, protocol, &sock);
+	retval = sock_create(family, type, protocol, &sock); //创建socket实例
 	if (retval < 0)
 		goto out;
 
@@ -1544,13 +1544,13 @@ asmlinkage long sys_send(int fd, void __user * buff, size_t len, unsigned flags)
 }
 
 /*
- *	Receive a frame from the socket and optionally record the address of the 
- *	sender. We verify the buffers are writable and if needed move the
+ *	Receive a frame from the socket and optionally record the address of the  从套接字接收帧并选择性地记录发送方的地址。我们验证缓冲区是否
+ *	sender. We verify the buffers are writable and if needed move the         可写，如果需要，将发送方地址从内核移至用户空间
  *	sender address from kernel to user space.
  */
 
 asmlinkage long sys_recvfrom(int fd, void __user * ubuf, size_t size, unsigned flags,
-			     struct sockaddr __user *addr, int __user *addr_len)
+			     struct sockaddr __user *addr, int __user *addr_len) //系统调用recvfrom 
 {
 	struct socket *sock;
 	struct iovec iov;
@@ -1558,7 +1558,7 @@ asmlinkage long sys_recvfrom(int fd, void __user * ubuf, size_t size, unsigned f
 	char address[MAX_SOCK_ADDR];
 	int err,err2;
 
-	sock = sockfd_lookup(fd, &err);
+	sock = sockfd_lookup(fd, &err);	//根据用户传入的fd找到socket对象 红黑树
 	if (!sock)
 		goto out;
 
@@ -1572,7 +1572,7 @@ asmlinkage long sys_recvfrom(int fd, void __user * ubuf, size_t size, unsigned f
 	msg.msg_namelen=MAX_SOCK_ADDR;
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
-	err=sock_recvmsg(sock, &msg, size, flags);
+	err=sock_recvmsg(sock, &msg, size, flags); //sock->ops->recvmsg 调用inet_recvmsg(tcp_recvmsg)
 
 	if(err >= 0 && addr != NULL)
 	{
