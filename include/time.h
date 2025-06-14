@@ -16,15 +16,15 @@ typedef unsigned int size_t;
 typedef long clock_t;
 
 struct tm {
-	int tm_sec;
-	int tm_min;
-	int tm_hour;
-	int tm_mday;
-	int tm_mon;
-	int tm_year;
-	int tm_wday;
-	int tm_yday;
-	int tm_isdst;
+	int tm_sec;  // 秒 (0 - 60)
+	int tm_min;	 // 分 (0 - 59)
+	int tm_hour; // 小时 (0 - 23)
+	int tm_mday; // 月份中的第几天 (1 - 31)
+	int tm_mon;  // 月份 (0 - 11，0 表示 1 月)
+	int tm_year; // 年份减去 1900（例如：2025 -> 125）
+	int tm_wday; // 星期几 (0 - 6, 0 表示星期日)
+	int tm_yday; // 一年中的第几天 (0 - 365)
+	int tm_isdst;// 夏令时标志
 };
 
 clock_t clock(void);
