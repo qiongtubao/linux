@@ -43,7 +43,7 @@ void show_stat(void)
 			show_task(i,task[i]);
 }
 
-#define LATCH (1193180/HZ)
+#define LATCH (1193180/HZ) // 主板上的晶体振荡器频率为 14.31818 MHz /12
 
 extern void mem_use(void);
 
@@ -57,7 +57,7 @@ union task_union {
 
 static union task_union init_task = {INIT_TASK,};
 
-long volatile jiffies=0;
+long volatile jiffies=0;//一个全局变量，记录系统自启动以来经历的时钟中断次数。
 long startup_time=0;
 struct task_struct *current = &(init_task.task);
 struct task_struct *last_task_used_math = NULL;
@@ -108,37 +108,37 @@ void schedule(void)
 
 /* check alarm, wake up any interruptible tasks that have got a signal */
 
-	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
-		if (*p) {
-			if ((*p)->alarm && (*p)->alarm < jiffies) {
-					(*p)->signal |= (1<<(SIGALRM-1));
-					(*p)->alarm = 0;
+	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p) //遍历所有任务（从最后一个到第一个）
+		if (*p) { //存在任务
+			if ((*p)->alarm && (*p)->alarm < jiffies) { //已经到期 （小于jiffies)
+					(*p)->signal |= (1<<(SIGALRM-1)); //发送SIGALRM
+					(*p)->alarm = 0;				  //清空alarm
 				}
 			if (((*p)->signal & ~(_BLOCKABLE & (*p)->blocked)) &&
-			(*p)->state==TASK_INTERRUPTIBLE)
-				(*p)->state=TASK_RUNNING;
+			(*p)->state==TASK_INTERRUPTIBLE) //如果未被阻塞 （_BLOCKABLE）且当前状态是TASK_INTERRUPTIBLE
+				(*p)->state=TASK_RUNNING; //修改状态 表示可以参与调度
 		}
 
 /* this is the scheduler proper: */
 
-	while (1) {
+	while (1) { //找出当前拥有最多剩余时间片的任务
 		c = -1;
 		next = 0;
-		i = NR_TASKS;
-		p = &task[NR_TASKS];
+		i = NR_TASKS; 			//最后一个 往前找
+		p = &task[NR_TASKS];	
 		while (--i) {
-			if (!*--p)
+			if (!*--p)		//task 是空 跳过
 				continue;
-			if ((*p)->state == TASK_RUNNING && (*p)->counter > c)
-				c = (*p)->counter, next = i;
+			if ((*p)->state == TASK_RUNNING && (*p)->counter > c) //状态可运行 且 事件分片大于最大值
+				c = (*p)->counter, next = i;	//更新最大的counter 和 任务索引
 		}
-		if (c) break;
-		for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+		if (c) break; //找到了最大时间片 跳出循环
+		for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)	//所有任务的时间分片为0。重制时间分片
 			if (*p)
 				(*p)->counter = ((*p)->counter >> 1) +
-						(*p)->priority;
+						(*p)->priority; //时间分片 = counter >> 1 +  优先级
 	}
-	switch_to(next);
+	switch_to(next); //next 记录对应的进程编号
 }
 
 int sys_pause(void)
@@ -264,9 +264,9 @@ void do_floppy_timer(void)
 #define TIME_REQUESTS 64
 
 static struct timer_list {
-	long jiffies;
-	void (*fn)();
-	struct timer_list * next;
+	long jiffies;	//剩余滴答数
+	void (*fn)();	//回调函数
+	struct timer_list * next; //下一个
 } timer_list[TIME_REQUESTS], * next_timer = NULL;
 
 void add_timer(long jiffies, void (*fn)(void))
@@ -302,23 +302,23 @@ void add_timer(long jiffies, void (*fn)(void))
 	sti();
 }
 
-void do_timer(long cpl)
+void do_timer(long cpl) //cpl：当前特权级（Current Privilege Level），表示当前运行的是用户态（3）还是内核态（0）
 {
-	extern int beepcount;
-	extern void sysbeepstop(void);
+	extern int beepcount;		  // 用于控制 PC 扬声器发出蜂鸣的时间长度。
+	extern void sysbeepstop(void);// 关闭蜂鸣的函数。
 
-	if (beepcount)
-		if (!--beepcount)
-			sysbeepstop();
+	if (beepcount)		//这是非常早期版本的简单蜂鸣机制，现代系统已经不再使用
+		if (!--beepcount) //如果 beepcount > 0，则减一。
+			sysbeepstop();//若减到 0，则调用 sysbeepstop() 关闭蜂鸣。
 
 	if (cpl)
-		current->utime++;
+		current->utime++; //增加用户态运行时间 utime
 	else
-		current->stime++;
+		current->stime++; //增加内核态运行时间 stime
 
-	if (next_timer) {
-		next_timer->jiffies--;
-		while (next_timer && next_timer->jiffies <= 0) {
+	if (next_timer) {	//一个简单的定时器链表处理逻辑
+		next_timer->jiffies--;	//将当前定时器的 jiffies 减一（倒计时）
+		while (next_timer && next_timer->jiffies <= 0) { //如果 jiffies <= 0，说明该定时器已到期，调用其回调函数 fn()
 			void (*fn)(void);
 			
 			fn = next_timer->fn;
@@ -327,12 +327,12 @@ void do_timer(long cpl)
 			(fn)();
 		}
 	}
-	if (current_DOR & 0xf0)
-		do_floppy_timer();
-	if ((--current->counter)>0) return;
+	if (current_DOR & 0xf0) //current_DOR 是软盘控制器的数字输出寄存器（Digital Output Register）。
+		do_floppy_timer();	//如果某些位被设置（如电机仍在运转），则调用 do_floppy_timer() 继续处理软盘状态
+	if ((--current->counter)>0) return; //current->counter：当前进程剩余的时间片（timeslice）
 	current->counter=0;
-	if (!cpl) return;
-	schedule();
+	if (!cpl) return;	//内核态不会被抢占
+	schedule(); //如果是用户态，调用 schedule() 触发调度
 }
 
 int sys_alarm(long seconds)
@@ -387,26 +387,26 @@ void sched_init(void)
 	int i;
 	struct desc_struct * p;
 
-	if (sizeof(struct sigaction) != 16)
+	if (sizeof(struct sigaction) != 16) //因为在汇编或底层机制中，很多地方会硬编码偏移量来访问这个结构体字段。
 		panic("Struct sigaction MUST be 16 bytes");
-	set_tss_desc(gdt+FIRST_TSS_ENTRY,&(init_task.task.tss));
-	set_ldt_desc(gdt+FIRST_LDT_ENTRY,&(init_task.task.ldt));
+	set_tss_desc(gdt+FIRST_TSS_ENTRY,&(init_task.task.tss)); //gdt[4] 设置tss。
+	set_ldt_desc(gdt+FIRST_LDT_ENTRY,&(init_task.task.ldt)); //gdt[5] 设置ldt 
 	p = gdt+2+FIRST_TSS_ENTRY;
-	for(i=1;i<NR_TASKS;i++) {
-		task[i] = NULL;
-		p->a=p->b=0;
+	for(i=1;i<NR_TASKS;i++) { //task 保存所有进程的指针（最多 NR_TASKS 个，默认为 64）。
+		task[i] = NULL; //清空task
+		p->a=p->b=0;	//一个任务对应2个gdt对象
 		p++;
 		p->a=p->b=0;
 		p++;
 	}
 /* Clear NT, so that we won't have troubles with that later on */
-	__asm__("pushfl ; andl $0xffffbfff,(%esp) ; popfl");
-	ltr(0);
-	lldt(0);
-	outb_p(0x36,0x43);		/* binary, mode 3, LSB/MSB, ch 0 */
-	outb_p(LATCH & 0xff , 0x40);	/* LSB */
+	__asm__("pushfl ; andl $0xffffbfff,(%esp) ; popfl"); // 使用内联汇编清除 EFLAGS 中的 NT（Nested Task）位。 NT 位用于任务嵌套切换，不清除可能导致异常。
+	ltr(0); //加载 TR（Task Register），指向 GDT 中第 0 个 TSS 描述符（其实是跳过前几个无效描述符后的第一个有效 TSS）。
+	lldt(0);//加载 LDTR，指向第一个 LDT 描述符。
+	outb_p(0x36,0x43);		//向 8253/8254 PIT 芯片发送命令，设置定时器 0 工作在模式 3（方波输出）。 /* binary, mode 3, LSB/MSB, ch 0 */
+	outb_p(LATCH & 0xff , 0x40);	/* LSB */ 
 	outb(LATCH >> 8 , 0x40);	/* MSB */
-	set_intr_gate(0x20,&timer_interrupt);
-	outb(inb_p(0x21)&~0x01,0x21);
-	set_system_gate(0x80,&system_call);
+	set_intr_gate(0x20,&timer_interrupt); //注册时钟中断处理函数（timer_interrupt）到0x20 当pit触发的时候跳转到timer_interrupt
+	outb(inb_p(0x21)&~0x01,0x21);		//允许irq0事件 传入cpu
+	set_system_gate(0x80,&system_call); //注册调用门 用户态也可调用 128中断事件 为系统调用函数
 }

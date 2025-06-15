@@ -2,7 +2,7 @@
 #define _SCHED_H
 
 #define NR_TASKS 64
-#define HZ 100
+#define HZ 100	//1秒100次
 
 #define FIRST_TASK task[0]
 #define LAST_TASK task[NR_TASKS-1]
@@ -77,11 +77,11 @@ struct tss_struct {
 	struct i387_struct i387;
 };
 
-struct task_struct {
+struct task_struct { //进程对象
 /* these are hardcoded - don't touch */
 	long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
-	long counter;
-	long priority;
+	long counter; //时间片 调度
+	long priority;//优先级
 	long signal;
 	struct sigaction sigaction[32];
 	long blocked;	/* bitmap of masked signals */
@@ -92,7 +92,7 @@ struct task_struct {
 	unsigned short uid,euid,suid;
 	unsigned short gid,egid,sgid;
 	long alarm;
-	long utime,stime,cutime,cstime,start_time;
+	long utime/*当前进程在用户态运行的时间*/,stime/*当前进程在内核态运行的时间*/,cutime/*所有已终止并等待回收的子进程的用户态时间总和*/,cstime/*所有已终止并等待回收的子进程的内核态时间总和*/,start_time;
 	unsigned short used_math;
 /* file system info */
 	int tty;		/* -1 if no tty, so it must be signed */
