@@ -47,17 +47,17 @@
 #
 	.equ ROOT_DEV, 0x301
 	ljmp    $BOOTSEG, $_start
-_start:
-	mov	$BOOTSEG, %ax	#将ds段寄存器设置为0x7C0
+_start:					#bios 把数据加载到内存0x7c00 512字节 然后复制到0x9000
+	mov	$BOOTSEG, %ax	#将ds段寄存器设置为0x7C0.   ds数据段寄存器在内存寻址时，充当段基址的作用 比如 mov ax, [0x0001] = mov ax, [ds:0x0001].  
 	mov	%ax, %ds
-	mov	$INITSEG, %ax	#将es段寄存器设置为0x900
+	mov	$INITSEG, %ax	#将es段寄存器设置为0x900.   拷贝0x9000 复制到ax寄存器。再复制到es附加段
 	mov	%ax, %es
 	mov	$256, %cx		#设置移动计数值256字
-	sub	%si, %si		#源地址	ds:si = 0x07C0:0x0000
-	sub	%di, %di		#目标地址 es:si = 0x9000:0x0000
-	rep					#重复执行并递减cx的值
-	movsw				#从内存[si]处移动cx个字到[di]处
-	ljmp	$INITSEG, $go	#段间跳转，这里INITSEG指出跳转到的段地址，解释了cs的值为0x9000
+	sub	%si, %si		#源地址	ds:si = 0x07C0:0x0000.   #sub a,b  is (a = a - b) si清0
+	sub	%di, %di		#目标地址 es:di = 0x9000:0x0000  # di清0
+	rep					#重复执行并递减cx的值			#rep movsw 重复执行movsw	
+	movsw				#从内存[si]处移动cx个字到[di]处 #这里复制了cx（256次. 一次2字节 => 512字节 ） ds:si -> es:di  就是从0x7c00  拷贝到0x90000   拷贝512字节
+	ljmp	$INITSEG, $go	#段间跳转，这里INITSEG指出跳转到的段地址，解释了cs的值为0x9000 跳转到0x90000
 go:	mov	%cs, %ax		#将ds，es，ss都设置成移动后代码所在的段处(0x9000)
 	mov	%ax, %ds
 	mov	%ax, %es
@@ -262,7 +262,7 @@ msg1:
 root_dev:
 	.word ROOT_DEV
 boot_flag:
-	.word 0xAA55
+	.word 0xAA55 # 什么是启动区 只要第一个扇区的512字节的最后两字节分别是0x55和0xaa
 	
 	.text
 	endtext:
