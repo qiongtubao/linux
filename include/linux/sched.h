@@ -16,11 +16,11 @@
 #error "Currently the close-on-exec-flags are in one word, max 32 files/proc"
 #endif
 
-#define TASK_RUNNING		0
-#define TASK_INTERRUPTIBLE	1
-#define TASK_UNINTERRUPTIBLE	2
-#define TASK_ZOMBIE		3
-#define TASK_STOPPED		4
+#define TASK_RUNNING		0			//进程正在运行或就绪,等待CPU时间片
+#define TASK_INTERRUPTIBLE	1			//可中断睡眠状态，等待某个事件发生（I/O）可被信号唤醒
+#define TASK_UNINTERRUPTIBLE	2		//不可中断睡眠状态 等待关键事件完成（不能被信号打断）
+#define TASK_ZOMBIE		3				//僵尸进程，子进程结束但父进程尚未调用wait() 回收资源
+#define TASK_STOPPED		4			//进程被暂停 （如收到SIGSTOP，SIGTSTP等信号）
 
 #ifndef NULL
 #define NULL ((void *) 0)
@@ -83,7 +83,7 @@ struct task_struct { //进程对象
 	long counter; //时间片 调度
 	long priority;//优先级
 	long signal;
-	struct sigaction sigaction[32];
+	struct sigaction sigaction[32]; //16*32
 	long blocked;	/* bitmap of masked signals */
 /* various fields */
 	int exit_code;
@@ -172,14 +172,14 @@ __asm__("str %%ax\n\t" \
  */
 #define switch_to(n) {\
 struct {long a,b;} __tmp; \
-__asm__("cmpl %%ecx,current\n\t" \
-	"je 1f\n\t" \
-	"movw %%dx,%1\n\t" \
-	"xchgl %%ecx,current\n\t" \
-	"ljmp *%0\n\t" \
-	"cmpl %%ecx,last_task_used_math\n\t" \
-	"jne 1f\n\t" \
-	"clts\n" \
+__asm__("cmpl %%ecx,current\n\t" !比较当前进程是否就是目标进程\
+	"je 1f\n\t" !如果是，跳转到标号1（不切换）\			
+	"movw %%dx,%1\n\t" !将TSS 段选择子写入局部变量 __tmp.b\
+	"xchgl %%ecx,current\n\t" !切换current 指针 原子交换\
+	"ljmp *%0\n\t" !长跳转到tss 触发硬件上下文切换\
+	"cmpl %%ecx,last_task_used_math\n\t" !是否是最后一个使用fpu的进程？\
+	"jne 1f\n\t" !否跳到1\
+	"clts\n" !是的话清理CR0.TS \
 	"1:" \
 	::"m" (*&__tmp.a),"m" (*&__tmp.b), \
 	"d" (_TSS(n)),"c" ((long) task[n])); \
