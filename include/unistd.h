@@ -136,9 +136,9 @@
   type name(void) \
 { \
 long __res; \
-__asm__ volatile ("int $0x80" \
-	: "=a" (__res) \
-	: "0" (__NR_##name)); \
+__asm__ volatile ("int $0x80" \		// 触发中断 0x80，进入内核态
+	: "=a" (__res) \				// 返回值存入 eax
+	: "0" (__NR_##name)); \			// 系统调用号放入 eax
 if (__res >= 0) \
 	return (type) __res; \
 errno = -__res; \
