@@ -153,16 +153,16 @@ int sys_stime(long * tptr)
 	return 0;
 }
 
-int sys_times(struct tms * tbuf)
+int sys_times(struct tms * tbuf /* 指向用户空间的 struct tms 缓冲区，用于接收时间统计信息。 */) //它的作用是获取当前进程及其子进程的 CPU 时间统计信息，并返回当前系统时钟滴答数（jiffies）。
 {
-	if (tbuf) {
-		verify_area(tbuf,sizeof *tbuf);
-		put_fs_long(current->utime,(unsigned long *)&tbuf->tms_utime);
-		put_fs_long(current->stime,(unsigned long *)&tbuf->tms_stime);
-		put_fs_long(current->cutime,(unsigned long *)&tbuf->tms_cutime);
-		put_fs_long(current->cstime,(unsigned long *)&tbuf->tms_cstime);
+	if (tbuf) { //如果用户传入了非空指针 tbuf，则进行写入操作。
+		verify_area(tbuf,sizeof *tbuf); //验证用户空间地址合法性
+		put_fs_long(current->utime,(unsigned long *)&tbuf->tms_utime);  //当前进程在用户态运行的时间（单位：jiffies） 内核态空间写入用户空间地址
+		put_fs_long(current->stime,(unsigned long *)&tbuf->tms_stime);	//当前进程在内核态运行的时间
+		put_fs_long(current->cutime,(unsigned long *)&tbuf->tms_cutime);//所有已终止并等待回收的子进程的用户态时间总和
+		put_fs_long(current->cstime,(unsigned long *)&tbuf->tms_cstime);//所有已终止并等待回收的子进程的内核态时间总和
 	}
-	return jiffies;
+	return jiffies; //是一个全局变量，记录系统自启动以来经历的时钟中断次数。
 }
 
 int sys_brk(unsigned long end_data_seg)
