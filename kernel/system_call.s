@@ -91,7 +91,7 @@ system_call:
 	mov %dx,%es
 	movl $0x17,%edx		# fs points to local data space
 	mov %dx,%fs
-	call *sys_call_table(,%eax,4)
+	call *sys_call_table(,%eax,4) # 在sys.h中
 	pushl %eax
 	movl current,%eax
 	cmpl $0,state(%eax)		# state
@@ -173,7 +173,7 @@ device_not_available:
 	ret
 
 .align 2
-timer_interrupt:
+timer_interrupt:	# 内核中时钟中断（Timer Interrupt）的汇编处理入口，用于响应来自定时器芯片（如 PIT，可编程间隔定时器）触发的硬件中断。它是整个内核调度和时间管理机制的核心部分。
 	push %ds		# save ds,es and put kernel data space
 	push %es		# into them. %fs is used by _system_call
 	push %fs
@@ -181,20 +181,20 @@ timer_interrupt:
 	pushl %ecx		# save those across function calls. %ebx
 	pushl %ebx		# is saved as we use that in ret_sys_call
 	pushl %eax
-	movl $0x10,%eax
-	mov %ax,%ds
-	mov %ax,%es
-	movl $0x17,%eax
-	mov %ax,%fs
-	incl jiffies
-	movb $0x20,%al		# EOI to interrupt controller #1
-	outb %al,$0x20
-	movl CS(%esp),%eax
-	andl $3,%eax		# %eax is CPL (0 or 3, 0=supervisor)
-	pushl %eax
-	call do_timer		# 'do_timer(long CPL)' does everything from
+	movl $0x10,%eax # 0x10 是内核数据段的选择子（Segment Selector）。
+	mov %ax,%ds		# ds 设置内核数据段
+	mov %ax,%es		# es 设置内核数据段
+	movl $0x17,%eax	# 0x17 是用户数据段选择子
+	mov %ax,%fs		# FS 段用于访问用户态内存（例如在系统调用或异常处理中使用）。
+	incl jiffies		# jiffies+1
+	movb $0x20,%al		# 中断控制器收到中断后需要手动发送 EOI（End Of Interrupt）信号才能继续接收下一次中断。# EOI to interrupt controller #1
+	outb %al,$0x20		# 此处只向主片（主 PIC）发送 EOI，因为时钟中断连接的是 IRQ0。
+	movl CS(%esp),%eax  # 从栈中取出当前堆栈中的 CS（代码段寄存器）值。
+	andl $3,%eax		# %eax is CPL (0 or 3, 0=supervisor内核态,3是用户态)
+	pushl %eax			# 将 CPL 压栈作为参数传入 do_timer(long CPL)
+	call do_timer		# 调用do_timer # 'do_timer(long CPL)' does everything from
 	addl $4,%esp		# task switching to accounting ...
-	jmp ret_from_sys_call
+	jmp ret_from_sys_call # 跳转到 ret_from_sys_call 标签，这是一个通用的中断/系统调用返回路径
 
 .align 2
 sys_execve:
@@ -205,8 +205,8 @@ sys_execve:
 	ret
 
 .align 2
-sys_fork:
-	call find_empty_process
+sys_fork:  #系统调用 进程创建
+	call find_empty_process #找空的函数
 	testl %eax,%eax
 	js 1f
 	push %gs
@@ -214,7 +214,7 @@ sys_fork:
 	pushl %edi
 	pushl %ebp
 	pushl %eax
-	call copy_process
+	call copy_process	#拷贝程序
 	addl $20,%esp
 1:	ret
 
