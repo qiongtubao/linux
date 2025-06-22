@@ -54,7 +54,7 @@ static long HIGH_MEMORY = 0;
 #define copy_page(from,to) \
 __asm__("cld ; rep ; movsl"::"S" (from),"D" (to),"c" (1024))
 
-static unsigned char mem_map [ PAGING_PAGES ] = {0,};
+static unsigned char mem_map [ PAGING_PAGES ] = {0,}; //每个物理页面的引用次数
 
 /*
  * Get physical address of first (actually last :-) free page, and mark it
@@ -147,7 +147,7 @@ int free_page_tables(unsigned long from,unsigned long size)
  * 1 Mb-range, so the pages can be shared with the kernel. Thus the
  * special case for nr=xxxx.
  */
-int copy_page_tables(unsigned long from,unsigned long to,long size)
+int copy_page_tables(unsigned long from,unsigned long to,long size) //复制进程页表
 {
 	unsigned long * from_page_table;
 	unsigned long * to_page_table;
@@ -155,36 +155,36 @@ int copy_page_tables(unsigned long from,unsigned long to,long size)
 	unsigned long * from_dir, * to_dir;
 	unsigned long nr;
 
-	if ((from&0x3fffff) || (to&0x3fffff))
+	if ((from&0x3fffff) || (to&0x3fffff)) //检查是否对齐4MB
 		panic("copy_page_tables called with wrong alignment");
-	from_dir = (unsigned long *) ((from>>20) & 0xffc); /* _pg_dir = 0 */
+	from_dir = (unsigned long *) ((from>>20) & 0xffc); //虚拟地址通常划分为 页目录索引（10位 1024） + 页表索引（10位 1024） + 页内偏移（1页 4k 4096） 右边移动20位 & 0xffc（111111111100） 页目录索引00（12位 4字节对齐）
 	to_dir = (unsigned long *) ((to>>20) & 0xffc);
-	size = ((unsigned) (size+0x3fffff)) >> 22;
-	for( ; size-->0 ; from_dir++,to_dir++) {
-		if (1 & *to_dir)
+	size = ((unsigned) (size+0x3fffff)) >> 22;			//size + 0x3fffff 向上取整到4MB （即一个页目录项管理的大小） >> 22 相当于除以4MB
+	for( ; size-->0 ; from_dir++,to_dir++) {			//遍历页目录并复制页表
+		if (1 & *to_dir)								//检查目标目录是否已被占用
 			panic("copy_page_tables: already exist");
-		if (!(1 & *from_dir))
+		if (!(1 & *from_dir))							//检查源目录是否存在 不存在跳过
 			continue;
-		from_page_table = (unsigned long *) (0xfffff000 & *from_dir);
-		if (!(to_page_table = (unsigned long *) get_free_page()))
+		from_page_table = (unsigned long *) (0xfffff000 & *from_dir); 	//获得源页表地址 0xfffff000  保留页目录索引（10） + 页表索引（10）  
+		if (!(to_page_table = (unsigned long *) get_free_page()))		//为子进程分配新页表
 			return -1;	/* Out of memory, see freeing */
-		*to_dir = ((unsigned long) to_page_table) | 7;
-		nr = (from==0)?0xA0:1024;
-		for ( ; nr-- > 0 ; from_page_table++,to_page_table++) {
-			this_page = *from_page_table;
-			if (!(1 & this_page))
+		*to_dir = ((unsigned long) to_page_table) | 7;					//｜7   1（Present）1（R/W可读写）1（用户态可访问） 
+		nr = (from==0)?0xA0:1024;	//from == 0 表示内核页表 只复制前0xA0（160）项 否则复制整个页表
+		for ( ; nr-- > 0 ; from_page_table++,to_page_table++) {//遍历table
+			this_page = *from_page_table;	//从源页表中取出当前物理页地址和标志位
+			if (!(1 & this_page))			//如果该页不存在就跳过
 				continue;
-			this_page &= ~2;
+			this_page &= ~2;				//清除 写保护指标。 设置成只读。为后续的写时复制（copy-on-write）做准备
 			*to_page_table = this_page;
-			if (this_page > LOW_MEM) {
-				*from_page_table = this_page;
-				this_page -= LOW_MEM;
-				this_page >>= 12;
-				mem_map[this_page]++;
+			if (this_page > LOW_MEM) {		  //0x100000 = 2^20 = 1MB 如果该在低端内存以上（大于LOW_MEM）才更新引用计数
+				*from_page_table = this_page; //重新设置页内存
+				this_page -= LOW_MEM;		  //为了不增加变量 所以用this_page 计算物理页的索引	
+				this_page >>= 12;			  //偏移量（-1MB）/4k（1页）= 计算页面 	
+				mem_map[this_page]++;		//物理页的引用计数数组 + 1
 			}
 		}
 	}
-	invalidate();
+	invalidate();  //刷新cpu的页表缓存tlb 确保新设置的页表立即生效
 	return 0;
 }
 
