@@ -154,14 +154,14 @@ void sleep_on(struct task_struct **p)
 
 	if (!p)
 		return;
-	if (current == &(init_task.task))
+	if (current == &(init_task.task)) //进程pid=0系统初始化用的特殊进程 不能进入睡眠
 		panic("task[0] trying to sleep");
-	tmp = *p;
-	*p = current;
-	current->state = TASK_UNINTERRUPTIBLE;
-	schedule();
+	tmp = *p;	 //移出之前值
+	*p = current;//存放当前进程
+	current->state = TASK_UNINTERRUPTIBLE; //设置状态不可中断 让出cpu就不会被选到
+	schedule();	 //让出cpu 
 	if (tmp)
-		tmp->state=0;
+		tmp->state=0; //0 = TASK_RUNNING 唤醒tmp？？
 }
 
 void interruptible_sleep_on(struct task_struct **p)
@@ -188,8 +188,8 @@ repeat:	current->state = TASK_INTERRUPTIBLE;
 void wake_up(struct task_struct **p)
 {
 	if (p && *p) {
-		(**p).state=0;
-		*p=NULL;
+		(**p).state=0;  //0 = TASK_RUNNING 设置唤醒等待的第一个进程
+		*p=NULL;		//清空队列头
 	}
 }
 
