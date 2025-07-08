@@ -43,7 +43,7 @@ static int reset = 0;
  *  This struct defines the HD's and their types.
  */
 struct hd_i_struct {
-	int head,sect,cyl,wpcom,lzone,ctl;
+	int head/*磁头数*/,sect/*每磁道扇区数*/,cyl/*柱面数*/,wpcom/*写前预补偿柱面号*/,lzone/*磁头着陆区柱面号*/,ctl/*控制字节*/;
 	};
 #ifdef HD_TYPE
 struct hd_i_struct hd_info[] = { HD_TYPE };
@@ -81,12 +81,12 @@ int sys_setup(void * BIOS)
 	callable = 0;
 #ifndef HD_TYPE
 	for (drive=0 ; drive<2 ; drive++) {
-		hd_info[drive].cyl = *(unsigned short *) BIOS;
-		hd_info[drive].head = *(unsigned char *) (2+BIOS);
-		hd_info[drive].wpcom = *(unsigned short *) (5+BIOS);
-		hd_info[drive].ctl = *(unsigned char *) (8+BIOS);
-		hd_info[drive].lzone = *(unsigned short *) (12+BIOS);
-		hd_info[drive].sect = *(unsigned char *) (14+BIOS);
+		hd_info[drive].cyl = *(unsigned short *) BIOS;			//柱面数
+		hd_info[drive].head = *(unsigned char *) (2+BIOS);		//磁头数
+		hd_info[drive].wpcom = *(unsigned short *) (5+BIOS);	//写前预补偿柱面号
+		hd_info[drive].ctl = *(unsigned char *) (8+BIOS);		//控制字节
+		hd_info[drive].lzone = *(unsigned short *) (12+BIOS);	//磁头着陆区柱面号
+		hd_info[drive].sect = *(unsigned char *) (14+BIOS);		//每磁道扇区数
 		BIOS += 16;
 	}
 	if (hd_info[1].cyl)
@@ -134,17 +134,17 @@ int sys_setup(void * BIOS)
 		hd[i*5].nr_sects = 0;
 	}
 	for (drive=0 ; drive<NR_HD ; drive++) {
-		if (!(bh = bread(0x300 + drive*5,0))) {
+		if (!(bh = bread(0x300 + drive*5,0))) { //bread 调用磁盘读取数据，0x300 表示第一个磁盘的主设备号 ，参数2表示读取第一个块1024B
 			printk("Unable to read partition table of drive %d\n\r",
 				drive);
 			panic("");
 		}
 		if (bh->b_data[510] != 0x55 || (unsigned char)
-		    bh->b_data[511] != 0xAA) {
+		    bh->b_data[511] != 0xAA) { //磁盘第0块数据的最后2个字节必须是0x55 + 0xAA
 			printk("Bad partition table on drive %d\n\r",drive);
 			panic("");
 		}
-		p = 0x1BE + (void *)bh->b_data;
+		p = 0x1BE + (void *)bh->b_data; //获得分区信息
 		for (i=1;i<5;i++,p++) {
 			hd[i+5*drive].start_sect = p->start_sect;
 			hd[i+5*drive].nr_sects = p->nr_sects;
@@ -153,8 +153,8 @@ int sys_setup(void * BIOS)
 	}
 	if (NR_HD)
 		printk("Partition table%s ok.\n\r",(NR_HD>1)?"s":"");
-	rd_load();
-	mount_root();
+	rd_load();		//当有randisk（虚拟内存盘）时才会执行，所谓虚拟内存盘是通过软件将一部分内存（RAM）模拟成硬盘的技术
+	mount_root();	//加载根文件系统   重要！！！
 	return (0);
 }
 
@@ -342,8 +342,8 @@ void do_hd_request(void)
 
 void hd_init(void)
 {
-	blk_dev[MAJOR_NR].request_fn = DEVICE_REQUEST;
-	set_intr_gate(0x2E,&hd_interrupt);
-	outb_p(inb_p(0x21)&0xfb,0x21);
+	blk_dev[MAJOR_NR].request_fn = DEVICE_REQUEST; 	//设置块设备（硬盘）的读写方法
+	set_intr_gate(0x2E,&hd_interrupt);				//硬盘发生读写，会给cpu发出中断
+	outb_p(inb_p(0x21)&0xfb,0x21);					//往某些IO端口上读写一些数据 表示允许硬盘控制器发送中断请求信号
 	outb(inb_p(0xA1)&0xbf,0xA1);
 }

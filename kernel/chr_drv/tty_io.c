@@ -104,7 +104,7 @@ struct tty_queue * table_list[]={
 
 void tty_init(void)
 {
-	rs_init();
+	rs_init(); //串口中断  现在已经很少用到了 可忽略
 	con_init();
 }
 

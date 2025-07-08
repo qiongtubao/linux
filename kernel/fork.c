@@ -83,7 +83,7 @@ int copy_process(int nr/*find_empty_process找到的函数索引*/,long ebp,long
 	
 	// NOTE!: the following statement now work with gcc 4.3.2 now, and you
 	// must compile _THIS_ memcpy without no -O of gcc.#ifndef GCC4_3
-	*p = *current;	//拷贝大部分属性 栈不会拷贝 /* NOTE! this doesn't copy the supervisor stack */
+	*p = *current;	//拷贝父进程大部分属性 栈不会拷贝 /* NOTE! this doesn't copy the supervisor stack */
 	p->state = TASK_UNINTERRUPTIBLE; //状态设置为不可运行状态
 	p->pid = last_pid;				 //使用之前分配的唯一 PID
 	p->father = current->pid;		 //父pid为当前进程的pid

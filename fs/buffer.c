@@ -26,7 +26,7 @@
 #include <asm/system.h>
 #include <asm/io.h>
 
-extern int end;
+extern int end;//ld链接整个程序的时候帮忙设置的内核代码的未尾地址
 extern void put_super(int);
 extern void invalidate_inodes(int);
 
@@ -128,7 +128,7 @@ void check_disk_change(int dev)
 	invalidate_buffers(dev);
 }
 
-#define _hashfn(dev,block) (((unsigned)(dev^block))%NR_HASH)
+#define _hashfn(dev,block) (((unsigned)(dev^block))%NR_HASH)   //dev^block%307   设备号^逻辑块号
 #define hash(dev,block) hash_table[_hashfn(dev,block)]
 
 static inline void remove_from_queues(struct buffer_head * bh)
@@ -350,7 +350,7 @@ struct buffer_head * breada(int dev,int first, ...)
 
 void buffer_init(long buffer_end)
 {
-	struct buffer_head * h = start_buffer;
+	struct buffer_head * h = start_buffer;//程序的结尾地址 end
 	void * b;
 	int i;
 
@@ -379,6 +379,6 @@ void buffer_init(long buffer_end)
 	free_list = start_buffer;
 	free_list->b_prev_free = h;
 	h->b_next_free = free_list;
-	for (i=0;i<NR_HASH;i++)
+	for (i=0;i<NR_HASH;i++) // 哈希表初始化  方便之后快速定位设备中的缓冲区
 		hash_table[i]=NULL;
 }	

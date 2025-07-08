@@ -22,7 +22,7 @@
  */
 static inline fork(void) __attribute__((always_inline));   //强制编译器 始终内联展开
 static inline pause(void) __attribute__((always_inline));
-static inline _syscall0(int,fork)		//生成fork函数
+static inline _syscall0(int,fork)		//生成fork函数  设置eax寄存器值为2 然后进行0x80 中断 调用sys_fork
 static inline _syscall0(int,pause)
 static inline _syscall1(int,setup,void *,BIOS)
 static inline _syscall0(int,sync)
@@ -129,13 +129,13 @@ void main(void)		/* This really IS void, no error here. */ //系统的开始
 	mem_init(main_memory_start,memory_end); //初始化内存管理子系统，标记哪些内存可以被动态分配。
 	trap_init(); 	//中断陷阱处理初始化
 	blk_dev_init(); // 块设备初始化
-	chr_dev_init(); // 字符设备初始化
+	chr_dev_init(); // 字符设备初始化  没实现
 	tty_init();		// 终端设备初始化
 	time_init();	// 时间/时钟初始化
 	sched_init();	// 调度器初始化
 	buffer_init(buffer_memory_end);	// 缓冲区初始化
 	hd_init();		// 硬盘初始化
-	floppy_init();	// 软驱初始化
+	floppy_init();	// 软驱初始化  现在已经被淘汰了
 	sti();			// 开启全局中断
 	move_to_user_mode();	//通过修改标志寄存器（EFLAGS）中的 IOPL 字段，使 CPU 进入用户模式运行。尽管此时仍在内核空间执行，但模拟了用户态权限。
 	if (!fork()) {		/* we count on this going ok */ //使用 fork() 创建一个新的进程（进程号为 1）。
@@ -172,7 +172,7 @@ void init(void)  //1号线程会一直创建子进程 shell交互进程 不退�
 {
 	int pid,i;
 
-	setup((void *) &drive_info);		//从BIOS获取磁盘信息 并挂在根文件系统 初始化设备信息
+	setup((void *) &drive_info);		//0x90080 从BIOS获取磁盘信息 并挂在根文件系统 初始化设备信息
 	(void) open("/dev/tty0",O_RDWR,0);	//打开第一个虚拟终端 /dev/tty0。作为标准输入 （fd=0）。
 	(void) dup(0);						//会复制fd=0（标准输入） 得到fd=1（stdout）		
 	(void) dup(0);						//再次复制。得到fd=2 (stderr)

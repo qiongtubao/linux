@@ -186,7 +186,7 @@ timer_interrupt:	# 内核中时钟中断（Timer Interrupt）的汇编处理入�
 	mov %ax,%es		# es 设置内核数据段
 	movl $0x17,%eax	# 0x17 是用户数据段选择子
 	mov %ax,%fs		# FS 段用于访问用户态内存（例如在系统调用或异常处理中使用）。
-	incl jiffies		# jiffies+1
+	incl jiffies		# jiffies+1 系统滴答数
 	movb $0x20,%al		# 中断控制器收到中断后需要手动发送 EOI（End Of Interrupt）信号才能继续接收下一次中断。# EOI to interrupt controller #1
 	outb %al,$0x20		# 此处只向主片（主 PIC）发送 EOI，因为时钟中断连接的是 IRQ0。
 	movl CS(%esp),%eax  # 从栈中取出当前堆栈中的 CS（代码段寄存器）值。

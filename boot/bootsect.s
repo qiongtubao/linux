@@ -47,7 +47,7 @@
 #
 	.equ ROOT_DEV, 0x301
 	ljmp    $BOOTSEG, $_start
-_start:					#bios 把数据加载到内存0x7c00 512字节 然后复制到0x9000
+_start:					#一切的开始 bios 把数据加载到内存0x7c00 512字节 然后复制到0x9000
 	mov	$BOOTSEG, %ax	#将ds段寄存器设置为0x7C0.   ds数据段寄存器在内存寻址时，充当段基址的作用 比如 mov ax, [0x0001] = mov ax, [ds:0x0001].  
 	mov	%ax, %ds
 	mov	$INITSEG, %ax	#将es段寄存器设置为0x900.   拷贝0x9000 复制到ax寄存器。再复制到es附加段
@@ -111,15 +111,15 @@ ok_load_setup:
 	#lea	msg1, %bp
 	mov     $msg1, %bp
 	mov	$0x1301, %ax		# write string, move cursor
-	int	$0x10
+	int	$0x10				# 使用 BIOS 中断 int 0x10 输出字符串 "IceCityOS is booting ..."。
 
 # ok, we've written the message, now
 # we want to load the system (at 0x10000)
 
 	mov	$SYSSEG, %ax
 	mov	%ax, %es		# segment of 0x010000
-	call	read_it
-	call	kill_motor
+	call	read_it		# 加载系统 函数负责按轨道/扇区读取系统模块到内存。
+	call	kill_motor  # 关闭软驱马达。
 
 # After that we check which root-device to use. If the device is
 # defined (#= 0), nothing is done and the given device is used.

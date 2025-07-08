@@ -76,7 +76,7 @@ _start:
 	mov	%bx, %ds:10
 	mov	%cx, %ds:12
 
-# Get hd0 data
+# Get hd0 data 硬盘1的参数信息 包括柱面数，磁头数，扇区数等信息放到  0x90080中
 
 	mov	$0x0000, %ax
 	mov	%ax, %ds
@@ -88,7 +88,7 @@ _start:
 	rep
 	movsb
 
-# Get hd1 data
+# Get hd1 data 硬盘2的参数信息 包括柱面数，磁头数，扇区数等信息放到  0x90090中
 
 	mov	$0x0000, %ax
 	mov	%ax, %ds

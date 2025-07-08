@@ -29,11 +29,11 @@ struct task_struct * wait_for_request = NULL;
  *	do_request-address
  *	next-request
  */
-struct blk_dev_struct blk_dev[NR_BLK_DEV] = {
+struct blk_dev_struct blk_dev[NR_BLK_DEV] = { //块设备的读写方法
 	{ NULL, NULL },		/* no_dev */
-	{ NULL, NULL },		/* dev mem */
-	{ NULL, NULL },		/* dev fd */
-	{ NULL, NULL },		/* dev hd */
+	{ NULL, NULL },		/* dev mem */ //内存
+	{ NULL, NULL },		/* dev fd */ 
+	{ NULL, NULL },		/* dev hd */  //硬盘
 	{ NULL, NULL },		/* dev ttyx */
 	{ NULL, NULL },		/* dev tty */
 	{ NULL, NULL }		/* dev lp */

@@ -58,7 +58,7 @@ struct tss_struct {
 	long	ss1;		/* 16 high bits zero */
 	long	esp2;
 	long	ss2;		/* 16 high bits zero */
-	long	cr3;
+	long	cr3;		/* cr3寄存器存储的值  指向页目录表的起始地址  不同进程之间内存冲突 全靠它 */
 	long	eip;
 	long	eflags;
 	long	eax,ecx,edx,ebx;
@@ -79,7 +79,7 @@ struct tss_struct {
 
 struct task_struct { //进程对象
 /* these are hardcoded - don't touch */
-	long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+	long state;	//进程状态。在让出cpu前设置状态 可告诉调度器 先别分给我 /* -1 unrunnable, 0 runnable, >0 stopped */
 	long counter; //时间片 调度
 	long priority;//优先级
 	long signal;
@@ -105,7 +105,7 @@ struct task_struct { //进程对象
 /* ldt for this task 0 - zero 1 - cs 2 - ds&ss */
 	struct desc_struct ldt[3];
 /* tss for this task */
-	struct tss_struct tss;
+	struct tss_struct tss; 
 };
 
 /*
@@ -172,14 +172,14 @@ __asm__("str %%ax\n\t" \
  */
 #define switch_to(n) {\
 struct {long a,b;} __tmp; \
-__asm__("cmpl %%ecx,current\n\t" !比较当前进程是否就是目标进程\
-	"je 1f\n\t" !如果是，跳转到标号1（不切换）\			
-	"movw %%dx,%1\n\t" !将TSS 段选择子写入局部变量 __tmp.b\
-	"xchgl %%ecx,current\n\t" !切换current 指针 原子交换\
-	"ljmp *%0\n\t" !长跳转到tss 触发硬件上下文切换\
-	"cmpl %%ecx,last_task_used_math\n\t" !是否是最后一个使用fpu的进程？\
-	"jne 1f\n\t" !否跳到1\
-	"clts\n" !是的话清理CR0.TS \
+__asm__("cmpl %%ecx,current\n\t" /*比较当前进程是否就是目标进程*/\
+	"je 1f\n\t" /*如果是，跳转到标号1（不切换）*/\			
+	"movw %%dx,%1\n\t" /*将TSS 段选择子写入局部变量 __tmp.b*/\
+	"xchgl %%ecx,current\n\t" /*切换current 指针 原子交换*/\
+	"ljmp *%0\n\t" /*核心代码  保存上下文跳到新进程 长跳转到tss 触发硬件上下文切换 */\
+	"cmpl %%ecx,last_task_used_math\n\t" /*是否是最后一个使用fpu的进程？*/\
+	"jne 1f\n\t" /*否跳到1*/\
+	"clts\n" /*是的话清理CR0.TS*/ \
 	"1:" \
 	::"m" (*&__tmp.a),"m" (*&__tmp.b), \
 	"d" (_TSS(n)),"c" ((long) task[n])); \

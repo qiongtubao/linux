@@ -1,12 +1,12 @@
 #define move_to_user_mode() \
 __asm__ ("movl %%esp,%%eax\n\t" \
-	"pushl $0x17\n\t" \
-	"pushl %%eax\n\t" \
-	"pushfl\n\t" \
-	"pushl $0x0f\n\t" \
-	"pushl $1f\n\t" \
-	"iret\n" \
-	"1:\tmovl $0x17,%%eax\n\t" \
+	"pushl $0x17\n\t" /*给ss堆栈段 赋值*/\
+	"pushl %%eax\n\t" /*给esp 栈顶指针*/\
+	"pushfl\n\t" /*eflags 标记寄存器*/\
+	"pushl $0x0f\n\t" /*给cs代码段 赋值   0000000000001111 最后2位表示特权级别3 用户态 倒数第3位为1表示ldt局部描述符（0表示gdt）*/\
+	"pushl $1f\n\t" /*给eip指令寄存器*/\
+	"iret\n" /*执行中断返回指令*/\
+	"1:\tmovl $0x17,%%eax\n\t" /*中断返回后就会来到这里， 这里的效果就是继续往下执行*/\
 	"movw %%ax,%%ds\n\t" \
 	"movw %%ax,%%es\n\t" \
 	"movw %%ax,%%fs\n\t" \

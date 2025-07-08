@@ -36,7 +36,7 @@ static inline void oom(void)
 	do_exit(SIGSEGV);
 }
 
-#define invalidate() \
+#define invalidate() /*刷新页变换高速缓冲宏函数*/\
 __asm__("movl %%eax,%%cr3"::"a" (0))
 
 /* these are not to be changed without changing head.s etc */
@@ -61,7 +61,7 @@ static unsigned char mem_map [ PAGING_PAGES ] = {0,}; //每个物理页面的引
  * used. If no free pages left, return 0.
  */
 unsigned long get_free_page(void)
-{
+{//从mem_map[]数组中找出值为0的项 设置成1 计算并返回页内存起始地址
 register unsigned long __res asm("ax");
 
 __asm__("std ; repne ; scasb\n\t"
@@ -223,12 +223,12 @@ void un_wp_page(unsigned long * table_entry)
 	unsigned long old_page,new_page;
 
 	old_page = 0xfffff000 & *table_entry;
-	if (old_page >= LOW_MEM && mem_map[MAP_NR(old_page)]==1) {
-		*table_entry |= 2;
+	if (old_page >= LOW_MEM && mem_map[MAP_NR(old_page)]==1) { //只被引用1次 说明没有被共享，那只改读写属性就行了
+		*table_entry |= 2; //10  是修改为可读写
 		invalidate();
 		return;
 	}
-	if (!(new_page=get_free_page()))
+	if (!(new_page=get_free_page())) //被引用多次 就需要复制页表了
 		oom();
 	if (old_page >= LOW_MEM)
 		mem_map[MAP_NR(old_page)]--;
@@ -254,7 +254,7 @@ void do_wp_page(unsigned long error_code,unsigned long address)
 #endif
 	un_wp_page((unsigned long *)
 		(((address>>10) & 0xffc) + (0xfffff000 &
-		*((unsigned long *) ((address>>20) &0xffc)))));
+		*((unsigned long *) ((address>>20) &0xffc)))));//括号里是一大段计算address页表项的指针
 
 }
 
