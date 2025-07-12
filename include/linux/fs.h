@@ -91,13 +91,13 @@ struct d_inode {
 };
 
 struct m_inode {
-	unsigned short i_mode;
-	unsigned short i_uid;
-	unsigned long i_size;
-	unsigned long i_mtime;
-	unsigned char i_gid;
+	unsigned short i_mode;	//文件类型
+	unsigned short i_uid;	//用户id
+	unsigned long i_size;	//文件大小
+	unsigned long i_mtime;	//修改时间
+	unsigned char i_gid;	//组id
 	unsigned char i_nlinks;
-	unsigned short i_zone[9];
+	unsigned short i_zone[9];	//块数组9个，0-6直接索引，7为一次间接索引，8位2次间接索引
 /* these are in memory also */
 	struct task_struct * i_wait;
 	unsigned long i_atime;
@@ -114,19 +114,19 @@ struct m_inode {
 };
 
 struct file {
-	unsigned short f_mode;
-	unsigned short f_flags;
-	unsigned short f_count;
-	struct m_inode * f_inode;
+	unsigned short f_mode;		//类型
+	unsigned short f_flags;		//
+	unsigned short f_count;		//引用次数
+	struct m_inode * f_inode;	//inode信息
 	off_t f_pos;
 };
 
 struct super_block {
-	unsigned short s_ninodes;
-	unsigned short s_nzones;
-	unsigned short s_imap_blocks;
-	unsigned short s_zmap_blocks;
-	unsigned short s_firstdatazone;
+	unsigned short s_ninodes;		//inode个数
+	unsigned short s_nzones;		//块数
+	unsigned short s_imap_blocks;	//inode位图占用的块数
+	unsigned short s_zmap_blocks;	//块位图占用的块数
+	unsigned short s_firstdatazone;	//第一个块在哪里
 	unsigned short s_log_zone_size;
 	unsigned long s_max_size;
 	unsigned short s_magic;
@@ -143,12 +143,12 @@ struct super_block {
 	unsigned char s_dirt;
 };
 
-struct d_super_block {
-	unsigned short s_ninodes;
-	unsigned short s_nzones;
-	unsigned short s_imap_blocks;
-	unsigned short s_zmap_blocks;
-	unsigned short s_firstdatazone;
+struct d_super_block { //超级块
+	unsigned short s_ninodes; 	//inode个数
+	unsigned short s_nzones;	//块数
+	unsigned short s_imap_blocks;//inode位图占用的块数
+	unsigned short s_zmap_blocks;//块位图占用的块数
+	unsigned short s_firstdatazone;//第一个块在哪里
 	unsigned short s_log_zone_size;
 	unsigned long s_max_size;
 	unsigned short s_magic;

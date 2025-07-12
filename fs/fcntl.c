@@ -15,13 +15,13 @@
 
 extern int sys_close(int fd);
 
-static int dupfd(unsigned int fd, unsigned int arg)
+static int dupfd(unsigned int fd, unsigned int arg) //fd复制的文件描述符，arg是指定新文件描述符的最小数值
 {
 	if (fd >= NR_OPEN || !current->filp[fd])
 		return -EBADF;
 	if (arg >= NR_OPEN)
 		return -EINVAL;
-	while (arg < NR_OPEN)
+	while (arg < NR_OPEN)//从filp数组中找到空闲的位置
 		if (current->filp[arg])
 			arg++;
 		else
@@ -29,8 +29,8 @@ static int dupfd(unsigned int fd, unsigned int arg)
 	if (arg >= NR_OPEN)
 		return -EMFILE;
 	current->close_on_exec &= ~(1<<arg);
-	(current->filp[arg] = current->filp[fd])->f_count++;
-	return arg;
+	(current->filp[arg] = current->filp[fd])->f_count++; //文件赋值给新fd  引用+1
+	return arg; //返回新的文件描述符
 }
 
 int sys_dup2(unsigned int oldfd, unsigned int newfd)

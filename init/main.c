@@ -151,13 +151,13 @@ void main(void)		/* This really IS void, no error here. */ //系统的开始
 	for(;;) pause(); //父进程（进程号为 0）进入无限循环并调用 pause()。
 }
 
-static int printf(const char *fmt, ...)
+static int printf(const char *fmt, ...) //一切的打印必须在/dev/tty0 已经初始化好了有与外设交互能力之后
 {
 	va_list args;
 	int i;
 
 	va_start(args, fmt);
-	write(1,printbuf,i=vsprintf(printbuf, fmt, args));
+	write(1,printbuf,i=vsprintf(printbuf, fmt, args)); //这里的1就是 stdout 文件/dev/tty
 	va_end(args);
 	return i;
 }
@@ -174,7 +174,7 @@ void init(void)  //1号线程会一直创建子进程 shell交互进程 不退�
 
 	setup((void *) &drive_info);		//0x90080 从BIOS获取磁盘信息 并挂在根文件系统 初始化设备信息
 	(void) open("/dev/tty0",O_RDWR,0);	//打开第一个虚拟终端 /dev/tty0。作为标准输入 （fd=0）。
-	(void) dup(0);						//会复制fd=0（标准输入） 得到fd=1（stdout）		
+	(void) dup(0);						//通过中断后调用sys_dup 会复制fd=0（标准输入） 得到fd=1（stdout）		
 	(void) dup(0);						//再次复制。得到fd=2 (stderr)
 	printf("%d buffers = %d bytes buffer space\n\r",NR_BUFFERS,
 		NR_BUFFERS*BLOCK_SIZE);//输出缓存

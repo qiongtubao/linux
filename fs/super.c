@@ -248,34 +248,34 @@ void mount_root(void)
 	if (32 != sizeof (struct d_inode))
 		panic("bad i-node size");
 	for(i=0;i<NR_FILE;i++)
-		file_table[i].f_count=0;
+		file_table[i].f_count=0; //进程所使用的文件 引用次数清0
 	if (MAJOR(ROOT_DEV) == 2) {
 		printk("Insert root floppy and press ENTER");
 		wait_for_keypress();
 	}
-	for(p = &super_block[0] ; p < &super_block[NR_SUPER] ; p++) {
+	for(p = &super_block[0] ; p < &super_block[NR_SUPER] ; p++) { //超级块 清零工作
 		p->s_dev = 0;
 		p->s_lock = 0;
 		p->s_wait = NULL;
 	}
-	if (!(p=read_super(ROOT_DEV)))
+	if (!(p=read_super(ROOT_DEV))) //磁盘中的超级块读取到内存
 		panic("Unable to mount root");
-	if (!(mi=iget(ROOT_DEV,ROOT_INO)))
+	if (!(mi=iget(ROOT_DEV,ROOT_INO)))//读取根inode信息
 		panic("Unable to read root i-node");
 	mi->i_count += 3 ;	/* NOTE! it is logically used 4 times, not 1 */
 	p->s_isup = p->s_imount = mi;
-	current->pwd = mi;
-	current->root = mi;
+	current->pwd = mi;	//根目录设置为当前进程（进程1）的当前工作目录
+	current->root = mi; //根目录设置根目录
 	free=0;
 	i=p->s_nzones;
 	while (-- i >= 0)
-		if (!set_bit(i&8191,p->s_zmap[i>>13]->b_data))
+		if (!set_bit(i&8191,p->s_zmap[i>>13]->b_data)) //记录块位图
 			free++;
 	printk("%d/%d free blocks\n\r",free,p->s_nzones);
 	free=0;
 	i=p->s_ninodes+1;
 	while (-- i >= 0)
-		if (!set_bit(i&8191,p->s_imap[i>>13]->b_data))
+		if (!set_bit(i&8191,p->s_imap[i>>13]->b_data))//记录inode位图
 			free++;
 	printk("%d/%d free inodes\n\r",free,p->s_ninodes);
 }

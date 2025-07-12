@@ -14,7 +14,7 @@ int open(const char * filename, int flag, ...)
 	va_list arg;
 
 	va_start(arg,flag);
-	__asm__("int $0x80"
+	__asm__("int $0x80" /*触发0x80中断, 调用sys_open*/
 		:"=a" (res)
 		:"0" (__NR_open),"b" (filename),"c" (flag),
 		"d" (va_arg(arg,int)));
