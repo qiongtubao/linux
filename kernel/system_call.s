@@ -198,9 +198,9 @@ timer_interrupt:	# 内核中时钟中断（Timer Interrupt）的汇编处理入�
 
 .align 2
 sys_execve:
-	lea EIP(%esp),%eax
+	lea EIP(%esp),%eax #EIP=0x1C 把中断返回前EIP的地址转换成参数传给do_execve 重要！！！
 	pushl %eax
-	call do_execve
+	call do_execve #执行do_execve
 	addl $4,%esp
 	ret
 

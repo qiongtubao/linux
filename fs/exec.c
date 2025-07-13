@@ -179,8 +179,8 @@ static unsigned long change_ldt(unsigned long text_size,unsigned long * page)
 /*
  * 'do_execve()' executes a new program.
  */
-int do_execve(unsigned long * eip,long tmp,char * filename,
-	char ** argv, char ** envp)
+int do_execve(unsigned long * eip/*调用方触发系统调用时由CPU压入栈空间中的eip指针*/,long tmp/*无用的占位符*/,char * filename/*ELF文件名*/,
+	char ** argv/*执行参数*/, char ** envp/*环境变量*/)
 {
 	struct m_inode * inode;
 	struct buffer_head * bh;
@@ -190,13 +190,13 @@ int do_execve(unsigned long * eip,long tmp,char * filename,
 	int e_uid, e_gid;
 	int retval;
 	int sh_bang = 0;
-	unsigned long p=PAGE_SIZE*MAX_ARG_PAGES-4;
+	unsigned long p=PAGE_SIZE*MAX_ARG_PAGES-4; //p = 0x1FFFC = 4K * 32 - 4 （偏移4B）
 
 	if ((0xffff & eip[1]) != 0x000f)
 		panic("execve called from supervisor mode");
 	for (i=0 ; i<MAX_ARG_PAGES ; i++)	/* clear page-table */
 		page[i]=0;
-	if (!(inode=namei(filename)))		/* get executables inode */
+	if (!(inode=namei(filename)))/*获得文件*/		/* get executables inode */
 		return -ENOENT;
 	argc = count(argv);
 	envc = count(envp);
@@ -218,12 +218,12 @@ restart_interp:
 		retval = -ENOEXEC;
 		goto exec_error2;
 	}
-	if (!(bh = bread(inode->i_dev,inode->i_zone[0]))) {
+	if (!(bh = bread(inode->i_dev,inode->i_zone[0]))) { //读取文件第一块（1KB）数据
 		retval = -EACCES;
 		goto exec_error2;
 	}
-	ex = *((struct exec *) bh->b_data);	/* read exec-header */
-	if ((bh->b_data[0] == '#') && (bh->b_data[1] == '!') && (!sh_bang)) {
+	ex = *((struct exec *) bh->b_data);	//读取数据部分 强转成exec结构体/* read exec-header */
+	if ((bh->b_data[0] == '#') && (bh->b_data[1] == '!') && (!sh_bang)) { //简单粗暴的判断如果开头是#! 就认为是脚本文件 
 		/*
 		 * This section does the #! interpretation.
 		 * Sorta complicated, but hopefully it will work.  -TYT
@@ -295,7 +295,7 @@ restart_interp:
 		set_fs(old_fs);
 		goto restart_interp;
 	}
-	brelse(bh);
+	brelse(bh);//释放缓冲区
 	if (N_MAGIC(ex) != ZMAGIC || ex.a_trsize || ex.a_drsize ||
 		ex.a_text+ex.a_data+ex.a_bss>0x3000000 ||
 		inode->i_size < ex.a_text+ex.a_data+ex.a_syms+N_TXTOFF(ex)) {
@@ -308,8 +308,8 @@ restart_interp:
 		goto exec_error2;
 	}
 	if (!sh_bang) {
-		p = copy_strings(envc,envp,page,p,0);
-		p = copy_strings(argc,argv,page,p,0);
+		p = copy_strings(envc,envp,page,p,0); //p = 0x1FFF5 = 128K - 4 - 7 （home=/\0）
+		p = copy_strings(argc,argv,page,p,0); //p = 0x1FFED = 128K - 4 - 7 - 8 (/bin/bash)  
 		if (!p) {
 			retval = -ENOMEM;
 			goto exec_error2;
@@ -330,8 +330,8 @@ restart_interp:
 	if (last_task_used_math == current)
 		last_task_used_math = NULL;
 	current->used_math = 0;
-	p += change_ldt(ex.a_text,page)-MAX_ARG_PAGES*PAGE_SIZE;
-	p = (unsigned long) create_tables((char *)p,argc,envc);
+	p += change_ldt(ex.a_text,page)-MAX_ARG_PAGES*PAGE_SIZE; //P = 9X3FFFED = 64M - 4- 7 - 8
+	p = (unsigned long) create_tables((char *)p,argc,envc);  // P = 0X3FFFFD0
 	current->brk = ex.a_bss +
 		(current->end_data = ex.a_data +
 		(current->end_code = ex.a_text));
@@ -341,8 +341,8 @@ restart_interp:
 	i = ex.a_text+ex.a_data;
 	while (i&0xfff)
 		put_fs_byte(0,(char *) (i++));
-	eip[0] = ex.a_entry;		/* eip, magic happens :-) */
-	eip[3] = p;			/* stack pointer */
+	eip[0] = ex.a_entry;//修改中断返回后的eip内容（中断后就运行）		/* eip, magic happens :-) */
+	eip[3] = p;	//修改返回后栈指针 重要！！！ （0：eip（中断发生前的指令寄存器），1:cs（中断发生前的代码段）, 2:EFLAGS（标志寄存器）, 3:ESP (中断发生前的栈顶指针),4:SS（中断发生前的堆栈段）		/* stack pointer */
 	return 0;
 exec_error2:
 	iput(inode);

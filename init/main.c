@@ -157,7 +157,7 @@ static int printf(const char *fmt, ...) //一切的打印必须在/dev/tty0 已�
 	int i;
 
 	va_start(args, fmt);
-	write(1,printbuf,i=vsprintf(printbuf, fmt, args)); //这里的1就是 stdout 文件/dev/tty
+	write(1,printbuf,i=vsprintf(printbuf, fmt, args)); //这里的1就是 stdout 文件/dev/tty0
 	va_end(args);
 	return i;
 }
@@ -181,9 +181,9 @@ void init(void)  //1号线程会一直创建子进程 shell交互进程 不退�
 	printf("Free mem: %d bytes\n\r",memory_end-main_memory_start);//输出内存信息
 	if (!(pid=fork())) {	
 		close(0);//子进程 关闭标准输出stdout。？
-		if (open("/etc/rc",O_RDONLY,0)) //打开/etc/rc文件作为stdin 
+		if (open("/etc/rc",O_RDONLY,0)) //只读的方式打开/etc/rc文件作为stdin 
 			_exit(1); //exit 是C标准库函数。它会在退出前执行一些清理工作，_exit() 是系统调用（sys_exit) 直接终止进程，不进行任何清理
-		execve("/bin/sh",argv_rc,envp_rc);	//使用shell脚本执行rc文件脚本 
+		execve("/bin/sh",argv_rc,envp_rc);	//调用sys_execve => 调用do_execve ,使用shell脚本执行rc文件脚本 
 		_exit(2);
 	}
 	if (pid>0)

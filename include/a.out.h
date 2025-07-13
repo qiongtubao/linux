@@ -4,14 +4,14 @@
 #define __GNU_EXEC_MACROS__
 
 struct exec {
-  unsigned long a_magic;	/* Use macros N_MAGIC, etc for access */
-  unsigned a_text;		/* length of text, in bytes */
-  unsigned a_data;		/* length of data, in bytes */
-  unsigned a_bss;		/* length of uninitialized data area for file, in bytes */
-  unsigned a_syms;		/* length of symbol table data in file, in bytes */
-  unsigned a_entry;		/* start address */
-  unsigned a_trsize;		/* length of relocation info for text, in bytes */
-  unsigned a_drsize;		/* length of relocation info for data, in bytes */
+  unsigned long a_magic;//魔数	/* Use macros N_MAGIC, etc for access */
+  unsigned a_text;//代码区长度		/* length of text, in bytes */
+  unsigned a_data;//数据区长度		/* length of data, in bytes */
+  unsigned a_bss;//未初始化数据区长度		/* length of uninitialized data area for file, in bytes */
+  unsigned a_syms;//符号表长度	/* length of symbol table data in file, in bytes */
+  unsigned a_entry;//执行开始地址		/* start address */
+  unsigned a_trsize;//代码重定位信息长度		/* length of relocation info for text, in bytes */
+  unsigned a_drsize;//数据重定位信息长度	/* length of relocation info for data, in bytes */
 };
 
 #ifndef N_MAGIC
