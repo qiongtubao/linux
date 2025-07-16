@@ -45,12 +45,12 @@ keyboard_interrupt:
 	mov %ax,%ds
 	mov %ax,%es
 	xor %al,%al		/* %eax is scan code */
-	inb $0x60,%al
+	inb $0x60,%al #读取键盘扫描码
 	cmpb $0xe0,%al
 	je set_e0
 	cmpb $0xe1,%al
 	je set_e1
-	call *key_table(,%eax,4)
+	call *key_table(,%eax,4) #调用对应按键的处理函数
 	movb $0,e0
 e0_e1:	inb $0x61,%al
 	jmp 1f
@@ -65,7 +65,7 @@ e0_e1:	inb $0x61,%al
 	outb %al,$0x61
 	movb $0x20,%al
 	outb %al,$0x20
-	pushl $0
+	pushl $0	#0 作为参数  调用do_tty_interrupt
 	call do_tty_interrupt
 	addl $4,%esp
 	pop %es

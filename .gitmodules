@@ -1,0 +1,3 @@
+[submodule "deps/xv6-public"]
+	path = deps/xv6-public
+	url = https://github.com/qiongtubao/xv6-public.git

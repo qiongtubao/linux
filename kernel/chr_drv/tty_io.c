@@ -147,7 +147,7 @@ void copy_to_cooked(struct tty_struct * tty)
 	signed char c;
 
 	while (!EMPTY(tty->read_q) && !FULL(tty->secondary)) {
-		GETCH(tty->read_q,c);
+		GETCH(tty->read_q,c); //从读取队列read_q中提取字符
 		if (c==13)
 			if (I_CRNL(tty))
 				c=10;
@@ -222,7 +222,7 @@ void copy_to_cooked(struct tty_struct * tty)
 				PUTCH(c,tty->write_q);
 			tty->write(tty);
 		}
-		PUTCH(c,tty->secondary);
+		PUTCH(c,tty->secondary);//处理后的字符放入辅助队列里
 	}
 	wake_up(&tty->secondary.proc_list);
 }
@@ -342,7 +342,7 @@ int tty_write(unsigned channel, char * buf, int nr)
  */
 void do_tty_interrupt(int tty)
 {
-	copy_to_cooked(tty_table+tty);
+	copy_to_cooked(tty_table+tty); //0:控制台 1:串行终端1  2:串行终端2
 }
 
 void chr_dev_init(void)

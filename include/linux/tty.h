@@ -47,9 +47,9 @@ struct tty_struct {
 	int pgrp;
 	int stopped;
 	void (*write)(struct tty_struct * tty);
-	struct tty_queue read_q;
-	struct tty_queue write_q;
-	struct tty_queue secondary;
+	struct tty_queue read_q;//读队列
+	struct tty_queue write_q;//写队列
+	struct tty_queue secondary;//辅助队列
 	};
 
 extern struct tty_struct tty_table[];

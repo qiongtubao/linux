@@ -204,14 +204,14 @@ unsigned long put_page(unsigned long page,unsigned long address)
 		printk("Trying to put page %p at %p\n",page,address);
 	if (mem_map[(page-LOW_MEM)>>12] != 1)
 		printk("mem_map disagrees with %p at %p\n",page,address);
-	page_table = (unsigned long *) ((address>>20) & 0xffc);
+	page_table = (unsigned long *) ((address>>20) & 0xffc);//找到页目录项
 	if ((*page_table)&1)
 		page_table = (unsigned long *) (0xfffff000 & *page_table);
 	else {
-		if (!(tmp=get_free_page()))
+		if (!(tmp=get_free_page()))//写入页目录项
 			return 0;
 		*page_table = tmp|7;
-		page_table = (unsigned long *) tmp;
+		page_table = (unsigned long *) tmp;//写入页表项
 	}
 	page_table[(address>>12) & 0x3ff] = page | 7;
 /* no need for invalidate */
@@ -371,30 +371,30 @@ void do_no_page(unsigned long error_code,unsigned long address)
 	int block,i;
 
 	address &= 0xfffff000;
-	tmp = address - current->start_code;
+	tmp = address - current->start_code;//计算相对于进程基数的偏移0
 	if (!current->executable || tmp >= current->end_data) {
 		get_empty_page(address);
 		return;
 	}
 	if (share_page(tmp))
 		return;
-	if (!(page = get_free_page()))
-		oom();
+	if (!(page = get_free_page()))//寻找空闲页
+		oom();//内存不足 oom
 /* remember that 1 block is used for header */
-	block = 1 + tmp/BLOCK_SIZE;
-	for (i=0 ; i<4 ; block++,i++)
+	block = 1 + tmp/BLOCK_SIZE;//计算这个地址在文件中的哪个数据块
+	for (i=0 ; i<4 ; block++,i++)//磁盘1块1024B 内存一页4k 需要读4块
 		nr[i] = bmap(current->executable,block);
-	bread_page(page,current->executable->i_dev,nr);
+	bread_page(page,current->executable->i_dev,nr);//磁盘读取到内存
 	i = tmp + 4096 - current->end_data;
 	tmp = page + 4096;
 	while (i-- > 0) {
 		tmp--;
 		*(char *)tmp = 0;
 	}
-	if (put_page(page,address))
+	if (put_page(page,address))//完成页表的映射
 		return;
-	free_page(page);
-	oom();
+	free_page(page);//映射失败 释放页内存
+	oom();			//报错oom
 }
 
 void mem_init(long start_mem, long end_mem)
