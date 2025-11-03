@@ -1270,8 +1270,8 @@ struct task_struct {
 	 * during the current scan window. When the scan completes, the counts
 	 * in faults_memory and faults_cpu decay and these values are copied.
 	 */
-	unsigned long			*numa_faults;
-	unsigned long			total_numa_faults;
+	unsigned long			*numa_faults;		// 每个节点访问计数数组
+	unsigned long			total_numa_faults;  // 总访问次数
 
 	/*
 	 * numa_faults_locality tracks if faults recorded during the last

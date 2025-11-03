@@ -1412,12 +1412,12 @@ static inline unsigned long group_weight(struct task_struct *p, int nid,
 bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
 				int src_nid, int dst_cpu)
 {
-	struct numa_group *ng = deref_curr_numa_group(p);
-	int dst_nid = cpu_to_node(dst_cpu);
+	struct numa_group *ng = deref_curr_numa_group(p);	//numa组 
+	int dst_nid = cpu_to_node(dst_cpu);					//目标cpu所属的numa节点
 	int last_cpupid, this_cpupid;
 
-	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid);
-	last_cpupid = page_cpupid_xchg_last(page, this_cpupid);
+	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid); //cpu+pid 存入int数据结构 
+	last_cpupid = page_cpupid_xchg_last(page, this_cpupid); //写入页结构并返回上次访问该页的任务信息
 
 	/*
 	 * Allow first faults or private faults to migrate immediately early in
@@ -1425,8 +1425,8 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
 	 * two full passes of the "multi-stage node selection" test that is
 	 * executed below.
 	 */
-	if ((p->numa_preferred_nid == NUMA_NO_NODE || p->numa_scan_seq <= 4) &&
-	    (cpupid_pid_unset(last_cpupid) || cpupid_match_pid(p, last_cpupid)))
+	if ((p->numa_preferred_nid == NUMA_NO_NODE /*未设置首选numa节点*/ || p->numa_scan_seq <= 4 /* 早期扫描阶段 */) &&
+	    (cpupid_pid_unset(last_cpupid) /*之前没有访问过该页*/ || cpupid_match_pid(p, last_cpupid) /* 上一次访问者就是自己*/ ))
 		return true;
 
 	/*
@@ -1446,16 +1446,16 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
 	 * This quadric squishes small probabilities, making it less likely we
 	 * act on an unlikely task<->page relation.
 	 */
-	if (!cpupid_pid_unset(last_cpupid) &&
-				cpupid_to_nid(last_cpupid) != dst_nid)
+	if (!cpupid_pid_unset(last_cpupid) /*之前访问过*/ &&
+				cpupid_to_nid(last_cpupid) != dst_nid /*其他numa节点*/)
 		return false;
 
 	/* Always allow migrate on private faults */
-	if (cpupid_match_pid(p, last_cpupid))
+	if (cpupid_match_pid(p, last_cpupid)/*上次访问者就是当前任务*/)
 		return true;
 
 	/* A shared fault, but p->numa_group has not been set up yet. */
-	if (!ng)
+	if (!ng) //没有关联到任何numa组
 		return true;
 
 	/*
@@ -1463,7 +1463,7 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
 	 * node? Allow migration.
 	 */
 	if (group_faults_cpu(ng, dst_nid) > group_faults_cpu(ng, src_nid) *
-					ACTIVE_NODE_FRACTION)
+					ACTIVE_NODE_FRACTION) //目标节点上访问次数是当前节点的3倍以上
 		return true;
 
 	/*
@@ -1474,8 +1474,8 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
 	 * --------------- * - > ---------------
 	 * faults_mem(dst)   4   faults_mem(src)
 	 */
-	return group_faults_cpu(ng, dst_nid) * group_faults(p, src_nid) * 3 >
-	       group_faults_cpu(ng, src_nid) * group_faults(p, dst_nid) * 4;
+	return group_faults_cpu(ng, dst_nid) /*目标节点cpu访问次数*/ * group_faults(p, src_nid) /*源节点内存访问次数*/* 3 >
+	       group_faults_cpu(ng, src_nid) /*源节点cpu访问次数*/* group_faults(p, dst_nid)/*目标节点内存访问次数*/ * 4;
 }
 
 /*
@@ -2715,7 +2715,7 @@ static void task_numa_work(struct callback_head *work)
 	unsigned long migrate, next_scan, now = jiffies;
 	struct task_struct *p = current;
 	struct mm_struct *mm = p->mm;
-	u64 runtime = p->se.sum_exec_runtime;
+	u64 runtime = p->se.sum_exec_runtime; //运行时间
 	struct vm_area_struct *vma;
 	unsigned long start, end;
 	unsigned long nr_pte_updates = 0;
@@ -2737,23 +2737,23 @@ static void task_numa_work(struct callback_head *work)
 
 	if (!mm->numa_next_scan) {
 		mm->numa_next_scan = now +
-			msecs_to_jiffies(sysctl_numa_balancing_scan_delay);
+			msecs_to_jiffies(sysctl_numa_balancing_scan_delay); //设置下次扫描时间
 	}
 
 	/*
 	 * Enforce maximal scan/migration frequency..
 	 */
 	migrate = mm->numa_next_scan;
-	if (time_before(now, migrate))
+	if (time_before(now, migrate)) //扫描时间未到， 跳过
 		return;
 
 	if (p->numa_scan_period == 0) {
-		p->numa_scan_period_max = task_scan_max(p);
-		p->numa_scan_period = task_scan_start(p);
+		p->numa_scan_period_max = task_scan_max(p);//返回最大周期
+		p->numa_scan_period = task_scan_start(p); //返回根据当前进程负载动态调整的值；
 	}
 
 	next_scan = now + msecs_to_jiffies(p->numa_scan_period);
-	if (cmpxchg(&mm->numa_next_scan, migrate, next_scan) != migrate)
+	if (cmpxchg(&mm->numa_next_scan, migrate, next_scan) != migrate) //设置下次扫描时间
 		return;
 
 	/*
@@ -2762,24 +2762,24 @@ static void task_numa_work(struct callback_head *work)
 	 */
 	p->node_stamp += 2 * TICK_NSEC;
 
-	start = mm->numa_scan_offset;
-	pages = sysctl_numa_balancing_scan_size;
+	start = mm->numa_scan_offset;				//上次扫描结束的位置
+	pages = sysctl_numa_balancing_scan_size;	//每次扫描多少MB
 	pages <<= 20 - PAGE_SHIFT; /* MB in pages */
 	virtpages = pages * 8;	   /* Scan up to this much virtual space */
 	if (!pages)
 		return;
 
 
-	if (!mmap_read_trylock(mm))
+	if (!mmap_read_trylock(mm)) //读锁
 		return;
 	vma = find_vma(mm, start);
-	if (!vma) {
+	if (!vma) {//未找到 重置从0开始
 		reset_ptenuma_scan(p);
 		start = 0;
 		vma = mm->mmap;
 	}
 	for (; vma; vma = vma->vm_next) {
-		if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
+		if (!vma_migratable(vma) /*不可迁移*/ || !vma_policy_mof(vma) ||
 			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
 			continue;
 		}
@@ -2791,14 +2791,14 @@ static void task_numa_work(struct callback_head *work)
 		 * as migrating the pages will be of marginal benefit.
 		 */
 		if (!vma->vm_mm ||
-		    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ)))
+		    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ))) //不处理共享库
 			continue;
 
 		/*
 		 * Skip inaccessible VMAs to avoid any confusion between
 		 * PROT_NONE and NUMA hinting ptes
 		 */
-		if (!vma_is_accessible(vma))
+		if (!vma_is_accessible(vma)) //跳过 无法访问vma
 			continue;
 
 		do {
@@ -2823,7 +2823,7 @@ static void task_numa_work(struct callback_head *work)
 			if (pages <= 0 || virtpages <= 0)
 				goto out;
 
-			cond_resched();
+			cond_resched();	//可能让出cpu
 		} while (end != vma->vm_end);
 	}
 
@@ -2835,10 +2835,10 @@ out:
 	 * scanner to the start so check it now.
 	 */
 	if (vma)
-		mm->numa_scan_offset = start;
+		mm->numa_scan_offset = start; //更新下次扫描偏移量
 	else
 		reset_ptenuma_scan(p);
-	mmap_read_unlock(mm);
+	mmap_read_unlock(mm); //解读锁
 
 	/*
 	 * Make sure tasks use at least 32x as much time to run other code
@@ -2847,8 +2847,8 @@ out:
 	 * overloaded system we need to limit overhead on a per task basis.
 	 */
 	if (unlikely(p->se.sum_exec_runtime != runtime)) {
-		u64 diff = p->se.sum_exec_runtime - runtime;
-		p->node_stamp += 32 * diff;
+		u64 diff = p->se.sum_exec_runtime - runtime; //运行扫描时间
+		p->node_stamp += 32 * diff;					 //确保任务运行其它代码的时间是此处的32倍
 	}
 }
 
@@ -2864,12 +2864,12 @@ void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 			mm->numa_scan_seq = 0;
 		}
 	}
-	p->node_stamp			= 0;
-	p->numa_scan_seq		= mm ? mm->numa_scan_seq : 0;
-	p->numa_scan_period		= sysctl_numa_balancing_scan_delay;
+	p->node_stamp			= 0;							//用于控制下一次numa扫描的时间偏移
+	p->numa_scan_seq		= mm ? mm->numa_scan_seq : 0;  	//从地址空间继承当前扫描序列号；
+	p->numa_scan_period		= sysctl_numa_balancing_scan_delay; //初始扫描周期 1000ms
 	/* Protect against double add, see task_tick_numa and task_numa_work */
-	p->numa_work.next		= &p->numa_work;
-	p->numa_faults			= NULL;
+	p->numa_work.next		= &p->numa_work;				//链表子环初始化
+	p->numa_faults			= NULL;							//记录访问各个 NUMA 节点的缺页次数；
 	RCU_INIT_POINTER(p->numa_group, NULL);
 	p->last_task_numa_placement	= 0;
 	p->last_sum_exec_runtime	= 0;
@@ -2919,9 +2919,9 @@ static void task_tick_numa(struct rq *rq, struct task_struct *curr)
 	now = curr->se.sum_exec_runtime;
 	period = (u64)curr->numa_scan_period * NSEC_PER_MSEC;
 
-	if (now > curr->node_stamp + period) {
+	if (now > curr->node_stamp + period) { //判断当前时间是否达到扫描时间点
 		if (!curr->node_stamp)
-			curr->numa_scan_period = task_scan_start(curr);
+			curr->numa_scan_period = task_scan_start(curr); //第一次运行时设置初始扫描周期
 		curr->node_stamp += period;
 
 		if (!time_before(jiffies, curr->mm->numa_next_scan))
@@ -6023,28 +6023,28 @@ find_idlest_group_cpu(struct sched_group *group, struct task_struct *p, int this
 	int i;
 
 	/* Check if we have any choice: */
-	if (group->group_weight == 1)
+	if (group->group_weight == 1)		//只有一个cpu
 		return cpumask_first(sched_group_span(group));
 
 	/* Traverse only the allowed CPUs */
-	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
+	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) { //遍历组内允许运行该任务的cpu
 		struct rq *rq = cpu_rq(i);
 
-		if (!sched_core_cookie_match(rq, p))
+		if (!sched_core_cookie_match(rq, p)) //与当前任务是否兼容
 			continue;
 
-		if (sched_idle_cpu(i))
+		if (sched_idle_cpu(i)) //优先完全空闲
 			return i;
 
 		if (available_idle_cpu(i)) {
 			struct cpuidle_state *idle = idle_get_state(rq);
-			if (idle && idle->exit_latency < min_exit_latency) {
+			if (idle && idle->exit_latency/*空闲状态退出延迟*/ < min_exit_latency) {
 				/*
 				 * We give priority to a CPU whose idle state
 				 * has the smallest exit latency irrespective
 				 * of any idle timestamp.
 				 */
-				min_exit_latency = idle->exit_latency;
+				min_exit_latency = idle->exit_latency; //刷新最近的进入空闲的cpu （更快响应和缓存更热）
 				latest_idle_timestamp = rq->idle_stamp;
 				shallowest_idle_cpu = i;
 			} else if ((!idle || idle->exit_latency == min_exit_latency) &&
@@ -6057,7 +6057,7 @@ find_idlest_group_cpu(struct sched_group *group, struct task_struct *p, int this
 				latest_idle_timestamp = rq->idle_stamp;
 				shallowest_idle_cpu = i;
 			}
-		} else if (shallowest_idle_cpu == -1) {
+		} else if (shallowest_idle_cpu == -1) { //没有浅层空闲 找负载最小的cpu
 			load = cpu_load(cpu_rq(i));
 			if (load < min_load) {
 				min_load = load;
@@ -6074,34 +6074,34 @@ static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p
 {
 	int new_cpu = cpu;
 
-	if (!cpumask_intersects(sched_domain_span(sd), p->cpus_ptr))
+	if (!cpumask_intersects(sched_domain_span(sd), p->cpus_ptr)) //调度域不包含任务可运行的cpu 返回prev_cpu
 		return prev_cpu;
 
 	/*
 	 * We need task's util for cpu_util_without, sync it up to
 	 * prev_cpu's last_update_time.
 	 */
-	if (!(sd_flag & SD_BALANCE_FORK))
+	if (!(sd_flag & SD_BALANCE_FORK))	//非fork情况下 同步任务的负载信息
 		sync_entity_load_avg(&p->se);
 
-	while (sd) {
+	while (sd) {	//遍历调度域  从上到下选择最空闲组和cpu
 		struct sched_group *group;
 		struct sched_domain *tmp;
 		int weight;
 
-		if (!(sd->flags & sd_flag)) {
+		if (!(sd->flags & sd_flag)) { //不支持当前平衡策略 跳过进入子域
 			sd = sd->child;
 			continue;
 		}
 
-		group = find_idlest_group(sd, p, cpu);
+		group = find_idlest_group(sd, p, cpu);	//比较各个组的负载 找出最空闲的一个
 		if (!group) {
 			sd = sd->child;
 			continue;
 		}
 
-		new_cpu = find_idlest_group_cpu(group, p, cpu);
-		if (new_cpu == cpu) {
+		new_cpu = find_idlest_group_cpu(group, p, cpu);	//找出最空闲的cpu
+		if (new_cpu == cpu) {							//如果选出的 CPU 就是当前 CPU，说明可能还有更优解，继续向下层调度域查找。
 			/* Now try balancing at a lower domain level of 'cpu': */
 			sd = sd->child;
 			continue;
@@ -6909,34 +6909,34 @@ unlock:
  * Returns the target CPU number.
  */
 static int
-select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+select_task_rq_fair(struct task_struct *p/*被唤醒的进程*/, int prev_cpu/*之前所在cpu*/, int wake_flags/*唤醒标志位*/)
 {
-	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING); //设置了WF_SYNC且不是退出状态 标记为同步唤醒
 	struct sched_domain *tmp, *sd = NULL;
-	int cpu = smp_processor_id();
-	int new_cpu = prev_cpu;
-	int want_affine = 0;
+	int cpu = smp_processor_id(); //当前正在执行的 CPU；
+	int new_cpu = prev_cpu;		  //默认选择prev_cpu
+	int want_affine = 0;		  //是否希望保持亲和性（affinity）；
 	/* SD_flags and WF_flags share the first nibble */
-	int sd_flag = wake_flags & 0xF;
+	int sd_flag = wake_flags & 0xF;	//从 wake_flags 提取调度域标志（如 SD_BALANCE_WAKE）；
 
 	/*
 	 * required for stable ->cpus_allowed
 	 */
 	lockdep_assert_held(&p->pi_lock);
-	if (wake_flags & WF_TTWU) {
-		record_wakee(p);
+	if (wake_flags & WF_TTWU) {	//记录唤醒者并判断能效
+		record_wakee(p);		//记录是谁唤醒了这个任务
 
-		if (sched_energy_enabled()) {
-			new_cpu = find_energy_efficient_cpu(p, prev_cpu);
+		if (sched_energy_enabled()) {	//如果启用能量感知调度  寻找最节能的cpu
+			new_cpu = find_energy_efficient_cpu(p, prev_cpu);	//寻找最节能的cpu
 			if (new_cpu >= 0)
 				return new_cpu;
-			new_cpu = prev_cpu;
+			new_cpu = prev_cpu; //没找到重新赋值给上次执行的cpu
 		}
 
-		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr) /*cpu在允许的掩码中*/;
 	}
 
-	rcu_read_lock();
+	rcu_read_lock();			//加读锁
 	for_each_domain(cpu, tmp) {
 		/*
 		 * If both 'cpu' and 'prev_cpu' are part of this domain,
@@ -6959,12 +6959,12 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 
 	if (unlikely(sd)) {
 		/* Slow path */
-		new_cpu = find_idlest_cpu(sd, p, cpu, prev_cpu, sd_flag);
+		new_cpu = find_idlest_cpu(sd, p, cpu, prev_cpu, sd_flag); //找到最闲的cpu
 	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
 		/* Fast path */
-		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);	//尝试找一个与 prev_cpu 同一级缓存的空闲 CPU；
 	}
-	rcu_read_unlock();
+	rcu_read_unlock();		//解读锁
 
 	return new_cpu;
 }
@@ -11068,7 +11068,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
-		entity_tick(cfs_rq, se, queued);
+		entity_tick(cfs_rq, se, queued); //cfs核心调度
 	}
 
 	if (static_branch_unlikely(&sched_numa_balancing))

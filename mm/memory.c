@@ -4324,11 +4324,11 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
 		      unsigned long addr, int page_nid, int *flags)
 {
-	get_page(page);
+	get_page(page); //增加引用计数器
 
-	count_vm_numa_event(NUMA_HINT_FAULTS);
+	count_vm_numa_event(NUMA_HINT_FAULTS); //numa_hint_faults 统计+1
 	if (page_nid == numa_node_id()) {
-		count_vm_numa_event(NUMA_HINT_FAULTS_LOCAL);
+		count_vm_numa_event(NUMA_HINT_FAULTS_LOCAL); //numa_hint_faults_local 统计+1
 		*flags |= TNF_FAULT_LOCAL;
 	}
 
@@ -4337,13 +4337,13 @@ int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
 
 static vm_fault_t do_numa_page(struct vm_fault *vmf)
 {
-	struct vm_area_struct *vma = vmf->vma;
+	struct vm_area_struct *vma = vmf->vma; //vma
 	struct page *page = NULL;
 	int page_nid = NUMA_NO_NODE;
 	int last_cpupid;
 	int target_nid;
 	pte_t pte, old_pte;
-	bool was_writable = pte_savedwrite(vmf->orig_pte);
+	bool was_writable = pte_savedwrite(vmf->orig_pte); //可写标记
 	int flags = 0;
 
 	/*
@@ -4351,7 +4351,7 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	 * validation through pte_unmap_same(). It's of NUMA type but
 	 * the pfn may be screwed if the read is non atomic.
 	 */
-	vmf->ptl = pte_lockptr(vma->vm_mm, vmf->pmd);
+	vmf->ptl = pte_lockptr(vma->vm_mm, vmf->pmd); //pte锁
 	spin_lock(vmf->ptl);
 	if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -4360,14 +4360,14 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 
 	/* Get the normal PTE  */
 	old_pte = ptep_get(vmf->pte);
-	pte = pte_modify(old_pte, vma->vm_page_prot);
+	pte = pte_modify(old_pte, vma->vm_page_prot); //
 
-	page = vm_normal_page(vma, vmf->address, pte);
-	if (!page)
+	page = vm_normal_page(vma, vmf->address, pte); //获得物理页
+	if (!page)	//失败跳出
 		goto out_map;
 
 	/* TODO: handle PTE-mapped THP */
-	if (PageCompound(page))
+	if (PageCompound(page)) //当前不支持THP复合页
 		goto out_map;
 
 	/*
@@ -4378,34 +4378,34 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	 * pte_dirty has unpredictable behaviour between PTE scan updates,
 	 * background writeback, dirty balancing and application behaviour.
 	 */
-	if (!was_writable)
+	if (!was_writable)	//非可写
 		flags |= TNF_NO_GROUP;
 
 	/*
 	 * Flag if the page is shared between multiple address spaces. This
 	 * is later used when determining whether to group tasks together
 	 */
-	if (page_mapcount(page) > 1 && (vma->vm_flags & VM_SHARED))
-		flags |= TNF_SHARED;
+	if (page_mapcount(page) > 1 && (vma->vm_flags & VM_SHARED)) //多进程共享
+		flags |= TNF_SHARED;	
 
-	last_cpupid = page_cpupid_last(page);
-	page_nid = page_to_nid(page);
+	last_cpupid = page_cpupid_last(page); 	//获取最后一次访问该页的cpuid
+	page_nid = page_to_nid(page);			//获得该页所在numa节点
 	target_nid = numa_migrate_prep(page, vma, vmf->address, page_nid,
-			&flags);
-	if (target_nid == NUMA_NO_NODE) {
+			&flags);						//获得最终numa节点
+	if (target_nid == NUMA_NO_NODE) { 		//节点=-1 不需要迁移
 		put_page(page);
 		goto out_map;
 	}
-	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);	//解锁
 
 	/* Migrate to the requested node */
-	if (migrate_misplaced_page(page, vma, target_nid)) {
+	if (migrate_misplaced_page(page, vma, target_nid)) { //尝试迁移到目标节点
 		page_nid = target_nid;
-		flags |= TNF_MIGRATED;
+		flags |= TNF_MIGRATED;			//迁移成功
 	} else {
-		flags |= TNF_MIGRATE_FAIL;
+		flags |= TNF_MIGRATE_FAIL;		//迁移失败
 		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
-		spin_lock(vmf->ptl);
+		spin_lock(vmf->ptl);			//加锁
 		if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			goto out;
@@ -4415,18 +4415,18 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 
 out:
 	if (page_nid != NUMA_NO_NODE)
-		task_numa_fault(last_cpupid, page_nid, 1, flags);
+		task_numa_fault(last_cpupid, page_nid, 1, flags);	//刷新迁移失败次数
 	return 0;
 out_map:
 	/*
 	 * Make it present again, depending on how arch implements
 	 * non-accessible ptes, some can allow access by kernel mode.
 	 */
-	old_pte = ptep_modify_prot_start(vma, vmf->address, vmf->pte);
-	pte = pte_modify(old_pte, vma->vm_page_prot);
-	pte = pte_mkyoung(pte);
-	if (was_writable)
-		pte = pte_mkwrite(pte);
+	old_pte = ptep_modify_prot_start(vma, vmf->address, vmf->pte); //获得pte 
+	pte = pte_modify(old_pte, vma->vm_page_prot);				    //修改读权限
+	pte = pte_mkyoung(pte);											//标记最近访问 LRU回收
+	if (was_writable)												
+		pte = pte_mkwrite(pte);										//恢复写权限
 	ptep_modify_prot_commit(vma, vmf->address, vmf->pte, old_pte, pte);
 	update_mmu_cache(vma, vmf->address, vmf->pte);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -4510,7 +4510,7 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
  * The mmap_lock may have been released depending on flags and our return value.
  * See filemap_fault() and __lock_page_or_retry().
  */
-static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+static vm_fault_t handle_pte_fault(struct vm_fault *vmf) //
 {
 	pte_t entry;
 
@@ -4614,45 +4614,45 @@ unlock:
  * The mmap_lock may have been released depending on flags and our
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
-static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
-		unsigned long address, unsigned int flags)
+static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma /*发生缺页虚拟内存区域*/,
+		unsigned long address /* 对齐后的虚拟地址 */, unsigned int flags /*缺页标志*/)
 {
 	struct vm_fault vmf = {
 		.vma = vma,
 		.address = address & PAGE_MASK,
 		.flags = flags,
-		.pgoff = linear_page_index(vma, address),
-		.gfp_mask = __get_fault_gfp_mask(vma),
-	};
-	unsigned int dirty = flags & FAULT_FLAG_WRITE;
-	struct mm_struct *mm = vma->vm_mm;
+		.pgoff = linear_page_index(vma, address), 	//计算当前地址在文件或匿名映射中的偏移；
+		.gfp_mask = __get_fault_gfp_mask(vma),		//获取合适的分配掩码；
+	}; //缺页上下文
+	unsigned int dirty = flags & FAULT_FLAG_WRITE;	//
+	struct mm_struct *mm = vma->vm_mm;	//获取当前的内存描述符 
 	pgd_t *pgd;
 	p4d_t *p4d;
 	vm_fault_t ret;
 
-	pgd = pgd_offset(mm, address);
-	p4d = p4d_alloc(mm, pgd, address);
-	if (!p4d)
+	pgd = pgd_offset(mm, address);		//获得页全局
+	p4d = p4d_alloc(mm, pgd, address);	//分配页4级目录
+	if (!p4d)							//内存申请失败
 		return VM_FAULT_OOM;
 
-	vmf.pud = pud_alloc(mm, p4d, address);
+	vmf.pud = pud_alloc(mm, p4d, address);	//分配页上层目录
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
 retry_pud:
-	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) {
-		ret = create_huge_pud(&vmf);
+	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) { //pud是空 且启用了透明大页
+		ret = create_huge_pud(&vmf);//尝试创建大页
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
 	} else {
 		pud_t orig_pud = *vmf.pud;
 
 		barrier();
-		if (pud_trans_huge(orig_pud) || pud_devmap(orig_pud)) {
+		if (pud_trans_huge(orig_pud) || pud_devmap(orig_pud)) { //有大页映射
 
 			/* NUMA case for anonymous PUDs would go here */
 
-			if (dirty && !pud_write(orig_pud)) {
-				ret = wp_huge_pud(&vmf, orig_pud);
+			if (dirty && !pud_write(orig_pud)) { //写操作且没写权限
+				ret = wp_huge_pud(&vmf, orig_pud);//写保护处理
 				if (!(ret & VM_FAULT_FALLBACK))
 					return ret;
 			} else {
@@ -4662,15 +4662,15 @@ retry_pud:
 		}
 	}
 
-	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+	vmf.pmd = pmd_alloc(mm, vmf.pud, address);//页中间目录
 	if (!vmf.pmd)
 		return VM_FAULT_OOM;
 
 	/* Huge pud page fault raced with pmd_alloc? */
-	if (pud_trans_unstable(vmf.pud))
+	if (pud_trans_unstable(vmf.pud))	//如果不稳定 进行重试 
 		goto retry_pud;
 
-	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
+	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) { //pmd是空 且支持大页
 		ret = create_huge_pmd(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
@@ -4678,15 +4678,15 @@ retry_pud:
 		vmf.orig_pmd = *vmf.pmd;
 
 		barrier();
-		if (unlikely(is_swap_pmd(vmf.orig_pmd))) {
+		if (unlikely(is_swap_pmd(vmf.orig_pmd))) { //是否是swap大页映射
 			VM_BUG_ON(thp_migration_supported() &&
 					  !is_pmd_migration_entry(vmf.orig_pmd));
 			if (is_pmd_migration_entry(vmf.orig_pmd))
 				pmd_migration_entry_wait(mm, vmf.pmd);
 			return 0;
 		}
-		if (pmd_trans_huge(vmf.orig_pmd) || pmd_devmap(vmf.orig_pmd)) {
-			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))
+		if (pmd_trans_huge(vmf.orig_pmd) || pmd_devmap(vmf.orig_pmd)) { //检查是不是大页映射
+			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))	//如果是PROT_NONE 且VMA可访问
 				return do_huge_pmd_numa_page(&vmf);
 
 			if (dirty && !pmd_write(vmf.orig_pmd)) {

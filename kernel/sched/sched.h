@@ -929,9 +929,9 @@ struct rq {
 	 */
 	unsigned int		nr_running;
 #ifdef CONFIG_NUMA_BALANCING
-	unsigned int		nr_numa_running;
-	unsigned int		nr_preferred_running;
-	unsigned int		numa_migrate_on;
+	unsigned int		nr_numa_running;			//参与numa任务数
+	unsigned int		nr_preferred_running;		//偏好本地运行的任务数
+	unsigned int		numa_migrate_on;			//是否允许接收迁移任务；
 #endif
 #ifdef CONFIG_NO_HZ_COMMON
 #ifdef CONFIG_SMP

@@ -1456,7 +1456,7 @@ static inline int sanitize_mpol_flags(int *mode, unsigned short *flags)
 	return 0;
 }
 
-static long kernel_mbind(unsigned long start, unsigned long len,
+static long (unsigned long start, unsigned long len,
 			 unsigned long mode, const unsigned long __user *nmask,
 			 unsigned long maxnode, unsigned int flags)
 {
@@ -1719,11 +1719,11 @@ static struct mempolicy *get_vma_policy(struct vm_area_struct *vma,
 	return pol;
 }
 
-bool vma_policy_mof(struct vm_area_struct *vma)
+bool vma_policy_mof(struct vm_area_struct *vma) //判断虚拟内存区域是否开启了MPOL_F_MOF标记  （当该VMA的内存策略发生改变时候 需要迁移现有的页面到新的目标numa节点上）
 {
 	struct mempolicy *pol;
 
-	if (vma->vm_ops && vma->vm_ops->get_policy) {
+	if (vma->vm_ops && vma->vm_ops->get_policy) { //判断是否有自定义的vm_ops 所属文件映射
 		bool ret = false;
 
 		pol = vma->vm_ops->get_policy(vma, vma->vm_start);
@@ -1734,7 +1734,7 @@ bool vma_policy_mof(struct vm_area_struct *vma)
 		return ret;
 	}
 
-	pol = vma->vm_policy;
+	pol = vma->vm_policy;	//本身属性
 	if (!pol)
 		pol = get_task_policy(current);
 
@@ -2380,55 +2380,55 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long 
 {
 	struct mempolicy *pol;
 	struct zoneref *z;
-	int curnid = page_to_nid(page);
+	int curnid = page_to_nid(page);			//当前页面node节点
 	unsigned long pgoff;
-	int thiscpu = raw_smp_processor_id();
-	int thisnid = cpu_to_node(thiscpu);
+	int thiscpu = raw_smp_processor_id();	//当前执行线程的cpuid
+	int thisnid = cpu_to_node(thiscpu); 	//cpuid对应的node节点
 	int polnid = NUMA_NO_NODE;
 	int ret = NUMA_NO_NODE;
 
-	pol = get_vma_policy(vma, addr);
-	if (!(pol->flags & MPOL_F_MOF))
+	pol = get_vma_policy(vma, addr);	//获得当前地址对应的内存策略
+	if (!(pol->flags & MPOL_F_MOF))		//策略不进行迁移 跳出
 		goto out;
 
 	switch (pol->mode) {
-	case MPOL_INTERLEAVE:
-		pgoff = vma->vm_pgoff;
-		pgoff += (addr - vma->vm_start) >> PAGE_SHIFT;
-		polnid = offset_il_node(pol, pgoff);
+	case MPOL_INTERLEAVE:				//交错分配
+		pgoff = vma->vm_pgoff;			//vma的页偏移量  
+		pgoff += (addr - vma->vm_start) >> PAGE_SHIFT; // 地址离vm第一页的距离   按页为单位
+		polnid = offset_il_node(pol, pgoff);		   //偏移选择一个目标节点
 		break;
 
-	case MPOL_PREFERRED:
-		if (node_isset(curnid, pol->nodes))
+	case MPOL_PREFERRED:				//首选节点
+		if (node_isset(curnid, pol->nodes))	//当前节点已经在首选节点内 跳出
 			goto out;
-		polnid = first_node(pol->nodes);
+		polnid = first_node(pol->nodes);	//选择首选节点中第一个
 		break;
 
-	case MPOL_LOCAL:
+	case MPOL_LOCAL:					//本地优先
 		polnid = numa_node_id();
 		break;
 
-	case MPOL_BIND:
+	case MPOL_BIND:						//绑定节点集合
 		/* Optimize placement among multiple nodes via NUMA balancing */
-		if (pol->flags & MPOL_F_MORON) {
-			if (node_isset(thisnid, pol->nodes))
+		if (pol->flags & MPOL_F_MORON) { //是否开启自平衡
+			if (node_isset(thisnid, pol->nodes)) //当前节点在绑定节点中 跳出循环
 				break;
 			goto out;
 		}
 		fallthrough;
 
-	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_MANY:			//多节点首选
 		/*
 		 * use current page if in policy nodemask,
 		 * else select nearest allowed node, if any.
 		 * If no allowed nodes, use current [!misplaced].
 		 */
-		if (node_isset(curnid, pol->nodes))
+		if (node_isset(curnid, pol->nodes)) //在节点集合里 不迁移
 			goto out;
 		z = first_zones_zonelist(
 				node_zonelist(numa_node_id(), GFP_HIGHUSER),
 				gfp_zone(GFP_HIGHUSER),
-				&pol->nodes);
+				&pol->nodes);	//查找当前节点的 zonelist 集合中的可用节点
 		polnid = zone_to_nid(z->zone);
 		break;
 
@@ -2437,10 +2437,10 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long 
 	}
 
 	/* Migrate the page towards the node whose CPU is referencing it */
-	if (pol->flags & MPOL_F_MORON) {
-		polnid = thisnid;
+	if (pol->flags & MPOL_F_MORON) {	//开启自平衡
+		polnid = thisnid;				//cpu所在node节点
 
-		if (!should_numa_migrate_memory(current, page, curnid, thiscpu))
+		if (!should_numa_migrate_memory(current, page, curnid, thiscpu)) //判断是否需要迁移
 			goto out;
 	}
 
