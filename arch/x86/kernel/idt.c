@@ -170,7 +170,7 @@ static const __initconst struct idt_data apic_idts[] = {
 };
 
 /* Must be page-aligned because the real IDT is used in the cpu entry area */
-static gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;
+static gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;//这里是idt_table 内存数组（保存256个中断描述符）
 
 static struct desc_ptr idt_descr __ro_after_init = {
 	.size		= IDT_TABLE_SIZE - 1,
@@ -194,11 +194,11 @@ static __init void
 idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sys)
 {
 	gate_desc desc;
-
-	for (; size > 0; t++, size--) {
-		idt_init_desc(&desc, t);
-		write_idt_entry(idt, t->vector, &desc);
-		if (sys)
+	printk(KERN_INFO "[latte] idt_setup_from_table %d\n", size);
+	for (; size > 0; t++, size--) { //逐个处理每个中断向量的配置。
+		idt_init_desc(&desc, t);    //用 idt_init_desc() 填充 gate_desc
+		write_idt_entry(idt, t->vector, &desc);//写入 IDT 表
+		if (sys)	//标记“系统向量”
 			set_bit(t->vector, system_vectors);
 	}
 }
@@ -232,7 +232,7 @@ void __init idt_setup_early_traps(void)
 void __init idt_setup_traps(void)
 {
 	idt_setup_from_table(idt_table, def_idts, ARRAY_SIZE(def_idts), true);
-
+	printk(KERN_INFO "[latte] idt_setup_traps\n");
 	if (ia32_enabled())
 		idt_setup_from_table(idt_table, ia32_idt, ARRAY_SIZE(ia32_idt), true);
 }

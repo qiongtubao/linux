@@ -967,7 +967,8 @@ void start_kernel(void)
 	setup_log_buf(0);
 	vfs_caches_init_early();
 	sort_main_extable();
-	trap_init();
+	printk(KERN_INFO "[latte] main -> trap_init\n");
+	trap_init(); //初始化中断事件
 	mm_core_init();
 	maple_tree_init();
 	poking_init();

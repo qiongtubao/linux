@@ -132,13 +132,13 @@ struct idt_data {
 };
 
 struct gate_struct {
-	u16		offset_low;
-	u16		segment;
-	struct idt_bits	bits;
-	u16		offset_middle;
+	u16		offset_low;   //中断处理函数地址的低 16 位。
+	u16		segment;      //代码段选择子（通常是 __KERNEL_CS）。
+	struct idt_bits	bits; //类型和属性字段（包括 DPL、P 位、门类型等）。
+	u16		offset_middle;//地址的中间 16 位（bit 16–31）。
 #ifdef CONFIG_X86_64
-	u32		offset_high;
-	u32		reserved;
+	u32		offset_high;  //地址的高 32 位（bit 32–63），仅在 x86_64 中使用。
+	u32		reserved;	  //保留字段，必须为 0。
 #endif
 } __attribute__((packed));
 
