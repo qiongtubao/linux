@@ -231,6 +231,7 @@ void __init idt_setup_early_traps(void)
  */
 void __init idt_setup_traps(void)
 {
+	printk(KERN_INFO "[latte][x86] idt_table add def_idts\n");
 	idt_setup_from_table(idt_table, def_idts, ARRAY_SIZE(def_idts), true);
 
 	if (ia32_enabled())

@@ -1568,7 +1568,7 @@ void __init trap_init(void)
 
 	/* Initialize TSS before setting up traps so ISTs work */
 	cpu_init_exception_handling(true);
-
+	printk(KERN_INFO "[latte][x86] kernel idt setup traps\n");
 	/* Setup traps as cpu_init() might #GP */
 	if (!cpu_feature_enabled(X86_FEATURE_FRED))
 		idt_setup_traps();

@@ -954,6 +954,7 @@ void start_kernel(void)
 	setup_log_buf(0);
 	vfs_caches_init_early();
 	sort_main_extable();
+	printk(KERN_INFO "[latte][trap_init]\n");
 	trap_init();
 	mm_core_init();
 	maple_tree_init();
