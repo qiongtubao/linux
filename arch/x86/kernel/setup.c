@@ -956,7 +956,7 @@ void __init setup_arch(char **cmdline_p)
 	early_reserve_memory();
 
 	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
-	e820__memory_setup();
+	e820__memory_setup();//E820 到 memblock 的转换
 	parse_setup_data();
 
 	copy_edd();
@@ -1028,6 +1028,10 @@ void __init setup_arch(char **cmdline_p)
 	/*
 	 * partially used pages are not usable - thus
 	 * we are rounding upwards:
+	 *
+	 * max_pfn - 系统中最大的物理页帧号（Page Frame Number）
+	 * 这个值确定了系统可用的物理内存上限，是所有内存管理操作的基础。
+	 * 通过 e820 内存映射表确定系统中实际可用的 RAM 大小。
 	 */
 	max_pfn = e820__end_of_ram_pfn();
 
@@ -1072,6 +1076,18 @@ void __init setup_arch(char **cmdline_p)
 
 	cleanup_highmap();
 
+	/*
+	 * e820__memblock_setup() - 将 E820 内存映射转换为 memblock 结构
+	 *
+	 * 此函数将 BIOS/EFI 提供的 E820 内存映射信息转换为 Linux 内核的
+	 * memblock 内存管理器可以使用的格式。memblock 是内核启动早期使用的
+	 * 简单内存分配器，用于在完整的页面分配器初始化之前管理内存。
+	 *
+	 * 主要工作：
+	 * 1. 遍历 E820 表，将所有 E820_TYPE_RAM 类型的内存区域添加到 memblock
+	 * 2. 保留内核代码、数据、BSS 等关键区域
+	 * 3. 为后续的内存初始化（如 page allocator）准备内存布局信息
+	 */
 	e820__memblock_setup();
 
 	/*
@@ -1121,6 +1137,22 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	x86_platform.realmode_reserve();
 
+	/*
+	 * init_mem_mapping() - 初始化物理内存的直接映射
+	 *
+	 * 这是 x86 架构内存初始化的核心函数之一，主要完成以下工作：
+	 * 1. 建立物理内存到虚拟地址空间的直接映射（direct mapping）
+	 * 2. 遍历 E820 内存映射表，为所有 E820_TYPE_RAM 类型的内存区域创建页表映射
+	 * 3. 初始化页表结构，支持大页（2MB/1GB）映射以提高性能
+	 * 4. 设置内核可以直接访问所有物理内存的线性映射区域
+	 *
+	 * 在调用此函数之前，内核只能访问有限的早期内存区域。此函数执行后，
+	 * 内核可以通过直接映射访问所有可用的物理内存，为后续的内存管理子系统
+	 * 初始化（如 memblock、page allocator 等）奠定基础。
+	 *
+	 * 注意：此函数依赖于早期的 IDT 页错误处理，因此在调用后需要安装
+	 * 真正的页错误处理程序。
+	 */
 	init_mem_mapping();
 
 	/*
@@ -1186,6 +1218,18 @@ void __init setup_arch(char **cmdline_p)
 
 	x86_flattree_get_config();
 
+	/*
+	 * initmem_init() - 初始化内存节点和 NUMA 拓扑结构
+	 *
+	 * 此函数负责：
+	 * 1. 初始化 NUMA（Non-Uniform Memory Access）节点信息
+	 * 2. 检测和配置多节点内存拓扑结构
+	 * 3. 为每个内存节点建立数据结构，为后续的 zone 初始化做准备
+	 *
+	 * 在 x86_64 架构上，此函数调用 x86_numa_init() 来解析 ACPI SRAT
+	 * (Static Resource Affinity Table) 表，识别系统中的内存节点及其
+	 * 与 CPU 的亲和性关系。这对于多处理器系统和 NUMA 系统至关重要。
+	 */
 	initmem_init();
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
 
@@ -1203,6 +1247,24 @@ void __init setup_arch(char **cmdline_p)
 	if (!early_xdbc_setup_hardware())
 		early_xdbc_register_console();
 
+	/*
+	 * x86_init.paging.pagetable_init() - 完成分页系统的初始化
+	 *
+	 * 此函数调用架构相关的分页初始化函数（在 x86_64 上通常是 paging_init()），
+	 * 主要完成：
+	 * 1. 初始化稀疏内存映射（sparse memory mapping）
+	 * 2. 清除节点 0 的默认内存状态
+	 * 3. 调用 zone_sizes_init() 初始化所有内存节点的 zone 大小
+	 * 4. 为每个内存节点建立 zone 结构（DMA、DMA32、Normal、HighMem 等）
+	 *
+	 * zone 是 Linux 内存管理的基本单位，不同类型的 zone 用于不同用途：
+	 * - DMA zone: 用于 DMA 操作的低地址内存（< 16MB）
+	 * - DMA32 zone: 32位地址空间的 DMA 内存（< 4GB，仅 x86_64）
+	 * - Normal zone: 普通可映射内存
+	 * - HighMem zone: 高端内存（仅 32位系统）
+	 *
+	 * 这些 zone 的初始化是后续页面分配器（page allocator）工作的基础。
+	 */
 	x86_init.paging.pagetable_init();
 
 	kasan_init();

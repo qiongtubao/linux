@@ -5724,6 +5724,25 @@ static void per_cpu_pages_init(struct per_cpu_pages *pcp, struct per_cpu_zonesta
 static DEFINE_PER_CPU(struct per_cpu_pages, boot_pageset);
 static DEFINE_PER_CPU(struct per_cpu_zonestat, boot_zonestats);
 
+/*
+ * __build_all_zonelists() - 为所有内存节点构建 zone 列表
+ *
+ * zone 列表（zonelist）是页面分配器的核心数据结构，它定义了当需要分配
+ * 页面时，应该按什么顺序尝试从哪些 zone 分配。这对于 NUMA 系统特别重要，
+ * 因为不同 zone 的访问延迟不同。
+ *
+ * 主要工作：
+ * 1. 为每个内存节点构建 zonelist，按优先级排序（本地 zone 优先）
+ * 2. 在 NUMA 系统中，zonelist 包含本地和远程节点的 zone
+ * 3. 初始化每个 CPU 的页面集（pageset），用于 per-CPU 页面缓存
+ *
+ * zonelist 的构建策略：
+ * - 优先使用本地节点的 zone（减少跨节点访问延迟）
+ * - 按 zone 类型排序（DMA -> DMA32 -> Normal -> HighMem）
+ * - 在 NUMA 系统中，包含备用节点的 zone 作为后备
+ *
+ * 这个函数在系统启动时调用，也在内存热插拔时调用以更新 zonelist。
+ */
 static void __build_all_zonelists(void *data)
 {
 	int nid;
@@ -5732,8 +5751,8 @@ static void __build_all_zonelists(void *data)
 	unsigned long flags;
 
 	/*
-	 * The zonelist_update_seq must be acquired with irqsave because the
-	 * reader can be invoked from IRQ with GFP_ATOMIC.
+	 * 必须使用 irqsave 获取 zonelist_update_seq，因为读取者可能
+	 * 在 IRQ 上下文中以 GFP_ATOMIC 调用
 	 */
 	write_seqlock_irqsave(&zonelist_update_seq, flags);
 	/*
@@ -5783,57 +5802,92 @@ static void __build_all_zonelists(void *data)
 	write_sequnlock_irqrestore(&zonelist_update_seq, flags);
 }
 
+/*
+ * build_all_zonelists_init() - 初始化阶段构建所有 zone 列表
+ *
+ * 此函数在系统启动时调用，完成页面分配器的核心数据结构初始化：
+ * 1. 为所有内存节点构建 zonelist（zone 分配顺序列表）
+ * 2. 初始化每个 CPU 的 boot_pageset（启动阶段的页面集）
+ * 3. 验证 zonelist 的正确性
+ * 4. 初始化 cpuset 的内存允许掩码
+ *
+ * boot_pageset 用于启动阶段的页面分配，因为此时 per-CPU 分配器
+ * 尚未完全初始化。这是一个"鸡生蛋，蛋生鸡"的问题：
+ * - per-CPU 分配器需要页面分配器来分配其 pageset
+ * - 页面分配器需要 per-CPU 分配器来管理 per-CPU 页面缓存
+ *
+ * 解决方案是使用静态的 boot_pageset，在启动阶段提供基本的页面分配能力。
+ * 当 per-CPU 分配器可用后，会分配真正的 pageset 并替换 boot_pageset。
+ *
+ * 这个初始化是页面分配器工作的基础，之后所有的页面分配（包括 pagecache）
+ * 都依赖于这些 zonelist 和 pageset。
+ */
 static noinline void __init
 build_all_zonelists_init(void)
 {
 	int cpu;
 
+	/* 为所有内存节点构建 zonelist */
 	__build_all_zonelists(NULL);
 
 	/*
-	 * Initialize the boot_pagesets that are going to be used
-	 * for bootstrapping processors. The real pagesets for
-	 * each zone will be allocated later when the per cpu
-	 * allocator is available.
+	 * 初始化用于引导处理器的 boot_pagesets。
+	 * 每个 zone 的真正 pagesets 将在 per-CPU 分配器可用后分配。
 	 *
-	 * boot_pagesets are used also for bootstrapping offline
-	 * cpus if the system is already booted because the pagesets
-	 * are needed to initialize allocators on a specific cpu too.
-	 * F.e. the percpu allocator needs the page allocator which
-	 * needs the percpu allocator in order to allocate its pagesets
-	 * (a chicken-egg dilemma).
+	 * boot_pagesets 也用于引导离线 CPU（如果系统已经启动），
+	 * 因为 pagesets 也需要在特定 CPU 上初始化分配器。
+	 * 例如，per-CPU 分配器需要页面分配器，而页面分配器需要
+	 * per-CPU 分配器来分配其 pagesets（鸡生蛋问题）。
 	 */
 	for_each_possible_cpu(cpu)
 		per_cpu_pages_init(&per_cpu(boot_pageset, cpu), &per_cpu(boot_zonestats, cpu));
 
+	/* 验证 zonelist 的正确性 */
 	mminit_verify_zonelist();
+	/* 初始化当前进程的 cpuset 内存允许掩码 */
 	cpuset_init_current_mems_allowed();
 }
 
 /*
- * unless system_state == SYSTEM_BOOTING.
+ * build_all_zonelists() - 构建所有 zone 列表（启动时或运行时）
  *
- * __ref due to call of __init annotated helper build_all_zonelists_init
- * [protected by SYSTEM_BOOTING].
+ * 这是页面分配器初始化的入口函数，根据系统状态选择不同的初始化路径：
+ * 1. 系统启动时（SYSTEM_BOOTING）：调用 build_all_zonelists_init() 完成完整初始化
+ * 2. 运行时（内存热插拔等）：只更新指定节点的 zonelist
+ *
+ * 主要功能：
+ * - 构建 zonelist：定义页面分配时的 zone 优先级顺序
+ * - 初始化 per-CPU 页面集：为每个 CPU 建立页面缓存
+ * - 计算系统总页面数：用于决定是否启用页面迁移分组
+ *
+ * zonelist 的构建是页面分配器工作的基础。当需要分配页面时（例如为 pagecache
+ * 分配页面），分配器会按照 zonelist 中的顺序尝试从各个 zone 分配页面。
+ *
+ * 注意：__ref 标记是因为调用了 __init 注解的辅助函数 build_all_zonelists_init
+ * [受 SYSTEM_BOOTING 保护]
+ *
+ * @pgdat: 要更新的内存节点（运行时）或 NULL（启动时）
  */
 void __ref build_all_zonelists(pg_data_t *pgdat)
 {
 	unsigned long vm_total_pages;
 
 	if (system_state == SYSTEM_BOOTING) {
+		/* 系统启动时：完成所有节点的完整初始化 */
 		build_all_zonelists_init();
 	} else {
+		/* 运行时（如内存热插拔）：只更新指定节点的 zonelist */
 		__build_all_zonelists(pgdat);
-		/* cpuset refresh routine should be here */
+		/* cpuset 刷新例程应该在这里 */
 	}
-	/* Get the number of free pages beyond high watermark in all zones. */
+	/* 获取所有 zone 中超过高水位线的空闲页面数 */
 	vm_total_pages = nr_free_zone_pages(gfp_zone(GFP_HIGHUSER_MOVABLE));
 	/*
-	 * Disable grouping by mobility if the number of pages in the
-	 * system is too low to allow the mechanism to work. It would be
-	 * more accurate, but expensive to check per-zone. This check is
-	 * made on memory-hotadd so a system can start with mobility
-	 * disabled and enable it later
+	 * 如果系统中的页面数太少，禁用按迁移类型分组。
+	 * 如果页面数不足以让该机制工作，按迁移类型分组会失效。
+	 * 更准确的方法是按 zone 检查，但那样会很昂贵。
+	 * 这个检查在内存热添加时进行，所以系统可以从禁用迁移开始，
+	 * 稍后再启用
 	 */
 	if (vm_total_pages < (pageblock_nr_pages * MIGRATE_TYPES))
 		page_group_by_mobility_disabled = 1;

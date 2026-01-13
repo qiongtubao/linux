@@ -556,17 +556,21 @@ unsigned long __ref init_memory_mapping(unsigned long start,
 }
 
 /*
- * We need to iterate through the E820 memory map and create direct mappings
- * for only E820_TYPE_RAM and E820_KERN_RESERVED regions. We cannot simply
- * create direct mappings for all pfns from [0 to max_low_pfn) and
- * [4GB to max_pfn) because of possible memory holes in high addresses
- * that cannot be marked as UC by fixed/variable range MTRRs.
- * Depending on the alignment of E820 ranges, this may possibly result
- * in using smaller size (i.e. 4K instead of 2M or 1G) page tables.
+ * init_range_memory_mapping() - 为指定范围内的内存区域创建直接映射
  *
- * init_mem_mapping() calls init_range_memory_mapping() with big range.
- * That range would have hole in the middle or ends, and only ram parts
- * will be mapped in init_range_memory_mapping().
+ * 我们需要遍历 E820 内存映射表，只为 E820_TYPE_RAM 和 E820_KERN_RESERVED
+ * 类型的内存区域创建直接映射。不能简单地映射所有从 [0 到 max_low_pfn) 和
+ * [4GB 到 max_pfn) 的页帧，因为高地址可能存在内存空洞，这些空洞无法通过
+ * 固定/可变范围的 MTRR 标记为 UC（Uncacheable）。
+ *
+ * 根据 E820 范围的对齐情况，可能会使用较小的页面大小（例如 4K 而不是 2M 或 1G）。
+ *
+ * init_mem_mapping() 使用大范围调用此函数。该范围中间或两端可能有空洞，
+ * 只有 RAM 部分会在 init_range_memory_mapping() 中被映射。
+ *
+ * @r_start: 要映射的内存范围的起始地址
+ * @r_end: 要映射的内存范围的结束地址
+ * @return: 实际映射的内存大小（字节）
  */
 static unsigned long __init init_range_memory_mapping(
 					   unsigned long r_start,
@@ -756,12 +760,32 @@ static void __init init_trampoline(void)
 #endif
 }
 
+/*
+ * init_mem_mapping() - 初始化物理内存的直接映射（Direct Mapping）
+ *
+ * 这是 x86 架构内存初始化的核心函数，负责建立物理内存到虚拟地址空间的
+ * 线性映射关系。在 Linux 内核中，物理内存通过直接映射区域（通常从
+ * PAGE_OFFSET 开始）可以直接访问，无需通过页表查找。
+ *
+ * 主要工作流程：
+ * 1. 检测和配置页面大小支持（4KB、2MB、1GB 大页）
+ * 2. 映射 ISA 地址范围（0-16MB），确保早期设备可以访问
+ * 3. 初始化 trampoline 页表（用于 CPU 启动和 KASLR）
+ * 4. 根据内存分配方向（bottom-up 或 top-down）建立完整的内存映射
+ * 5. 为所有 E820_TYPE_RAM 类型的内存区域创建页表项
+ *
+ * 映射完成后，内核可以通过直接映射访问所有物理内存，为后续的页面分配器、
+ * pagecache 等内存管理子系统提供基础。
+ */
 void __init init_mem_mapping(void)
 {
 	unsigned long end;
 
+	/* 检查并禁用 PTI（Page Table Isolation）如果需要 */
 	pti_check_boottime_disable();
+	/* 探测 CPU 支持的页面大小（4KB、2MB、1GB） */
 	probe_page_size_mask();
+	/* 设置 PCID（Process Context IDentifier）支持 */
 	setup_pcid();
 
 #ifdef CONFIG_X86_64
@@ -770,29 +794,33 @@ void __init init_mem_mapping(void)
 	end = max_low_pfn << PAGE_SHIFT;
 #endif
 
-	/* the ISA range is always mapped regardless of memory holes */
+	/* 
+	 * ISA 地址范围（0-16MB）必须始终映射，即使存在内存空洞
+	 * 这是因为早期设备和 DMA 操作需要访问这个区域
+	 */
 	init_memory_mapping(0, ISA_END_ADDRESS, PAGE_KERNEL);
 
-	/* Init the trampoline, possibly with KASLR memory offset */
+	/* 初始化 trampoline 页表，可能包含 KASLR 内存偏移 */
 	init_trampoline();
 
 	/*
-	 * If the allocation is in bottom-up direction, we setup direct mapping
-	 * in bottom-up, otherwise we setup direct mapping in top-down.
+	 * 根据内存分配方向选择映射策略：
+	 * - bottom-up: 从低地址向高地址映射，适合内存碎片较少的系统
+	 * - top-down: 从高地址向低地址映射，适合需要保留低地址内存的系统
 	 */
 	if (memblock_bottom_up()) {
 		unsigned long kernel_end = __pa_symbol(_end);
 
 		/*
-		 * we need two separate calls here. This is because we want to
-		 * allocate page tables above the kernel. So we first map
-		 * [kernel_end, end) to make memory above the kernel be mapped
-		 * as soon as possible. And then use page tables allocated above
-		 * the kernel to map [ISA_END_ADDRESS, kernel_end).
+		 * 自底向上映射需要两次调用：
+		 * 1. 先映射 [kernel_end, end)，使内核上方的内存尽快可用
+		 * 2. 再映射 [ISA_END_ADDRESS, kernel_end)，使用已分配的页表
+		 * 这样可以将页表分配在内核上方，避免与内核代码冲突
 		 */
 		memory_map_bottom_up(kernel_end, end);
 		memory_map_bottom_up(ISA_END_ADDRESS, kernel_end);
 	} else {
+		/* 自顶向下映射：从高地址向低地址建立映射 */
 		memory_map_top_down(ISA_END_ADDRESS, end);
 	}
 

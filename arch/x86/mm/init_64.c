@@ -829,24 +829,58 @@ static __always_inline void x86_numa_init(void)
 }
 #endif
 
+/*
+ * initmem_init() - 初始化内存节点和 NUMA 拓扑结构
+ *
+ * 此函数负责初始化系统的内存节点信息，主要工作包括：
+ * 1. 调用 x86_numa_init() 解析 ACPI SRAT（Static Resource Affinity Table）表
+ * 2. 识别系统中的 NUMA 节点及其内存范围
+ * 3. 建立 CPU 与内存节点的亲和性关系
+ * 4. 为每个内存节点分配和初始化数据结构
+ *
+ * NUMA（Non-Uniform Memory Access）架构中，不同 CPU 访问不同内存节点的
+ * 延迟不同。正确识别和配置 NUMA 拓扑对于性能优化至关重要。
+ *
+ * 此函数在 setup_arch() 中调用，为后续的 zone 初始化和页面分配器
+ * 提供节点信息基础。
+ */
 void __init initmem_init(void)
 {
 	x86_numa_init();
 }
 
+/*
+ * paging_init() - 完成分页系统的初始化
+ *
+ * 此函数在内存映射建立后调用，完成分页系统的最后初始化步骤：
+ * 1. sparse_init() - 初始化稀疏内存映射系统
+ *    为每个内存节点建立 mem_section 结构，支持内存热插拔
+ * 2. 清除节点 0 的默认内存状态，为后续正确的节点状态设置做准备
+ * 3. zone_sizes_init() - 初始化所有内存节点的 zone 大小
+ *    为每个节点计算和设置各个 zone（DMA、DMA32、Normal 等）的大小
+ *
+ * zone 是 Linux 内存管理的基本单位，不同类型的 zone 用于不同用途：
+ * - DMA zone: 用于 DMA 操作的低地址内存（< 16MB）
+ * - DMA32 zone: 32位地址空间的 DMA 内存（< 4GB，仅 x86_64）
+ * - Normal zone: 普通可映射内存，是系统主要使用的内存区域
+ *
+ * 这些 zone 的初始化是页面分配器（page allocator）工作的基础，后续
+ * 所有的页面分配都基于这些 zone 进行。
+ */
 void __init paging_init(void)
 {
+	/* 初始化稀疏内存映射，支持内存热插拔 */
 	sparse_init();
 
 	/*
-	 * clear the default setting with node 0
-	 * note: don't use nodes_clear here, that is really clearing when
-	 *	 numa support is not compiled in, and later node_set_state
-	 *	 will not set it back.
+	 * 清除节点 0 的默认内存状态设置
+	 * 注意：不要使用 nodes_clear，因为当 NUMA 支持未编译时，
+	 * 那会真正清除所有节点，之后 node_set_state 无法恢复
 	 */
 	node_clear_state(0, N_MEMORY);
 	node_clear_state(0, N_NORMAL_MEMORY);
 
+	/* 初始化所有内存节点的 zone 大小 */
 	zone_sizes_init();
 }
 
@@ -1372,25 +1406,77 @@ void __init arch_mm_preinit(void)
 	pci_iommu_alloc();
 }
 
+/*
+ * mem_init() - 完成内存子系统的初始化，从 bootmem 转换到页面分配器
+ *
+ * 此函数标志着内存管理从早期的 bootmem 分配器转换到完整的页面分配器。
+ * 主要工作包括：
+ * 1. 标记 after_bootmem = 1，表示 bootmem 阶段结束
+ * 2. 注册页面 bootmem 信息，将早期保留的页面信息转换为 page 结构
+ * 3. 为 /proc/kcore 注册内存区域（用于内核转储分析）
+ * 4. 预分配 vmalloc 页面，为虚拟内存映射做准备
+ *
+ * 在此函数调用之前，内核使用简单的 bootmem 分配器管理内存。
+ * 调用后，完整的页面分配器（page allocator）开始工作，支持：
+ * - 页面缓存（pagecache）的分配和管理
+ * - 用户空间内存分配
+ * - 各种内核子系统的内存需求
+ *
+ * 这个转换过程确保了所有早期保留的内存区域都被正确初始化，
+ * 并且 deferred struct pages（延迟初始化的页面结构）都被正确处理。
+ */
+/*
+ * mem_init() - 完成内存子系统的初始化，从 bootmem 转换到页面分配器
+ *
+ * 此函数标志着内存管理从早期的 bootmem 分配器转换到完整的页面分配器。
+ * 主要工作包括：
+ * 1. 标记 after_bootmem = 1，表示 bootmem 阶段结束
+ * 2. 注册页面 bootmem 信息，将早期保留的页面信息转换为 page 结构
+ * 3. 为 /proc/kcore 注册内存区域（用于内核转储分析）
+ * 4. 预分配 vmalloc 页面，为虚拟内存映射做准备
+ *
+ * 在此函数调用之前，内核使用简单的 bootmem 分配器管理内存。
+ * 调用后，完整的页面分配器（page allocator）开始工作，支持：
+ * - 页面缓存（pagecache）的分配和管理
+ * - 用户空间内存分配
+ * - 各种内核子系统的内存需求
+ *
+ * 这个转换过程确保了所有早期保留的内存区域都被正确初始化，
+ * 并且 deferred struct pages（延迟初始化的页面结构）都被正确处理。
+ *
+ * 内存分割逻辑：
+ * 物理内存被分割成不同的 zone（DMA、DMA32、Normal、HighMem），
+ * 每个 zone 中的页面可以用于不同的用途：
+ * 1. Pagecache（页面缓存）：文件系统读取的数据缓存在内存中
+ * 2. 用户空间内存：进程的堆、栈、代码段等
+ * 3. 内核空间内存：内核数据结构、slab 分配器等
+ * 4. 保留内存：内核代码、数据、页表等
+ *
+ * 页面分配器通过 zonelist 管理这些 zone，当需要分配页面时（例如为
+ * pagecache 分配页面），会按照 zonelist 中的优先级顺序从各个 zone
+ * 中分配。pagecache 主要使用 Normal zone 的页面，通过文件系统的
+ * read/write 操作动态分配和释放。
+ */
 void __init mem_init(void)
 {
-	/* clear_bss() already clear the empty_zero_page */
+	/* clear_bss() 已经清空了 empty_zero_page */
 
+	/* 标记 bootmem 阶段结束，页面分配器开始工作 */
 	after_bootmem = 1;
 	x86_init.hyper.init_after_bootmem();
 
 	/*
-	 * Must be done after boot memory is put on freelist, because here we
-	 * might set fields in deferred struct pages that have not yet been
-	 * initialized, and memblock_free_all() initializes all the reserved
-	 * deferred pages for us.
+	 * 必须在 boot memory 放入空闲列表后执行，因为这里我们可能设置
+	 * 尚未初始化的 deferred struct pages 的字段，而 memblock_free_all()
+	 * 会为我们初始化所有保留的 deferred pages
 	 */
 	register_page_bootmem_info();
 
-	/* Register memory areas for /proc/kcore */
+	/* 为 /proc/kcore 注册内存区域（用于内核转储分析） */
 	if (get_gate_vma(&init_mm))
 		kclist_add(&kcore_vsyscall, (void *)VSYSCALL_ADDR, PAGE_SIZE, KCORE_USER);
 
+	/* 预分配 vmalloc 页面，为虚拟内存映射做准备 */
 	preallocate_vmalloc_pages();
 }
 
