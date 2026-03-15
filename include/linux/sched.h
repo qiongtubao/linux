@@ -646,7 +646,7 @@ struct task_struct {
 	struct thread_info		thread_info;
 #endif
 	/* -1 unrunnable, 0 runnable, >0 stopped: */
-	volatile long			state;
+	volatile long			state; /*进程状态*/
 
 	/*
 	 * This begins the randomizable portion of task_struct. Only
@@ -654,22 +654,22 @@ struct task_struct {
 	 */
 	randomized_struct_fields_start
 
-	void				*stack;
-	refcount_t			usage;
+	void				*stack; /*进程内核栈， linux 内核通过thread_union 联合体表示进程的内核栈， 分配内核栈/释放内核栈： alloc_thread_info/free_thread_info */
+	refcount_t			usage; /*进程描述符的使用计数 被设置为2时 表示进程描述符 正在被使用而且其相应的进程处于活动状态*/
 	/* Per task flags (PF_*), defined further below: */
-	unsigned int			flags;
+	unsigned int			flags; /*进程标志：进程当前的标志状态，但不是运行状态，用于内核识别进程当前的状态*/
 	unsigned int			ptrace;
 
-#ifdef CONFIG_SMP
-	int				on_cpu;
-	struct __call_single_node	wake_entry;
+#ifdef CONFIG_SMP //针对多处理器系统
+	int				on_cpu;					/*当前任务是否正在某个cpu上运行*/
+	struct __call_single_node	wake_entry;	/*结构体成员用来实现一个带有延迟删除功能的链表节点 用于等待唤醒队列中*/
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/* Current CPU: */
-	unsigned int			cpu;
+	unsigned int			cpu; //保存当前任务所在的cpu编号
 #endif
-	unsigned int			wakee_flips;
-	unsigned long			wakee_flip_decay_ts;
-	struct task_struct		*last_wakee;
+	unsigned int			wakee_flips;	/*睡眠状态到活跃状态反转次数*/
+	unsigned long			wakee_flip_decay_ts; /*睡眠状态到活跃状态时间*/
+	struct task_struct		*last_wakee; /*指向最后个被唤醒的任务所对应的进程/线程结构体*/
 
 	/*
 	 * recent_used_cpu is initially set as the last CPU used by a task
@@ -678,23 +678,23 @@ struct task_struct {
 	 * Tracking a recently used CPU allows a quick search for a recently
 	 * used CPU that may be idle.
 	 */
-	int				recent_used_cpu;
+	int				recent_used_cpu; //保存最近被使用过的cpu 编号 用来快速查找可能空闲的cpu
 	int				wake_cpu;
 #endif
 	int				on_rq;
 
-	int				prio;
-	int				static_prio;
-	int				normal_prio;
-	unsigned int			rt_priority;
+	int				prio; /*表示动态优先级 根据static_prio和交互性奖罚计算出来*/
+	int				static_prio; /*进程的静态优先级 在进程创建的时确定 范围从-20到19 值越小优先级越高*/
+	int				normal_prio; /*此优先级取决于静态优先级和调试策略*/
+	unsigned int			rt_priority; /* 专门用来保存实时优先级 范围是0到MAX_RT_PRIO-1(99)*/
 
-	const struct sched_class	*sched_class;
-	struct sched_entity		se;
-	struct sched_rt_entity		rt;
+	const struct sched_class	*sched_class; /*调用类*/
+	struct sched_entity		se;					/*普通进程的调用实体，每个进程都有的一个实体*/
+	struct sched_rt_entity		rt;				/*实时进程的调用实体，每个进程都有一个实体*/
 #ifdef CONFIG_CGROUP_SCHED
-	struct task_group		*sched_task_group;
+	struct task_group		*sched_task_group;	/*该结构体成员用来保存与任务组相关的调度信息，cgroup 任务组是由一组具有相同控制策略和资源限制的进程组成*/
 #endif
-	struct sched_dl_entity		dl;
+	struct sched_dl_entity		dl;				/*此结构体成员用来保存实时进程调试策略相关的信息*/
 
 #ifdef CONFIG_UCLAMP_TASK
 	/*
@@ -715,12 +715,12 @@ struct task_struct {
 #endif
 
 #ifdef CONFIG_BLK_DEV_IO_TRACE
-	unsigned int			btrace_seq;
+	unsigned int			btrace_seq; /*表示块设备io跟踪序列号*/
 #endif
 
-	unsigned int			policy;
-	int				nr_cpus_allowed;
-	const cpumask_t			*cpus_ptr;
+	unsigned int			policy;	/*调度策略*/
+	int				nr_cpus_allowed; /*允许运行当前进程/线程cpu数量*/
+	const cpumask_t			*cpus_ptr; /*表示当前进程/线程可以运行的cpu掩码*/
 	cpumask_t			cpus_mask;
 
 #ifdef CONFIG_PREEMPT_RCU
@@ -846,17 +846,17 @@ struct task_struct {
 	 */
 
 	/* Real parent process: */
-	struct task_struct __rcu	*real_parent;
+	struct task_struct __rcu	*real_parent; /*指向创建了P的进程描述符 如果P父进程不在就指向进程1的描述符*/
 
 	/* Recipient of SIGCHLD, wait4() reports: */
-	struct task_struct __rcu	*parent;
+	struct task_struct __rcu	*parent; /*如果指向P当前父进程 进程终止的时候需要发送给父进程，  偶尔和real_parent不同*/
 
 	/*
 	 * Children/sibling form the list of natural children:
 	 */
-	struct list_head		children;
-	struct list_head		sibling;
-	struct task_struct		*group_leader;
+	struct list_head		children; /*子进程列表的头节点。*/
+	struct list_head		sibling; /*在父进程的 children 链表中的节点。用于遍历兄弟进程。*/
+	struct task_struct		*group_leader; /*线程组的领导者。多线程进程中，group_leader 指向主线程。*/
 
 	/*
 	 * 'ptraced' is the list of tasks this task is using ptrace() on.

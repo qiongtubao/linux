@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Linux VFS inode管理
+ *
+ * 本文件实现了VFS层的inode（索引节点）管理：
+ * - inode的分配、初始化和释放
+ * - inode缓存（icache）管理
+ * - inode的查找和哈希
+ * - 脏inode的跟踪和同步
+ * - inode的引用计数管理
+ *
  * (C) 1997 Linus Torvalds
  * (C) 1999 Andrea Arcangeli <andrea@suse.de> (dynamic inode allocation)
  */
@@ -25,20 +34,20 @@
 #include "internal.h"
 
 /*
- * Inode locking rules:
+ * Inode锁定规则:
  *
- * inode->i_lock protects:
+ * inode->i_lock 保护:
  *   inode->i_state, inode->i_hash, __iget()
- * Inode LRU list locks protect:
+ * Inode LRU列表锁保护:
  *   inode->i_sb->s_inode_lru, inode->i_lru
- * inode->i_sb->s_inode_list_lock protects:
+ * inode->i_sb->s_inode_list_lock 保护:
  *   inode->i_sb->s_inodes, inode->i_sb_list
- * bdi->wb.list_lock protects:
+ * bdi->wb.list_lock 保护:
  *   bdi->wb.b_{dirty,io,more_io,dirty_time}, inode->i_io_list
- * inode_hash_lock protects:
+ * inode_hash_lock 保护:
  *   inode_hashtable, inode->i_hash
  *
- * Lock ordering:
+ * 锁定顺序:
  *
  * inode->i_sb->s_inode_list_lock
  *   inode->i_lock
@@ -55,29 +64,37 @@
  *   inode_hash_lock
  */
 
-static unsigned int i_hash_mask __read_mostly;
-static unsigned int i_hash_shift __read_mostly;
-static struct hlist_head *inode_hashtable __read_mostly;
-static __cacheline_aligned_in_smp DEFINE_SPINLOCK(inode_hash_lock);
+/* inode哈希表相关全局变量 */
+static unsigned int i_hash_mask __read_mostly;       /* 哈希掩码，用于计算哈希值 */
+static unsigned int i_hash_shift __read_mostly;      /* 哈希移位值 */
+static struct hlist_head *inode_hashtable __read_mostly; /* inode哈希表 */
+static __cacheline_aligned_in_smp DEFINE_SPINLOCK(inode_hash_lock);  /* 哈希表锁 */
 
 /*
- * Empty aops. Can be used for the cases where the user does not
- * define any of the address_space operations.
+ * 空的地址空间操作集合
+ * 当用户没有定义任何地址空间操作时可以使用这个
  */
 const struct address_space_operations empty_aops = {
 };
 EXPORT_SYMBOL(empty_aops);
 
 /*
- * Statistics gathering..
+ * inode统计信息收集
  */
 struct inodes_stat_t inodes_stat;
 
-static DEFINE_PER_CPU(unsigned long, nr_inodes);
-static DEFINE_PER_CPU(unsigned long, nr_unused);
+/* 每CPU变量：记录inode总数和未使用数 */
+static DEFINE_PER_CPU(unsigned long, nr_inodes);    /* 总inode数量 */
+static DEFINE_PER_CPU(unsigned long, nr_unused);    /* 未使用inode数量 */
 
-static struct kmem_cache *inode_cachep __read_mostly;
+static struct kmem_cache *inode_cachep __read_mostly;  /* inode缓存池 */
 
+/**
+ * get_nr_inodes - 获取系统中inode总数
+ *
+ * 遍历所有CPU统计每CPU的inode数量，返回总和
+ * 返回值: inode总数
+ */
 static long get_nr_inodes(void)
 {
 	int i;
@@ -87,6 +104,12 @@ static long get_nr_inodes(void)
 	return sum < 0 ? 0 : sum;
 }
 
+/**
+ * get_nr_inodes_unused - 获取未使用的inode数量
+ *
+ * 遍历所有CPU统计未使用的inode数量，返回总和
+ * 返回值: 未使用的inode总数
+ */
 static inline long get_nr_inodes_unused(void)
 {
 	int i;
@@ -96,6 +119,14 @@ static inline long get_nr_inodes_unused(void)
 	return sum < 0 ? 0 : sum;
 }
 
+/**
+ * get_nr_dirty_inodes - 获取脏inode的数量
+ *
+ * 这个函数计算脏inode的近似数量，实际上不是真正的脏inode数，
+ * 而是一个粗略的近似值：总inode数 - 未使用的inode数
+ *
+ * 返回值: 脏inode的近似数量
+ */
 long get_nr_dirty_inodes(void)
 {
 	/* not actually dirty inodes, but a wild approximation */
@@ -104,9 +135,19 @@ long get_nr_dirty_inodes(void)
 }
 
 /*
- * Handle nr_inode sysctl
+ * 处理nr_inode系统控制
  */
 #ifdef CONFIG_SYSCTL
+/**
+ * proc_nr_inodes - 处理/proc/sys/fs/inode-nr的读写
+ * @table: sysctl表项
+ * @write: 是否为写操作
+ * @buffer: 用户数据缓冲区
+ * @lenp: 数据长度
+ * @ppos: 文件位置
+ *
+ * 返回值: 成功返回0，失败返回错误码
+ */
 int proc_nr_inodes(struct ctl_table *table, int write,
 		   void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -116,18 +157,28 @@ int proc_nr_inodes(struct ctl_table *table, int write,
 }
 #endif
 
+/**
+ * no_open - 默认的打开操作，总是返回错误
+ * @inode: inode节点
+ * @file: 文件结构
+ *
+ * 这是一个默认的文件打开操作，用于没有定义打开操作的inode
+ * 返回值: 总是返回-ENXIO (设备不存在)
+ */
 static int no_open(struct inode *inode, struct file *file)
 {
 	return -ENXIO;
 }
 
 /**
- * inode_init_always - perform inode structure initialisation
- * @sb: superblock inode belongs to
- * @inode: inode to initialise
+ * inode_init_always - 执行inode结构的初始化
+ * @sb: inode所属的超级块
+ * @inode: 要初始化的inode
  *
- * These are initializations that need to be done on every inode
- * allocation as the fields are not initialised by slab allocation.
+ * 这些是每次分配inode时都需要进行的初始化，因为slab分配器
+ * 不会初始化这些字段。初始化inode的各种字段、锁、地址空间等。
+ *
+ * 返回值: 成功返回0，失败返回-ENOMEM
  */
 int inode_init_always(struct super_block *sb, struct inode *inode)
 {
@@ -210,12 +261,25 @@ out:
 }
 EXPORT_SYMBOL(inode_init_always);
 
+/**
+ * free_inode_nonrcu - 非RCU方式释放inode内存
+ * @inode: 要释放的inode
+ *
+ * 直接将inode内存释放回slab缓存，不使用RCU延迟释放
+ */
 void free_inode_nonrcu(struct inode *inode)
 {
 	kmem_cache_free(inode_cachep, inode);
 }
 EXPORT_SYMBOL(free_inode_nonrcu);
 
+/**
+ * i_callback - RCU回调函数，用于释放inode
+ * @head: RCU头部
+ *
+ * RCU宽限期结束后调用此函数来实际释放inode内存。
+ * 如果文件系统定义了free_inode操作则使用它，否则使用默认释放函数。
+ */
 static void i_callback(struct rcu_head *head)
 {
 	struct inode *inode = container_of(head, struct inode, i_rcu);
@@ -225,6 +289,15 @@ static void i_callback(struct rcu_head *head)
 		free_inode_nonrcu(inode);
 }
 
+/**
+ * alloc_inode - 分配一个新的inode
+ * @sb: 超级块指针
+ *
+ * 为指定的超级块分配一个新的inode。如果文件系统定义了自己的
+ * alloc_inode操作，则使用它；否则从inode缓存中分配。
+ *
+ * 返回值: 成功返回inode指针，失败返回NULL
+ */
 static struct inode *alloc_inode(struct super_block *sb)
 {
 	const struct super_operations *ops = sb->s_op;
@@ -252,6 +325,18 @@ static struct inode *alloc_inode(struct super_block *sb)
 	return inode;
 }
 
+/**
+ * __destroy_inode - 销毁inode的内部处理
+ * @inode: 要销毁的inode
+ *
+ * 执行inode销毁的核心工作：
+ * - 检查并清理缓冲区
+ * - 分离writeback相关资源
+ * - 释放安全和通知相关资源
+ * - 释放文件锁上下文
+ * - 清理POSIX ACL
+ * - 更新统计计数
+ */
 void __destroy_inode(struct inode *inode)
 {
 	BUG_ON(inode_has_buffers(inode));
@@ -274,6 +359,16 @@ void __destroy_inode(struct inode *inode)
 }
 EXPORT_SYMBOL(__destroy_inode);
 
+/**
+ * destroy_inode - 销毁inode
+ * @inode: 要销毁的inode
+ *
+ * 完整销毁一个inode：
+ * 1. 确保inode不在LRU列表中
+ * 2. 调用__destroy_inode执行内部清理
+ * 3. 如果文件系统定义了destroy_inode操作则调用它
+ * 4. 使用RCU延迟释放内存
+ */
 static void destroy_inode(struct inode *inode)
 {
 	const struct super_operations *ops = inode->i_sb->s_op;
@@ -290,15 +385,12 @@ static void destroy_inode(struct inode *inode)
 }
 
 /**
- * drop_nlink - directly drop an inode's link count
- * @inode: inode
+ * drop_nlink - 直接减少inode的链接计数
+ * @inode: 目标inode
  *
- * This is a low-level filesystem helper to replace any
- * direct filesystem manipulation of i_nlink.  In cases
- * where we are attempting to track writes to the
- * filesystem, a decrement to zero means an imminent
- * write when the file is truncated and actually unlinked
- * on the filesystem.
+ * 这是一个低级文件系统辅助函数，用于替代直接操作i_nlink。
+ * 在我们试图跟踪写入到文件系统时，减少到零意味着当文件被
+ * 截断并在文件系统上真正取消链接时即将发生写入。
  */
 void drop_nlink(struct inode *inode)
 {
@@ -310,12 +402,11 @@ void drop_nlink(struct inode *inode)
 EXPORT_SYMBOL(drop_nlink);
 
 /**
- * clear_nlink - directly zero an inode's link count
- * @inode: inode
+ * clear_nlink - 直接将inode的链接计数清零
+ * @inode: 目标inode
  *
- * This is a low-level filesystem helper to replace any
- * direct filesystem manipulation of i_nlink.  See
- * drop_nlink() for why we care about i_nlink hitting zero.
+ * 这是一个低级文件系统辅助函数，用于替代直接操作i_nlink。
+ * 请参见drop_nlink()了解为什么我们关心i_nlink变为零。
  */
 void clear_nlink(struct inode *inode)
 {
@@ -327,12 +418,11 @@ void clear_nlink(struct inode *inode)
 EXPORT_SYMBOL(clear_nlink);
 
 /**
- * set_nlink - directly set an inode's link count
- * @inode: inode
- * @nlink: new nlink (should be non-zero)
+ * set_nlink - 直接设置inode的链接计数
+ * @inode: 目标inode
+ * @nlink: 新的链接计数（应该非零）
  *
- * This is a low-level filesystem helper to replace any
- * direct filesystem manipulation of i_nlink.
+ * 这是一个低级文件系统辅助函数，用于替代直接操作i_nlink。
  */
 void set_nlink(struct inode *inode, unsigned int nlink)
 {
@@ -349,12 +439,11 @@ void set_nlink(struct inode *inode, unsigned int nlink)
 EXPORT_SYMBOL(set_nlink);
 
 /**
- * inc_nlink - directly increment an inode's link count
- * @inode: inode
+ * inc_nlink - 直接增加inode的链接计数
+ * @inode: 目标inode
  *
- * This is a low-level filesystem helper to replace any
- * direct filesystem manipulation of i_nlink.  Currently,
- * it is only here for parity with dec_nlink().
+ * 这是一个低级文件系统辅助函数，用于替代直接操作i_nlink。
+ * 目前它在这里只是为了与dec_nlink()保持对称性。
  */
 void inc_nlink(struct inode *inode)
 {
@@ -367,6 +456,16 @@ void inc_nlink(struct inode *inode)
 }
 EXPORT_SYMBOL(inc_nlink);
 
+/**
+ * __address_space_init_once - 地址空间结构的内部初始化
+ * @mapping: 要初始化的地址空间
+ *
+ * 初始化地址空间的核心数据结构：
+ * - 页面缓存(i_pages)
+ * - 内存映射读写信号量
+ * - 私有数据列表和锁
+ * - VMA红黑树
+ */
 static void __address_space_init_once(struct address_space *mapping)
 {
 	xa_init_flags(&mapping->i_pages, XA_FLAGS_LOCK_IRQ | XA_FLAGS_ACCOUNT);
@@ -376,6 +475,13 @@ static void __address_space_init_once(struct address_space *mapping)
 	mapping->i_mmap = RB_ROOT_CACHED;
 }
 
+/**
+ * address_space_init_once - 完整初始化地址空间结构
+ * @mapping: 要初始化的地址空间
+ *
+ * 清零整个结构并调用内部初始化函数。这个函数通常在
+ * slab构造函数中使用。
+ */
 void address_space_init_once(struct address_space *mapping)
 {
 	memset(mapping, 0, sizeof(*mapping));
@@ -384,9 +490,16 @@ void address_space_init_once(struct address_space *mapping)
 EXPORT_SYMBOL(address_space_init_once);
 
 /*
- * These are initializations that only need to be done
- * once, because the fields are idempotent across use
- * of the inode, so let the slab aware of that.
+ * 这些初始化只需要做一次，因为这些字段在inode的
+ * 整个使用过程中是幂等的，所以让slab知道这一点。
+ */
+/**
+ * inode_init_once - inode结构的一次性初始化
+ * @inode: 要初始化的inode
+ *
+ * 初始化inode中只需要设置一次的字段，如各种列表头、
+ * 哈希节点、地址空间等。这些字段在inode的整个生命
+ * 周期中保持不变。
  */
 void inode_init_once(struct inode *inode)
 {
@@ -401,6 +514,12 @@ void inode_init_once(struct inode *inode)
 }
 EXPORT_SYMBOL(inode_init_once);
 
+/**
+ * init_once - slab缓存构造函数
+ * @foo: 要初始化的对象（实际上是inode指针）
+ *
+ * 这是inode_cachep的slab构造函数，在对象第一次分配时调用
+ */
 static void init_once(void *foo)
 {
 	struct inode *inode = (struct inode *) foo;
@@ -409,13 +528,29 @@ static void init_once(void *foo)
 }
 
 /*
- * inode->i_lock must be held
+ * 必须持有inode->i_lock
+ */
+/**
+ * __iget - 增加inode引用计数（需要持锁）
+ * @inode: 要增加引用的inode
+ *
+ * 原子性地增加inode的引用计数。调用前必须持有inode->i_lock。
+ * 这是内部函数，外部调用应使用ihold()或igrab()。
  */
 void __iget(struct inode *inode)
 {
 	atomic_inc(&inode->i_count);
 }
 
+/**
+ * ihold - 获取inode的额外引用
+ * @inode: 要增加引用的inode
+ *
+ * 获取inode的额外引用；调用者必须已经持有一个引用。
+ * 用于在已有引用的基础上增加引用计数。
+ *
+ * 返回值: 无
+ */
 /*
  * get additional reference to inode; caller must already hold one.
  */
@@ -425,6 +560,14 @@ void ihold(struct inode *inode)
 }
 EXPORT_SYMBOL(ihold);
 
+/**
+ * inode_lru_list_add - 将inode添加到LRU列表
+ * @inode: 要添加的inode
+ *
+ * 尝试将inode添加到其超级块的LRU列表中。如果添加成功，
+ * 增加未使用inode计数；如果失败（已在列表中），则标记
+ * inode为已引用状态。
+ */
 static void inode_lru_list_add(struct inode *inode)
 {
 	if (list_lru_add(&inode->i_sb->s_inode_lru, &inode->i_lru))
@@ -434,9 +577,19 @@ static void inode_lru_list_add(struct inode *inode)
 }
 
 /*
- * Add inode to LRU if needed (inode is unused and clean).
+ * 如果需要，将inode添加到LRU（inode未使用且干净）
  *
- * Needs inode->i_lock held.
+ * 需要持有inode->i_lock
+ */
+/**
+ * inode_add_lru - 条件性地将inode添加到LRU列表
+ * @inode: 要检查和添加的inode
+ *
+ * 如果inode满足以下条件则将其添加到LRU列表：
+ * - 不脏（没有I_DIRTY_ALL | I_SYNC | I_FREEING | I_WILL_FREE标志）
+ * - 引用计数为0
+ * - 超级块处于活动状态
+ * 调用前必须持有inode->i_lock
  */
 void inode_add_lru(struct inode *inode)
 {
@@ -447,6 +600,12 @@ void inode_add_lru(struct inode *inode)
 }
 
 
+/**
+ * inode_lru_list_del - 从LRU列表删除inode
+ * @inode: 要删除的inode
+ *
+ * 从LRU列表中删除inode，如果删除成功则减少未使用inode计数
+ */
 static void inode_lru_list_del(struct inode *inode)
 {
 
@@ -455,8 +614,11 @@ static void inode_lru_list_del(struct inode *inode)
 }
 
 /**
- * inode_sb_list_add - add inode to the superblock list of inodes
- * @inode: inode to add
+ * inode_sb_list_add - 将inode添加到超级块的inode列表
+ * @inode: 要添加的inode
+ *
+ * 将inode添加到其超级块的s_inodes列表中，这个列表包含
+ * 超级块上的所有活动inode
  */
 void inode_sb_list_add(struct inode *inode)
 {
@@ -466,6 +628,12 @@ void inode_sb_list_add(struct inode *inode)
 }
 EXPORT_SYMBOL_GPL(inode_sb_list_add);
 
+/**
+ * inode_sb_list_del - 从超级块列表删除inode
+ * @inode: 要删除的inode
+ *
+ * 从超级块的s_inodes列表中删除inode，如果inode确实在列表中的话
+ */
 static inline void inode_sb_list_del(struct inode *inode)
 {
 	if (!list_empty(&inode->i_sb_list)) {
@@ -475,6 +643,16 @@ static inline void inode_sb_list_del(struct inode *inode)
 	}
 }
 
+/**
+ * hash - 计算inode哈希值
+ * @sb: 超级块指针
+ * @hashval: 用于哈希的值（通常是inode号）
+ *
+ * 基于超级块指针和给定值计算哈希表索引。使用黄金比例
+ * 和移位操作来产生良好的哈希分布。
+ *
+ * 返回值: 哈希表索引
+ */
 static unsigned long hash(struct super_block *sb, unsigned long hashval)
 {
 	unsigned long tmp;
@@ -486,12 +664,11 @@ static unsigned long hash(struct super_block *sb, unsigned long hashval)
 }
 
 /**
- *	__insert_inode_hash - hash an inode
- *	@inode: unhashed inode
- *	@hashval: unsigned long value used to locate this object in the
- *		inode_hashtable.
+ *	__insert_inode_hash - 将inode加入哈希表
+ *	@inode: 未哈希的inode
+ *	@hashval: 用于在inode_hashtable中定位此对象的无符号长整型值
  *
- *	Add an inode to the inode hash for this superblock.
+ *	将inode添加到此超级块的inode哈希表中
  */
 void __insert_inode_hash(struct inode *inode, unsigned long hashval)
 {
@@ -506,10 +683,10 @@ void __insert_inode_hash(struct inode *inode, unsigned long hashval)
 EXPORT_SYMBOL(__insert_inode_hash);
 
 /**
- *	__remove_inode_hash - remove an inode from the hash
- *	@inode: inode to unhash
+ *	__remove_inode_hash - 从哈希表移除inode
+ *	@inode: 要取消哈希的inode
  *
- *	Remove an inode from the superblock.
+ *	从超级块中移除inode
  */
 void __remove_inode_hash(struct inode *inode)
 {
@@ -521,6 +698,14 @@ void __remove_inode_hash(struct inode *inode)
 }
 EXPORT_SYMBOL(__remove_inode_hash);
 
+/**
+ * clear_inode - 清理inode使其可以被释放
+ * @inode: 要清理的inode
+ *
+ * 清理inode的各种状态，确保所有页面都已清空，没有私有数据，
+ * 然后将状态设置为I_FREEING | I_CLEAR。这个函数在evict_inode
+ * 或文件系统的自定义清理函数中调用。
+ */
 void clear_inode(struct inode *inode)
 {
 	/*
@@ -542,17 +727,26 @@ void clear_inode(struct inode *inode)
 EXPORT_SYMBOL(clear_inode);
 
 /*
- * Free the inode passed in, removing it from the lists it is still connected
- * to. We remove any pages still attached to the inode and wait for any IO that
- * is still in progress before finally destroying the inode.
+ * 释放传入的inode，将其从仍连接的列表中移除。我们移除仍附加到inode的
+ * 任何页面，并等待任何仍在进行的IO完成，然后最终销毁inode。
  *
- * An inode must already be marked I_FREEING so that we avoid the inode being
- * moved back onto lists if we race with other code that manipulates the lists
- * (e.g. writeback_single_inode). The caller is responsible for setting this.
+ * inode必须已经标记为I_FREEING，这样我们可以避免在与操作列表的其他代码
+ * （如writeback_single_inode）竞争时inode被移回列表。调用者负责设置此标志。
  *
- * An inode must already be removed from the LRU list before being evicted from
- * the cache. This should occur atomically with setting the I_FREEING state
- * flag, so no inodes here should ever be on the LRU when being evicted.
+ * 在从缓存中驱逐之前，inode必须已经从LRU列表中移除。这应该与设置I_FREEING
+ * 状态标志原子性地发生，因此这里被驱逐的inode都不应该在LRU上。
+ */
+/**
+ * evict - 驱逐并销毁inode
+ * @inode: 要驱逐的inode（必须已标记I_FREEING）
+ *
+ * 完整地驱逐一个inode的步骤：
+ * 1. 从IO列表和超级块列表移除
+ * 2. 等待writeback完成
+ * 3. 调用文件系统的evict_inode或执行默认清理
+ * 4. 处理块/字符设备特殊情况
+ * 5. 从哈希表移除
+ * 6. 唤醒等待者并销毁inode
  */
 static void evict(struct inode *inode)
 {
@@ -596,11 +790,19 @@ static void evict(struct inode *inode)
 }
 
 /*
- * dispose_list - dispose of the contents of a local list
- * @head: the head of the list to free
+ * dispose_list - 处理本地列表的内容
+ * @head: 要释放的列表头
  *
- * Dispose-list gets a local list with local inodes in it, so it doesn't
- * need to worry about list corruption and SMP locks.
+ * Dispose-list获得一个包含本地inode的本地列表，因此它不需要
+ * 担心列表破坏和SMP锁。
+ */
+/**
+ * dispose_list - 批量处理待释放的inode列表
+ * @head: inode列表的头部
+ *
+ * 遍历列表中的所有inode并逐个驱逐它们。这是一个内部函数，
+ * 处理已经从各种列表中分离出来的inode。在每次驱逐后调用
+ * cond_resched()以避免长时间占用CPU。
  */
 static void dispose_list(struct list_head *head)
 {
@@ -616,13 +818,12 @@ static void dispose_list(struct list_head *head)
 }
 
 /**
- * evict_inodes	- evict all evictable inodes for a superblock
- * @sb:		superblock to operate on
+ * evict_inodes - 驱逐超级块的所有可驱逐inode
+ * @sb: 要操作的超级块
  *
- * Make sure that no inodes with zero refcount are retained.  This is
- * called by superblock shutdown after having SB_ACTIVE flag removed,
- * so any inode reaching zero refcount during or after that call will
- * be immediately evicted.
+ * 确保没有引用计数为零的inode被保留。这在超级块关闭时调用，
+ * 在移除SB_ACTIVE标志之后，因此在该调用期间或之后达到零引用
+ * 计数的任何inode都将被立即驱逐。
  */
 void evict_inodes(struct super_block *sb)
 {
@@ -665,14 +866,13 @@ again:
 EXPORT_SYMBOL_GPL(evict_inodes);
 
 /**
- * invalidate_inodes	- attempt to free all inodes on a superblock
- * @sb:		superblock to operate on
- * @kill_dirty: flag to guide handling of dirty inodes
+ * invalidate_inodes - 尝试释放超级块上的所有inode
+ * @sb: 要操作的超级块
+ * @kill_dirty: 指导如何处理脏inode的标志
  *
- * Attempts to free all inodes for a given superblock.  If there were any
- * busy inodes return a non-zero value, else zero.
- * If @kill_dirty is set, discard dirty inodes too, otherwise treat
- * them as busy.
+ * 尝试释放给定超级块的所有inode。如果有繁忙的inode则返回
+ * 非零值，否则返回零。
+ * 如果@kill_dirty被设置，则丢弃脏inode，否则将它们视为繁忙。
  */
 int invalidate_inodes(struct super_block *sb, bool kill_dirty)
 {
@@ -718,19 +918,28 @@ again:
 }
 
 /*
- * Isolate the inode from the LRU in preparation for freeing it.
+ * 为释放做准备，将inode从LRU隔离出来。
  *
- * Any inodes which are pinned purely because of attached pagecache have their
- * pagecache removed.  If the inode has metadata buffers attached to
- * mapping->private_list then try to remove them.
+ * 任何纯粹因为附加页缓存而被固定的inode会删除其页缓存。
+ * 如果inode有元数据缓冲区附加到mapping->private_list，
+ * 则尝试移除它们。
  *
- * If the inode has the I_REFERENCED flag set, then it means that it has been
- * used recently - the flag is set in iput_final(). When we encounter such an
- * inode, clear the flag and move it to the back of the LRU so it gets another
- * pass through the LRU before it gets reclaimed. This is necessary because of
- * the fact we are doing lazy LRU updates to minimise lock contention so the
- * LRU does not have strict ordering. Hence we don't want to reclaim inodes
- * with this flag set because they are the inodes that are out of order.
+ * 如果inode设置了I_REFERENCED标志，则意味着它最近被使用过 -
+ * 该标志在iput_final()中设置。当我们遇到这样的inode时，
+ * 清除标志并将其移到LRU的后面，这样它在被回收之前会在LRU中
+ * 再获得一次机会。这是必要的，因为我们正在进行延迟LRU更新
+ * 以最小化锁争用，所以LRU没有严格的顺序。因此我们不想回收
+ * 设置了此标志的inode，因为它们是无序的inode。
+ */
+/**
+ * inode_lru_isolate - LRU隔离回调函数，用于inode回收
+ * @item: LRU列表项（实际上是inode的i_lru）
+ * @lru: LRU控制结构
+ * @lru_lock: LRU锁
+ * @arg: 传递给函数的参数（可释放列表）
+ *
+ * 这是内存回收子系统的回调函数，用于决定是否可以回收一个inode。
+ * 返回值: LRU_SKIP（跳过）、LRU_REMOVED（已移除）、LRU_ROTATE（旋转到后面）、LRU_RETRY（重试）
  */
 static enum lru_status inode_lru_isolate(struct list_head *item,
 		struct list_lru_one *lru, spinlock_t *lru_lock, void *arg)
@@ -793,10 +1002,19 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 }
 
 /*
- * Walk the superblock inode LRU for freeable inodes and attempt to free them.
- * This is called from the superblock shrinker function with a number of inodes
- * to trim from the LRU. Inodes to be freed are moved to a temporary list and
- * then are freed outside inode_lock by dispose_list().
+ * 遍历超级块inode LRU寻找可释放的inode并尝试释放它们。
+ * 这从超级块收缩器函数调用，带有要从LRU修剪的inode数量。
+ * 要释放的inode移到临时列表，然后在inode_lock外通过dispose_list()释放。
+ */
+/**
+ * prune_icache_sb - 修剪超级块的inode缓存
+ * @sb: 目标超级块
+ * @sc: 收缩控制结构
+ *
+ * 从指定超级块的inode LRU列表中回收inode。这是内存管理
+ * 子系统在内存压力下调用的函数。
+ *
+ * 返回值: 实际释放的inode数量
  */
 long prune_icache_sb(struct super_block *sb, struct shrink_control *sc)
 {
@@ -809,9 +1027,25 @@ long prune_icache_sb(struct super_block *sb, struct shrink_control *sc)
 	return freed;
 }
 
+/**
+ * __wait_on_freeing_inode - 等待正在释放的inode完成释放
+ * @inode: 正在释放的inode
+ */
 static void __wait_on_freeing_inode(struct inode *inode);
 /*
- * Called with the inode lock held.
+ * 在持有inode锁的情况下调用
+ */
+/**
+ * find_inode - 在哈希表中查找匹配的inode
+ * @sb: 超级块
+ * @head: 哈希表头部
+ * @test: 用于比较inode的回调函数
+ * @data: 传递给test函数的不透明数据
+ *
+ * 在指定哈希链中查找匹配的inode。如果找到匹配项且inode
+ * 没有正在被释放，则增加引用计数并返回。
+ *
+ * 返回值: 匹配的inode（增加了引用计数）或NULL
  */
 static struct inode *find_inode(struct super_block *sb,
 				struct hlist_head *head,
@@ -843,8 +1077,18 @@ repeat:
 }
 
 /*
- * find_inode_fast is the fast path version of find_inode, see the comment at
- * iget_locked for details.
+ * find_inode_fast是find_inode的快速路径版本，详情参见iget_locked的注释
+ */
+/**
+ * find_inode_fast - 通过inode号快速查找inode
+ * @sb: 超级块
+ * @head: 哈希表头部
+ * @ino: 要查找的inode号
+ *
+ * 这是find_inode的优化版本，用于只需要通过inode号查找的情况。
+ * 比通用的find_inode函数更快，因为不需要调用测试函数。
+ *
+ * 返回值: 匹配的inode（增加了引用计数）或NULL
  */
 static struct inode *find_inode_fast(struct super_block *sb,
 				struct hlist_head *head, unsigned long ino)
@@ -874,23 +1118,31 @@ repeat:
 }
 
 /*
- * Each cpu owns a range of LAST_INO_BATCH numbers.
- * 'shared_last_ino' is dirtied only once out of LAST_INO_BATCH allocations,
- * to renew the exhausted range.
+ * 每个CPU拥有一个LAST_INO_BATCH数字范围。
+ * 'shared_last_ino'只在LAST_INO_BATCH分配中被弄脏一次，
+ * 以更新耗尽的范围。
  *
- * This does not significantly increase overflow rate because every CPU can
- * consume at most LAST_INO_BATCH-1 unused inode numbers. So there is
- * NR_CPUS*(LAST_INO_BATCH-1) wastage. At 4096 and 1024, this is ~0.1% of the
- * 2^32 range, and is a worst-case. Even a 50% wastage would only increase
- * overflow rate by 2x, which does not seem too significant.
+ * 这不会显著增加溢出率，因为每个CPU最多可以消耗
+ * LAST_INO_BATCH-1个未使用的inode号。所以有
+ * NR_CPUS*(LAST_INO_BATCH-1)的浪费。在4096和1024时，
+ * 这大约是2^32范围的0.1%，这是最坏情况。即使50%的
+ * 浪费也只会将溢出率增加2倍，这似乎并不太重要。
  *
- * On a 32bit, non LFS stat() call, glibc will generate an EOVERFLOW
- * error if st_ino won't fit in target struct field. Use 32bit counter
- * here to attempt to avoid that.
+ * 在32位，非LFS stat()调用上，如果st_ino不适合目标
+ * 结构字段，glibc会生成EOVERFLOW错误。这里使用32位
+ * 计数器来尝试避免这种情况。
  */
 #define LAST_INO_BATCH 1024
 static DEFINE_PER_CPU(unsigned int, last_ino);
 
+/**
+ * get_next_ino - 获取下一个inode号
+ *
+ * 获取一个唯一的inode号，每个CPU维护自己的计数器以减少争用。
+ * 当CPU本地计数器用完时，从全局共享计数器获取新的批次。
+ *
+ * 返回值: 唯一的inode号（保证非零）
+ */
 unsigned int get_next_ino(void)
 {
 	unsigned int *p = &get_cpu_var(last_ino);
@@ -916,14 +1168,14 @@ unsigned int get_next_ino(void)
 EXPORT_SYMBOL(get_next_ino);
 
 /**
- *	new_inode_pseudo 	- obtain an inode
- *	@sb: superblock
+ *	new_inode_pseudo - 获取一个伪inode
+ *	@sb: 超级块
  *
- *	Allocates a new inode for given superblock.
- *	Inode wont be chained in superblock s_inodes list
- *	This means :
- *	- fs can't be unmount
- *	- quotas, fsnotify, writeback can't work
+ *	为给定的超级块分配一个新的inode。
+ *	inode不会链接到超级块的s_inodes列表中
+ *	这意味着：
+ *	- 文件系统无法卸载
+ *	- 配额、fsnotify、writeback无法工作
  */
 struct inode *new_inode_pseudo(struct super_block *sb)
 {
@@ -939,15 +1191,14 @@ struct inode *new_inode_pseudo(struct super_block *sb)
 }
 
 /**
- *	new_inode 	- obtain an inode
- *	@sb: superblock
+ *	new_inode - 获取一个inode
+ *	@sb: 超级块
  *
- *	Allocates a new inode for given superblock. The default gfp_mask
- *	for allocations related to inode->i_mapping is GFP_HIGHUSER_MOVABLE.
- *	If HIGHMEM pages are unsuitable or it is known that pages allocated
- *	for the page cache are not reclaimable or migratable,
- *	mapping_set_gfp_mask() must be called with suitable flags on the
- *	newly created inode's mapping
+ *	为给定超级块分配一个新的inode。与inode->i_mapping相关的
+ *	分配的默认gfp_mask是GFP_HIGHUSER_MOVABLE。
+ *	如果HIGHMEM页面不合适或已知为页面缓存分配的页面不可回收
+ *	或不可迁移，必须在新创建的inode映射上使用合适的标志调用
+ *	mapping_set_gfp_mask()
  *
  */
 struct inode *new_inode(struct super_block *sb)
@@ -985,11 +1236,11 @@ EXPORT_SYMBOL(lockdep_annotate_inode_mutex_key);
 #endif
 
 /**
- * unlock_new_inode - clear the I_NEW state and wake up any waiters
- * @inode:	new inode to unlock
+ * unlock_new_inode - 清除I_NEW状态并唤醒等待者
+ * @inode: 要解锁的新inode
  *
- * Called when the inode is fully initialised to clear the new state of the
- * inode and wake up anyone waiting for the inode to finish initialisation.
+ * 当inode完全初始化后调用，清除inode的新状态并唤醒
+ * 任何等待inode完成初始化的进程。
  */
 void unlock_new_inode(struct inode *inode)
 {
@@ -1003,6 +1254,13 @@ void unlock_new_inode(struct inode *inode)
 }
 EXPORT_SYMBOL(unlock_new_inode);
 
+/**
+ * discard_new_inode - 丢弃新创建的inode
+ * @inode: 要丢弃的新inode
+ *
+ * 当新inode初始化失败时调用，清除I_NEW状态，唤醒等待者，
+ * 并释放inode。这用于处理inode创建过程中的错误情况。
+ */
 void discard_new_inode(struct inode *inode)
 {
 	lockdep_annotate_inode_mutex_key(inode);
@@ -1017,13 +1275,13 @@ void discard_new_inode(struct inode *inode)
 EXPORT_SYMBOL(discard_new_inode);
 
 /**
- * lock_two_nondirectories - take two i_mutexes on non-directory objects
+ * lock_two_nondirectories - 对两个非目录对象获取i_mutex锁
  *
- * Lock any non-NULL argument that is not a directory.
- * Zero, one or two objects may be locked by this function.
+ * 锁定任何非NULL且不是目录的参数。
+ * 此函数可能锁定零个、一个或两个对象。
  *
- * @inode1: first inode to lock
- * @inode2: second inode to lock
+ * @inode1: 第一个要锁定的inode
+ * @inode2: 第二个要锁定的inode
  */
 void lock_two_nondirectories(struct inode *inode1, struct inode *inode2)
 {
@@ -1038,9 +1296,9 @@ void lock_two_nondirectories(struct inode *inode1, struct inode *inode2)
 EXPORT_SYMBOL(lock_two_nondirectories);
 
 /**
- * unlock_two_nondirectories - release locks from lock_two_nondirectories()
- * @inode1: first inode to unlock
- * @inode2: second inode to unlock
+ * unlock_two_nondirectories - 释放从lock_two_nondirectories()获得的锁
+ * @inode1: 第一个要解锁的inode
+ * @inode2: 第二个要解锁的inode
  */
 void unlock_two_nondirectories(struct inode *inode1, struct inode *inode2)
 {
@@ -1052,24 +1310,22 @@ void unlock_two_nondirectories(struct inode *inode1, struct inode *inode2)
 EXPORT_SYMBOL(unlock_two_nondirectories);
 
 /**
- * inode_insert5 - obtain an inode from a mounted file system
- * @inode:	pre-allocated inode to use for insert to cache
- * @hashval:	hash value (usually inode number) to get
- * @test:	callback used for comparisons between inodes
- * @set:	callback used to initialize a new struct inode
- * @data:	opaque data pointer to pass to @test and @set
+ * inode_insert5 - 从挂载的文件系统获取inode
+ * @inode: 用于插入缓存的预分配inode
+ * @hashval: 哈希值（通常是inode号）
+ * @test: 用于inode间比较的回调函数
+ * @set: 用于初始化新inode结构的回调函数
+ * @data: 传递给@test和@set的不透明数据指针
  *
- * Search for the inode specified by @hashval and @data in the inode cache,
- * and if present it is return it with an increased reference count. This is
- * a variant of iget5_locked() for callers that don't want to fail on memory
- * allocation of inode.
+ * 在inode缓存中搜索由@hashval和@data指定的inode，
+ * 如果存在则返回它并增加引用计数。这是iget5_locked()
+ * 的变体，用于不希望在inode内存分配失败时失败的调用者。
  *
- * If the inode is not in cache, insert the pre-allocated inode to cache and
- * return it locked, hashed, and with the I_NEW flag set. The file system gets
- * to fill it in before unlocking it via unlock_new_inode().
+ * 如果inode不在缓存中，将预分配的inode插入缓存并返回它
+ * （已锁定、已哈希，并设置I_NEW标志）。文件系统在通过
+ * unlock_new_inode()解锁之前需要填充它。
  *
- * Note both @test and @set are called with the inode_hash_lock held, so can't
- * sleep.
+ * 注意@test和@set都在持有inode_hash_lock的情况下调用，所以不能睡眠。
  */
 struct inode *inode_insert5(struct inode *inode, unsigned long hashval,
 			    int (*test)(struct inode *, void *),
@@ -1121,24 +1377,23 @@ unlock:
 EXPORT_SYMBOL(inode_insert5);
 
 /**
- * iget5_locked - obtain an inode from a mounted file system
- * @sb:		super block of file system
- * @hashval:	hash value (usually inode number) to get
- * @test:	callback used for comparisons between inodes
- * @set:	callback used to initialize a new struct inode
- * @data:	opaque data pointer to pass to @test and @set
+ * iget5_locked - 从挂载的文件系统获取inode
+ * @sb: 文件系统的超级块
+ * @hashval: 哈希值（通常是inode号）
+ * @test: 用于inode间比较的回调函数
+ * @set: 用于初始化新inode结构的回调函数
+ * @data: 传递给@test和@set的不透明数据指针
  *
- * Search for the inode specified by @hashval and @data in the inode cache,
- * and if present it is return it with an increased reference count. This is
- * a generalized version of iget_locked() for file systems where the inode
- * number is not sufficient for unique identification of an inode.
+ * 在inode缓存中搜索由@hashval和@data指定的inode，
+ * 如果inode在缓存中，则返回它并增加引用计数。这是
+ * iget_locked()的通用版本，用于inode号不足以唯一
+ * 标识inode的文件系统。
  *
- * If the inode is not in cache, allocate a new inode and return it locked,
- * hashed, and with the I_NEW flag set. The file system gets to fill it in
- * before unlocking it via unlock_new_inode().
+ * 如果inode不在缓存中，分配新inode并返回它（已锁定、
+ * 已哈希，并设置I_NEW标志）。文件系统在通过
+ * unlock_new_inode()解锁之前需要填充它。
  *
- * Note both @test and @set are called with the inode_hash_lock held, so can't
- * sleep.
+ * 注意@test和@set都在持有inode_hash_lock的情况下调用，所以不能睡眠。
  */
 struct inode *iget5_locked(struct super_block *sb, unsigned long hashval,
 		int (*test)(struct inode *, void *),
@@ -1161,17 +1416,16 @@ struct inode *iget5_locked(struct super_block *sb, unsigned long hashval,
 EXPORT_SYMBOL(iget5_locked);
 
 /**
- * iget_locked - obtain an inode from a mounted file system
- * @sb:		super block of file system
- * @ino:	inode number to get
+ * iget_locked - 从挂载的文件系统获取inode
+ * @sb: 文件系统的超级块
+ * @ino: 要获取的inode号
  *
- * Search for the inode specified by @ino in the inode cache and if present
- * return it with an increased reference count. This is for file systems
- * where the inode number is sufficient for unique identification of an inode.
+ * 在inode缓存中搜索由@ino指定的inode，如果存在则返回它
+ * 并增加引用计数。这用于inode号足以唯一标识inode的文件系统。
  *
- * If the inode is not in cache, allocate a new inode and return it locked,
- * hashed, and with the I_NEW flag set.  The file system gets to fill it in
- * before unlocking it via unlock_new_inode().
+ * 如果inode不在缓存中，分配新inode并返回它（已锁定、已哈希，
+ * 并设置I_NEW标志）。文件系统在通过unlock_new_inode()解锁
+ * 之前需要填充它。
  */
 struct inode *iget_locked(struct super_block *sb, unsigned long ino)
 {
@@ -1235,11 +1489,20 @@ again:
 EXPORT_SYMBOL(iget_locked);
 
 /*
- * search the inode cache for a matching inode number.
- * If we find one, then the inode number we are trying to
- * allocate is not unique and so we should not use it.
+ * 在inode缓存中搜索匹配的inode号。
+ * 如果我们找到一个，那么我们试图分配的inode号不是唯一的，
+ * 所以我们不应该使用它。
  *
- * Returns 1 if the inode number is unique, 0 if it is not.
+ * 如果inode号是唯一的则返回1，如果不是则返回0。
+ */
+/**
+ * test_inode_iunique - 测试inode号是否唯一
+ * @sb: 超级块
+ * @ino: 要测试的inode号
+ *
+ * 检查给定的inode号在指定超级块中是否已经被使用。
+ *
+ * 返回值: 如果唯一返回1，如果已使用返回0
  */
 static int test_inode_iunique(struct super_block *sb, unsigned long ino)
 {
@@ -1254,18 +1517,16 @@ static int test_inode_iunique(struct super_block *sb, unsigned long ino)
 }
 
 /**
- *	iunique - get a unique inode number
- *	@sb: superblock
- *	@max_reserved: highest reserved inode number
+ *	iunique - 获取唯一的inode号
+ *	@sb: 超级块
+ *	@max_reserved: 最高保留的inode号
  *
- *	Obtain an inode number that is unique on the system for a given
- *	superblock. This is used by file systems that have no natural
- *	permanent inode numbering system. An inode number is returned that
- *	is higher than the reserved limit but unique.
+ *	为给定超级块获取在系统上唯一的inode号。这由没有
+ *	自然永久inode编号系统的文件系统使用。返回的inode号
+ *	高于保留限制但是唯一的。
  *
- *	BUGS:
- *	With a large number of inodes live on the file system this function
- *	currently becomes quite slow.
+ *	缺陷:
+ *	当文件系统上有大量活动inode时，此函数目前变得相当慢。
  */
 ino_t iunique(struct super_block *sb, ino_t max_reserved)
 {
@@ -1292,6 +1553,16 @@ ino_t iunique(struct super_block *sb, ino_t max_reserved)
 }
 EXPORT_SYMBOL(iunique);
 
+/**
+ * igrab - 安全地获取inode引用
+ * @inode: 要获取引用的inode
+ *
+ * 如果inode没有正在被释放，则增加其引用计数。这是一个
+ * "安全"的引用获取函数，它检查inode状态以避免在inode
+ * 正在被销毁时获取引用。
+ *
+ * 返回值: 成功返回inode指针，如果inode正在被释放则返回NULL
+ */
 struct inode *igrab(struct inode *inode)
 {
 	spin_lock(&inode->i_lock);
@@ -1312,20 +1583,19 @@ struct inode *igrab(struct inode *inode)
 EXPORT_SYMBOL(igrab);
 
 /**
- * ilookup5_nowait - search for an inode in the inode cache
- * @sb:		super block of file system to search
- * @hashval:	hash value (usually inode number) to search for
- * @test:	callback used for comparisons between inodes
- * @data:	opaque data pointer to pass to @test
+ * ilookup5_nowait - 在inode缓存中搜索inode
+ * @sb: 要搜索的文件系统超级块
+ * @hashval: 要搜索的哈希值（通常是inode号）
+ * @test: 用于inode间比较的回调函数
+ * @data: 传递给@test的不透明数据指针
  *
- * Search for the inode specified by @hashval and @data in the inode cache.
- * If the inode is in the cache, the inode is returned with an incremented
- * reference count.
+ * 在inode缓存中搜索由@hashval和@data指定的inode。
+ * 如果inode在缓存中，返回inode并增加引用计数。
  *
- * Note: I_NEW is not waited upon so you have to be very careful what you do
- * with the returned inode.  You probably should be using ilookup5() instead.
+ * 注意: 不等待I_NEW，所以你必须非常小心处理返回的inode。
+ * 你可能应该使用ilookup5()替代。
  *
- * Note2: @test is called with the inode_hash_lock held, so can't sleep.
+ * 注意2: @test在持有inode_hash_lock的情况下调用，所以不能睡眠。
  */
 struct inode *ilookup5_nowait(struct super_block *sb, unsigned long hashval,
 		int (*test)(struct inode *, void *), void *data)
@@ -1342,21 +1612,20 @@ struct inode *ilookup5_nowait(struct super_block *sb, unsigned long hashval,
 EXPORT_SYMBOL(ilookup5_nowait);
 
 /**
- * ilookup5 - search for an inode in the inode cache
- * @sb:		super block of file system to search
- * @hashval:	hash value (usually inode number) to search for
- * @test:	callback used for comparisons between inodes
- * @data:	opaque data pointer to pass to @test
+ * ilookup5 - 在inode缓存中搜索inode
+ * @sb: 要搜索的文件系统超级块
+ * @hashval: 要搜索的哈希值（通常是inode号）
+ * @test: 用于inode间比较的回调函数
+ * @data: 传递给@test的不透明数据指针
  *
- * Search for the inode specified by @hashval and @data in the inode cache,
- * and if the inode is in the cache, return the inode with an incremented
- * reference count.  Waits on I_NEW before returning the inode.
- * returned with an incremented reference count.
+ * 在inode缓存中搜索由@hashval和@data指定的inode，
+ * 如果inode在缓存中，返回inode并增加引用计数。
+ * 在返回inode前等待I_NEW完成。
  *
- * This is a generalized version of ilookup() for file systems where the
- * inode number is not sufficient for unique identification of an inode.
+ * 这是ilookup()的通用版本，用于inode号不足以唯一标识
+ * inode的文件系统。
  *
- * Note: @test is called with the inode_hash_lock held, so can't sleep.
+ * 注意: @test在持有inode_hash_lock的情况下调用，所以不能睡眠。
  */
 struct inode *ilookup5(struct super_block *sb, unsigned long hashval,
 		int (*test)(struct inode *, void *), void *data)
@@ -1376,12 +1645,12 @@ again:
 EXPORT_SYMBOL(ilookup5);
 
 /**
- * ilookup - search for an inode in the inode cache
- * @sb:		super block of file system to search
- * @ino:	inode number to search for
+ * ilookup - 在inode缓存中搜索inode
+ * @sb: 要搜索的文件系统超级块
+ * @ino: 要搜索的inode号
  *
- * Search for the inode @ino in the inode cache, and if the inode is in the
- * cache, the inode is returned with an incremented reference count.
+ * 在inode缓存中搜索@ino，如果inode在缓存中，
+ * 返回inode并增加引用计数。
  */
 struct inode *ilookup(struct super_block *sb, unsigned long ino)
 {
@@ -1406,27 +1675,23 @@ again:
 EXPORT_SYMBOL(ilookup);
 
 /**
- * find_inode_nowait - find an inode in the inode cache
- * @sb:		super block of file system to search
- * @hashval:	hash value (usually inode number) to search for
- * @match:	callback used for comparisons between inodes
- * @data:	opaque data pointer to pass to @match
+ * find_inode_nowait - 在inode缓存中查找inode
+ * @sb: 要搜索的文件系统超级块
+ * @hashval: 要搜索的哈希值（通常是inode号）
+ * @match: 用于inode间比较的回调函数
+ * @data: 传递给@match的不透明数据指针
  *
- * Search for the inode specified by @hashval and @data in the inode
- * cache, where the helper function @match will return 0 if the inode
- * does not match, 1 if the inode does match, and -1 if the search
- * should be stopped.  The @match function must be responsible for
- * taking the i_lock spin_lock and checking i_state for an inode being
- * freed or being initialized, and incrementing the reference count
- * before returning 1.  It also must not sleep, since it is called with
- * the inode_hash_lock spinlock held.
+ * 在inode缓存中搜索由@hashval和@data指定的inode，
+ * 其中辅助函数@match在inode不匹配时返回0，匹配时返回1，
+ * 应该停止搜索时返回-1。@match函数必须负责获取i_lock
+ * 自旋锁并检查正在释放或正在初始化的inode的i_state，
+ * 并在返回1之前增加引用计数。它也不能睡眠，因为它是在
+ * 持有inode_hash_lock自旋锁的情况下调用的。
  *
- * This is a even more generalized version of ilookup5() when the
- * function must never block --- find_inode() can block in
- * __wait_on_freeing_inode() --- or when the caller can not increment
- * the reference count because the resulting iput() might cause an
- * inode eviction.  The tradeoff is that the @match funtion must be
- * very carefully implemented.
+ * 这是ilookup5()的更通用版本，当函数绝不能阻塞时使用---
+ * find_inode()可能在__wait_on_freeing_inode()中阻塞---
+ * 或当调用者不能增加引用计数时，因为resulting iput()可能
+ * 导致inode驱逐。权衡是@match函数必须非常小心地实现。
  */
 struct inode *find_inode_nowait(struct super_block *sb,
 				unsigned long hashval,
@@ -1456,25 +1721,23 @@ out:
 EXPORT_SYMBOL(find_inode_nowait);
 
 /**
- * find_inode_rcu - find an inode in the inode cache
- * @sb:		Super block of file system to search
- * @hashval:	Key to hash
- * @test:	Function to test match on an inode
- * @data:	Data for test function
+ * find_inode_rcu - 在inode缓存中查找inode
+ * @sb: 要搜索的文件系统超级块
+ * @hashval: 哈希键
+ * @test: 在inode上测试匹配的函数
+ * @data: 测试函数的数据
  *
- * Search for the inode specified by @hashval and @data in the inode cache,
- * where the helper function @test will return 0 if the inode does not match
- * and 1 if it does.  The @test function must be responsible for taking the
- * i_lock spin_lock and checking i_state for an inode being freed or being
- * initialized.
+ * 在inode缓存中搜索由@hashval和@data指定的inode，
+ * 其中辅助函数@test在inode不匹配时返回0，匹配时返回1。
+ * @test函数必须负责获取i_lock自旋锁并检查正在释放或
+ * 正在初始化的inode的i_state。
  *
- * If successful, this will return the inode for which the @test function
- * returned 1 and NULL otherwise.
+ * 如果成功，将返回@test函数返回1的inode，否则返回NULL。
  *
- * The @test function is not permitted to take a ref on any inode presented.
- * It is also not permitted to sleep.
+ * @test函数不允许对任何呈现的inode获取引用。
+ * 它也不允许睡眠。
  *
- * The caller must hold the RCU read lock.
+ * 调用者必须持有RCU读锁。
  */
 struct inode *find_inode_rcu(struct super_block *sb, unsigned long hashval,
 			     int (*test)(struct inode *, void *), void *data)
@@ -1496,23 +1759,19 @@ struct inode *find_inode_rcu(struct super_block *sb, unsigned long hashval,
 EXPORT_SYMBOL(find_inode_rcu);
 
 /**
- * find_inode_by_rcu - Find an inode in the inode cache
- * @sb:		Super block of file system to search
- * @ino:	The inode number to match
+ * find_inode_by_ino_rcu - 在inode缓存中查找inode
+ * @sb: 要搜索的文件系统超级块
+ * @ino: 要匹配的inode号
  *
- * Search for the inode specified by @hashval and @data in the inode cache,
- * where the helper function @test will return 0 if the inode does not match
- * and 1 if it does.  The @test function must be responsible for taking the
- * i_lock spin_lock and checking i_state for an inode being freed or being
- * initialized.
+ * 在inode缓存中搜索由@ino指定的inode。这是find_inode_rcu
+ * 的简化版本，专门用于通过inode号查找。
  *
- * If successful, this will return the inode for which the @test function
- * returned 1 and NULL otherwise.
+ * 如果成功，返回匹配的inode，否则返回NULL。
  *
- * The @test function is not permitted to take a ref on any inode presented.
- * It is also not permitted to sleep.
+ * 此函数不允许对任何呈现的inode获取引用。
+ * 它也不允许睡眠。
  *
- * The caller must hold the RCU read lock.
+ * 调用者必须持有RCU读锁。
  */
 struct inode *find_inode_by_ino_rcu(struct super_block *sb,
 				    unsigned long ino)
@@ -1533,6 +1792,15 @@ struct inode *find_inode_by_ino_rcu(struct super_block *sb,
 }
 EXPORT_SYMBOL(find_inode_by_ino_rcu);
 
+/**
+ * insert_inode_locked - 插入inode到哈希表并锁定
+ * @inode: 要插入的inode
+ *
+ * 将inode插入到哈希表中，如果成功则设置I_NEW和I_CREATING标志。
+ * 如果已经存在相同inode号的inode，则等待其完成并返回-EBUSY。
+ *
+ * 返回值: 成功返回0，如果存在冲突则返回-EBUSY
+ */
 int insert_inode_locked(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
@@ -1580,6 +1848,19 @@ int insert_inode_locked(struct inode *inode)
 }
 EXPORT_SYMBOL(insert_inode_locked);
 
+/**
+ * insert_inode_locked4 - 使用自定义测试函数插入并锁定inode
+ * @inode: 要插入的inode
+ * @hashval: 哈希值
+ * @test: 用于比较的测试函数
+ * @data: 传递给测试函数的数据
+ *
+ * 类似于insert_inode_locked，但使用自定义的测试函数来
+ * 确定是否存在冲突的inode。设置I_CREATING标志并使用
+ * inode_insert5进行实际的插入工作。
+ *
+ * 返回值: 成功返回0，如果存在冲突则返回-EBUSY
+ */
 int insert_inode_locked4(struct inode *inode, unsigned long hashval,
 		int (*test)(struct inode *, void *), void *data)
 {
@@ -1597,6 +1878,15 @@ int insert_inode_locked4(struct inode *inode, unsigned long hashval,
 EXPORT_SYMBOL(insert_inode_locked4);
 
 
+/**
+ * generic_delete_inode - 通用的删除inode函数
+ * @inode: 要删除的inode
+ *
+ * 这是一个简单的删除inode函数，总是返回1，表示应该删除inode。
+ * 文件系统可以将此函数用作其drop_inode操作的默认实现。
+ *
+ * 返回值: 总是返回1（表示删除inode）
+ */
 int generic_delete_inode(struct inode *inode)
 {
 	return 1;
@@ -1604,14 +1894,19 @@ int generic_delete_inode(struct inode *inode)
 EXPORT_SYMBOL(generic_delete_inode);
 
 /*
- * Called when we're dropping the last reference
- * to an inode.
+ * 当我们丢弃对inode的最后一个引用时调用。
  *
- * Call the FS "drop_inode()" function, defaulting to
- * the legacy UNIX filesystem behaviour.  If it tells
- * us to evict inode, do so.  Otherwise, retain inode
- * in cache if fs is alive, sync and evict if fs is
- * shutting down.
+ * 调用FS的"drop_inode()"函数，默认为传统的UNIX文件系统行为。
+ * 如果它告诉我们驱逐inode，就这样做。否则，如果fs是活动的，
+ * 则在缓存中保留inode，如果fs正在关闭，则同步并驱逐。
+ */
+/**
+ * iput_final - inode引用计数降为0时的最终处理
+ * @inode: 引用计数为0的inode
+ *
+ * 当inode的最后一个引用被释放时调用此函数。决定是将inode
+ * 放入LRU列表（如果文件系统活动且不需要立即删除），还是
+ * 立即驱逐inode（如果文件系统要求删除或正在关闭）。
  */
 static void iput_final(struct inode *inode)
 {
@@ -1655,13 +1950,15 @@ static void iput_final(struct inode *inode)
 }
 
 /**
- *	iput	- put an inode
- *	@inode: inode to put
+ * iput - 释放inode引用
+ * @inode: 要释放的inode
  *
- *	Puts an inode, dropping its usage count. If the inode use count hits
- *	zero, the inode is then freed and may also be destroyed.
+ * 释放一个inode，减少其使用计数。如果inode使用计数降为零，
+ * inode将被释放并可能被销毁。
  *
- *	Consequently, iput() can sleep.
+ * 因此，iput()可能会睡眠。
+ *
+ * 返回值: 无
  */
 void iput(struct inode *inode)
 {
@@ -1684,18 +1981,16 @@ EXPORT_SYMBOL(iput);
 
 #ifdef CONFIG_BLOCK
 /**
- *	bmap	- find a block number in a file
- *	@inode:  inode owning the block number being requested
- *	@block: pointer containing the block to find
+ *	bmap - 在文件中查找块号
+ *	@inode: 拥有请求块号的inode
+ *	@block: 指向要查找的块的指针
  *
- *	Replaces the value in ``*block`` with the block number on the device holding
- *	corresponding to the requested block number in the file.
- *	That is, asked for block 4 of inode 1 the function will replace the
- *	4 in ``*block``, with disk block relative to the disk start that holds that
- *	block of the file.
+ *	将``*block``中的值替换为持有文件中请求块号对应块的设备上的块号。
+ *	也就是说，请求inode 1的第4块，函数将用保存该文件块的
+ *	相对于磁盘开始的磁盘块替换``*block``中的4。
  *
- *	Returns -EINVAL in case of error, 0 otherwise. If mapping falls into a
- *	hole, returns 0 and ``*block`` is also set to 0.
+ *	错误时返回-EINVAL，否则返回0。如果映射落入洞中，
+ *	返回0且``*block``也设置为0。
  */
 int bmap(struct inode *inode, sector_t *block)
 {
@@ -1709,9 +2004,22 @@ EXPORT_SYMBOL(bmap);
 #endif
 
 /*
- * With relative atime, only update atime if the previous atime is
- * earlier than either the ctime or mtime or if at least a day has
- * passed since the last atime update.
+ * 使用相对atime时，只有在以前的atime早于ctime或mtime，
+ * 或者距离上次atime更新至少过了一天时，才更新atime。
+ */
+/**
+ * relatime_need_update - 检查是否需要更新atime
+ * @mnt: 挂载点
+ * @inode: 要检查的inode
+ * @now: 当前时间
+ *
+ * 在relatime模式下决定是否需要更新访问时间。只有在以下情况下
+ * 才更新atime：
+ * 1. mtime比atime新
+ * 2. ctime比atime新
+ * 3. 距离上次atime更新超过24小时
+ *
+ * 返回值: 需要更新返回1，否则返回0
  */
 static int relatime_need_update(struct vfsmount *mnt, struct inode *inode,
 			     struct timespec64 now)
@@ -1742,6 +2050,17 @@ static int relatime_need_update(struct vfsmount *mnt, struct inode *inode,
 	return 0;
 }
 
+/**
+ * generic_update_time - 通用的时间更新函数
+ * @inode: 要更新的inode
+ * @time: 新的时间值
+ * @flags: 指定要更新哪些时间字段的标志
+ *
+ * 根据flags参数更新inode的时间字段（atime、ctime、mtime）
+ * 和版本号。如果文件系统不支持lazy time，则立即标记为脏。
+ *
+ * 返回值: 总是返回0
+ */
 int generic_update_time(struct inode *inode, struct timespec64 *time, int flags)
 {
 	int iflags = I_DIRTY_TIME;
@@ -1767,8 +2086,19 @@ int generic_update_time(struct inode *inode, struct timespec64 *time, int flags)
 EXPORT_SYMBOL(generic_update_time);
 
 /*
- * This does the actual work of updating an inodes time or version.  Must have
- * had called mnt_want_write() before calling this.
+ * 这执行更新inode时间或版本的实际工作。在调用此函数之前
+ * 必须已经调用了mnt_want_write()。
+ */
+/**
+ * update_time - 更新inode时间字段
+ * @inode: 要更新的inode
+ * @time: 新的时间值
+ * @flags: 指定要更新哪些时间字段的标志
+ *
+ * 如果inode操作定义了update_time函数则调用它，否则使用
+ * 通用的generic_update_time函数。
+ *
+ * 返回值: 成功返回0，失败返回错误码
  */
 static int update_time(struct inode *inode, struct timespec64 *time, int flags)
 {
@@ -1778,13 +2108,14 @@ static int update_time(struct inode *inode, struct timespec64 *time, int flags)
 }
 
 /**
- *	touch_atime	-	update the access time
- *	@path: the &struct path to update
- *	@inode: inode to update
+ *	atime_needs_update - 检查是否需要更新访问时间
+ *	@path: 要更新的&struct path
+ *	@inode: 要检查的inode
  *
- *	Update the accessed time on an inode and mark it for writeback.
- *	This function automatically handles read only file systems and media,
- *	as well as the "noatime" flag and inode specific "noatime" markers.
+ *	检查inode的访问时间是否需要更新。此函数自动处理只读文件系统
+ *	和媒体，以及"noatime"标志和inode特定的"noatime"标记。
+ *
+ *	返回值: 需要更新返回true，否则返回false
  */
 bool atime_needs_update(const struct path *path, struct inode *inode)
 {
@@ -1821,6 +2152,15 @@ bool atime_needs_update(const struct path *path, struct inode *inode)
 	return true;
 }
 
+/**
+ * touch_atime - 更新访问时间
+ * @path: 要更新的路径
+ *
+ * 更新inode上的访问时间并标记为需要回写。此函数自动处理
+ * 只读文件系统和媒体，以及"noatime"标志和inode特定的
+ * "noatime"标记。首先检查是否需要更新，然后获取写权限
+ * 并调用update_time。
+ */
 void touch_atime(const struct path *path)
 {
 	struct vfsmount *mnt = path->mnt;
@@ -1853,10 +2193,21 @@ skip_update:
 EXPORT_SYMBOL(touch_atime);
 
 /*
- * The logic we want is
+ * 我们想要的逻辑是
  *
  *	if suid or (sgid and xgrp)
  *		remove privs
+ */
+/**
+ * should_remove_suid - 检查是否应该移除suid/sgid位
+ * @dentry: 要检查的dentry
+ *
+ * 检查文件的权限位，确定是否需要移除setuid或setgid位。
+ * 规则：
+ * - suid位总是必须被清除
+ * - sgid位只有在设置了执行权限时才需要清除
+ *
+ * 返回值: 需要清除的权限位掩码，如果不需要清除则返回0
  */
 int should_remove_suid(struct dentry *dentry)
 {
@@ -1882,9 +2233,17 @@ int should_remove_suid(struct dentry *dentry)
 EXPORT_SYMBOL(should_remove_suid);
 
 /*
- * Return mask of changes for notify_change() that need to be done as a
- * response to write or truncate. Return 0 if nothing has to be changed.
- * Negative value on error (change should be denied).
+ * 返回notify_change()需要的更改掩码，作为对写入或截断的响应。
+ * 如果没有需要更改的内容则返回0。错误时返回负值（应拒绝更改）。
+ */
+/**
+ * dentry_needs_remove_privs - 检查dentry是否需要移除特权
+ * @dentry: 要检查的dentry
+ *
+ * 检查在写入或截断操作后是否需要移除文件的特权位。
+ * 结合suid/sgid检查和安全模块的检查。
+ *
+ * 返回值: 需要清除的属性掩码，0表示不需要，负值表示错误
  */
 int dentry_needs_remove_privs(struct dentry *dentry)
 {
@@ -1904,6 +2263,16 @@ int dentry_needs_remove_privs(struct dentry *dentry)
 	return mask;
 }
 
+/**
+ * __remove_privs - 实际移除文件特权位
+ * @dentry: 要处理的dentry
+ * @kill: 要移除的特权位掩码
+ *
+ * 执行实际的特权位移除操作。设置适当的iattr结构并调用
+ * notify_change来执行更改。
+ *
+ * 返回值: 成功返回0，失败返回错误码
+ */
 static int __remove_privs(struct dentry *dentry, int kill)
 {
 	struct iattr newattrs;
@@ -1917,8 +2286,17 @@ static int __remove_privs(struct dentry *dentry, int kill)
 }
 
 /*
- * Remove special file priviledges (suid, capabilities) when file is written
- * to or truncated.
+ * 当文件被写入或截断时移除特殊文件特权（suid、capabilities）。
+ */
+/**
+ * file_remove_privs - 移除文件的特权位
+ * @file: 要处理的文件
+ *
+ * 在文件写入或截断时移除特殊文件特权（suid、sgid、capabilities）。
+ * 这是一个安全措施，防止通过修改设置了特权位的可执行文件来
+ * 进行权限提升攻击。
+ *
+ * 返回值: 成功返回0，失败返回错误码
  */
 int file_remove_privs(struct file *file)
 {
@@ -1949,16 +2327,14 @@ int file_remove_privs(struct file *file)
 EXPORT_SYMBOL(file_remove_privs);
 
 /**
- *	file_update_time	-	update mtime and ctime time
- *	@file: file accessed
+ *	file_update_time - 更新mtime和ctime时间
+ *	@file: 被访问的文件
  *
- *	Update the mtime and ctime members of an inode and mark the inode
- *	for writeback.  Note that this function is meant exclusively for
- *	usage in the file write path of filesystems, and filesystems may
- *	choose to explicitly ignore update via this function with the
- *	S_NOCMTIME inode flag, e.g. for network filesystem where these
- *	timestamps are handled by the server.  This can return an error for
- *	file systems who need to allocate space in order to update an inode.
+ *	更新inode的mtime和ctime成员并标记inode为需要写回。
+ *	注意此函数专门用于文件系统的文件写入路径，文件系统可以
+ *	选择通过S_NOCMTIME inode标志显式忽略通过此函数进行的
+ *	更新，例如对于网络文件系统，这些时间戳由服务器处理。
+ *	对于需要分配空间以更新inode的文件系统，这可能返回错误。
  */
 
 int file_update_time(struct file *file)
@@ -1996,7 +2372,19 @@ int file_update_time(struct file *file)
 }
 EXPORT_SYMBOL(file_update_time);
 
-/* Caller must hold the file's inode lock */
+/* 调用者必须持有文件的inode锁 */
+/**
+ * file_modified - 处理文件修改时的权限和时间更新
+ * @file: 被修改的文件
+ *
+ * 当文件被修改时调用，执行两个主要操作：
+ * 1. 清除安全位（如果进程不是以root运行），防止修改setuid和setgid二进制文件
+ * 2. 更新文件的时间戳
+ *
+ * 调用者必须持有文件的inode锁。
+ *
+ * 返回值: 成功返回0，失败返回错误码
+ */
 int file_modified(struct file *file)
 {
 	int err;
@@ -2016,6 +2404,15 @@ int file_modified(struct file *file)
 }
 EXPORT_SYMBOL(file_modified);
 
+/**
+ * inode_needs_sync - 检查inode是否需要同步
+ * @inode: 要检查的inode
+ *
+ * 检查inode是否需要同步写入。对于设置了IS_SYNC标志的inode
+ * 或者是目录且设置了IS_DIRSYNC标志的inode返回真。
+ *
+ * 返回值: 需要同步返回1，否则返回0
+ */
 int inode_needs_sync(struct inode *inode)
 {
 	if (IS_SYNC(inode))
@@ -2027,15 +2424,20 @@ int inode_needs_sync(struct inode *inode)
 EXPORT_SYMBOL(inode_needs_sync);
 
 /*
- * If we try to find an inode in the inode hash while it is being
- * deleted, we have to wait until the filesystem completes its
- * deletion before reporting that it isn't found.  This function waits
- * until the deletion _might_ have completed.  Callers are responsible
- * to recheck inode state.
+ * 如果我们尝试在inode哈希中查找一个正在被删除的inode，
+ * 我们必须等到文件系统完成删除后才能报告找不到它。
+ * 此函数等待删除_可能_已完成。调用者负责重新检查inode状态。
  *
- * It doesn't matter if I_NEW is not set initially, a call to
- * wake_up_bit(&inode->i_state, __I_NEW) after removing from the hash list
- * will DTRT.
+ * 最初是否设置I_NEW并不重要，在从哈希列表中移除后调用
+ * wake_up_bit(&inode->i_state, __I_NEW)将正确处理。
+ */
+/**
+ * __wait_on_freeing_inode - 等待正在释放的inode完成释放
+ * @inode: 正在释放的inode
+ *
+ * 当发现inode正在被释放时，等待释放过程完成。这避免了
+ * 在inode释放过程中返回错误的查找结果。使用等待队列机制
+ * 等待I_NEW位被清除，这发生在inode释放完成时。
  */
 static void __wait_on_freeing_inode(struct inode *inode)
 {
@@ -2050,7 +2452,15 @@ static void __wait_on_freeing_inode(struct inode *inode)
 	spin_lock(&inode_hash_lock);
 }
 
-static __initdata unsigned long ihash_entries;
+static __initdata unsigned long ihash_entries;  /* inode哈希表条目数 */
+/**
+ * set_ihash_entries - 设置inode哈希表条目数的启动参数处理函数
+ * @str: 参数字符串
+ *
+ * 处理启动参数"ihash_entries="，用于设置inode哈希表的大小。
+ *
+ * 返回值: 成功返回1，失败返回0
+ */
 static int __init set_ihash_entries(char *str)
 {
 	if (!str)
@@ -2061,7 +2471,14 @@ static int __init set_ihash_entries(char *str)
 __setup("ihash_entries=", set_ihash_entries);
 
 /*
- * Initialize the waitqueues and inode hash table.
+ * 初始化等待队列和inode哈希表。
+ */
+/**
+ * inode_init_early - inode子系统的早期初始化
+ *
+ * 在系统启动的早期阶段初始化inode哈希表。如果哈希分布在
+ * NUMA节点上，则推迟哈希分配直到vmalloc空间可用。
+ * 这是在内存管理完全初始化之前调用的。
  */
 void __init inode_init_early(void)
 {
@@ -2083,6 +2500,15 @@ void __init inode_init_early(void)
 					0);
 }
 
+/**
+ * inode_init - inode子系统的完整初始化
+ *
+ * 完成inode子系统的初始化：
+ * 1. 创建inode slab缓存
+ * 2. 如果之前没有在inode_init_early中创建，则创建inode哈希表
+ *
+ * 这在内存管理系统完全初始化后调用。
+ */
 void __init inode_init(void)
 {
 	/* inode slab cache */
@@ -2109,6 +2535,20 @@ void __init inode_init(void)
 					0);
 }
 
+/**
+ * init_special_inode - 初始化特殊类型的inode
+ * @inode: 要初始化的inode
+ * @mode: inode的模式（类型和权限）
+ * @rdev: 设备号（对设备文件有效）
+ *
+ * 根据inode类型初始化特殊inode的文件操作：
+ * - 字符设备: 设置字符设备文件操作
+ * - 块设备: 设置块设备文件操作
+ * - FIFO: 设置管道文件操作
+ * - 套接字: 保持默认（no_open_fops）
+ *
+ * 对于未知类型会打印调试信息。
+ */
 void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev)
 {
 	inode->i_mode = mode;

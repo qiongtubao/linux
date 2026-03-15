@@ -15,6 +15,18 @@
  *          (lots of bits borrowed from Ingo Molnar & Andrew Morton)
  */
 
+/*
+ * Linux页面分配器（Buddy System）
+ *
+ * 本文件实现了Linux内核的物理页面分配器，核心是伙伴系统(buddy system)：
+ * - 以页面为单位管理物理内存
+ * - 支持2^order大小的连续页面分配
+ * - 每个内存区(zone)维护独立的空闲页面链表
+ * - 通过per-CPU缓存减少锁竞争
+ * - 支持NUMA拓扑感知分配
+ * - 实现内存水位线控制和OOM处理
+ */
+
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
@@ -179,6 +191,10 @@ DEFINE_STATIC_KEY_FALSE(init_on_free);
 #endif
 EXPORT_SYMBOL(init_on_free);
 
+/*
+ * 早期初始化分配时清零功能
+ * 解析内核启动参数init_on_alloc，决定是否在页面分配时自动清零
+ */
 static int __init early_init_on_alloc(char *buf)
 {
 	int ret;
@@ -197,6 +213,10 @@ static int __init early_init_on_alloc(char *buf)
 }
 early_param("init_on_alloc", early_init_on_alloc);
 
+/*
+ * 早期初始化释放时清零功能
+ * 解析内核启动参数init_on_free，决定是否在页面释放时自动清零
+ */
 static int __init early_init_on_free(char *buf)
 {
 	int ret;
@@ -223,11 +243,20 @@ early_param("init_on_free", early_init_on_free);
  * index, e.g. page might have MIGRATE_CMA set but be on a pcplist with any
  * other index - this ensures that it will be put on the correct CMA freelist.
  */
+/*
+ * 获取PCP页面的迁移类型
+ * 从页面的index字段中读取缓存的迁移类型信息
+ * 用于避免从pageblock中重复查询迁移类型
+ */
 static inline int get_pcppage_migratetype(struct page *page)
 {
 	return page->index;
 }
 
+/*
+ * 设置PCP页面的迁移类型
+ * 将迁移类型信息缓存到页面的index字段中
+ */
 static inline void set_pcppage_migratetype(struct page *page, int migratetype)
 {
 	page->index = migratetype;
@@ -246,6 +275,12 @@ static inline void set_pcppage_migratetype(struct page *page, int migratetype)
 
 static gfp_t saved_gfp_mask;
 
+/**
+ * pm_restore_gfp_mask - 恢复电源管理前的GFP掩码
+ *
+ * 在系统电源管理操作完成后恢复之前保存的GFP分配掩码，
+ * 允许系统恢复正常的内存分配行为。
+ */
 void pm_restore_gfp_mask(void)
 {
 	WARN_ON(!mutex_is_locked(&system_transition_mutex));
@@ -255,6 +290,12 @@ void pm_restore_gfp_mask(void)
 	}
 }
 
+/**
+ * pm_restrict_gfp_mask - 限制电源管理期间的GFP掩码
+ *
+ * 在电源管理操作期间保存当前的GFP掩码并应用限制，
+ * 防止在系统挂起/恢复过程中进行不当的内存分配。
+ */
 void pm_restrict_gfp_mask(void)
 {
 	WARN_ON(!mutex_is_locked(&system_transition_mutex));
@@ -263,6 +304,14 @@ void pm_restrict_gfp_mask(void)
 	gfp_allowed_mask &= ~(__GFP_IO | __GFP_FS);
 }
 
+/**
+ * pm_suspended_storage - 检查存储设备是否已挂起
+ *
+ * 检查系统中的存储设备是否处于挂起状态，
+ * 用于在电源管理期间避免访问已挂起的存储设备。
+ *
+ * 返回值: 如果存储设备已挂起返回true，否则返回false
+ */
 bool pm_suspended_storage(void)
 {
 	if ((gfp_allowed_mask & (__GFP_IO | __GFP_FS)) == (__GFP_IO | __GFP_FS))
@@ -409,13 +458,27 @@ static DEFINE_STATIC_KEY_TRUE(deferred_pages);
  * on-demand allocation and then freed again before the deferred pages
  * initialization is done, but this is not likely to happen.
  */
+/**
+ * kasan_free_nondeferred_pages - KASAN延迟页面释放处理
+ * @page: 要释放的页面
+ * @order: 页面阶数
+ *
+ * 只在延迟内存初始化完成后调用kasan_free_pages()。
+ * 在延迟内存初始化期间避免KASAN毒化以提高性能。
+ */
 static inline void kasan_free_nondeferred_pages(struct page *page, int order)
 {
 	if (!static_branch_unlikely(&deferred_pages))
 		kasan_free_pages(page, order);
 }
 
-/* Returns true if the struct page for the pfn is uninitialised */
+/**
+ * early_page_uninitialised - 检查页面是否未初始化
+ * @pfn: 页面帧号
+ *
+ * 检查指定的页面是否尚未完成初始化。
+ * 返回值: 如果页面未初始化返回true，否则返回false
+ */
 static inline bool __meminit early_page_uninitialised(unsigned long pfn)
 {
 	int nid = early_pfn_to_nid(pfn);
@@ -426,9 +489,14 @@ static inline bool __meminit early_page_uninitialised(unsigned long pfn)
 	return false;
 }
 
-/*
- * Returns true when the remaining initialisation should be deferred until
- * later in the boot cycle when it can be parallelised.
+/**
+ * defer_init - 判断是否延迟初始化
+ * @nid: NUMA节点ID
+ * @pfn: 页面帧号
+ * @end_pfn: 结束页面帧号
+ *
+ * 判断剩余的初始化是否应该推迟到启动周期的后期进行并行化处理。
+ * 返回值: 如果应该延迟初始化返回true，否则返回false
  */
 static bool __meminit
 defer_init(int nid, unsigned long pfn, unsigned long end_pfn)
@@ -474,7 +542,14 @@ static inline bool defer_init(int nid, unsigned long pfn, unsigned long end_pfn)
 }
 #endif
 
-/* Return a pointer to the bitmap storing bits affecting a block of pages */
+/**
+ * get_pageblock_bitmap - 获取页面块位图
+ * @page: 目标页面
+ * @pfn: 页面帧号
+ *
+ * 返回指向影响页面块的位图存储区域的指针。
+ * 返回值: 指向位图的指针
+ */
 static inline unsigned long *get_pageblock_bitmap(struct page *page,
 							unsigned long pfn)
 {
@@ -485,6 +560,14 @@ static inline unsigned long *get_pageblock_bitmap(struct page *page,
 #endif /* CONFIG_SPARSEMEM */
 }
 
+/**
+ * pfn_to_bitidx - 将PFN转换为位图索引
+ * @page: 目标页面
+ * @pfn: 页面帧号
+ *
+ * 将页面帧号转换为在页面块位图中的位索引。
+ * 返回值: 位图中的位索引
+ */
 static inline int pfn_to_bitidx(struct page *page, unsigned long pfn)
 {
 #ifdef CONFIG_SPARSEMEM
@@ -521,12 +604,29 @@ unsigned long __get_pfnblock_flags_mask(struct page *page,
 	return (word >> bitidx) & mask;
 }
 
+/**
+ * get_pfnblock_flags_mask - 获取页面块的标志位
+ * @page: 目标页面
+ * @pfn: 页面帧号
+ * @mask: 感兴趣的位掩码
+ *
+ * 获取pageblock_nr_pages页面块的请求标志组。
+ * 返回值: 页面块的标志位
+ */
 unsigned long get_pfnblock_flags_mask(struct page *page, unsigned long pfn,
 					unsigned long mask)
 {
 	return __get_pfnblock_flags_mask(page, pfn, mask);
 }
 
+/**
+ * get_pfnblock_migratetype - 获取页面块的迁移类型
+ * @page: 目标页面
+ * @pfn: 页面帧号
+ *
+ * 获取指定页面块的迁移类型。
+ * 返回值: 迁移类型
+ */
 static __always_inline int get_pfnblock_migratetype(struct page *page, unsigned long pfn)
 {
 	return __get_pfnblock_flags_mask(page, pfn, MIGRATETYPE_MASK);
@@ -569,6 +669,14 @@ void set_pfnblock_flags_mask(struct page *page, unsigned long flags,
 	}
 }
 
+/**
+ * set_pageblock_migratetype - 设置页面块的迁移类型
+ * @page: 目标页面
+ * @migratetype: 要设置的迁移类型
+ *
+ * 为指定的页面块设置迁移类型，用于页面迁移和内存碎片整理。
+ * 迁移类型决定了页面的分配策略和回收行为。
+ */
 void set_pageblock_migratetype(struct page *page, int migratetype)
 {
 	if (unlikely(page_group_by_mobility_disabled &&
@@ -580,6 +688,14 @@ void set_pageblock_migratetype(struct page *page, int migratetype)
 }
 
 #ifdef CONFIG_DEBUG_VM
+/**
+ * page_outside_zone_boundaries - 检查页面是否在区域边界外
+ * @zone: 内存区域
+ * @page: 要检查的页面
+ *
+ * 检查页面是否位于指定内存区域的边界范围外。
+ * 返回值: 如果页面在边界外返回1，否则返回0
+ */
 static int page_outside_zone_boundaries(struct zone *zone, struct page *page)
 {
 	int ret = 0;
@@ -603,6 +719,14 @@ static int page_outside_zone_boundaries(struct zone *zone, struct page *page)
 	return ret;
 }
 
+/**
+ * page_is_consistent - 检查页面一致性
+ * @zone: 内存区域
+ * @page: 要检查的页面
+ *
+ * 检查页面的一致性，包括PFN有效性和区域匹配。
+ * 返回值: 如果页面一致返回1，否则返回0
+ */
 static int page_is_consistent(struct zone *zone, struct page *page)
 {
 	if (!pfn_valid_within(page_to_pfn(page)))
@@ -612,8 +736,13 @@ static int page_is_consistent(struct zone *zone, struct page *page)
 
 	return 1;
 }
-/*
- * Temporary debugging check for pages not lying within a given zone.
+/**
+ * bad_range - 检查页面范围错误
+ * @zone: 内存区域
+ * @page: 要检查的页面
+ *
+ * 临时调试检查，用于检测不在给定区域内的页面。
+ * 返回值: 如果页面范围有误返回1，否则返回0
  */
 static int __maybe_unused bad_range(struct zone *zone, struct page *page)
 {
@@ -631,6 +760,14 @@ static inline int __maybe_unused bad_range(struct zone *zone, struct page *page)
 }
 #endif
 
+/**
+ * bad_page - 处理损坏页面的错误情况
+ * @page: 损坏的页面
+ * @reason: 损坏原因描述
+ *
+ * 当检测到页面状态异常时调用，记录错误信息并尝试修复页面状态。
+ * 这是页面完整性检查的重要组成部分，帮助发现内存损坏问题。
+ */
 static void bad_page(struct page *page, const char *reason)
 {
 	static unsigned long resume;
@@ -685,12 +822,27 @@ out:
  * This usage means that zero-order pages may not be compound.
  */
 
+/**
+ * free_compound_page - 释放复合页面
+ * @page: 要释放的复合页面
+ *
+ * 释放由多个连续页面组成的复合页面（如大页面或huge pages），
+ * 处理复合页面的特殊释放逻辑。
+ */
 void free_compound_page(struct page *page)
 {
 	mem_cgroup_uncharge(page);
 	__free_pages_ok(page, compound_order(page), FPI_NONE);
 }
 
+/**
+ * prep_compound_page - 准备复合页面
+ * @page: 要准备的页面
+ * @order: 页面order（2^order个页面）
+ *
+ * 初始化复合页面的结构，设置head页面和tail页面之间的关系，
+ * 为多页面分配做准备。
+ */
 void prep_compound_page(struct page *page, unsigned int order)
 {
 	int i;
@@ -722,12 +874,25 @@ EXPORT_SYMBOL(_debug_pagealloc_enabled);
 
 DEFINE_STATIC_KEY_FALSE(_debug_guardpage_enabled);
 
+/**
+ * early_debug_pagealloc - 早期调试页面分配器设置
+ * @buf: 命令行参数缓冲区
+ *
+ * 解析debug_pagealloc内核启动参数，用于启用页面分配调试。
+ * 返回值: 成功返回0，失败返回错误码
+ */
 static int __init early_debug_pagealloc(char *buf)
 {
 	return kstrtobool(buf, &_debug_pagealloc_enabled_early);
 }
 early_param("debug_pagealloc", early_debug_pagealloc);
 
+/**
+ * init_debug_pagealloc - 初始化调试页面分配器
+ *
+ * 初始化页面分配调试功能，包括启用调试页面分配和保护页面功能。
+ * 必须在页面分配器初始化之后调用。
+ */
 void init_debug_pagealloc(void)
 {
 	if (!debug_pagealloc_enabled())
@@ -741,6 +906,13 @@ void init_debug_pagealloc(void)
 	static_branch_enable(&_debug_guardpage_enabled);
 }
 
+/**
+ * debug_guardpage_minorder_setup - 设置调试保护页面最小order
+ * @buf: 命令行参数缓冲区
+ *
+ * 解析debug_guardpage_minorder内核启动参数，设置保护页面的最小order值。
+ * 返回值: 成功返回0，失败返回0
+ */
 static int __init debug_guardpage_minorder_setup(char *buf)
 {
 	unsigned long res;
@@ -755,6 +927,16 @@ static int __init debug_guardpage_minorder_setup(char *buf)
 }
 early_param("debug_guardpage_minorder", debug_guardpage_minorder_setup);
 
+/**
+ * set_page_guard - 设置页面保护
+ * @zone: 内存区域
+ * @page: 要保护的页面
+ * @order: 页面order
+ * @migratetype: 迁移类型
+ *
+ * 为指定页面设置调试保护，用于检测页面使用后释放等错误。
+ * 返回值: 设置成功返回true，否则返回false
+ */
 static inline bool set_page_guard(struct zone *zone, struct page *page,
 				unsigned int order, int migratetype)
 {
@@ -773,6 +955,15 @@ static inline bool set_page_guard(struct zone *zone, struct page *page,
 	return true;
 }
 
+/**
+ * clear_page_guard - 清除页面保护
+ * @zone: 内存区域
+ * @page: 要清除保护的页面
+ * @order: 页面order
+ * @migratetype: 迁移类型
+ *
+ * 清除页面的调试保护设置，恢复页面的正常状态。
+ */
 static inline void clear_page_guard(struct zone *zone, struct page *page,
 				unsigned int order, int migratetype)
 {
@@ -792,24 +983,30 @@ static inline void clear_page_guard(struct zone *zone, struct page *page,
 				unsigned int order, int migratetype) {}
 #endif
 
+/**
+ * set_buddy_order - 设置伙伴页面的order
+ * @page: 页面
+ * @order: 要设置的order值
+ *
+ * 为伙伴系统中的页面设置order值并标记为Buddy页面。
+ */
 static inline void set_buddy_order(struct page *page, unsigned int order)
 {
 	set_page_private(page, order);
 	__SetPageBuddy(page);
 }
 
-/*
- * This function checks whether a page is free && is the buddy
- * we can coalesce a page and its buddy if
- * (a) the buddy is not in a hole (check before calling!) &&
- * (b) the buddy is in the buddy system &&
- * (c) a page and its buddy have the same order &&
- * (d) a page and its buddy are in the same zone.
+/**
+ * page_is_buddy - 检查页面是否为伙伴页面
+ * @page: 基页面
+ * @buddy: 潜在的伙伴页面
+ * @order: 页面order
  *
- * For recording whether a page is in the buddy system, we set PageBuddy.
- * Setting, clearing, and testing PageBuddy is serialized by zone->lock.
+ * 检查两个页面是否可以合并为伙伴。合并条件包括：
+ * (a) 伙伴不在空洞中 (b) 伙伴在伙伴系统中
+ * (c) 页面和伙伴有相同order (d) 在同一区域中
  *
- * For recording page's order, we use page_private(page).
+ * 返回值: 如果是伙伴返回true，否则返回false
  */
 static inline bool page_is_buddy(struct page *page, struct page *buddy,
 							unsigned int order)
@@ -982,6 +1179,31 @@ buddy_merge_likely(unsigned long pfn, unsigned long buddy_pfn,
  * -- nyc
  */
 
+/**
+ * __free_one_page - 释放单个页面到伙伴系统
+ * @page: 要释放的页面
+ * @pfn: 页面帧号
+ * @zone: 内存区域
+ * @order: 页面阶数(2^order 个页面)
+ * @migratetype: 迁移类型
+ * @fpi_flags: 页面释放标志
+ *
+ * 这是伙伴系统的核心函数，负责将页面释放并尝试与相邻的空闲页面合并
+ * 形成更大的连续内存块，触发向上合并直到无法再合并为止。
+ */
+/**
+ * __free_one_page - 伙伴系统释放页面的核心函数
+ * @page: 要释放的页面
+ * @pfn: 页面帧号
+ * @zone: 内存区域
+ * @order: 页面order（2^order个页面）
+ * @migratetype: 页面迁移类型
+ * @fpi_flags: 释放页面时的标志
+ *
+ * 伙伴系统的核心释放函数，将页面释放到对应的空闲链表中，
+ * 并尝试与相邻的空闲页面合并形成更大的连续内存块。
+ * 这是buddy allocator算法的关键实现。
+ */
 static inline void __free_one_page(struct page *page,
 		unsigned long pfn,
 		struct zone *zone, unsigned int order,
@@ -1078,10 +1300,13 @@ done_merging:
 		page_reporting_notify_free(order);
 }
 
-/*
- * A bad page could be due to a number of fields. Instead of multiple branches,
- * try and check multiple fields with one check. The caller must do a detailed
- * check if necessary.
+/**
+ * page_expected_state - 检查页面期望状态
+ * @page: 要检查的页面
+ * @check_flags: 需要检查的标志位
+ *
+ * 检查页面是否处于期望的状态，包括mapcount、mapping、引用计数等。
+ * 返回值: 如果页面状态符合期望返回true，否则返回false
  */
 static inline bool page_expected_state(struct page *page,
 					unsigned long check_flags)
@@ -1100,6 +1325,14 @@ static inline bool page_expected_state(struct page *page,
 	return true;
 }
 
+/**
+ * page_bad_reason - 获取页面错误的原因
+ * @page: 要检查的页面
+ * @flags: 检查的标志位
+ *
+ * 分析并返回页面状态异常的具体原因描述字符串。
+ * 返回值: 描述错误原因的字符串指针，如果无错误返回NULL
+ */
 static const char *page_bad_reason(struct page *page, unsigned long flags)
 {
 	const char *bad_reason = NULL;
@@ -1123,12 +1356,26 @@ static const char *page_bad_reason(struct page *page, unsigned long flags)
 	return bad_reason;
 }
 
+/**
+ * check_free_page_bad - 检查释放页面的错误状态
+ * @page: 要检查的页面
+ *
+ * 检查待释放页面是否存在错误状态，如引用计数异常、
+ * 标志位错误等。发现问题时调用bad_page进行处理。
+ */
 static void check_free_page_bad(struct page *page)
 {
 	bad_page(page,
 		 page_bad_reason(page, PAGE_FLAGS_CHECK_AT_FREE));
 }
 
+/**
+ * check_free_page - 检查页面是否可以安全释放
+ * @page: 要检查的页面
+ *
+ * 检查页面状态是否符合释放的条件，如果发现问题会调用错误处理。
+ * 返回值: 0表示页面可以安全释放，1表示发现错误
+ */
 static inline int check_free_page(struct page *page)
 {
 	if (likely(page_expected_state(page, PAGE_FLAGS_CHECK_AT_FREE)))
@@ -1139,6 +1386,14 @@ static inline int check_free_page(struct page *page)
 	return 1;
 }
 
+/**
+ * free_tail_pages_check - 检查复合页面的尾页状态
+ * @head_page: 复合页面的头页
+ * @page: 要检查的尾页
+ *
+ * 检查复合页面中尾页的完整性，确保尾页的mapping、标志等字段正确设置。
+ * 返回值: 0表示检查通过，1表示发现错误
+ */
 static int free_tail_pages_check(struct page *head_page, struct page *page)
 {
 	int ret = 1;
@@ -1189,6 +1444,14 @@ out:
 	return ret;
 }
 
+/**
+ * kernel_init_free_pages - 内核初始化空闲页面
+ * @page: 要初始化的页面起始地址
+ * @numpages: 要初始化的页面数量
+ *
+ * 在内核启动时或页面首次使用前初始化页面内容，
+ * 通常用于安全清零或设置特定的初始值。
+ */
 static void kernel_init_free_pages(struct page *page, int numpages)
 {
 	int i;
@@ -1200,6 +1463,16 @@ static void kernel_init_free_pages(struct page *page, int numpages)
 	kasan_enable_current();
 }
 
+/**
+ * free_pages_prepare - 准备释放页面前的检查和清理工作
+ * @page: 要释放的页面
+ * @order: 页面阶数(2^order 个页面)
+ * @check_free: 是否进行释放检查
+ *
+ * 在实际释放页面到伙伴系统之前，进行必要的检查、清理和调试验证。
+ * 包括页面标志检查、内存毒化、KASAN清理等安全相关操作。
+ * 返回值: true表示页面可以安全释放，false表示发现错误
+ */
 static __always_inline bool free_pages_prepare(struct page *page,
 					unsigned int order, bool check_free)
 {
@@ -1281,16 +1554,27 @@ static __always_inline bool free_pages_prepare(struct page *page,
 }
 
 #ifdef CONFIG_DEBUG_VM
-/*
- * With DEBUG_VM enabled, order-0 pages are checked immediately when being freed
- * to pcp lists. With debug_pagealloc also enabled, they are also rechecked when
- * moved from pcp lists to free lists.
+/**
+ * free_pcp_prepare - PCP页面释放前的准备工作
+ * @page: 要释放的页面
+ *
+ * 在将页面释放到per-CPU页面缓存之前进行必要的检查和准备工作。
+ * 根据DEBUG_VM配置决定检查的严格程度。
+ *
+ * 返回值: true表示页面准备就绪，false表示不应释放
  */
 static bool free_pcp_prepare(struct page *page)
 {
 	return free_pages_prepare(page, 0, true);
 }
 
+/**
+ * bulkfree_pcp_prepare - 批量释放PCP页面的准备工作
+ * @page: 要释放的页面
+ *
+ * 在批量释放PCP页面到伙伴系统时进行的检查和准备工作。
+ * 返回值: true表示发现错误需要跳过，false表示可以继续释放
+ */
 static bool bulkfree_pcp_prepare(struct page *page)
 {
 	if (debug_pagealloc_enabled_static())
@@ -1319,6 +1603,13 @@ static bool bulkfree_pcp_prepare(struct page *page)
 }
 #endif /* CONFIG_DEBUG_VM */
 
+/**
+ * prefetch_buddy - 预取伙伴页面
+ * @page: 当前页面
+ *
+ * 预取当前页面的伙伴页面到缓存中，以提高后续在zone->lock保护下
+ * 访问伙伴页面时的性能。通过减少内存延迟来提升整体性能。
+ */
 static inline void prefetch_buddy(struct page *page)
 {
 	unsigned long pfn = page_to_pfn(page);
@@ -1328,16 +1619,15 @@ static inline void prefetch_buddy(struct page *page)
 	prefetch(buddy);
 }
 
-/*
- * Frees a number of pages from the PCP lists
- * Assumes all pages on list are in same zone, and of same order.
- * count is the number of pages to free.
+/**
+ * free_pcppages_bulk - 从PCP链表批量释放页面
+ * @zone: 内存区域
+ * @count: 要释放的页面数量
+ * @pcp: per-CPU页面结构
  *
- * If the zone was previously in an "all pages pinned" state then look to
- * see if this freeing clears that state.
- *
- * And clear the zone's pages_scanned counter, to hold off the "all pages are
- * pinned" detection logic.
+ * 从PCP链表中批量释放指定数量的页面到zone的空闲链表中。
+ * 采用轮询方式从不同迁移类型的链表中取页面，避免某些链表被过度使用。
+ * 如果zone之前处于"所有页面被固定"状态，此操作可能会清除该状态。
  */
 static void free_pcppages_bulk(struct zone *zone, int count,
 					struct per_cpu_pages *pcp)
@@ -1421,6 +1711,18 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	spin_unlock(&zone->lock);
 }
 
+/**
+ * free_one_page - 释放页面到指定内存区域的入口函数
+ * @zone: 目标内存区域
+ * @page: 要释放的页面
+ * @pfn: 页面帧号
+ * @order: 页面order（2^order个页面）
+ * @migratetype: 页面迁移类型
+ * @fpi_flags: 释放页面时的标志
+ *
+ * 释放页面到指定zone的入口函数，执行必要的检查和统计更新，
+ * 然后调用__free_one_page执行实际的释放操作。
+ */
 static void free_one_page(struct zone *zone,
 				struct page *page, unsigned long pfn,
 				unsigned int order,
@@ -1435,6 +1737,16 @@ static void free_one_page(struct zone *zone,
 	spin_unlock(&zone->lock);
 }
 
+/**
+ * __init_single_page - 初始化单个页面
+ * @page: 要初始化的页面
+ * @pfn: 页面帧号
+ * @zone: 区域ID
+ * @nid: NUMA节点ID
+ *
+ * 初始化单个页面的基本字段，包括清零、设置链接关系、
+ * 初始化引用计数和各种状态标志。
+ */
 static void __meminit __init_single_page(struct page *page, unsigned long pfn,
 				unsigned long zone, int nid)
 {
@@ -1711,21 +2023,26 @@ static void __init deferred_free_range(unsigned long pfn,
 static atomic_t pgdat_init_n_undone __initdata;
 static __initdata DECLARE_COMPLETION(pgdat_init_all_done_comp);
 
+/**
+ * pgdat_init_report_one_done - 报告一个pgdat初始化完成
+ *
+ * 原子性地减少未完成的pgdat初始化计数，当所有pgdat初始化完成时
+ * 发送完成信号。用于协调多个并行的内存节点初始化线程。
+ */
 static inline void __init pgdat_init_report_one_done(void)
 {
 	if (atomic_dec_and_test(&pgdat_init_n_undone))
 		complete(&pgdat_init_all_done_comp);
 }
 
-/*
- * Returns true if page needs to be initialized or freed to buddy allocator.
+/**
+ * deferred_pfn_valid - 检查延迟初始化中PFN是否有效
+ * @pfn: 页面帧号
  *
- * First we check if pfn is valid on architectures where it is possible to have
- * holes within pageblock_nr_pages. On systems where it is not possible, this
- * function is optimized out.
+ * 检查在延迟页面初始化过程中指定的PFN是否有效。
+ * 首先检查架构相关的pfn有效性，然后检查大页面头部PFN的有效性。
  *
- * Then, we check if a current large page is valid by only checking the validity
- * of the head pfn.
+ * 返回值: 如果PFN有效返回true，否则返回false
  */
 static inline bool __init deferred_pfn_valid(unsigned long pfn)
 {
@@ -1736,9 +2053,13 @@ static inline bool __init deferred_pfn_valid(unsigned long pfn)
 	return true;
 }
 
-/*
- * Free pages to buddy allocator. Try to free aligned pages in
- * pageblock_nr_pages sizes.
+/**
+ * deferred_free_pages - 延迟释放页面到伙伴分配器
+ * @pfn: 起始页面帧号
+ * @end_pfn: 结束页面帧号
+ *
+ * 在延迟初始化过程中释放页面到伙伴分配器。
+ * 尝试释放pageblock_nr_pages大小的对齐页面块以提高效率。
  */
 static void __init deferred_free_pages(unsigned long pfn,
 				       unsigned long end_pfn)
@@ -1761,10 +2082,16 @@ static void __init deferred_free_pages(unsigned long pfn,
 	deferred_free_range(pfn - nr_free, nr_free);
 }
 
-/*
- * Initialize struct pages.  We minimize pfn page lookups and scheduler checks
- * by performing it only once every pageblock_nr_pages.
- * Return number of pages initialized.
+/**
+ * deferred_init_pages - 延迟初始化页面结构
+ * @zone: 内存区域
+ * @pfn: 起始页面帧号
+ * @end_pfn: 结束页面帧号
+ *
+ * 初始化struct page结构。为了减少pfn查找和调度器检查的开销，
+ * 每个pageblock_nr_pages才执行一次这些操作。
+ *
+ * 返回值: 初始化的页面数量
  */
 static unsigned long  __init deferred_init_pages(struct zone *zone,
 						 unsigned long pfn,
@@ -1791,11 +2118,18 @@ static unsigned long  __init deferred_init_pages(struct zone *zone,
 	return (nr_pages);
 }
 
-/*
- * This function is meant to pre-load the iterator for the zone init.
- * Specifically it walks through the ranges until we are caught up to the
- * first_init_pfn value and exits there. If we never encounter the value we
- * return false indicating there are no valid ranges left.
+/**
+ * deferred_init_mem_pfn_range_in_zone - 延迟初始化内存PFN范围预加载
+ * @i: 迭代器指针
+ * @zone: 内存区域
+ * @spfn: 起始PFN指针
+ * @epfn: 结束PFN指针
+ * @first_init_pfn: 第一个初始化PFN
+ *
+ * 为zone初始化预加载迭代器。遍历范围直到到达first_init_pfn值并退出。
+ * 如果从未遇到该值，返回false表示没有有效范围剩余。
+ *
+ * 返回值: 找到有效范围返回true，否则返回false
  */
 static bool __init
 deferred_init_mem_pfn_range_in_zone(u64 *i, struct zone *zone,
@@ -1821,15 +2155,20 @@ deferred_init_mem_pfn_range_in_zone(u64 *i, struct zone *zone,
 	return false;
 }
 
-/*
- * Initialize and free pages. We do it in two loops: first we initialize
- * struct page, then free to buddy allocator, because while we are
- * freeing pages we can access pages that are ahead (computing buddy
- * page in __free_one_page()).
+/**
+ * deferred_init_maxorder - 延迟初始化最大order处理
+ * @i: 迭代器指针
+ * @zone: 内存区域
+ * @start_pfn: 起始PFN指针
+ * @end_pfn: 结束PFN指针
  *
- * In order to try and keep some memory in the cache we have the loop
- * broken along max page order boundaries. This way we will not cause
- * any issues with the buddy page computation.
+ * 分两个循环初始化和释放页面：首先初始化struct page，然后释放到伙伴分配器。
+ * 这样做是因为在释放页面时可以访问后续页面（在__free_one_page中计算伙伴页面）。
+ *
+ * 为了保持缓存中的一些内存，循环按照最大页面order边界分割，
+ * 这样不会对伙伴页面计算造成任何问题。
+ *
+ * 返回值: 处理的页面数量
  */
 static unsigned long __init
 deferred_init_maxorder(u64 *i, struct zone *zone, unsigned long *start_pfn,
@@ -1875,6 +2214,15 @@ deferred_init_maxorder(u64 *i, struct zone *zone, unsigned long *start_pfn,
 	return nr_pages;
 }
 
+/**
+ * deferred_init_memmap_chunk - 延迟初始化内存映射块
+ * @start_pfn: 起始页面帧号
+ * @end_pfn: 结束页面帧号
+ * @arg: 参数（内存区域指针）
+ *
+ * 延迟初始化指定范围的内存映射。以MAX_ORDER大小的增量初始化和释放页面，
+ * 以避免对伙伴分配器造成问题。
+ */
 static void __init
 deferred_init_memmap_chunk(unsigned long start_pfn, unsigned long end_pfn,
 			   void *arg)
@@ -2158,6 +2506,17 @@ void __init init_cma_reserved_pageblock(struct page *page)
  *
  * -- nyc
  */
+/**
+ * expand - 将大块页面拆分为小块页面
+ * @zone: 内存区域
+ * @page: 要拆分的页面
+ * @low: 目标order
+ * @high: 当前order
+ * @migratetype: 页面迁移类型
+ *
+ * 伙伴系统核心函数，将高order的大页面块拆分成低order的小页面块。
+ * 例如将8页的块拆分成1个4页块和1个4页块，再将4页块拆分成2个2页块等。
+ */
 static inline void expand(struct zone *zone, struct page *page,
 	int low, int high, int migratetype)
 {
@@ -2182,6 +2541,13 @@ static inline void expand(struct zone *zone, struct page *page,
 	}
 }
 
+/**
+ * check_new_page_bad - 检查新分配页面的错误状态
+ * @page: 要检查的新页面
+ *
+ * 检查新分配的页面是否存在异常状态，确保页面可以安全使用。
+ * 这是分配路径中的重要安全检查。
+ */
 static void check_new_page_bad(struct page *page)
 {
 	if (unlikely(page->flags & __PG_HWPOISON)) {
@@ -2277,6 +2643,16 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	set_page_owner(page, order, gfp_flags);
 }
 
+/**
+ * prep_new_page - 准备新分配的页面
+ * @page: 新分配的页面
+ * @order: 页面order（2^order个页面）
+ * @gfp_flags: 分配标志
+ * @alloc_flags: 内部分配标志
+ *
+ * 对新分配的页面进行初始化处理，包括清零、设置标志位、
+ * 调用分配后钩子函数等操作，确保页面可以安全使用。
+ */
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
 							unsigned int alloc_flags)
 {
@@ -2627,9 +3003,14 @@ int find_suitable_fallback(struct free_area *area, unsigned int order,
 	return -1;
 }
 
-/*
- * Reserve a pageblock for exclusive use of high-order atomic allocations if
- * there are no empty page blocks that contain a page with a suitable order
+/**
+ * reserve_highatomic_pageblock - 为高order原子分配预留页面块
+ * @page: 要预留的页面
+ * @zone: 内存区域
+ * @alloc_order: 分配order
+ *
+ * 如果没有包含合适order页面的空页面块，则预留一个页面块
+ * 专门用于高order原子分配。限制预留数量为1个pageblock或大约zone的1%。
  */
 static void reserve_highatomic_pageblock(struct page *page, struct zone *zone,
 				unsigned int alloc_order)
@@ -2664,14 +3045,17 @@ out_unlock:
 	spin_unlock_irqrestore(&zone->lock, flags);
 }
 
-/*
- * Used when an allocation is about to fail under memory pressure. This
- * potentially hurts the reliability of high-order allocations when under
- * intense memory pressure but failed atomic allocations should be easier
- * to recover from than an OOM.
+/**
+ * unreserve_highatomic_pageblock - 取消预留高原子分配页面块
+ * @ac: 分配上下文
+ * @force: 是否强制取消预留
  *
- * If @force is true, try to unreserve a pageblock even though highatomic
- * pageblock is exhausted.
+ * 在内存压力下分配即将失败时使用。这可能会影响高order分配的可靠性，
+ * 但失败的原子分配比OOM更容易恢复。
+ *
+ * 如果@force为true，即使高原子pageblock已耗尽也尝试取消预留。
+ *
+ * 返回值: 成功取消预留返回true，否则返回false
  */
 static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
 						bool force)
@@ -2745,15 +3129,17 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
 	return false;
 }
 
-/*
- * Try finding a free buddy page on the fallback list and put it on the free
- * list of requested migratetype, possibly along with other pages from the same
- * block, depending on fragmentation avoidance heuristics. Returns true if
- * fallback was found so that __rmqueue_smallest() can grab it.
+/**
+ * __rmqueue_fallback - 伙伴分配器的fallback机制
+ * @zone: 内存区域
+ * @order: 请求的页面order
+ * @start_migratetype: 起始迁移类型
+ * @alloc_flags: 分配标志
  *
- * The use of signed ints for order and current_order is a deliberate
- * deviation from the rest of this file, to make the for loop
- * condition simpler.
+ * 在fallback列表中寻找空闲的伙伴页面，并将其放到请求的迁移类型的空闲列表中。
+ * 根据碎片避免启发式算法，可能会同时移动同一块中的其他页面。
+ *
+ * 返回值: 找到fallback返回true，否则返回false
  */
 static __always_inline bool
 __rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
@@ -2837,6 +3223,18 @@ do_steal:
  * Do the hard work of removing an element from the buddy allocator.
  * Call me with the zone->lock already held.
  */
+/**
+ * __rmqueue - 从内存区域移除页面的核心函数
+ * @zone: 目标内存区域
+ * @order: 页面order（2^order个页面）
+ * @migratetype: 页面迁移类型
+ * @alloc_flags: 分配标志
+ *
+ * 伙伴系统分配的核心函数，从指定zone的空闲链表中移除页面。
+ * 首先尝试从指定迁移类型的链表获取，失败时进行fallback。
+ *
+ * 返回值: 成功返回页面指针，失败返回NULL
+ */
 static __always_inline struct page *
 __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 						unsigned int alloc_flags)
@@ -2872,10 +3270,19 @@ retry:
 	return page;
 }
 
-/*
- * Obtain a specified number of elements from the buddy allocator, all under
- * a single hold of the lock, for efficiency.  Add them to the supplied list.
- * Returns the number of new pages which were placed at *list.
+/**
+ * rmqueue_bulk - 批量从伙伴分配器获取页面
+ * @zone: 内存区域
+ * @order: 页面order
+ * @count: 请求的页面数量
+ * @list: 存放页面的链表
+ * @migratetype: 迁移类型
+ * @alloc_flags: 分配标志
+ *
+ * 从伙伴分配器批量获取指定数量的页面，所有操作在单次锁持有下进行以提高效率。
+ * 将获取的页面添加到提供的链表中。
+ *
+ * 返回值: 成功放入链表的新页面数量
  */
 static int rmqueue_bulk(struct zone *zone, unsigned int order,
 			unsigned long count, struct list_head *list,
@@ -2930,6 +3337,14 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
  * Note that this function must be called with the thread pinned to
  * a single processor.
  */
+/**
+ * drain_zone_pages - 排空指定zone的per-CPU页面缓存
+ * @zone: 目标内存区域
+ * @pcp: per-CPU页面结构
+ *
+ * 将指定zone的per-CPU页面缓存中的部分页面返回给伙伴系统，
+ * 用于在内存压力下释放缓存的页面，提高内存利用率。
+ */
 void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp)
 {
 	unsigned long flags;
@@ -2944,12 +3359,13 @@ void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp)
 }
 #endif
 
-/*
- * Drain pcplists of the indicated processor and zone.
+/**
+ * drain_pages_zone - 排空指定CPU和zone的PCP链表
+ * @cpu: CPU编号
+ * @zone: 内存区域
  *
- * The processor must either be the current processor and the
- * thread pinned to the current processor or a processor that
- * is not online.
+ * 排空指定处理器和zone的per-CPU页面链表。
+ * 处理器必须是当前处理器且线程绑定到当前处理器，或者是离线的处理器。
  */
 static void drain_pages_zone(unsigned int cpu, struct zone *zone)
 {
@@ -2966,12 +3382,12 @@ static void drain_pages_zone(unsigned int cpu, struct zone *zone)
 	local_irq_restore(flags);
 }
 
-/*
- * Drain pcplists of all zones on the indicated processor.
+/**
+ * drain_pages - 排空指定CPU所有zone的PCP链表
+ * @cpu: CPU编号
  *
- * The processor must either be the current processor and the
- * thread pinned to the current processor or a processor that
- * is not online.
+ * 排空指定处理器所有zone的per-CPU页面链表。
+ * 处理器必须是当前处理器且线程绑定到当前处理器，或者是离线的处理器。
  */
 static void drain_pages(unsigned int cpu)
 {
@@ -2987,6 +3403,13 @@ static void drain_pages(unsigned int cpu)
  *
  * The CPU has to be pinned. When zone parameter is non-NULL, spill just
  * the single zone's pages.
+ */
+/**
+ * drain_local_pages - 排空本地CPU的页面缓存
+ * @zone: 目标内存区域（NULL表示所有zone）
+ *
+ * 将当前CPU的per-CPU页面缓存中的页面返回给伙伴系统，
+ * 在内存回收或CPU热拔插时调用。
  */
 void drain_local_pages(struct zone *zone)
 {
@@ -3022,6 +3445,13 @@ static void drain_local_pages_wq(struct work_struct *work)
  * When zone parameter is non-NULL, spill just the single zone's pages.
  *
  * Note that this can be extremely slow as the draining happens in a workqueue.
+ */
+/**
+ * drain_all_pages - 排空所有CPU的页面缓存
+ * @zone: 目标内存区域（NULL表示所有zone）
+ *
+ * 在所有CPU上排空per-CPU页面缓存，将缓存的页面返回给伙伴系统。
+ * 这是一个全局操作，通常在内存紧张或系统维护时调用。
  */
 void drain_all_pages(struct zone *zone)
 {
@@ -3199,6 +3629,14 @@ static void free_unref_page_commit(struct page *page, unsigned long pfn)
 /*
  * Free a 0-order page
  */
+/**
+ * free_unref_page - 释放单个无引用页面
+ * @page: 要释放的页面
+ *
+ * 释放一个引用计数为0的页面到per-CPU缓存或伙伴系统。
+ * 这是单页面释放的主要入口函数，会进行页面有效性检查
+ * 并选择合适的释放路径（PCP缓存或直接释放）。
+ */
 void free_unref_page(struct page *page)
 {
 	unsigned long flags;
@@ -3214,6 +3652,13 @@ void free_unref_page(struct page *page)
 
 /*
  * Free a list of 0-order pages
+ */
+/**
+ * free_unref_page_list - 批量释放无引用页面列表
+ * @list: 要释放的页面链表
+ *
+ * 批量释放多个无引用页面，提高释放效率。
+ * 将页面批量提交到per-CPU缓存或伙伴系统，减少锁开销。
  */
 void free_unref_page_list(struct list_head *list)
 {
@@ -3258,6 +3703,14 @@ void free_unref_page_list(struct list_head *list)
  * Note: this is probably too low level an operation for use in drivers.
  * Please consult with lkml before using this in your driver.
  */
+/**
+ * split_page - 分割页面为单独的页面
+ * @page: 要分割的复合页面
+ * @order: 页面order
+ *
+ * 将一个高order的复合页面分割成多个独立的单页面，
+ * 每个页面都有独立的引用计数。常用于内存分配器的内部操作。
+ */
 void split_page(struct page *page, unsigned int order)
 {
 	int i;
@@ -3271,6 +3724,16 @@ void split_page(struct page *page, unsigned int order)
 }
 EXPORT_SYMBOL_GPL(split_page);
 
+/**
+ * __isolate_free_page - 从伙伴系统隔离空闲页面
+ * @page: 要隔离的页面
+ * @order: 页面order
+ *
+ * 从伙伴系统的空闲链表中移除指定的页面，但不进行分配。
+ * 主要用于内存热拔插、内存压缩等需要临时隔离页面的场景。
+ *
+ * 返回值: 成功返回1，失败返回0
+ */
 int __isolate_free_page(struct page *page, unsigned int order)
 {
 	unsigned long watermark;
@@ -3327,6 +3790,15 @@ int __isolate_free_page(struct page *page, unsigned int order)
  *
  * This function is meant to return a page pulled from the free lists via
  * __isolate_free_page back to the free lists they were pulled from.
+ */
+/**
+ * __putback_isolated_page - 将隔离页面放回伙伴系统
+ * @page: 要放回的页面
+ * @order: 页面order
+ * @mt: 迁移类型
+ *
+ * 将之前从伙伴系统隔离的页面重新放回到空闲链表中。
+ * 这是__isolate_free_page的逆操作，用于恢复页面的可分配状态。
  */
 void __putback_isolated_page(struct page *page, unsigned int order, int mt)
 {
@@ -3416,6 +3888,20 @@ static struct page *rmqueue_pcplist(struct zone *preferred_zone,
 
 /*
  * Allocate a page from the given zone. Use pcplists for order-0 allocations.
+ */
+/**
+ * rmqueue - 从zone分配页面的入口函数
+ * @preferred_zone: 首选内存区域
+ * @zone: 实际分配的内存区域
+ * @order: 页面order（2^order个页面）
+ * @gfp_flags: GFP分配标志
+ * @alloc_flags: 内部分配标志
+ * @migratetype: 页面迁移类型
+ *
+ * 从指定zone分配页面的主要入口函数，首先尝试从per-CPU页面缓存分配，
+ * 失败时回退到伙伴系统分配。处理统计信息更新和zone平衡。
+ *
+ * 返回值: 成功返回页面指针，失败返回NULL
  */
 static inline
 struct page *rmqueue(struct zone *preferred_zone,
@@ -3661,6 +4147,20 @@ bool zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 					zone_page_state(z, NR_FREE_PAGES));
 }
 
+/**
+ * zone_watermark_fast - 快速检查zone水位线
+ * @z: 要检查的内存区域
+ * @order: 页面order（2^order个页面）
+ * @mark: 水位线标记（min/low/high）
+ * @highest_zoneidx: 最高zone索引
+ * @alloc_flags: 分配标志
+ * @gfp_mask: GFP分配掩码
+ *
+ * 快速检查指定zone是否满足水位线要求，这是分配路径中的关键检查点。
+ * 水位线确保系统保留足够的空闲内存以应对突发的分配需求。
+ *
+ * 返回值: 满足水位线要求返回true，否则返回false
+ */
 static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 				unsigned long mark, int highest_zoneidx,
 				unsigned int alloc_flags, gfp_t gfp_mask)
@@ -3783,6 +4283,19 @@ static inline unsigned int current_alloc_flags(gfp_t gfp_mask,
 /*
  * get_page_from_freelist goes through the zonelist trying to allocate
  * a page.
+ */
+/**
+ * get_page_from_freelist - 从空闲列表获取页面的核心函数
+ * @gfp_mask: GFP分配标志
+ * @order: 页面order（2^order个页面）
+ * @alloc_flags: 内部分配标志
+ * @ac: 分配上下文，包含zonelist等信息
+ *
+ * 页面分配器的核心函数，遍历zonelist尝试从各个zone分配页面。
+ * 检查水位线、执行zone平衡、处理脏页限制等核心逻辑。
+ * 这是快速分配路径的主要实现。
+ *
+ * 返回值: 成功返回分配的页面，失败返回NULL
  */
 static struct page *
 get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
@@ -3953,6 +4466,16 @@ static void warn_alloc_show_mem(gfp_t gfp_mask, nodemask_t *nodemask)
 	show_mem(filter, nodemask);
 }
 
+/**
+ * warn_alloc - 输出内存分配失败的警告信息
+ * @gfp_mask: 分配时使用的GFP标志
+ * @nodemask: 节点掩码
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ *
+ * 当内存分配失败时打印详细的警告信息，包括当前内存状态、
+ * 分配参数、进程信息等，帮助诊断内存不足的原因。
+ */
 void warn_alloc(gfp_t gfp_mask, nodemask_t *nodemask, const char *fmt, ...)
 {
 	struct va_format vaf;
@@ -3976,6 +4499,18 @@ void warn_alloc(gfp_t gfp_mask, nodemask_t *nodemask, const char *fmt, ...)
 	warn_alloc_show_mem(gfp_mask, nodemask);
 }
 
+/**
+ * __alloc_pages_cpuset_fallback - CPUSET回退分配
+ * @gfp_mask: 分配标志掩码
+ * @order: 分配order
+ * @alloc_flags: 内部分配标志
+ * @ac: 分配上下文
+ *
+ * 当节点耗尽时，首先尝试遵守CPUSET限制的分配，
+ * 失败时回退到忽略CPUSET限制的分配。
+ *
+ * 返回值: 成功返回页面指针，失败返回NULL
+ */
 static inline struct page *
 __alloc_pages_cpuset_fallback(gfp_t gfp_mask, unsigned int order,
 			      unsigned int alloc_flags,
@@ -3996,6 +4531,18 @@ __alloc_pages_cpuset_fallback(gfp_t gfp_mask, unsigned int order,
 	return page;
 }
 
+/**
+ * __alloc_pages_may_oom - 可能触发OOM的页面分配
+ * @gfp_mask: 分配标志掩码
+ * @order: 分配order
+ * @ac: 分配上下文
+ * @did_some_progress: 输出参数，指示是否有进展
+ *
+ * 在内存极度紧张时尝试分配页面，可能会触发OOM killer。
+ * 获取OOM锁并尝试最后的分配努力，必要时调用OOM killer。
+ *
+ * 返回值: 成功返回页面指针，失败返回NULL
+ */
 static inline struct page *
 __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	const struct alloc_context *ac, unsigned long *did_some_progress)
@@ -4089,7 +4636,20 @@ out:
 #define MAX_COMPACT_RETRIES 16
 
 #ifdef CONFIG_COMPACTION
-/* Try memory compaction for high-order allocations before reclaim */
+/**
+ * __alloc_pages_direct_compact - 高order分配前的直接内存压缩
+ * @gfp_mask: 分配标志掩码
+ * @order: 分配order
+ * @alloc_flags: 内部分配标志
+ * @ac: 分配上下文
+ * @prio: 压缩优先级
+ * @compact_result: 压缩结果输出
+ *
+ * 在高order分配前尝试内存压缩以减少碎片。
+ * 如果压缩成功产生了可用页面，准备并返回页面。
+ *
+ * 返回值: 成功返回页面指针，失败返回NULL
+ */
 static struct page *
 __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 		unsigned int alloc_flags, const struct alloc_context *ac,
@@ -4145,6 +4705,20 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	return NULL;
 }
 
+/**
+ * should_compact_retry - 判断是否应该重试内存压缩
+ * @ac: 分配上下文
+ * @order: 分配order
+ * @alloc_flags: 分配标志
+ * @compact_result: 上次压缩的结果
+ * @compact_priority: 压缩优先级指针
+ * @compaction_retries: 压缩重试次数指针
+ *
+ * 根据上次压缩的结果和当前状态，判断是否应该再次尝试内存压缩。
+ * 考虑重试次数、优先级和压缩结果等因素。
+ *
+ * 返回值: 应该重试返回true，否则返回false
+ */
 static inline bool
 should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 		     enum compact_result compact_result,
@@ -4604,6 +5178,21 @@ check_retry_cpuset(int cpuset_mems_cookie, struct alloc_context *ac)
 	return false;
 }
 
+/**
+ * __alloc_pages_slowpath - 页面分配的慢路径处理
+ * @gfp_mask: GFP分配标志
+ * @order: 页面order（2^order个页面）
+ * @ac: 分配上下文
+ *
+ * 当快速路径分配失败时进入的慢路径函数，执行复杂的内存回收和分配策略：
+ * - 尝试直接回收（direct reclaim）
+ * - 调用OOM killer处理内存不足
+ * - 执行内存压缩（compaction）
+ * - 处理高优先级分配请求
+ * 这是内存分配器处理内存压力的核心逻辑。
+ *
+ * 返回值: 成功返回分配的页面，失败返回NULL
+ */
 static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
@@ -4913,6 +5502,19 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 /*
  * This is the 'heart' of the zoned buddy allocator.
  */
+/**
+ * __alloc_pages_nodemask - 页面分配的主要入口函数
+ * @gfp_mask: GFP分配标志，指定分配行为
+ * @order: 页面order（2^order个页面）
+ * @preferred_nid: 首选的NUMA节点ID
+ * @nodemask: 允许分配的NUMA节点掩码
+ *
+ * 这是内核页面分配的主要入口函数，被其他分配函数调用。
+ * 首先尝试快速路径分配，失败时进入慢路径进行复杂的内存回收操作。
+ * 处理NUMA拓扑、内存计费、分配约束等高级特性。
+ *
+ * 返回值: 成功返回分配的页面，失败返回NULL
+ */
 struct page *
 __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 							nodemask_t *nodemask)
@@ -5007,6 +5609,14 @@ static inline void free_the_page(struct page *page, unsigned int order)
 		__free_pages_ok(page, order, FPI_NONE);
 }
 
+/**
+ * __free_pages - 释放指定order的页面
+ * @page: 要释放的页面
+ * @order: 页面order（2^order个页面）
+ *
+ * 释放指定数量的连续页面到伙伴系统。这是内核中释放页面的
+ * 主要接口函数，会检查页面引用计数并选择合适的释放路径。
+ */
 void __free_pages(struct page *page, unsigned int order)
 {
 	if (put_page_testzero(page))
@@ -5017,6 +5627,14 @@ void __free_pages(struct page *page, unsigned int order)
 }
 EXPORT_SYMBOL(__free_pages);
 
+/**
+ * free_pages - 根据虚拟地址释放页面
+ * @addr: 要释放的虚拟地址
+ * @order: 页面order（2^order个页面）
+ *
+ * 根据虚拟地址释放指定数量的页面。将虚拟地址转换为页面结构，
+ * 然后调用__free_pages进行实际的释放操作。
+ */
 void free_pages(unsigned long addr, unsigned int order)
 {
 	if (addr != 0) {
@@ -5327,6 +5945,13 @@ long si_mem_available(void)
 }
 EXPORT_SYMBOL_GPL(si_mem_available);
 
+/**
+ * si_meminfo - 获取系统内存统计信息
+ * @val: 用于返回内存信息的结构
+ *
+ * 填充系统内存统计信息，包括总内存、空闲内存、缓冲区、
+ * 共享内存等。这些信息通过/proc/meminfo等接口提供给用户空间。
+ */
 void si_meminfo(struct sysinfo *val)
 {
 	val->totalram = totalram_pages();
@@ -5341,6 +5966,14 @@ void si_meminfo(struct sysinfo *val)
 EXPORT_SYMBOL(si_meminfo);
 
 #ifdef CONFIG_NUMA
+/**
+ * si_meminfo_node - 获取指定NUMA节点的内存统计信息
+ * @val: 用于返回内存信息的结构
+ * @nid: NUMA节点ID
+ *
+ * 获取指定NUMA节点的内存统计信息，包括该节点上的
+ * 总内存、空闲内存等。用于NUMA感知的内存管理和监控。
+ */
 void si_meminfo_node(struct sysinfo *val, int nid)
 {
 	int zone_type;		/* needs to be signed */
@@ -5373,9 +6006,16 @@ void si_meminfo_node(struct sysinfo *val, int nid)
 }
 #endif
 
-/*
- * Determine whether the node should be displayed or not, depending on whether
- * SHOW_MEM_FILTER_NODES was passed to show_free_areas().
+/**
+ * show_mem_node_skip - 判断是否应该跳过显示节点
+ * @flags: 显示标志
+ * @nid: 节点ID
+ * @nodemask: 节点掩码
+ *
+ * 根据是否传递了SHOW_MEM_FILTER_NODES标志来决定是否应该显示节点。
+ * 用于过滤不在当前cpuset允许范围内的节点。
+ *
+ * 返回值: 应该跳过显示返回true，否则返回false
  */
 static bool show_mem_node_skip(unsigned int flags, int nid, nodemask_t *nodemask)
 {
@@ -5395,6 +6035,14 @@ static bool show_mem_node_skip(unsigned int flags, int nid, nodemask_t *nodemask
 
 #define K(x) ((x) << (PAGE_SHIFT-10))
 
+/**
+ * show_migration_types - 显示迁移类型信息
+ * @type: 迁移类型的位掩码
+ *
+ * 将迁移类型的位掩码转换为可读的字符串并打印。
+ * 每种迁移类型对应一个字符：U(不可移动)、M(可移动)、E(可回收)、
+ * H(高原子)、C(CMA)、I(隔离)。
+ */
 static void show_migration_types(unsigned char type)
 {
 	static const char types[MIGRATE_TYPES] = {
@@ -5430,6 +6078,15 @@ static void show_migration_types(unsigned char type)
  * Bits in @filter:
  * SHOW_MEM_FILTER_NODES: suppress nodes that are not allowed by current's
  *   cpuset.
+ */
+/**
+ * show_free_areas - 显示系统内存区域使用情况
+ * @filter: 显示过滤标志
+ * @nodemask: 要显示的NUMA节点掩码
+ *
+ * 显示系统各个内存区域的详细使用情况，包括每个zone的空闲页面数、
+ * 水位线、活动/非活动页面数等信息。这是重要的内存调试和监控接口，
+ * 被/proc/buddyinfo、OOM killer等使用。
  */
 void show_free_areas(unsigned int filter, nodemask_t *nodemask)
 {
@@ -7568,6 +8225,14 @@ static int __init cmdline_parse_movablecore(char *p)
 early_param("kernelcore", cmdline_parse_kernelcore);
 early_param("movablecore", cmdline_parse_movablecore);
 
+/**
+ * adjust_managed_page_count - 调整zone的可管理页面计数
+ * @page: 相关页面
+ * @count: 要调整的页面数（可为负数）
+ *
+ * 调整zone中可由伙伴系统管理的页面数量。当页面在可管理和
+ * 不可管理状态之间转换时（如内存热插拔），需要更新这个计数。
+ */
 void adjust_managed_page_count(struct page *page, long count)
 {
 	atomic_long_add(count, &page_zone(page)->managed_pages);
@@ -7892,6 +8557,14 @@ static void __setup_per_zone_wmarks(void)
  *
  * Ensures that the watermark[min,low,high] values for each zone are set
  * correctly with respect to min_free_kbytes.
+ */
+/**
+ * setup_per_zone_wmarks - 设置各zone的水位线
+ *
+ * 根据系统内存大小和min_free_kbytes参数设置各个内存区域的水位线。
+ * 水位线包括min（最小）、low（低）、high（高）三个级别，用于控制
+ * 内存回收和分配行为。当空闲内存低于相应水位线时触发不同的回收策略。
+ * 这是内存管理的重要初始化和维护函数。
  */
 void setup_per_zone_wmarks(void)
 {

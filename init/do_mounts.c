@@ -1,4 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/**
+ * init/do_mounts.c - 根文件系统挂载
+ *
+ * 本文件实现内核启动过程中挂载根文件系统的核心逻辑，
+ * 在 kernel_init_freeable() 中通过 prepare_namespace() 调用，
+ * 是内核进入用户空间前的最后一步关键初始化。
+ *
+ * 挂载流程：
+ *   kernel_init_freeable()
+ *   └─ prepare_namespace()       [本文件] 准备命名空间并挂载根文件系统
+ *       ├─ wait_for_device_probe()  等待存储设备（硬盘/USB/eMMC）探测完成
+ *       ├─ md_run_setup()           处理软件RAID(md)设备
+ *       ├─ initrd_load()            加载初始RAM磁盘(initrd/initramfs)
+ *       └─ mount_root()             挂载真正的根文件系统
+ *           ├─ mount_nfs_root()     (若root=NFS) 通过网络挂载NFS根
+ *           └─ mount_block_root()   (普通情况) 按设备名挂载块设备根
+ *               └─ do_mount_root()  实际执行sys_mount系统调用
+ *
+ * 关键内核参数（来自bootloader命令行）：
+ *   root=       - 根设备（如/dev/sda1、UUID=xxx、LABEL=xxx）
+ *   rootfstype= - 根文件系统类型（如ext4、xfs、btrfs）
+ *   rootflags=  - 挂载标志
+ *   rootwait    - 等待根设备出现（适用于慢速USB/eMMC设备）
+ *   rdinit=     - initramfs中的init程序路径
+ */
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/ctype.h>
@@ -423,6 +448,17 @@ out:
 	return ret;
 }
 
+/**
+ * mount_block_root - 通过尝试各种文件系统类型挂载块设备根文件系统
+ * @name:  根设备路径（如 "/dev/root"）
+ * @flags: 挂载标志（MS_RDONLY等）
+ *
+ * 遍历 root_fs_names 列表中的所有文件系统类型（如 ext4、xfs、btrfs 等），
+ * 依次尝试挂载根设备，直到某种类型成功为止。
+ *
+ * 若以只读方式挂载失败，会自动切换到只读模式重试。
+ * 若所有文件系统类型都失败，则打印所有可用分区信息并调用 panic()。
+ */
 void __init mount_block_root(char *name, int flags)
 {
 	struct page *page = alloc_page(GFP_KERNEL);
@@ -551,6 +587,16 @@ static int __init mount_cifs_root(void)
 }
 #endif
 
+/**
+ * mount_root - 根据根设备类型选择挂载方式
+ *
+ * 根据 ROOT_DEV 判断根文件系统类型，分别处理：
+ *   - NFS网络文件系统根（Root_NFS）
+ *   - CIFS/SMB网络文件系统根（Root_CIFS）
+ *   - 普通块设备根（最常见：本地硬盘、SSD、eMMC等）
+ *
+ * 对于块设备，先创建 /dev/root 设备节点，再调用 mount_block_root() 挂载。
+ */
 void __init mount_root(void)
 {
 #ifdef CONFIG_ROOT_NFS
@@ -581,11 +627,27 @@ void __init mount_root(void)
 /*
  * Prepare the namespace - decide what/where to mount, load ramdisks, etc.
  */
+/**
+ * prepare_namespace - 准备根文件系统命名空间（内核启动最后阶段）
+ *
+ * 由 kernel_init_freeable() 调用，是进入用户空间前挂载根文件系统的总入口。
+ *
+ * 执行流程：
+ *  1. 若设置了 root_delay，先等待指定秒数（给慢速设备初始化时间）
+ *  2. wait_for_device_probe()  等待所有块设备（硬盘/USB/eMMC）探测完成
+ *  3. md_run_setup()           初始化软件RAID(md)设备
+ *  4. 解析 root= 参数，将设备名转换为设备号(ROOT_DEV)
+ *  5. initrd_load()            若有initrd/initramfs则加载并执行其init
+ *  6. mount_root()             挂载最终的根文件系统
+ *  7. devtmpfs_mount()         将devtmpfs挂载到/dev
+ *  8. init_mount/init_chroot   切换根目录到真正的根文件系统
+ */
 void __init prepare_namespace(void)
 {
 	if (root_delay) {
 		printk(KERN_INFO "Waiting %d sec before mounting root device...\n",
 		       root_delay);
+		/* 等待指定秒数，给慢速存储设备（USB、eMMC）足够时间完成初始化 */
 		ssleep(root_delay);
 	}
 
@@ -596,22 +658,27 @@ void __init prepare_namespace(void)
 	 * For example, it is not atypical to wait 5 seconds here
 	 * for the touchpad of a laptop to initialize.
 	 */
+	/* 等待所有块设备驱动完成设备探测，确保根设备已就绪 */
 	wait_for_device_probe();
 
+	/* 初始化软件RAID(md)设备，处理多磁盘阵列配置 */
 	md_run_setup();
 
 	if (saved_root_name[0]) {
 		root_device_name = saved_root_name;
 		if (!strncmp(root_device_name, "mtd", 3) ||
 		    !strncmp(root_device_name, "ubi", 3)) {
+			/* MTD/UBI闪存设备直接挂载（嵌入式系统常用） */
 			mount_block_root(root_device_name, root_mountflags);
 			goto out;
 		}
+		/* 将设备名（如/dev/sda1、UUID=xxx）转换为内核设备号 */
 		ROOT_DEV = name_to_dev_t(root_device_name);
 		if (strncmp(root_device_name, "/dev/", 5) == 0)
 			root_device_name += 5;
 	}
 
+	/* 尝试加载initrd/initramfs，若成功则跳过块设备挂载 */
 	if (initrd_load())
 		goto out;
 
@@ -619,16 +686,21 @@ void __init prepare_namespace(void)
 	if ((ROOT_DEV == 0) && root_wait) {
 		printk(KERN_INFO "Waiting for root device %s...\n",
 			saved_root_name);
+		/* rootwait模式：持续等待直到根设备出现（适用于热插拔设备） */
 		while (driver_probe_done() != 0 ||
 			(ROOT_DEV = name_to_dev_t(saved_root_name)) == 0)
 			msleep(5);
 		async_synchronize_full();
 	}
 
+	/* 挂载根文件系统（NFS/CIFS/块设备） */
 	mount_root();
 out:
+	/* 将devtmpfs挂载到/dev，提供设备节点访问 */
 	devtmpfs_mount();
+	/* 将根文件系统移动挂载到/，替换早期的rootfs */
 	init_mount(".", "/", NULL, MS_MOVE, NULL);
+	/* 切换进程根目录到新挂载的根文件系统 */
 	init_chroot(".");
 }
 

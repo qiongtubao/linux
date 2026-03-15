@@ -429,11 +429,24 @@ static void show_pwq(struct pool_workqueue *pwq);
 
 static const struct debug_obj_descr work_debug_descr;
 
+/**
+ * work_debug_hint - 返回work对象的调试提示信息
+ * @addr: work_struct指针
+ *
+ * 供debug_object框架调用，返回work->func作为调试时的识别信息。
+ */
 static void *work_debug_hint(void *addr)
 {
 	return ((struct work_struct *) addr)->func;
 }
 
+/**
+ * work_is_static_object - 检查work是否为静态分配对象
+ * @addr: work_struct指针
+ *
+ * 供debug_object框架调用，通过WORK_STRUCT_STATIC_BIT标志判断
+ * work是否为静态对象（不需要动态初始化检查）。
+ */
 static bool work_is_static_object(void *addr)
 {
 	struct work_struct *work = addr;
@@ -441,6 +454,14 @@ static bool work_is_static_object(void *addr)
 	return test_bit(WORK_STRUCT_STATIC_BIT, work_data_bits(work));
 }
 
+/**
+ * work_fixup_init - 修复被错误初始化的活跃work对象
+ * @addr: work_struct指针
+ * @state: debug_object当前状态
+ *
+ * 当活跃状态的work被再次初始化时，先调用cancel_work_sync()等待其完成，
+ * 再重新初始化debug对象，防止use-after-free。
+ */
 /*
  * fixup_init is called when:
  * - an active object is initialized
@@ -459,6 +480,14 @@ static bool work_fixup_init(void *addr, enum debug_obj_state state)
 	}
 }
 
+/**
+ * work_fixup_free - 修复被错误释放的活跃work对象
+ * @addr: work_struct指针
+ * @state: debug_object当前状态
+ *
+ * 当活跃状态的work被释放时，先调用cancel_work_sync()等待其完成，
+ * 再释放debug对象，防止释放正在执行的work。
+ */
 /*
  * fixup_free is called when:
  * - an active object is freed
@@ -485,16 +514,37 @@ static const struct debug_obj_descr work_debug_descr = {
 	.fixup_free	= work_fixup_free,
 };
 
+/**
+ * debug_work_activate - 标记work进入活跃状态（调试用）
+ * @work: 目标work_struct
+ *
+ * 在DEBUG_OBJECTS_WORK模式下通知调试对象追踪系统work已激活，
+ * 检测并发激活或未初始化使用等错误。
+ */
 static inline void debug_work_activate(struct work_struct *work)
 {
 	debug_object_activate(work, &work_debug_descr);
 }
 
+/**
+ * debug_work_deactivate - 标记work退出活跃状态（调试用）
+ * @work: 目标work_struct
+ *
+ * 在DEBUG_OBJECTS_WORK模式下通知调试对象追踪系统work已停止活跃，
+ * 与debug_work_activate()配对使用，确保活跃状态计数正确。
+ */
 static inline void debug_work_deactivate(struct work_struct *work)
 {
 	debug_object_deactivate(work, &work_debug_descr);
 }
 
+/**
+ * __init_work - 初始化work_struct调试对象
+ *
+ * 在DEBUG_OBJECTS_WORK模式下注册work到调试子系统。@onstack为true
+ * 时使用栈上对象初始化路径，false时用堆分配路径。非调试构建下
+ * 此函数为空操作。
+ */
 void __init_work(struct work_struct *work, int onstack)
 {
 	if (onstack)
@@ -504,6 +554,12 @@ void __init_work(struct work_struct *work, int onstack)
 }
 EXPORT_SYMBOL_GPL(__init_work);
 
+/**
+ * destroy_work_on_stack - 释放栈上work的调试对象
+ *
+ * 与DECLARE_WORK_ONSTACK配对使用，在栈上work离开作用域前
+ * 注销其调试对象，避免debug_objects误报use-after-free。
+ */
 void destroy_work_on_stack(struct work_struct *work)
 {
 	debug_object_free(work, &work_debug_descr);
@@ -528,6 +584,13 @@ static inline void debug_work_deactivate(struct work_struct *work) { }
  *
  * Returns 0 if ID in [0, WORK_OFFQ_POOL_NONE) is allocated and assigned
  * successfully, -errno on failure.
+ */
+/**
+ * worker_pool_assign_id - 为worker_pool分配唯一ID
+ *
+ * 通过worker_pool_idr分配一个数值ID并存入pool->id，范围限于
+ * [0, WORK_OFFQ_POOL_NONE)。ID用于work->data中的OFFQ_POOL_ID
+ * 字段，在work不关联pwq时仍能找到所属pool。
  */
 static int worker_pool_assign_id(struct worker_pool *pool)
 {
@@ -556,6 +619,13 @@ static int worker_pool_assign_id(struct worker_pool *pool)
  *
  * Return: The unbound pool_workqueue for @node.
  */
+/**
+ * unbound_pwq_by_node - 获取unbound工作队列在指定NUMA节点上的pwq
+ *
+ * 返回@wq在@node对应的pool_workqueue。若node为NUMA_NO_NODE
+ * （CPU离线时可能发生），则退回到默认pwq。调用者需持有RCU或
+ * wq_mutex或pool_mutex之一。
+ */
 static struct pool_workqueue *unbound_pwq_by_node(struct workqueue_struct *wq,
 						  int node)
 {
@@ -573,11 +643,25 @@ static struct pool_workqueue *unbound_pwq_by_node(struct workqueue_struct *wq,
 	return rcu_dereference_raw(wq->numa_pwq_tbl[node]);
 }
 
+/**
+ * work_color_to_flags - 将颜色值转换为work->data的标志位
+ * @color: flush颜色值
+ *
+ * 将颜色值左移WORK_STRUCT_COLOR_SHIFT位，生成存入work->data的标志掩码，
+ * 供set_work_pwq()等函数在设置work->data时编码颜色信息。
+ */
 static unsigned int work_color_to_flags(int color)
 {
 	return color << WORK_STRUCT_COLOR_SHIFT;
 }
 
+/**
+ * get_work_color - 获取work当前颜色值
+ *
+ * work颜色（color）用于flush_workqueue()的"颜色翻转"机制：
+ * 每轮flush给新入队的work打上不同颜色，等待所有当前颜色的
+ * work执行完毕，实现精确的全队列同步。
+ */
 static int get_work_color(struct work_struct *work)
 {
 	return (*work_data_bits(work) >> WORK_STRUCT_COLOR_SHIFT) &
@@ -609,6 +693,13 @@ static int work_next_color(int color)
  * but stay off timer and worklist for arbitrarily long and nobody should
  * try to steal the PENDING bit.
  */
+/**
+ * set_work_data - 原子设置work->data字段
+ *
+ * work->data低位编码PENDING/PWQ/LINKED等标志，高位存储pool ID
+ * 或pwq指针。此函数在持有PENDING位（work被"owned"）时才能调用，
+ * 保证对work状态的原子更新。
+ */
 static inline void set_work_data(struct work_struct *work, unsigned long data,
 				 unsigned long flags)
 {
@@ -616,6 +707,12 @@ static inline void set_work_data(struct work_struct *work, unsigned long data,
 	atomic_long_set(&work->data, data | flags | work_static(work));
 }
 
+/**
+ * set_work_pwq - 将work关联到指定pool_workqueue
+ *
+ * 设置work->data指向@pwq，并置PENDING|PWQ标志，表示work已入队
+ * 等待执行。extra_flags可附加LINKED等额外标志位。
+ */
 static void set_work_pwq(struct work_struct *work, struct pool_workqueue *pwq,
 			 unsigned long extra_flags)
 {
@@ -623,6 +720,13 @@ static void set_work_pwq(struct work_struct *work, struct pool_workqueue *pwq,
 		      WORK_STRUCT_PENDING | WORK_STRUCT_PWQ | extra_flags);
 }
 
+/**
+ * set_work_pool_and_keep_pending - 记录pool ID并保留PENDING位
+ *
+ * 将work->data设置为@pool_id（OFFQ格式）同时保持PENDING位，
+ * 用于work完成执行后但尚未清除PENDING时的过渡状态，防止
+ * 执行期间的重复入队竞争。
+ */
 static void set_work_pool_and_keep_pending(struct work_struct *work,
 					   int pool_id)
 {
@@ -630,6 +734,13 @@ static void set_work_pool_and_keep_pending(struct work_struct *work,
 		      WORK_STRUCT_PENDING);
 }
 
+/**
+ * set_work_pool_and_clear_pending - 记录pool ID并清除PENDING位
+ *
+ * work执行完毕后调用：将work->data设置为@pool_id（OFFQ格式）
+ * 同时清除PENDING标志，允许work重新入队。与
+ * set_work_pool_and_keep_pending()相对，这是执行完成路径。
+ */
 static void set_work_pool_and_clear_pending(struct work_struct *work,
 					    int pool_id)
 {
@@ -672,12 +783,24 @@ static void set_work_pool_and_clear_pending(struct work_struct *work,
 	smp_mb();
 }
 
+/**
+ * clear_work_data - 清除work关联数据（标记为无pool）
+ *
+ * 写屏障后将work->data重置为WORK_STRUCT_NO_POOL，表示该work
+ * 当前未关联任何pool或pwq，可安全重新入队。
+ */
 static void clear_work_data(struct work_struct *work)
 {
 	smp_wmb();	/* see set_work_pool_and_clear_pending() */
 	set_work_data(work, WORK_STRUCT_NO_POOL, 0);
 }
 
+/**
+ * get_work_pwq - 获取work当前关联的pool_workqueue
+ *
+ * 从work->data读取pool_workqueue指针（仅当WORK_STRUCT_PWQ标志
+ * 已设置时有效）。若work处于OFFQ状态（已完成或无pwq），返回NULL。
+ */
 static struct pool_workqueue *get_work_pwq(struct work_struct *work)
 {
 	unsigned long data = atomic_long_read(&work->data);
@@ -702,6 +825,13 @@ static struct pool_workqueue *get_work_pwq(struct work_struct *work)
  * returned pool is and stays online.
  *
  * Return: The worker_pool @work was last associated with.  %NULL if none.
+ */
+/**
+ * get_work_pool - 获取work最近关联的worker_pool
+ *
+ * 从work->data读取pool ID或pwq指针，返回对应的worker_pool。
+ * 若work处于空闲或canceling状态则可能返回NULL。
+ * 调用者需持有RCU或pool_mutex保证pool不被销毁。
  */
 static struct worker_pool *get_work_pool(struct work_struct *work)
 {
@@ -728,6 +858,13 @@ static struct worker_pool *get_work_pool(struct work_struct *work)
  * Return: The worker_pool ID @work was last associated with.
  * %WORK_OFFQ_POOL_NONE if none.
  */
+/**
+ * get_work_pool_id - 获取work最近关联的worker_pool ID
+ *
+ * 若work->data中WORK_STRUCT_PWQ标志已设，从pwq->pool->id取；
+ * 否则从OFFQ字段直接读取pool_id。用于work执行完成后记录
+ * 最后所属pool，供cancel/flush路径快速定位。
+ */
 static int get_work_pool_id(struct work_struct *work)
 {
 	unsigned long data = atomic_long_read(&work->data);
@@ -739,6 +876,13 @@ static int get_work_pool_id(struct work_struct *work)
 	return data >> WORK_OFFQ_POOL_SHIFT;
 }
 
+/**
+ * mark_work_canceling - 标记work正在被取消
+ *
+ * 在cancel_work_sync()流程中，将work->data设置为OFFQ_CANCELING
+ * 状态，防止其他CPU重新入队或抢占PENDING位，确保取消操作的
+ * 原子性。
+ */
 static void mark_work_canceling(struct work_struct *work)
 {
 	unsigned long pool_id = get_work_pool_id(work);
@@ -747,6 +891,12 @@ static void mark_work_canceling(struct work_struct *work)
 	set_work_data(work, pool_id | WORK_OFFQ_CANCELING, WORK_STRUCT_PENDING);
 }
 
+/**
+ * work_is_canceling - 检查work是否正在被取消
+ *
+ * 返回true表示work处于OFFQ（无pwq关联）且设置了OFFQ_CANCELING
+ * 标志，即cancel_work_sync()正在进行中，此时不应再次入队。
+ */
 static bool work_is_canceling(struct work_struct *work)
 {
 	unsigned long data = atomic_long_read(&work->data);
@@ -760,6 +910,12 @@ static bool work_is_canceling(struct work_struct *work)
  * they're being called with pool->lock held.
  */
 
+/**
+ * __need_more_worker - 检查pool是否需要更多worker运行
+ *
+ * 当pool->nr_running为0时返回true，表示没有正在运行的worker
+ * 处理work，需要唤醒空闲worker或创建新worker。
+ */
 static bool __need_more_worker(struct worker_pool *pool)
 {
 	return !atomic_read(&pool->nr_running);
@@ -773,17 +929,38 @@ static bool __need_more_worker(struct worker_pool *pool)
  * function will always return %true for unbound pools as long as the
  * worklist isn't empty.
  */
+/**
+ * need_more_worker - 检查pool是否需要唤醒worker
+ *
+ * worklist非空且没有正在运行的worker时返回true。对于unbound
+ * pool（nr_running始终为0），只要有work就总是返回true。
+ * 是__need_more_worker()的外层封装，增加了worklist非空检查。
+ */
 static bool need_more_worker(struct worker_pool *pool)
 {
 	return !list_empty(&pool->worklist) && __need_more_worker(pool);
 }
 
+/**
+ * may_start_working - 检查pool中是否有空闲worker可以开始工作
+ *
+ * 返回pool->nr_idle是否非零。由忙碌但未运行的worker调用，
+ * 判断是否有其他idle worker可以接管工作，从而决定自身是否
+ * 需要保持运行状态或转入idle。
+ */
 /* Can I start working?  Called from busy but !running workers. */
 static bool may_start_working(struct worker_pool *pool)
 {
 	return pool->nr_idle;
 }
 
+/**
+ * keep_working - 检查worker是否需要继续处理work
+ *
+ * 由正在运行的worker调用：worklist非空且自己是唯一运行的
+ * worker（nr_running<=1）时返回true，worker应继续循环取work。
+ * 若有其他worker也在运行则不必再处理，可能进入idle。
+ */
 /* Do I need to keep working?  Called from currently running workers. */
 static bool keep_working(struct worker_pool *pool)
 {
@@ -791,12 +968,24 @@ static bool keep_working(struct worker_pool *pool)
 		atomic_read(&pool->nr_running) <= 1;
 }
 
+/**
+ * need_to_create_worker - 判断是否需要创建新工作线程
+ *
+ * 由manager调用：当有待执行work但没有空闲worker时返回true，
+ * 触发maybe_create_worker()创建新线程。
+ */
 /* Do we need a new worker?  Called from manager. */
 static bool need_to_create_worker(struct worker_pool *pool)
 {
 	return need_more_worker(pool) && !may_start_working(pool);
 }
 
+/**
+ * too_many_workers - 判断是否空闲worker过多
+ *
+ * 当空闲worker数超过2且 (idle-2)*MAX_IDLE_WORKERS_RATIO >= busy时
+ * 返回true，触发idle_worker_timeout()逐步回收多余线程。
+ */
 /* Do we have too many workers and should some go away? */
 static bool too_many_workers(struct worker_pool *pool)
 {
@@ -811,6 +1000,13 @@ static bool too_many_workers(struct worker_pool *pool)
  * Wake up functions.
  */
 
+/**
+ * first_idle_worker - 获取pool中第一个空闲worker
+ *
+ * 从pool->idle_list链表头取出第一个空闲worker。调用时需关闭
+ * 抢占（或持有pool->lock），保证链表遍历的安全性。若无空闲
+ * worker则返回NULL。
+ */
 /* Return the first idle worker.  Safe with preemption disabled */
 static struct worker *first_idle_worker(struct worker_pool *pool)
 {
@@ -829,6 +1025,13 @@ static struct worker *first_idle_worker(struct worker_pool *pool)
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock).
  */
+/**
+ * wake_up_worker - 唤醒pool中第一个空闲worker
+ *
+ * 在持有pool->lock时调用，取出idle_list首个worker并调用
+ * wake_up_process()唤醒。用于insert_work()和wq_worker_sleeping()
+ * 在需要更多并发时触发idle worker开始处理work。
+ */
 static void wake_up_worker(struct worker_pool *pool)
 {
 	struct worker *worker = first_idle_worker(pool);
@@ -842,6 +1045,13 @@ static void wake_up_worker(struct worker_pool *pool)
  * @task: task waking up
  *
  * This function is called when a worker returns from schedule()
+ */
+/**
+ * wq_worker_running - 工作线程从睡眠恢复运行
+ *
+ * 由调度器在worker任务被唤醒后调用（schedule()返回路径）。
+ * 若worker此前处于sleeping状态且未被标记NOT_RUNNING，则递增
+ * pool->nr_running，使并发管理感知到该线程已再次活跃。
  */
 void wq_worker_running(struct task_struct *task)
 {
@@ -861,6 +1071,13 @@ void wq_worker_running(struct task_struct *task)
  * This function is called from schedule() when a busy worker is
  * going to sleep. Preemption needs to be disabled to protect ->sleeping
  * assignment.
+ */
+/**
+ * wq_worker_sleeping - 工作线程即将进入睡眠
+ *
+ * 由调度器在worker任务调用schedule()时（抢占前）调用。递减
+ * pool->nr_running，若降至0且worklist非空则唤醒下一个空闲worker，
+ * 维持并发度。rescuer线程（WORKER_NOT_RUNNING）不参与此计数。
  */
 void wq_worker_sleeping(struct task_struct *task)
 {
@@ -905,28 +1122,15 @@ void wq_worker_sleeping(struct task_struct *task)
 }
 
 /**
- * wq_worker_last_func - retrieve worker's last work function
- * @task: Task to retrieve last work function of.
+ * wq_worker_last_func - 获取worker最后执行的work函数
+ * @task: 目标worker任务结构体
  *
- * Determine the last function a worker executed. This is called from
- * the scheduler to get a worker's last known identity.
+ * 在schedule()路径中（kworker即将进入睡眠时）由调度器调用，
+ * 用于PSI（Pressure Stall Information）识别聚合worker的身份，
+ * 当该worker是系统或cgroup中最后进入睡眠的任务时可关闭周期性聚合。
+ * 不涉及workqueue锁，仅在调度器的入/出队路径中返回稳定值。
  *
- * CONTEXT:
- * raw_spin_lock_irq(rq->lock)
- *
- * This function is called during schedule() when a kworker is going
- * to sleep. It's used by psi to identify aggregation workers during
- * dequeuing, to allow periodic aggregation to shut-off when that
- * worker is the last task in the system or cgroup to go to sleep.
- *
- * As this function doesn't involve any workqueue-related locking, it
- * only returns stable values when called from inside the scheduler's
- * queuing and dequeuing paths, when @task, which must be a kworker,
- * is guaranteed to not be processing any works.
- *
- * Return:
- * The last work function %current executed as a worker, NULL if it
- * hasn't executed any work yet.
+ * Return: worker最后执行的work函数指针，未执行过任何work时为NULL。
  */
 work_func_t wq_worker_last_func(struct task_struct *task)
 {
@@ -944,6 +1148,13 @@ work_func_t wq_worker_last_func(struct task_struct *task)
  *
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock)
+ */
+/**
+ * worker_set_flags - 设置worker标志位并维护nr_running计数
+ *
+ * 设置worker->flags中指定位。若设置了WORKER_NOT_RUNNING标志
+ * （如等待flush、管理任务等），则同步递减pool->nr_running，
+ * 通知并发管理该线程暂时不执行work。
  */
 static inline void worker_set_flags(struct worker *worker, unsigned int flags)
 {
@@ -969,6 +1180,13 @@ static inline void worker_set_flags(struct worker *worker, unsigned int flags)
  *
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock)
+ */
+/**
+ * worker_clr_flags - 清除worker标志位并维护nr_running计数
+ *
+ * 清除worker->flags中指定位。若清除了WORKER_NOT_RUNNING标志
+ * （worker重新进入可运行状态），则递增pool->nr_running，
+ * 通知并发管理该线程恢复活跃。
  */
 static inline void worker_clr_flags(struct worker *worker, unsigned int flags)
 {
@@ -1022,6 +1240,13 @@ static inline void worker_clr_flags(struct worker *worker, unsigned int flags)
  * Pointer to worker which is executing @work if found, %NULL
  * otherwise.
  */
+/**
+ * find_worker_executing_work - 查找正在执行指定work的worker
+ *
+ * 在pool->busy_hash哈希表中按work地址查找当前正在执行该work的
+ * worker线程。用于检测work并发执行冲突，决定是否需要barrier或
+ * 等待当前执行完毕再重新入队。
+ */
 static struct worker *find_worker_executing_work(struct worker_pool *pool,
 						 struct work_struct *work)
 {
@@ -1052,6 +1277,13 @@ static struct worker *find_worker_executing_work(struct worker_pool *pool,
  *
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock).
+ */
+/**
+ * move_linked_works - 将链式work批量移动到目标链表头
+ *
+ * 将以@work起始的一组链式work（通过WORK_STRUCT_LINKED标志串联）
+ * 整体移到@head链表尾部，用于process_one_work()在执行前将同一批
+ * 关联work从pool->worklist搬移到本地列表，保证原子提交语义。
  */
 static void move_linked_works(struct work_struct *work, struct list_head *head,
 			      struct work_struct **nextp)
@@ -1084,6 +1316,12 @@ static void move_linked_works(struct work_struct *work, struct list_head *head,
  * Obtain an extra reference on @pwq.  The caller should guarantee that
  * @pwq has positive refcnt and be holding the matching pool->lock.
  */
+/**
+ * get_pwq - 增加pool_workqueue引用计数
+ *
+ * 在持有pool->lock时对@pwq引用计数加一。调用者必须保证@pwq
+ * 当前引用计数大于0，通常在将work入队到该pwq时调用。
+ */
 static void get_pwq(struct pool_workqueue *pwq)
 {
 	lockdep_assert_held(&pwq->pool->lock);
@@ -1097,6 +1335,13 @@ static void get_pwq(struct pool_workqueue *pwq)
  *
  * Drop a reference of @pwq.  If its refcnt reaches zero, schedule its
  * destruction.  The caller should be holding the matching pool->lock.
+ */
+/**
+ * put_pwq - 释放pool_workqueue引用计数
+ *
+ * 对@pwq引用计数减一。若降至0，调度pwq_unbound_release_workfn()
+ * 异步释放（不能在pool->lock下直接释放），仅unbound队列才会
+ * 真正触发销毁。
  */
 static void put_pwq(struct pool_workqueue *pwq)
 {
@@ -1122,6 +1367,12 @@ static void put_pwq(struct pool_workqueue *pwq)
  *
  * put_pwq() with locking.  This function also allows %NULL @pwq.
  */
+/**
+ * put_pwq_unlocked - 不加锁版put_pwq，可接受NULL
+ *
+ * 自动获取pool->lock后调用put_pwq()，适用于调用者未持有
+ * pool->lock的场景。安全处理@pwq为NULL的情况。
+ */
 static void put_pwq_unlocked(struct pool_workqueue *pwq)
 {
 	if (pwq) {
@@ -1135,6 +1386,13 @@ static void put_pwq_unlocked(struct pool_workqueue *pwq)
 	}
 }
 
+/**
+ * pwq_activate_delayed_work - 将延迟work从delayed_works移入活跃队列
+ *
+ * 当pwq->nr_active未超过max_active时，将@work从pwq->delayed_works
+ * 移到pool->worklist，清除DELAYED标志，递增nr_active，使work
+ * 进入可被worker线程执行的状态。
+ */
 static void pwq_activate_delayed_work(struct work_struct *work)
 {
 	struct pool_workqueue *pwq = get_work_pwq(work);
@@ -1147,6 +1405,13 @@ static void pwq_activate_delayed_work(struct work_struct *work)
 	pwq->nr_active++;
 }
 
+/**
+ * pwq_activate_first_delayed - 激活delayed_works链表的第一个work
+ *
+ * 取出pwq->delayed_works链表头部第一个被延迟的work，调用
+ * pwq_activate_delayed_work()将其移入pool->worklist，使其
+ * 成为可被worker线程执行的活跃work。
+ */
 static void pwq_activate_first_delayed(struct pool_workqueue *pwq)
 {
 	struct work_struct *work = list_first_entry(&pwq->delayed_works,
@@ -1165,6 +1430,13 @@ static void pwq_activate_first_delayed(struct pool_workqueue *pwq)
  *
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock).
+ */
+/**
+ * pwq_dec_nr_in_flight - work执行完成后更新pwq飞行中计数
+ *
+ * work完成后递减pwq->nr_in_flight[color]和nr_active，若有
+ * delayed_works等待则激活首个延迟work。同时检查是否满足flush
+ * 屏障条件，通知等待flush的调用者。
  */
 static void pwq_dec_nr_in_flight(struct pool_workqueue *pwq, int color)
 {
@@ -1231,6 +1503,15 @@ out_put:
  * responsible for releasing it using local_irq_restore(*@flags).
  *
  * This function is safe to call from any context including IRQ handler.
+ */
+/**
+ * try_to_grab_pending - 尝试抢占work的PENDING位并从worklist移除
+ *
+ * 用于cancel_work()/cancel_delayed_work()流程。可处理work处于
+ * 空闲、定时器或worklist上的任意状态：
+ *   返回1：成功从worklist偷取；返回0：work空闲，直接置PENDING；
+ *   返回-EAGAIN：暂时无法抢占，可重试；返回-ENOENT：已被其他人取消。
+ * 成功时禁用IRQ并存入@flags，调用者需恢复。
  */
 static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
 			       unsigned long *flags)
@@ -1322,6 +1603,13 @@ fail:
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock).
  */
+/**
+ * insert_work - 将work item插入工作队列的执行链表
+ *
+ * 设置work的pwq关联（set_work_pwq）并将其添加到指定链表尾部，
+ * 递增pwq引用计数。通过内存屏障确保work的数据对工作线程可见。
+ * 若worker_pool处于运行状态但没有活跃worker，则唤醒一个工作线程。
+ */
 static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
 			struct list_head *head, unsigned int extra_flags)
 {
@@ -1347,6 +1635,13 @@ static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
  * Test whether @work is being queued from another work executing on the
  * same workqueue.
  */
+/**
+ * is_chained_work - 检查当前是否在同一wq的work回调中入队
+ *
+ * 若调用者本身就是正在执行@wq上某个work的worker线程，则返回true。
+ * 用于__queue_work()检测链式入队（chained work），避免在
+ * WQ_MEM_RECLAIM队列中因自我依赖导致死锁。
+ */
 static bool is_chained_work(struct workqueue_struct *wq)
 {
 	struct worker *worker;
@@ -1363,6 +1658,13 @@ static bool is_chained_work(struct workqueue_struct *wq)
  * When queueing an unbound work item to a wq, prefer local CPU if allowed
  * by wq_unbound_cpumask.  Otherwise, round robin among the allowed ones to
  * avoid perturbing sensitive tasks.
+ */
+/**
+ * wq_select_unbound_cpu - 为unbound work选择目标CPU
+ *
+ * 优先选择当前本地CPU（若在wq_unbound_cpumask内），否则轮询
+ * 允许的CPU列表。若启用了wq_debug_force_rr_cpu则强制轮询以便
+ * 调试。用于__queue_work()确定unbound work的目标pool。
  */
 static int wq_select_unbound_cpu(int cpu)
 {
@@ -1392,6 +1694,14 @@ static int wq_select_unbound_cpu(int cpu)
 	return new_cpu;
 }
 
+/**
+ * __queue_work - 将work item加入工作队列（核心实现）
+ *
+ * 选择合适的pool_workqueue（pwq）：优先使用与work上次执行的pool相同
+ * 的pwq以利用缓存局部性（工作迁移优化）；若队列被限速则检查是否可执行。
+ * 最终调用insert_work()将work加入待执行链表，并在必要时唤醒工作线程。
+ * 处理unbound workqueue、NUMA感知放置和WQ_MEM_RECLAIM特殊情况。
+ */
 static void __queue_work(int cpu, struct workqueue_struct *wq,
 			 struct work_struct *work)
 {
@@ -1509,6 +1819,14 @@ out:
  *
  * Return: %false if @work was already on a queue, %true otherwise.
  */
+/**
+ * queue_work_on - 将work item提交到指定CPU的工作队列
+ *
+ * 原子地设置WORK_STRUCT_PENDING_BIT标志（防止同一work被重复入队），
+ * 成功后调用__queue_work()将work加入目标CPU的worker_pool队列。
+ * 返回true表示成功入队，false表示work已在队列中（pending）。
+ * 这是queue_work()/queue_work_on()系列函数的公共路径。
+ */
 bool queue_work_on(int cpu, struct workqueue_struct *wq,
 		   struct work_struct *work)
 {
@@ -1535,6 +1853,13 @@ EXPORT_SYMBOL(queue_work_on);
  * node. If there are no CPUs available on the given node it will return
  * WORK_CPU_UNBOUND indicating that we should just schedule to any
  * available CPU if we need to schedule this work.
+ */
+/**
+ * workqueue_select_cpu_near - 选择指定NUMA节点上的CPU
+ *
+ * 为unbound work选择一个靠近@node的CPU：若NUMA未启用或节点
+ * 无效/离线，返回WORK_CPU_UNBOUND；否则优先返回当前CPU（若在
+ * 同节点），否则返回节点上第一个在线CPU。
  */
 static int workqueue_select_cpu_near(int node)
 {
@@ -1580,6 +1905,13 @@ static int workqueue_select_cpu_near(int node)
  *
  * Return: %false if @work was already on a queue, %true otherwise.
  */
+/**
+ * queue_work_node - 将work提交到指定NUMA节点上的工作队列
+ *
+ * 尽力将@work调度到@node上的某个CPU执行，优先选取当前在该节点
+ * 上运行的CPU，否则选取该节点第一个在线CPU。若节点无效或离线，
+ * 退回到标准queue_work行为。返回false表示work已在队列中。
+ */
 bool queue_work_node(int node, struct workqueue_struct *wq,
 		     struct work_struct *work)
 {
@@ -1611,6 +1943,13 @@ bool queue_work_node(int node, struct workqueue_struct *wq,
 }
 EXPORT_SYMBOL_GPL(queue_work_node);
 
+/**
+ * delayed_work_timer_fn - delayed_work定时器到期回调
+ *
+ * 在IRQ关闭状态下由hrtimer/timer触发，从dwork->wq和dwork->cpu
+ * 读取目标参数，直接调用__queue_work()将work立即入队执行。
+ * delayed_work到期后进入普通work执行流程的入口点。
+ */
 void delayed_work_timer_fn(struct timer_list *t)
 {
 	struct delayed_work *dwork = from_timer(dwork, t, timer);
@@ -1620,6 +1959,13 @@ void delayed_work_timer_fn(struct timer_list *t)
 }
 EXPORT_SYMBOL(delayed_work_timer_fn);
 
+/**
+ * __queue_delayed_work - 延迟work入队的内部实现
+ *
+ * 若delay为0则直接调用__queue_work()立即入队；否则设置
+ * dwork->cpu和dwork->wq并启动高精度定时器，超时后由
+ * delayed_work_timer_fn()回调触发实际入队操作。
+ */
 static void __queue_delayed_work(int cpu, struct workqueue_struct *wq,
 				struct delayed_work *dwork, unsigned long delay)
 {
@@ -1663,6 +2009,13 @@ static void __queue_delayed_work(int cpu, struct workqueue_struct *wq,
  * @delay is zero and @dwork is idle, it will be scheduled for immediate
  * execution.
  */
+/**
+ * queue_delayed_work_on - 将delayed_work提交到指定CPU（带延迟）
+ *
+ * 若work处于idle状态，设置PENDING位后启动定时器（或直接入队），
+ * 延迟@delay jiffies后在@cpu上执行。返回true表示成功入队，
+ * false表示work已在pending状态。
+ */
 bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
 			   struct delayed_work *dwork, unsigned long delay)
 {
@@ -1701,6 +2054,13 @@ EXPORT_SYMBOL(queue_delayed_work_on);
  * This function is safe to call from any context including IRQ handler.
  * See try_to_grab_pending() for details.
  */
+/**
+ * mod_delayed_work_on - 修改delayed_work的延迟时间和目标CPU
+ *
+ * 取消当前pending的@dwork并以新的@delay和@cpu重新入队。若
+ * work正在执行中则返回-EAGAIN并重试。可在任意上下文调用，
+ * 参见try_to_grab_pending()。
+ */
 bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
 			 struct delayed_work *dwork, unsigned long delay)
 {
@@ -1721,6 +2081,13 @@ bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
 }
 EXPORT_SYMBOL_GPL(mod_delayed_work_on);
 
+/**
+ * rcu_work_rcufn - RCU宽限期结束后将rcu_work入队
+ *
+ * 作为call_rcu()的回调，在RCU宽限期过后被调用，将rwork
+ * 提交到WORK_CPU_UNBOUND池执行。禁用IRQ后调用__queue_work()
+ * 保证在正确上下文中入队。
+ */
 static void rcu_work_rcufn(struct rcu_head *rcu)
 {
 	struct rcu_work *rwork = container_of(rcu, struct rcu_work, rcu);
@@ -1740,6 +2107,14 @@ static void rcu_work_rcufn(struct rcu_head *rcu)
  * that a full RCU grace period is guaranteed only after a %true return.
  * While @rwork is guaranteed to be executed after a %false return, the
  * execution may happen before a full RCU grace period has passed.
+ */
+/**
+ * queue_rcu_work - 等待RCU宽限期后将work入队执行
+ *
+ * 设置PENDING位后调用call_rcu()注册回调，宽限期结束后由
+ * rcu_work_rcufn()将work提交到@wq。返回true表示成功注册，
+ * false表示work已在pending状态。注意返回false时work仍会
+ * 在宽限期结束后执行（并非保证不执行）。
  */
 bool queue_rcu_work(struct workqueue_struct *wq, struct rcu_work *rwork)
 {
@@ -1764,6 +2139,13 @@ EXPORT_SYMBOL(queue_rcu_work);
  *
  * LOCKING:
  * raw_spin_lock_irq(pool->lock).
+ */
+/**
+ * worker_enter_idle - worker线程进入空闲状态
+ *
+ * 设置WORKER_IDLE标志，将worker加入pool->idle_list，递减
+ * nr_workers并（若需要）启动idle超时定时器。若pool->worklist
+ * 仍有work则唤醒另一个worker继续处理。
  */
 static void worker_enter_idle(struct worker *worker)
 {
@@ -1805,6 +2187,13 @@ static void worker_enter_idle(struct worker *worker)
  * LOCKING:
  * raw_spin_lock_irq(pool->lock).
  */
+/**
+ * worker_leave_idle - worker线程离开空闲状态
+ *
+ * 清除WORKER_IDLE标志，从pool->idle_list移除，递减nr_idle。
+ * 在worker被唤醒开始处理work时调用，与worker_enter_idle()
+ * 配对，维护pool的idle计数和列表一致性。
+ */
 static void worker_leave_idle(struct worker *worker)
 {
 	struct worker_pool *pool = worker->pool;
@@ -1816,6 +2205,13 @@ static void worker_leave_idle(struct worker *worker)
 	list_del_init(&worker->entry);
 }
 
+/**
+ * alloc_worker - 分配并初始化worker结构
+ *
+ * 在@node节点上分配worker结构，初始化entry/scheduled/node
+ * 链表头，设置初始last_active时间戳。不绑定到pool，需后续
+ * 调用worker_attach_to_pool()完成完整初始化。
+ */
 static struct worker *alloc_worker(int node)
 {
 	struct worker *worker;
@@ -1839,6 +2235,13 @@ static struct worker *alloc_worker(int node)
  * Attach @worker to @pool.  Once attached, the %WORKER_UNBOUND flag and
  * cpu-binding of @worker are kept coordinated with the pool across
  * cpu-[un]hotplugs.
+ */
+/**
+ * worker_attach_to_pool - 将worker绑定到worker_pool
+ *
+ * 在持有wq_pool_attach_mutex的情况下将@worker加入
+ * pool->workers列表，设置worker->pool，并根据pool状态
+ * 设置WORKER_UNBOUND标志。确保CPU热插拔时能正确感知worker。
  */
 static void worker_attach_to_pool(struct worker *worker,
 				   struct worker_pool *pool)
@@ -1873,6 +2276,13 @@ static void worker_attach_to_pool(struct worker *worker,
  * caller worker shouldn't access to the pool after detached except it has
  * other reference to the pool.
  */
+/**
+ * worker_detach_from_pool - 将worker从pool解绑
+ *
+ * worker_attach_to_pool()的逆操作。从pool->workers移除worker，
+ * 若pool->detach_completion已设（put_unbound_pool()在等待），
+ * 则通知其所有worker已离开，可安全销毁pool。
+ */
 static void worker_detach_from_pool(struct worker *worker)
 {
 	struct worker_pool *pool = worker->pool;
@@ -1905,6 +2315,14 @@ static void worker_detach_from_pool(struct worker *worker)
  *
  * Return:
  * Pointer to the newly created worker.
+ */
+/**
+ * create_worker - 为worker_pool创建一个新工作线程
+ *
+ * 分配worker结构体，通过ida_simple_get()获取唯一ID用于命名kthread
+ * （格式：kworker/u<cpu>:<id> 或 kworker/<cpu>:<id>），然后创建
+ * 内核线程并绑定到pool的CPU（per-CPU pool）或设置为unbound。
+ * 创建成功后将worker加入pool->workers链表并启动线程。
  */
 static struct worker *create_worker(struct worker_pool *pool)
 {
@@ -1966,6 +2384,14 @@ fail:
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock).
  */
+/**
+ * destroy_worker - 销毁一个空闲工作线程
+ *
+ * 将worker从pool->idle_list和pool->workers链表中移除，
+ * 释放IDA ID，并唤醒内核线程使其退出（设置WORKER_DIE标志）。
+ * 只允许销毁处于IDLE状态且没有当前执行任务的worker。
+ * 用于控制worker_pool的线程数量（空闲超时后收缩）。
+ */
 static void destroy_worker(struct worker *worker)
 {
 	struct worker_pool *pool = worker->pool;
@@ -1986,6 +2412,13 @@ static void destroy_worker(struct worker *worker)
 	wake_up_process(worker->task);
 }
 
+/**
+ * idle_worker_timeout - 空闲worker超时定时器处理
+ *
+ * pool->idle_timer到期时触发：检查是否有过多空闲worker
+ * （too_many_workers()），若有则销毁最老的idle worker。
+ * 若仍有多余worker则重新设置定时器，逐步回收多余线程。
+ */
 static void idle_worker_timeout(struct timer_list *t)
 {
 	struct worker_pool *pool = from_timer(pool, t, idle_timer);
@@ -2011,6 +2444,13 @@ static void idle_worker_timeout(struct timer_list *t)
 	raw_spin_unlock_irq(&pool->lock);
 }
 
+/**
+ * send_mayday - 向WQ_MEM_RECLAIM队列的rescuer发送求救信号
+ *
+ * 当worker_pool无法创建新线程时调用。将@work所属wq加入
+ * pool->maydays链表，并唤醒wq->rescuer线程，让rescuer接管
+ * 执行该work，避免内存分配死锁。需持有wq_mayday_lock。
+ */
 static void send_mayday(struct work_struct *work)
 {
 	struct pool_workqueue *pwq = get_work_pwq(work);
@@ -2034,6 +2474,13 @@ static void send_mayday(struct work_struct *work)
 	}
 }
 
+/**
+ * pool_mayday_timeout - mayday定时器超时处理
+ *
+ * pool->mayday_timer到期时触发：遍历pool->worklist中所有属于
+ * WQ_MEM_RECLAIM队列的work，逐一调用send_mayday()发送求救信号，
+ * 并重启定时器以持续通知直到内存分配成功。
+ */
 static void pool_mayday_timeout(struct timer_list *t)
 {
 	struct worker_pool *pool = from_timer(pool, t, mayday_timer);
@@ -2076,6 +2523,14 @@ static void pool_mayday_timeout(struct timer_list *t)
  * raw_spin_lock_irq(pool->lock) which may be released and regrabbed
  * multiple times.  Does GFP_KERNEL allocations.  Called only from
  * manager.
+ */
+/**
+ * maybe_create_worker - 按需创建工作线程（manager专用）
+ *
+ * 在持有pool->lock的情况下被manager调用。若need_to_create_worker()
+ * 为真，循环调用create_worker()直到成功或不再需要。若创建耗时超过
+ * MAYDAY_INITIAL_TIMEOUT，向所有rescuer发送mayday信号，避免内存
+ * 分配死锁。函数返回时保证may_start_working()为真。
  */
 static void maybe_create_worker(struct worker_pool *pool)
 __releases(&pool->lock)
@@ -2130,6 +2585,15 @@ restart:
  * the conditions that the caller verified before calling the function may
  * no longer be true.
  */
+/**
+ * manage_workers - 工作线程池管理入口
+ *
+ * 由worker_thread()在发现需要管理时调用。每个pool同一时刻只允许
+ * 一个manager（POOL_MANAGER_ACTIVE标志互斥）。manager负责调用
+ * maybe_create_worker()保证pool有足够worker可用。返回false表示
+ * 无需管理，调用者可直接处理work；返回true表示执行了管理动作，
+ * 调用者需重新检查条件。
+ */
 static bool manage_workers(struct worker *worker)
 {
 	struct worker_pool *pool = worker->pool;
@@ -2161,6 +2625,15 @@ static bool manage_workers(struct worker *worker)
  *
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock) which is released and regrabbed.
+ */
+/**
+ * process_one_work - 执行一个work item
+ *
+ * 工作线程的核心执行函数。在释放pool->lock后调用work->func()，
+ * 执行完成后清除PENDING标志。处理WQ_CPU_INTENSIVE标志（将worker
+ * 标记为CPU密集型，使concurrency管理将其排除在活跃worker计数外）。
+ * 若发现同一work正被其他worker执行则等待（collision处理）。
+ * 使用lockdep跟踪work的锁依赖关系。
  */
 static void process_one_work(struct worker *worker, struct work_struct *work)
 __releases(&pool->lock)
@@ -2326,6 +2799,13 @@ __acquires(&pool->lock)
  * raw_spin_lock_irq(pool->lock) which may be released and regrabbed
  * multiple times.
  */
+/**
+ * process_scheduled_works - 依次处理worker->scheduled链表上所有work
+ *
+ * 被worker_thread()和rescuer_thread()调用，循环取出并执行
+ * worker->scheduled链表中的work。scheduled链表存放rescuer接管
+ * 的work或通过schedule_work_on()指定worker的work。
+ */
 static void process_scheduled_works(struct worker *worker)
 {
 	while (!list_empty(&worker->scheduled)) {
@@ -2335,6 +2815,13 @@ static void process_scheduled_works(struct worker *worker)
 	}
 }
 
+/**
+ * set_pf_worker - 设置或清除当前任务的PF_WQ_WORKER标志
+ *
+ * 在持有wq_pool_attach_mutex的情况下设置/清除task->flags中的
+ * PF_WQ_WORKER标志，用于worker线程在启动和退出时标识自身身份，
+ * 供调度器和lockdep正确处理工作线程的特殊语义。
+ */
 static void set_pf_worker(bool val)
 {
 	mutex_lock(&wq_pool_attach_mutex);
@@ -2356,6 +2843,16 @@ static void set_pf_worker(bool val)
  * will be explained in rescuer_thread().
  *
  * Return: 0
+ */
+/**
+ * worker_thread - 工作线程主循环（kworker内核线程）
+ *
+ * 每个worker_pool有一组工作线程运行此函数。主循环：
+ * 1. 检查是否需要退出（WORKER_DIE标志）
+ * 2. 若有待执行的work则调用process_one_work()处理
+ * 3. 若无work则进入睡眠等待唤醒（worklist为空时）
+ * 4. 实现动态并发控制（concurrency management）：保持池中
+ *    恰好有一个活跃worker，新work到来时唤醒更多worker
  */
 static int worker_thread(void *__worker)
 {
@@ -2460,6 +2957,14 @@ sleep:
  * This should happen rarely.
  *
  * Return: 0
+ */
+/**
+ * rescuer_thread - WQ_MEM_RECLAIM工作队列的救援线程
+ *
+ * 当worker_pool内存不足无法创建新worker时，救援线程接管并执行
+ * 该工作队列的待处理work item，防止内存回收路径发生死锁。
+ * 以RESCUER_NICE_LEVEL（-20，最高优先级）运行，处理完成后
+ * 回到睡眠等待下次救援请求。WQ_MEM_RECLAIM标志触发此机制。
  */
 static int rescuer_thread(void *__rescuer)
 {
@@ -2593,6 +3098,13 @@ repeat:
  * %WQ_MEM_RECLAIM as that can break forward-progress guarantee leading to
  * a deadlock.
  */
+/**
+ * check_flush_dependency - 检查flush依赖是否会导致死锁
+ *
+ * 若@target_wq未设WQ_MEM_RECLAIM，而调用者处于内存回收路径
+ * （PF_MEMALLOC）或正在执行WQ_MEM_RECLAIM队列的work，则警告：
+ * 这种flush可能破坏前向进度保证，导致死锁。
+ */
 static void check_flush_dependency(struct workqueue_struct *target_wq,
 				   struct work_struct *target_work)
 {
@@ -2620,6 +3132,13 @@ struct wq_barrier {
 	struct task_struct	*task;	/* purely informational */
 };
 
+/**
+ * wq_barrier_func - flush屏障work的执行函数
+ *
+ * 作为barrier work的回调，执行时仅调用complete(&barr->done)，
+ * 通知等待在wq_barrier上的flush调用者该屏障点已越过，所有
+ * 在屏障之前提交的work均已执行完毕。
+ */
 static void wq_barrier_func(struct work_struct *work)
 {
 	struct wq_barrier *barr = container_of(work, struct wq_barrier, work);
@@ -2649,6 +3168,13 @@ static void wq_barrier_func(struct work_struct *work)
  *
  * CONTEXT:
  * raw_spin_lock_irq(pool->lock).
+ */
+/**
+ * insert_wq_barrier - 在work执行路径上插入flush屏障
+ *
+ * 初始化@barr并将其作为一个特殊work插入@pwq。屏障保证@target
+ * 执行完毕后@barr->done才会被完成，从而实现flush_work()的
+ * 精确等待语义。屏障一旦入队不可取消。
  */
 static void insert_wq_barrier(struct pool_workqueue *pwq,
 			      struct wq_barrier *barr,
@@ -2721,6 +3247,13 @@ static void insert_wq_barrier(struct pool_workqueue *pwq,
  * %true if @flush_color >= 0 and there's something to flush.  %false
  * otherwise.
  */
+/**
+ * flush_workqueue_prep_pwqs - 为flush准备所有pwq（设置颜色和计数）
+ *
+ * 对@wq的所有pwq设置flush_color和work_color：flush_color用于标记
+ * 当前需要等待完成的work批次，work_color用于标记新提交work的颜色。
+ * 若有需要等待的pwq则返回true，调用者需等待nr_pwqs_to_flush降为0。
+ */
 static bool flush_workqueue_prep_pwqs(struct workqueue_struct *wq,
 				      int flush_color, int work_color)
 {
@@ -2767,6 +3300,14 @@ static bool flush_workqueue_prep_pwqs(struct workqueue_struct *wq,
  *
  * This function sleeps until all work items which were queued on entry
  * have finished execution, but it is not livelocked by new incoming ones.
+ */
+/**
+ * flush_workqueue - 等待工作队列中所有已提交的work执行完毕
+ *
+ * 实现颜色翻转（color flip）机制：分配一个新的flush_color，
+ * 等待所有先前提交的work（旧颜色）全部完成后才返回。
+ * 若有多个并发flush则形成flush链，按提交顺序依次完成。
+ * 此函数可睡眠，不能在中断上下文调用。
  */
 void flush_workqueue(struct workqueue_struct *wq)
 {
@@ -2930,6 +3471,13 @@ EXPORT_SYMBOL(flush_workqueue);
  * by the depth of chaining and should be relatively short.  Whine if it
  * takes too long.
  */
+/**
+ * drain_workqueue - 等待工作队列完全排空
+ *
+ * 反复调用flush_workqueue()直到队列为空。排空期间设置__WQ_DRAINING
+ * 标志，只允许链式入队（当前正在执行的work再次入队）。若超过
+ * 10次flush仍未清空则发出警告，通常意味着存在深度链式依赖。
+ */
 void drain_workqueue(struct workqueue_struct *wq)
 {
 	unsigned int flush_cnt = 0;
@@ -2974,6 +3522,13 @@ reflush:
 }
 EXPORT_SYMBOL_GPL(drain_workqueue);
 
+/**
+ * start_flush_work - 为单个work启动flush等待
+ *
+ * 若@work正在执行或在队列中，则向其所在pwq插入一个wq_barrier，
+ * 调用者可wait_for_completion(&barr->done)等待该work完成。
+ * 返回true表示已插入屏障，false表示work已完成无需等待。
+ */
 static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr,
 			     bool from_cancel)
 {
@@ -3030,6 +3585,13 @@ already_gone:
 	return false;
 }
 
+/**
+ * __flush_work - 等待单个work执行完毕（内部实现）
+ *
+ * 调用start_flush_work()插入barrier并阻塞等待完成。
+ * @from_cancel为true时跳过lockdep检查（来自cancel路径）。
+ * 返回true表示成功等待，false表示work未在执行中。
+ */
 static bool __flush_work(struct work_struct *work, bool from_cancel)
 {
 	struct wq_barrier barr;
@@ -3065,6 +3627,13 @@ static bool __flush_work(struct work_struct *work, bool from_cancel)
  * %true if flush_work() waited for the work to finish execution,
  * %false if it was already idle.
  */
+/**
+ * flush_work - 等待work最近一次入队的执行完成
+ *
+ * 阻塞等待@work完成当前执行。若work在flush启动后未重新入队，
+ * 则返回时保证work处于idle状态。通过insert_wq_barrier()实现
+ * 精确同步。返回true表示等待了执行，false表示work已是idle。
+ */
 bool flush_work(struct work_struct *work)
 {
 	return __flush_work(work, false);
@@ -3076,6 +3645,13 @@ struct cwt_wait {
 	struct work_struct	*work;
 };
 
+/**
+ * cwt_wakefn - cancel_work_timer的等待队列唤醒函数
+ *
+ * 自定义唤醒函数，仅在key（正在被取消的work指针）与等待项
+ * 记录的work匹配时才唤醒。防止不相关的work完成错误唤醒
+ * cancel_work_sync()的等待者。
+ */
 static int cwt_wakefn(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
 {
 	struct cwt_wait *cwait = container_of(wait, struct cwt_wait, wait);
@@ -3167,6 +3743,13 @@ static bool __cancel_work_timer(struct work_struct *work, bool is_dwork)
  * Return:
  * %true if @work was pending, %false otherwise.
  */
+/**
+ * cancel_work_sync - 取消work并等待其执行完毕
+ *
+ * 取消@work并阻塞等待其结束（包括自我重新入队或迁移到其他
+ * workqueue的情况）。返回时保证work既不在pending也不在执行中。
+ * 不可用于delayed_work，应使用cancel_delayed_work_sync()。
+ */
 bool cancel_work_sync(struct work_struct *work)
 {
 	return __cancel_work_timer(work, false);
@@ -3184,6 +3767,13 @@ EXPORT_SYMBOL_GPL(cancel_work_sync);
  * Return:
  * %true if flush_work() waited for the work to finish execution,
  * %false if it was already idle.
+ */
+/**
+ * flush_delayed_work - 立即执行并等待delayed_work完成
+ *
+ * 若@dwork定时器尚在计时，取消定时器并立即入队执行；然后
+ * flush_work()等待执行完毕。只等待最后一次入队实例。
+ * 返回true表示等待了执行，false表示work已是idle。
  */
 bool flush_delayed_work(struct delayed_work *dwork)
 {
@@ -3203,6 +3793,13 @@ EXPORT_SYMBOL(flush_delayed_work);
  * %true if flush_rcu_work() waited for the work to finish execution,
  * %false if it was already idle.
  */
+/**
+ * flush_rcu_work - 等待RCU work执行完成
+ *
+ * 若@rwork仍在pending（等待RCU宽限期），先调用rcu_barrier()
+ * 等待所有RCU回调完成，再flush_work()等待work执行。
+ * 返回true表示等待发生，false表示work已完成。
+ */
 bool flush_rcu_work(struct rcu_work *rwork)
 {
 	if (test_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(&rwork->work))) {
@@ -3215,6 +3812,13 @@ bool flush_rcu_work(struct rcu_work *rwork)
 }
 EXPORT_SYMBOL(flush_rcu_work);
 
+/**
+ * __cancel_work - 取消work（不等待执行完毕）
+ *
+ * 尝试抢占work的PENDING位并从worklist移除。对delayed_work
+ * 还会先取消定时器。返回true表示work原本在pending状态。
+ * 不保证work的回调已经执行完毕，需要sync版本才能等待。
+ */
 static bool __cancel_work(struct work_struct *work, bool is_dwork)
 {
 	unsigned long flags;
@@ -3248,6 +3852,13 @@ static bool __cancel_work(struct work_struct *work, bool is_dwork)
  *
  * This function is safe to call from any context including IRQ handler.
  */
+/**
+ * cancel_delayed_work - 取消延迟work（不等待）
+ *
+ * 取消@dwork定时器并从worklist移除。回调可能仍在运行，
+ * 不保证完全结束。可在任意上下文（包括IRQ）中安全调用。
+ * 若需等待回调完成，使用cancel_delayed_work_sync()。
+ */
 bool cancel_delayed_work(struct delayed_work *dwork)
 {
 	return __cancel_work(&dwork->work, true);
@@ -3262,6 +3873,12 @@ EXPORT_SYMBOL(cancel_delayed_work);
  *
  * Return:
  * %true if @dwork was pending, %false otherwise.
+ */
+/**
+ * cancel_delayed_work_sync - 取消延迟work并等待执行完毕
+ *
+ * cancel_work_sync()的delayed_work版本。取消@dwork并阻塞等待
+ * 其回调执行结束。返回true表示work原本在pending状态。
  */
 bool cancel_delayed_work_sync(struct delayed_work *dwork)
 {
@@ -3279,6 +3896,13 @@ EXPORT_SYMBOL(cancel_delayed_work_sync);
  *
  * Return:
  * 0 on success, -errno on failure.
+ */
+/**
+ * schedule_on_each_cpu - 在每个CPU上调度执行一个工作函数
+ *
+ * 为每个online CPU分配一个per-cpu work_struct，提交到system_wq
+ * 并等待所有CPU执行完毕。用于需要在所有CPU上执行某操作的场景，
+ * 如刷新per-cpu缓存。注意此函数非常慢，不应在热路径中使用。
  */
 int schedule_on_each_cpu(work_func_t func)
 {
@@ -3318,6 +3942,13 @@ int schedule_on_each_cpu(work_func_t func)
  * Return:	0 - function was executed
  *		1 - function was scheduled for execution
  */
+/**
+ * execute_in_process_context - 在进程上下文中执行函数
+ *
+ * 若当前不在中断上下文，直接调用@fn；否则将其包装为work
+ * 提交到system_wq异步执行。用于需要在进程上下文中运行但
+ * 可能被中断调用的函数。返回0表示直接执行，1表示异步提交。
+ */
 int execute_in_process_context(work_func_t fn, struct execute_work *ew)
 {
 	if (!in_interrupt()) {
@@ -3338,6 +3969,12 @@ EXPORT_SYMBOL_GPL(execute_in_process_context);
  *
  * Undo alloc_workqueue_attrs().
  */
+/**
+ * free_workqueue_attrs - 释放workqueue_attrs结构
+ *
+ * 释放@attrs及其内嵌的cpumask，与alloc_workqueue_attrs()配对。
+ * 安全处理NULL指针。
+ */
 void free_workqueue_attrs(struct workqueue_attrs *attrs)
 {
 	if (attrs) {
@@ -3353,6 +3990,13 @@ void free_workqueue_attrs(struct workqueue_attrs *attrs)
  * return it.
  *
  * Return: The allocated new workqueue_attr on success. %NULL on failure.
+ */
+/**
+ * alloc_workqueue_attrs - 分配并初始化workqueue_attrs
+ *
+ * 分配新的workqueue_attrs结构，初始化nice为0，cpumask为全集。
+ * 用于创建unbound工作队列时指定属性（nice值、允许的CPU集合）。
+ * 返回NULL表示内存分配失败。
  */
 struct workqueue_attrs *alloc_workqueue_attrs(void)
 {
@@ -3371,6 +4015,13 @@ fail:
 	return NULL;
 }
 
+/**
+ * copy_workqueue_attrs - 拷贝workqueue_attrs
+ *
+ * 将@from的属性（nice、cpumask）完整拷贝到@to，包括
+ * no_numa标志。注意与哈希/相等性测试不同，此函数不忽略
+ * no_numa字段，保留完整属性信息。
+ */
 static void copy_workqueue_attrs(struct workqueue_attrs *to,
 				 const struct workqueue_attrs *from)
 {
@@ -3385,6 +4036,12 @@ static void copy_workqueue_attrs(struct workqueue_attrs *to,
 }
 
 /* hash value of the content of @attr */
+/**
+ * wqattrs_hash - 计算workqueue_attrs哈希值
+ *
+ * 对nice值和cpumask的位图进行哈希，用于在wq_unbound_pool_hash
+ * 中快速查找匹配的unbound worker_pool，实现相同属性的pool复用。
+ */
 static u32 wqattrs_hash(const struct workqueue_attrs *attrs)
 {
 	u32 hash = 0;
@@ -3395,6 +4052,12 @@ static u32 wqattrs_hash(const struct workqueue_attrs *attrs)
 	return hash;
 }
 
+/**
+ * wqattrs_equal - 比较两个workqueue_attrs是否等价
+ *
+ * 比较nice值和cpumask（忽略no_numa）。用于判断现有unbound
+ * worker_pool是否可复用，避免为属性相同的工作队列创建重复pool。
+ */
 /* content equality test */
 static bool wqattrs_equal(const struct workqueue_attrs *a,
 			  const struct workqueue_attrs *b)
@@ -3415,6 +4078,13 @@ static bool wqattrs_equal(const struct workqueue_attrs *a,
  * Return: 0 on success, -errno on failure.  Even on failure, all fields
  * inside @pool proper are initialized and put_unbound_pool() can be called
  * on @pool safely to release it.
+ */
+/**
+ * init_worker_pool - 初始化新分配的worker_pool结构
+ *
+ * 初始化@pool的自旋锁、链表、哈希表、定时器、NUMA节点、IDA等
+ * 字段，并分配pool->attrs。即使初始化失败，pool内部字段已被
+ * 正确初始化，可安全调用put_unbound_pool()释放。
  */
 static int init_worker_pool(struct worker_pool *pool)
 {
@@ -3445,6 +4115,13 @@ static int init_worker_pool(struct worker_pool *pool)
 	return 0;
 }
 
+/**
+ * wq_init_lockdep - 初始化工作队列的lockdep映射
+ * @wq: 目标工作队列
+ *
+ * 为工作队列注册独立的lockdep key，并以"(wq_completion)wq_name"格式
+ * 命名lockdep map，用于检测flush_workqueue()的死锁依赖。
+ */
 #ifdef CONFIG_LOCKDEP
 static void wq_init_lockdep(struct workqueue_struct *wq)
 {
@@ -3459,11 +4136,23 @@ static void wq_init_lockdep(struct workqueue_struct *wq)
 	lockdep_init_map(&wq->lockdep_map, lock_name, &wq->key, 0);
 }
 
+/**
+ * wq_unregister_lockdep - 注销工作队列的lockdep key
+ * @wq: 目标工作队列
+ *
+ * 在destroy_workqueue()时调用，释放wq的专属lockdep key。
+ */
 static void wq_unregister_lockdep(struct workqueue_struct *wq)
 {
 	lockdep_unregister_key(&wq->key);
 }
 
+/**
+ * wq_free_lockdep - 释放lockdep使用的lock_name字符串
+ * @wq: 目标工作队列
+ *
+ * 若lock_name是单独分配的（非直接指向wq->name），则kfree释放。
+ */
 static void wq_free_lockdep(struct workqueue_struct *wq)
 {
 	if (wq->lock_name != wq->name)
@@ -3483,6 +4172,13 @@ static void wq_free_lockdep(struct workqueue_struct *wq)
 }
 #endif
 
+/**
+ * rcu_free_wq - RCU延迟释放workqueue_struct
+ *
+ * destroy_workqueue()通过call_rcu()注册的回调，在RCU宽限期后
+ * 执行：释放lockdep map，释放per-cpu pwqs或unbound_attrs，
+ * 最后kfree整个wq结构。
+ */
 static void rcu_free_wq(struct rcu_head *rcu)
 {
 	struct workqueue_struct *wq =
@@ -3498,6 +4194,12 @@ static void rcu_free_wq(struct rcu_head *rcu)
 	kfree(wq);
 }
 
+/**
+ * rcu_free_pool - RCU延迟释放worker_pool
+ *
+ * RCU回调，在所有RCU读者退出后，销毁pool->worker_ida，
+ * 释放pool->attrs，最后kfree整个pool结构。
+ */
 static void rcu_free_pool(struct rcu_head *rcu)
 {
 	struct worker_pool *pool = container_of(rcu, struct worker_pool, rcu);
@@ -3507,6 +4209,13 @@ static void rcu_free_pool(struct rcu_head *rcu)
 	kfree(pool);
 }
 
+/**
+ * wq_manager_inactive - 等待pool manager退出并持有lock
+ *
+ * 若pool当前没有活跃manager（POOL_MANAGER_ACTIVE未设），
+ * 获取pool->lock并返回true；否则释放lock并返回false。
+ * 用于put_unbound_pool()在销毁pool前确保无manager在运行。
+ */
 /* This returns with the lock held on success (pool manager is inactive). */
 static bool wq_manager_inactive(struct worker_pool *pool)
 {
@@ -3529,6 +4238,13 @@ static bool wq_manager_inactive(struct worker_pool *pool)
  * successfully or not, init_worker_pool().
  *
  * Should be called with wq_pool_mutex held.
+ */
+/**
+ * put_unbound_pool - 释放unbound worker_pool引用
+ *
+ * 对@pool引用计数减一，若降至0则销毁：先驱逐所有idle worker，
+ * 等待detach完成，从哈希表移除，最后通过call_rcu()延迟释放
+ * pool结构。需持有wq_pool_mutex。
  */
 static void put_unbound_pool(struct worker_pool *pool)
 {
@@ -3596,6 +4312,13 @@ static void put_unbound_pool(struct worker_pool *pool)
  * Return: On success, a worker_pool with the same attributes as @attrs.
  * On failure, %NULL.
  */
+/**
+ * get_unbound_pool - 获取或创建匹配属性的unbound worker_pool
+ *
+ * 在wq_unbound_pool_hash中按@attrs哈希查找已有pool，找到则
+ * 递增引用计数返回；否则创建新pool，绑定对应NUMA节点，插入
+ * 哈希表并启动pool管理。需持有wq_pool_mutex。
+ */
 static struct worker_pool *get_unbound_pool(const struct workqueue_attrs *attrs)
 {
 	u32 hash = wqattrs_hash(attrs);
@@ -3656,6 +4379,12 @@ fail:
 	return NULL;
 }
 
+/**
+ * rcu_free_pwq - RCU延迟释放pool_workqueue结构
+ *
+ * pwq_unbound_release_workfn()通过call_rcu()注册的回调，
+ * 在所有RCU读者退出后直接kfree @pwq结构。
+ */
 static void rcu_free_pwq(struct rcu_head *rcu)
 {
 	kmem_cache_free(pwq_cache,
@@ -3665,6 +4394,13 @@ static void rcu_free_pwq(struct rcu_head *rcu)
 /*
  * Scheduled on system_wq by put_pwq() when an unbound pwq hits zero refcnt
  * and needs to be destroyed.
+ */
+/**
+ * pwq_unbound_release_workfn - 异步释放unbound pwq的工作函数
+ *
+ * put_pwq()在unbound pwq引用计数降为0时调度此函数到system_wq。
+ * 从wq和pool解绑pwq，调用put_unbound_pool()，然后通过
+ * call_rcu()延迟释放pwq结构。若这是最后一个pwq则同时释放wq。
  */
 static void pwq_unbound_release_workfn(struct work_struct *work)
 {
@@ -3706,6 +4442,13 @@ static void pwq_unbound_release_workfn(struct work_struct *work)
  * workqueue's saved_max_active and activate delayed work items
  * accordingly.  If @pwq is freezing, clear @pwq->max_active to zero.
  */
+/**
+ * pwq_adjust_max_active - 更新pwq的max_active为当前设置值
+ *
+ * 若队列正在冻结（WQ_FREEZABLE且系统frozen），将max_active
+ * 置0阻止新work执行；解冻后恢复saved_max_active并激活
+ * 所有积压的delayed_works，恢复正常并发处理能力。
+ */
 static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 {
 	struct workqueue_struct *wq = pwq->wq;
@@ -3746,6 +4489,13 @@ static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 	raw_spin_unlock_irqrestore(&pwq->pool->lock, flags);
 }
 
+/**
+ * init_pwq - 初始化新分配的pool_workqueue结构
+ *
+ * 将@pwq与@wq和@pool关联，初始化nr_in_flight数组、nr_active、
+ * max_active（来自wq->saved_max_active）、delayed_works链表
+ * 和unbound_release_work。是创建pwq的第一步。
+ */
 /* initialize newly alloced @pwq which is associated with @wq and @pool */
 static void init_pwq(struct pool_workqueue *pwq, struct workqueue_struct *wq,
 		     struct worker_pool *pool)
@@ -3764,6 +4514,13 @@ static void init_pwq(struct pool_workqueue *pwq, struct workqueue_struct *wq,
 	INIT_WORK(&pwq->unbound_release_work, pwq_unbound_release_workfn);
 }
 
+/**
+ * link_pwq - 将pwq同步到wq当前状态并链入wq数据结构
+ *
+ * 在持有wq->mutex时调用：将@pwq加入wq->pwqs链表，调用
+ * pwq_adjust_max_active()同步max_active。可被多次调用，
+ * 已链接时直接返回。
+ */
 /* sync @pwq with the current state of its associated wq and link it */
 static void link_pwq(struct pool_workqueue *pwq)
 {
@@ -3785,6 +4542,13 @@ static void link_pwq(struct pool_workqueue *pwq)
 	list_add_rcu(&pwq->pwqs_node, &wq->pwqs);
 }
 
+/**
+ * alloc_unbound_pwq - 获取匹配pool并创建新的unbound pwq
+ *
+ * 调用get_unbound_pool()获取与@attrs匹配的worker_pool，
+ * 分配pwq并调用init_pwq()初始化。需持有wq_pool_mutex。
+ * 失败时put_unbound_pool()并返回NULL。
+ */
 /* obtain a pool matching @attr and create a pwq associating the pool and @wq */
 static struct pool_workqueue *alloc_unbound_pwq(struct workqueue_struct *wq,
 					const struct workqueue_attrs *attrs)
@@ -3830,6 +4594,13 @@ static struct pool_workqueue *alloc_unbound_pwq(struct workqueue_struct *wq,
  * Return: %true if the resulting @cpumask is different from @attrs->cpumask,
  * %false if equal.
  */
+/**
+ * wq_calc_node_cpumask - 计算特定NUMA节点的有效cpumask
+ *
+ * 当wq_numa_enabled且@node有在线CPU时，将@cpumask设置为
+ * @attrs->cpumask与@node可用CPU的交集；否则直接用@attrs->cpumask。
+ * 返回true表示结果与@attrs->cpumask不同（需要独立pool），false表示相同。
+ */
 static bool wq_calc_node_cpumask(const struct workqueue_attrs *attrs, int node,
 				 int cpu_going_down, cpumask_t *cpumask)
 {
@@ -3860,6 +4631,13 @@ use_dfl:
 	return false;
 }
 
+/**
+ * numa_pwq_tbl_install - 安装新pwq到wq的NUMA节点pwq表
+ *
+ * 以RCU方式将@pwq安装到@wq->numa_pwq_tbl[@node]，返回旧的pwq。
+ * 调用者需持有wq->mutex，确保安装的原子性，旧pwq由调用者负责
+ * put_pwq_unlocked()释放。
+ */
 /* install @pwq into @wq's numa_pwq_tbl[] for @node and return the old pwq */
 static struct pool_workqueue *numa_pwq_tbl_install(struct workqueue_struct *wq,
 						   int node,
@@ -3887,6 +4665,12 @@ struct apply_wqattrs_ctx {
 	struct pool_workqueue	*pwq_tbl[];
 };
 
+/**
+ * apply_wqattrs_cleanup - 释放apply_wqattrs_ctx及其pwq资源
+ *
+ * 无论apply成功还是中止，都调用此函数清理上下文：逐NUMA节点
+ * put_pwq_unlocked()旧pwq，释放dfl_pwq，最后kfree ctx本身。
+ */
 /* free the resources after success or abort */
 static void apply_wqattrs_cleanup(struct apply_wqattrs_ctx *ctx)
 {
@@ -3974,6 +4758,13 @@ out_free:
 	return NULL;
 }
 
+/**
+ * apply_wqattrs_commit - 提交新pwq配置，原子替换wq中的旧pwq
+ *
+ * 持有wq->mutex后，将ctx中准备好的新pwq逐NUMA节点安装到wq，
+ * 更新dfl_pwq和unbound_attrs，并link所有新pwq。ctx返回时
+ * 携带旧pwq，由调用者通过apply_wqattrs_cleanup()释放。
+ */
 /* set attrs and install prepared pwqs, @ctx points to old pwqs on return */
 static void apply_wqattrs_commit(struct apply_wqattrs_ctx *ctx)
 {
@@ -3996,6 +4787,12 @@ static void apply_wqattrs_commit(struct apply_wqattrs_ctx *ctx)
 	mutex_unlock(&ctx->wq->mutex);
 }
 
+/**
+ * apply_wqattrs_lock - 获取apply_wqattrs所需的全局锁
+ *
+ * 在创建和安装新pwq前调用：先get_online_cpus()防止CPU热插拔，
+ * 再锁wq_pool_mutex保护pool哈希表，确保pwq创建期间CPU拓扑稳定。
+ */
 static void apply_wqattrs_lock(void)
 {
 	/* CPUs should stay stable across pwq creations and installations */
@@ -4003,12 +4800,25 @@ static void apply_wqattrs_lock(void)
 	mutex_lock(&wq_pool_mutex);
 }
 
+/**
+ * apply_wqattrs_unlock - 释放apply_wqattrs所需的全局锁
+ *
+ * 与apply_wqattrs_lock()配对：解锁wq_pool_mutex，然后
+ * put_online_cpus()允许CPU热插拔继续。
+ */
 static void apply_wqattrs_unlock(void)
 {
 	mutex_unlock(&wq_pool_mutex);
 	put_online_cpus();
 }
 
+/**
+ * apply_workqueue_attrs_locked - 已持锁版本的wq属性应用
+ *
+ * 在已持有apply_wqattrs_lock()的情况下，为unbound工作队列
+ * 创建新的per-NUMA pwq集合并原子替换旧配置。仅允许unbound
+ * 工作队列修改属性，bound工作队列返回-EINVAL。
+ */
 static int apply_workqueue_attrs_locked(struct workqueue_struct *wq,
 					const struct workqueue_attrs *attrs)
 {
@@ -4055,6 +4865,13 @@ static int apply_workqueue_attrs_locked(struct workqueue_struct *wq,
  *
  * Return: 0 on success and -errno on failure.
  */
+/**
+ * apply_workqueue_attrs - 为unbound工作队列应用新属性
+ *
+ * 对@wq应用@attrs：在NUMA机器上为每个cpumask覆盖的NUMA节点
+ * 创建独立pwq，实现work的NUMA亲和性。旧pwq在in-flight work
+ * 完成后异步释放。仅适用于unbound工作队列。
+ */
 int apply_workqueue_attrs(struct workqueue_struct *wq,
 			  const struct workqueue_attrs *attrs)
 {
@@ -4090,6 +4907,13 @@ int apply_workqueue_attrs(struct workqueue_struct *wq,
  * workqueues behave on CPU_DOWN.  If a workqueue user wants strict
  * affinity, it's the user's responsibility to flush the work item from
  * CPU_DOWN_PREPARE.
+ */
+/**
+ * wq_update_unbound_numa - CPU上下线时更新unbound工作队列NUMA映射
+ *
+ * 当CPU online/offline时调用，为该CPU所属NUMA节点重新计算
+ * cpumask并更新对应pwq。确保工作队列的NUMA亲和性在CPU拓扑
+ * 变化时保持正确。需持有wq_pool_mutex。
  */
 static void wq_update_unbound_numa(struct workqueue_struct *wq, int cpu,
 				   bool online)
@@ -4154,6 +4978,13 @@ out_unlock:
 	put_pwq_unlocked(old_pwq);
 }
 
+/**
+ * alloc_and_link_pwqs - 为新工作队列分配并链接所有pwq
+ *
+ * 对于bound工作队列：为每个CPU分配per-cpu pwq并与对应的per-cpu
+ * worker_pool关联；对于unbound工作队列：调用apply_workqueue_attrs()
+ * 按属性创建NUMA感知的pwq集合。
+ */
 static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 {
 	bool highpri = wq->flags & WQ_HIGHPRI;
@@ -4194,6 +5025,13 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 	return ret;
 }
 
+/**
+ * wq_clamp_max_active - 将max_active限制在合法范围内
+ *
+ * 根据队列类型（UNBOUND限制更宽松）计算上限，将@max_active
+ * 夹在[1, lim]区间并发出越界警告。用于alloc_workqueue()和
+ * workqueue_set_max_active()时规范化用户输入。
+ */
 static int wq_clamp_max_active(int max_active, unsigned int flags,
 			       const char *name)
 {
@@ -4209,6 +5047,13 @@ static int wq_clamp_max_active(int max_active, unsigned int flags,
 /*
  * Workqueues which may be used during memory reclaim should have a rescuer
  * to guarantee forward progress.
+ */
+/**
+ * init_rescuer - 为WQ_MEM_RECLAIM工作队列初始化rescuer线程
+ *
+ * 仅WQ_MEM_RECLAIM队列需要rescuer。分配worker结构，创建
+ * rescuer_thread内核线程并设置PF_MEMALLOC，确保在内存紧张
+ * 时能为该队列的work提供前向进度保证。
  */
 static int init_rescuer(struct workqueue_struct *wq)
 {
@@ -4238,6 +5083,16 @@ static int init_rescuer(struct workqueue_struct *wq)
 }
 
 __printf(1, 4)
+/**
+ * alloc_workqueue - 创建工作队列（通用接口）
+ *
+ * 分配workqueue_struct和per-CPU的pool_workqueue，初始化各项参数：
+ * - WQ_UNBOUND：创建unbound worker_pool，不绑定特定CPU
+ * - WQ_MEM_RECLAIM：创建救援线程（rescuer_thread）防止内存回收死锁
+ * - max_active：限制同时执行的work数量（0=无限制）
+ * 返回workqueue指针，失败返回NULL。通常通过alloc_ordered_workqueue()
+ * 或系统预定义队列（system_wq等）使用而非直接调用。
+ */
 struct workqueue_struct *alloc_workqueue(const char *fmt,
 					 unsigned int flags,
 					 int max_active, ...)
@@ -4335,6 +5190,14 @@ err_destroy:
 }
 EXPORT_SYMBOL_GPL(alloc_workqueue);
 
+/**
+ * pwq_busy - 检查pwq是否仍有未完成的work活动
+ * @pwq: 目标pool_workqueue
+ *
+ * 检查pwq是否可安全销毁：若任一颜色的nr_in_flight非零、
+ * 非默认pwq且引用计数>1、或有active/delayed work则返回true。
+ * 在destroy_workqueue()中用于判断是否可以安全释放pwq。
+ */
 static bool pwq_busy(struct pool_workqueue *pwq)
 {
 	int i;
@@ -4356,6 +5219,14 @@ static bool pwq_busy(struct pool_workqueue *pwq)
  * @wq: target workqueue
  *
  * Safely destroy a workqueue. All work currently pending will be done first.
+ */
+/**
+ * destroy_workqueue - 安全销毁工作队列
+ *
+ * 销毁流程：先注销sysfs条目，再drain_workqueue()等待所有work完成，
+ * 然后停止rescuer线程，最后释放per-cpu或NUMA pwq引用。对于bound队列
+ * 通过call_rcu()延迟释放；对于unbound队列逐NUMA节点drop pwq引用，
+ * 最后一个pwq释放时自动free整个wq结构。
  */
 void destroy_workqueue(struct workqueue_struct *wq)
 {
@@ -4454,6 +5325,13 @@ EXPORT_SYMBOL_GPL(destroy_workqueue);
  * CONTEXT:
  * Don't call from IRQ context.
  */
+/**
+ * workqueue_set_max_active - 动态修改工作队列的max_active
+ *
+ * 修改@wq的max_active并立即更新所有关联pwq的max_active值，
+ * 若有delayed_works等待，适时激活。有序队列（__WQ_ORDERED_EXPLICIT）
+ * 禁止修改。不可从IRQ上下文调用。
+ */
 void workqueue_set_max_active(struct workqueue_struct *wq, int max_active)
 {
 	struct pool_workqueue *pwq;
@@ -4484,6 +5362,12 @@ EXPORT_SYMBOL_GPL(workqueue_set_max_active);
  *
  * Return: work struct if %current task is a workqueue worker, %NULL otherwise.
  */
+/**
+ * current_work - 获取当前worker正在执行的work
+ *
+ * 若当前任务是工作线程，返回其正在执行的work_struct指针；
+ * 否则返回NULL。可在work回调中调用以获取自身work对象。
+ */
 struct work_struct *current_work(void)
 {
 	struct worker *worker = current_wq_worker();
@@ -4499,6 +5383,13 @@ EXPORT_SYMBOL(current_work);
  * work functions to determine whether it's being run off the rescuer task.
  *
  * Return: %true if %current is a workqueue rescuer. %false otherwise.
+ */
+/**
+ * current_is_workqueue_rescuer - 检查当前任务是否为workqueue rescuer
+ *
+ * 返回true表示当前任务是WQ_MEM_RECLAIM队列的rescuer线程
+ * （worker->rescue_wq非NULL）。可用于判断当前是否在内存
+ * 回收安全路径中执行。
  */
 bool current_is_workqueue_rescuer(void)
 {
@@ -4525,6 +5416,13 @@ bool current_is_workqueue_rescuer(void)
  * Return:
  * %true if congested, %false otherwise.
  */
+/**
+ * workqueue_congested - 检查工作队列是否拥塞
+ *
+ * 检查@cpu（或当前CPU）对应pwq的delayed_works链表是否非空，
+ * 非空表示有work因达到max_active限制而被延迟，队列已拥塞。
+ * 可用于背压控制，决定是否继续入队或等待。
+ */
 bool workqueue_congested(int cpu, struct workqueue_struct *wq)
 {
 	struct pool_workqueue *pwq;
@@ -4550,15 +5448,13 @@ bool workqueue_congested(int cpu, struct workqueue_struct *wq)
 EXPORT_SYMBOL_GPL(workqueue_congested);
 
 /**
- * work_busy - test whether a work is currently pending or running
- * @work: the work to be tested
+ * work_busy - 查询work当前是否处于pending或running状态
+ * @work: 要检测的work_struct
  *
- * Test whether @work is currently pending or running.  There is no
- * synchronization around this function and the test result is
- * unreliable and only useful as advisory hints or for debugging.
+ * 无同步保证，结果仅供参考（调试/建议用）。检查PENDING位判断是否待执行，
+ * 并在关联pool中查找是否有worker正在执行该work。
  *
- * Return:
- * OR'd bitmask of WORK_BUSY_* bits.
+ * Return: WORK_BUSY_PENDING和/或WORK_BUSY_RUNNING的OR组合。
  */
 unsigned int work_busy(struct work_struct *work)
 {
@@ -4593,6 +5489,13 @@ EXPORT_SYMBOL_GPL(work_busy);
  * information will be printed out together to help debugging.  The
  * description can be at most WORKER_DESC_LEN including the trailing '\0'.
  */
+/**
+ * set_worker_desc - 设置当前worker的描述字符串
+ *
+ * 在work回调中调用，为当前worker设置描述信息（最多
+ * WORKER_DESC_LEN字节）。信息在任务崩溃时随task dump
+ * 一起输出，方便调试定位具体是哪个work导致问题。
+ */
 void set_worker_desc(const char *fmt, ...)
 {
 	struct worker *worker = current_wq_worker();
@@ -4618,6 +5521,16 @@ EXPORT_SYMBOL_GPL(set_worker_desc);
  * This function can be safely called on any task as long as the
  * task_struct itself is accessible.  While safe, this function isn't
  * synchronized and may print out mixups or garbages of limited length.
+ */
+/**
+ * print_worker_info - 打印worker任务信息（用于任务转储）
+ * @log_lvl: 内核日志级别字符串（如KERN_INFO）
+ * @task: 目标任务结构体
+ *
+ * 若@task是一个worker且正在执行work，则打印当前work函数名、
+ * 所属工作队列名以及通过set_worker_desc()设置的描述字符串。
+ * 使用copy_from_kernel_nofault()安全读取可能未同步的worker状态，
+ * 避免因并发修改导致崩溃，适合在任务转储（如sysrq-t）中调用。
  */
 void print_worker_info(const char *log_lvl, struct task_struct *task)
 {
@@ -4655,6 +5568,13 @@ void print_worker_info(const char *log_lvl, struct task_struct *task)
 	}
 }
 
+/**
+ * pr_cont_pool_info - 打印worker_pool基本属性信息
+ * @pool: 目标worker_pool
+ *
+ * 以pr_cont方式（续接上一行）输出pool的cpumask、NUMA节点号、
+ * flags和nice值，供show_pwq()和show_workqueue_state()调用。
+ */
 static void pr_cont_pool_info(struct worker_pool *pool)
 {
 	pr_cont(" cpus=%*pbl", nr_cpumask_bits, pool->attrs->cpumask);
@@ -4663,6 +5583,14 @@ static void pr_cont_pool_info(struct worker_pool *pool)
 	pr_cont(" flags=0x%x nice=%d", pool->flags, pool->attrs->nice);
 }
 
+/**
+ * pr_cont_work - 打印单个work项信息（续接当前行）
+ * @comma: 是否在输出前加逗号分隔符
+ * @work: 目标work_struct
+ *
+ * 若work是flush屏障（wq_barrier_func），则输出"BAR(pid)"格式；
+ * 否则输出work->func的函数名符号。用于show_pwq()的in-flight/pending列表展示。
+ */
 static void pr_cont_work(bool comma, struct work_struct *work)
 {
 	if (work->func == wq_barrier_func) {
@@ -4677,6 +5605,14 @@ static void pr_cont_work(bool comma, struct work_struct *work)
 	}
 }
 
+/**
+ * show_pwq - 显示pool_workqueue的详细运行状态
+ * @pwq: 目标pool_workqueue
+ *
+ * 依次打印pwq的active计数、max_active、refcnt、是否处于MAYDAY状态，
+ * 以及in-flight（正在执行）、pending（等待执行）和delayed（延迟等待激活）
+ * 三类work列表。由show_workqueue_state()在持pool->lock时调用。
+ */
 static void show_pwq(struct pool_workqueue *pwq)
 {
 	struct worker_pool *pool = pwq->pool;
@@ -4750,10 +5686,12 @@ static void show_pwq(struct pool_workqueue *pwq)
 }
 
 /**
- * show_workqueue_state - dump workqueue state
+ * show_workqueue_state - 转储所有工作队列和worker pool的当前状态
  *
- * Called from a sysrq handler or try_to_freeze_tasks() and prints out
- * all busy workqueues and pools.
+ * 由sysrq处理程序或try_to_freeze_tasks()调用，遍历所有工作队列和worker pool，
+ * 打印所有处于忙碌状态（有active或delayed work）的pwq详情，
+ * 以及所有非全空闲的pool的线程信息。每处理一个条目后调用
+ * touch_nmi_watchdog()以防止在原子上下文中长时间打印触发硬锁死检测。
  */
 void show_workqueue_state(void)
 {
@@ -4830,6 +5768,16 @@ void show_workqueue_state(void)
 	rcu_read_unlock();
 }
 
+/**
+ * wq_worker_comm - 生成worker任务的进程名字符串
+ * @buf: 输出缓冲区
+ * @size: 缓冲区大小
+ * @task: 目标任务结构体
+ *
+ * 用于/proc/PID/{comm,stat,status}接口，先写入实际comm名，
+ * 若任务是worker且有desc，则追加'+'（正在执行）或'-'（上次执行）
+ * 前缀的描述字符串，便于通过ps等工具查看worker当前处理的工作内容。
+ */
 /* used to show worker information through /proc/PID/{comm,stat,status} */
 void wq_worker_comm(char *buf, size_t size, struct task_struct *task)
 {
@@ -4886,6 +5834,15 @@ void wq_worker_comm(char *buf, size_t size, struct task_struct *task)
  * cpu comes back online.
  */
 
+/**
+ * unbind_workers - CPU下线时解除该CPU所有worker的绑定
+ * @cpu: 下线的CPU编号
+ *
+ * 遍历该CPU的所有worker_pool，将所有worker打上WORKER_UNBOUND标志，
+ * 并置POOL_DISASSOCIATED，随后清零nr_running关闭并发管理，
+ * 使pool以unbound方式继续处理work。调用schedule()穿越rq->lock，
+ * 确保调度回调能看到WORKER_UNBOUND标志。最后唤醒worker以避免stall。
+ */
 static void unbind_workers(int cpu)
 {
 	struct worker_pool *pool;
@@ -4940,10 +5897,13 @@ static void unbind_workers(int cpu)
 }
 
 /**
- * rebind_workers - rebind all workers of a pool to the associated CPU
- * @pool: pool of interest
+ * rebind_workers - CPU上线时将pool中所有worker重新绑定到该CPU
+ * @pool: 目标worker_pool（其关联CPU正在上线）
  *
- * @pool->cpu is coming online.  Rebind all workers to the CPU.
+ * 先恢复所有worker的CPU亲和性，再清除POOL_DISASSOCIATED标志，
+ * 然后将WORKER_UNBOUND替换为WORKER_REBOUND，唤醒所有空闲worker
+ * 让其迁移到上线CPU。worker在下次执行周期开始时通过worker_clr_flags()
+ * 清除REBOUND并恢复并发管理。需持wq_pool_attach_mutex调用。
  */
 static void rebind_workers(struct worker_pool *pool)
 {
@@ -5014,6 +5974,16 @@ static void rebind_workers(struct worker_pool *pool)
  * its cpus_allowed.  If @cpu is in @pool's cpumask which didn't have any
  * online CPU before, cpus_allowed of all its workers should be restored.
  */
+/**
+ * restore_unbound_workers_cpumask - 恢复unbound worker的cpumask绑定
+ * @pool: 目标unbound worker_pool
+ * @cpu: 正在上线的CPU
+ *
+ * unbound pool的cpumask可能不包含任何在线CPU，此时调度器会重置
+ * worker的cpus_allowed。当@cpu上线且属于@pool的cpumask范围时，
+ * 将pool中所有worker的cpus_allowed恢复为pool->attrs->cpumask与
+ * cpu_online_mask的交集，需持wq_pool_attach_mutex调用。
+ */
 static void restore_unbound_workers_cpumask(struct worker_pool *pool, int cpu)
 {
 	static cpumask_t cpumask;
@@ -5032,6 +6002,13 @@ static void restore_unbound_workers_cpumask(struct worker_pool *pool, int cpu)
 		WARN_ON_ONCE(set_cpus_allowed_ptr(worker->task, &cpumask) < 0);
 }
 
+/**
+ * workqueue_prepare_cpu - CPU上线前的工作队列准备（热插拔回调）
+ * @cpu: 即将上线的CPU编号
+ *
+ * 在CPU进入online状态之前调用，确保该CPU的每个worker_pool至少有
+ * 一个worker线程，若pool为空则创建初始worker，失败返回-ENOMEM。
+ */
 int workqueue_prepare_cpu(unsigned int cpu)
 {
 	struct worker_pool *pool;
@@ -5045,6 +6022,14 @@ int workqueue_prepare_cpu(unsigned int cpu)
 	return 0;
 }
 
+/**
+ * workqueue_online_cpu - CPU上线时的工作队列处理（热插拔回调）
+ * @cpu: 上线的CPU编号
+ *
+ * 遍历所有worker_pool：对绑定到该CPU的pool调用rebind_workers()重新绑定；
+ * 对unbound pool调用restore_unbound_workers_cpumask()恢复cpumask；
+ * 然后更新所有unbound工作队列的NUMA亲和性映射（wq_update_unbound_numa）。
+ */
 int workqueue_online_cpu(unsigned int cpu)
 {
 	struct worker_pool *pool;
@@ -5072,6 +6057,13 @@ int workqueue_online_cpu(unsigned int cpu)
 	return 0;
 }
 
+/**
+ * workqueue_offline_cpu - CPU下线时的工作队列处理（热插拔回调）
+ * @cpu: 下线的CPU编号（必须是当前CPU）
+ *
+ * 必须在目标CPU本地执行（unbind_workers要求），解绑该CPU所有worker，
+ * 然后更新所有unbound工作队列的NUMA亲和性映射，移除对下线CPU的依赖。
+ */
 int workqueue_offline_cpu(unsigned int cpu)
 {
 	struct workqueue_struct *wq;
@@ -5098,6 +6090,13 @@ struct work_for_cpu {
 	long ret;
 };
 
+/**
+ * work_for_cpu_fn - 在目标CPU上执行指定函数的work回调
+ * @work: 嵌入在work_for_cpu结构中的work_struct
+ *
+ * 从work_for_cpu容器中取出fn和arg，执行并将返回值存入ret，
+ * 供work_on_cpu()和work_on_cpu_safe()通过flush_work()同步获取结果。
+ */
 static void work_for_cpu_fn(struct work_struct *work)
 {
 	struct work_for_cpu *wfc = container_of(work, struct work_for_cpu, work);
@@ -5115,6 +6114,17 @@ static void work_for_cpu_fn(struct work_struct *work)
  * The caller must not hold any locks which would prevent @fn from completing.
  *
  * Return: The value @fn returns.
+ */
+/**
+ * work_on_cpu - 在指定CPU的线程上下文中运行函数
+ * @cpu: 目标CPU编号
+ * @fn: 要执行的函数指针
+ * @arg: 传给@fn的参数
+ *
+ * 将@fn封装成栈上work，调度到@cpu上执行，同步等待完成后返回@fn的返回值。
+ * 调用者需确保@cpu不会下线，且不能持有会阻止@fn完成的锁。
+ *
+ * Return: @fn的返回值。
  */
 long work_on_cpu(int cpu, long (*fn)(void *), void *arg)
 {
@@ -5139,6 +6149,18 @@ EXPORT_SYMBOL_GPL(work_on_cpu);
  *
  * Return: The value @fn returns.
  */
+/**
+ * work_on_cpu_safe - 安全地在指定CPU的线程上下文中运行函数
+ * @cpu: 目标CPU编号
+ * @fn: 要执行的函数指针
+ * @arg: 传给@fn的参数
+ *
+ * 在持有cpu_hotplug锁（get_online_cpus）的情况下调用work_on_cpu()，
+ * 防止执行期间CPU下线。若@cpu已离线则返回-ENODEV。
+ * 调用者不能持有会阻止@fn完成的锁。
+ *
+ * Return: @fn的返回值，或-ENODEV（CPU已离线）。
+ */
 long work_on_cpu_safe(int cpu, long (*fn)(void *), void *arg)
 {
 	long ret = -ENODEV;
@@ -5155,14 +6177,11 @@ EXPORT_SYMBOL_GPL(work_on_cpu_safe);
 #ifdef CONFIG_FREEZER
 
 /**
- * freeze_workqueues_begin - begin freezing workqueues
+ * freeze_workqueues_begin - 开始冻结所有可冻结工作队列
  *
- * Start freezing workqueues.  After this function returns, all freezable
- * workqueues will queue new works to their delayed_works list instead of
- * pool->worklist.
- *
- * CONTEXT:
- * Grabs and releases wq_pool_mutex, wq->mutex and pool->lock's.
+ * 设置workqueue_freezing标志，然后对所有工作队列调用pwq_adjust_max_active()，
+ * 使WQ_FREEZABLE队列将新work放入delayed_works而不是立即执行，
+ * 为系统挂起/休眠做准备。需持wq_pool_mutex、wq->mutex和pool->lock。
  */
 void freeze_workqueues_begin(void)
 {
@@ -5185,17 +6204,13 @@ void freeze_workqueues_begin(void)
 }
 
 /**
- * freeze_workqueues_busy - are freezable workqueues still busy?
+ * freeze_workqueues_busy - 检查可冻结工作队列是否仍有work在执行
  *
- * Check whether freezing is complete.  This function must be called
- * between freeze_workqueues_begin() and thaw_workqueues().
+ * 必须在freeze_workqueues_begin()之后、thaw_workqueues()之前调用。
+ * 遍历所有WQ_FREEZABLE工作队列，若任一pwq的nr_active不为零则返回true，
+ * 表示冻结尚未完成。nr_active单调递减，可在RCU读锁下无锁检查。
  *
- * CONTEXT:
- * Grabs and releases wq_pool_mutex.
- *
- * Return:
- * %true if some freezable workqueues are still busy.  %false if freezing
- * is complete.
+ * Return: %true表示仍有忙碌的可冻结工作队列，%false表示冻结完成。
  */
 bool freeze_workqueues_busy(void)
 {
@@ -5239,6 +6254,13 @@ out_unlock:
  * CONTEXT:
  * Grabs and releases wq_pool_mutex, wq->mutex and pool->lock's.
  */
+/**
+ * thaw_workqueues - 解冻所有可冻结工作队列
+ *
+ * 清除workqueue_freezing标志，然后对所有工作队列调用pwq_adjust_max_active()，
+ * 恢复max_active并将delayed_works中积压的work重新推入worklist执行，
+ * 在系统从挂起/休眠恢复时调用。
+ */
 void thaw_workqueues(void)
 {
 	struct workqueue_struct *wq;
@@ -5264,6 +6286,13 @@ out_unlock:
 }
 #endif /* CONFIG_FREEZER */
 
+/**
+ * workqueue_apply_unbound_cpumask - 将wq_unbound_cpumask应用到所有unbound工作队列
+ *
+ * 遍历所有WQ_UNBOUND且非__WQ_ORDERED的工作队列，以当前wq_unbound_cpumask
+ * 为基础通过apply_wqattrs_prepare()准备新pwq配置，全部准备好后批量提交。
+ * 若任一prepare失败则放弃所有提交，返回错误码。需持wq_pool_mutex调用。
+ */
 static int workqueue_apply_unbound_cpumask(void)
 {
 	LIST_HEAD(ctxs);
@@ -5299,16 +6328,14 @@ static int workqueue_apply_unbound_cpumask(void)
 }
 
 /**
- *  workqueue_set_unbound_cpumask - Set the low-level unbound cpumask
- *  @cpumask: the cpumask to set
+ * workqueue_set_unbound_cpumask - 设置全局unbound工作队列的cpumask
+ * @cpumask: 新的cpumask（与cpu_possible_mask取交集后生效）
  *
- *  The low-level workqueues cpumask is a global cpumask that limits
- *  the affinity of all unbound workqueues.  This function check the @cpumask
- *  and apply it to all unbound workqueues and updates all pwqs of them.
+ * wq_unbound_cpumask是限制所有unbound工作队列CPU亲和性的全局掩码。
+ * 先保存旧值，更新后调用workqueue_apply_unbound_cpumask()应用到全部unbound wq；
+ * 若应用失败则回滚到旧值。允许包含isolated CPU。
  *
- *  Retun:	0	- Success
- *  		-EINVAL	- Invalid @cpumask
- *  		-ENOMEM	- Failed to allocate memory for attrs or pwqs.
+ * Return: 0成功，-EINVAL cpumask为空，-ENOMEM内存不足。
  */
 int workqueue_set_unbound_cpumask(cpumask_var_t cpumask)
 {
@@ -5365,6 +6392,13 @@ struct wq_device {
 	struct device			dev;
 };
 
+/**
+ * dev_to_wq - 从sysfs device获取关联的workqueue_struct
+ * @dev: sysfs设备对象
+ *
+ * 通过container_of从wq_device结构取出对应的workqueue_struct指针，
+ * 供各sysfs属性show/store回调使用。
+ */
 static struct workqueue_struct *dev_to_wq(struct device *dev)
 {
 	struct wq_device *wq_dev = container_of(dev, struct wq_device, dev);
@@ -5381,6 +6415,15 @@ static ssize_t per_cpu_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(per_cpu);
 
+/**
+ * max_active_show - 读取工作队列max_active属性
+ * @dev: sysfs device对象
+ * @attr: 设备属性描述符
+ * @buf: 输出缓冲区
+ *
+ * 返回wq->saved_max_active当前值（字符串形式），对应
+ * /sys/bus/workqueue/devices/WQ_NAME/max_active。
+ */
 static ssize_t max_active_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
@@ -5389,6 +6432,15 @@ static ssize_t max_active_show(struct device *dev,
 	return scnprintf(buf, PAGE_SIZE, "%d\n", wq->saved_max_active);
 }
 
+/**
+ * max_active_store - 写入工作队列max_active属性
+ * @dev: sysfs device对象
+ * @attr: 设备属性描述符
+ * @buf: 用户写入的字符串
+ * @count: 字符串长度
+ *
+ * 解析正整数并调用workqueue_set_max_active()动态修改wq的并发度上限。
+ */
 static ssize_t max_active_store(struct device *dev,
 				struct device_attribute *attr, const char *buf,
 				size_t count)
@@ -5446,6 +6498,14 @@ static ssize_t wq_nice_show(struct device *dev, struct device_attribute *attr,
 	return written;
 }
 
+/**
+ * wq_sysfs_prep_attrs - 为sysfs store操作准备workqueue_attrs副本
+ * @wq: 目标工作队列
+ *
+ * 分配新attrs并拷贝wq->unbound_attrs当前值，供wq_nice_store/
+ * wq_cpumask_store等sysfs写回调修改后通过apply_workqueue_attrs()应用。
+ * 需持wq_pool_mutex调用。返回NULL表示内存分配失败。
+ */
 /* prepare workqueue_attrs for sysfs store operations */
 static struct workqueue_attrs *wq_sysfs_prep_attrs(struct workqueue_struct *wq)
 {
@@ -5609,6 +6669,13 @@ static struct device_attribute wq_sysfs_cpumask_attr =
 	__ATTR(cpumask, 0644, wq_unbound_cpumask_show,
 	       wq_unbound_cpumask_store);
 
+/**
+ * wq_sysfs_init - 初始化workqueue sysfs子系统
+ *
+ * 作为core_initcall注册workqueue虚拟总线（/sys/bus/workqueue），
+ * 并在总线根设备上创建全局unbound cpumask属性文件，
+ * 供用户空间通过sysfs查看和修改全局unbound工作队列CPU亲和性。
+ */
 static int __init wq_sysfs_init(void)
 {
 	int err;
@@ -5621,6 +6688,12 @@ static int __init wq_sysfs_init(void)
 }
 core_initcall(wq_sysfs_init);
 
+/**
+ * wq_device_release - 释放wq_device结构体
+ * @dev: 对应的sysfs device对象
+ *
+ * 当wq_device的引用计数归零时由设备框架调用，释放包含dev的wq_device内存。
+ */
 static void wq_device_release(struct device *dev)
 {
 	struct wq_device *wq_dev = container_of(dev, struct wq_device, dev);
@@ -5629,19 +6702,15 @@ static void wq_device_release(struct device *dev)
 }
 
 /**
- * workqueue_sysfs_register - make a workqueue visible in sysfs
- * @wq: the workqueue to register
+ * workqueue_sysfs_register - 将工作队列注册到sysfs
+ * @wq: 要注册的工作队列
  *
- * Expose @wq in sysfs under /sys/bus/workqueue/devices.
- * alloc_workqueue*() automatically calls this function if WQ_SYSFS is set
- * which is the preferred method.
+ * 在/sys/bus/workqueue/devices/下暴露@wq，供用户空间读写属性。
+ * alloc_workqueue*()在设置WQ_SYSFS时自动调用；若需在注册前先应用
+ * workqueue_attrs，则应直接调用本函数，避免用户空间与内核属性应用竞争。
+ * __WQ_ORDERED_EXPLICIT队列禁止注册（防止max_active被修改破坏顺序保证）。
  *
- * Workqueue user should use this function directly iff it wants to apply
- * workqueue_attrs before making the workqueue visible in sysfs; otherwise,
- * apply_workqueue_attrs() may race against userland updating the
- * attributes.
- *
- * Return: 0 on success, -errno on failure.
+ * Return: 0成功，-errno失败。
  */
 int workqueue_sysfs_register(struct workqueue_struct *wq)
 {
@@ -5697,10 +6766,11 @@ int workqueue_sysfs_register(struct workqueue_struct *wq)
 }
 
 /**
- * workqueue_sysfs_unregister - undo workqueue_sysfs_register()
- * @wq: the workqueue to unregister
+ * workqueue_sysfs_unregister - 从sysfs注销工作队列
+ * @wq: 要注销的工作队列
  *
- * If @wq is registered to sysfs by workqueue_sysfs_register(), unregister.
+ * 若@wq已通过workqueue_sysfs_register()注册，则将其从sysfs移除。
+ * 在destroy_workqueue()中调用，清理wq_dev设备对象。
  */
 static void workqueue_sysfs_unregister(struct workqueue_struct *wq)
 {
@@ -5741,6 +6811,12 @@ static struct timer_list wq_watchdog_timer;
 static unsigned long wq_watchdog_touched = INITIAL_JIFFIES;
 static DEFINE_PER_CPU(unsigned long, wq_watchdog_touched_cpu) = INITIAL_JIFFIES;
 
+/**
+ * wq_watchdog_reset_touched - 重置watchdog的所有touched时间戳
+ *
+ * 将全局wq_watchdog_touched和每个CPU的wq_watchdog_touched_cpu
+ * 都更新为当前jiffies，防止watchdog误报stall。
+ */
 static void wq_watchdog_reset_touched(void)
 {
 	int cpu;
@@ -5750,6 +6826,15 @@ static void wq_watchdog_reset_touched(void)
 		per_cpu(wq_watchdog_touched_cpu, cpu) = jiffies;
 }
 
+/**
+ * wq_watchdog_timer_fn - workqueue watchdog定时器回调
+ * @unused: 未使用的timer_list指针
+ *
+ * 周期性检查所有非空的worker_pool是否在阈值时间内有进展
+ * （worklist首项发生变化）。综合pool->watchdog_ts、全局touched和
+ * per-CPU touched三个时间戳取最新值，若超过阈值则打印"BUG: workqueue lockup"
+ * 并调用show_workqueue_state()转储状态，随后重置时间戳并重新arm定时器。
+ */
 static void wq_watchdog_timer_fn(struct timer_list *unused)
 {
 	unsigned long thresh = READ_ONCE(wq_watchdog_thresh) * HZ;
@@ -5804,6 +6889,13 @@ static void wq_watchdog_timer_fn(struct timer_list *unused)
 	mod_timer(&wq_watchdog_timer, jiffies + thresh);
 }
 
+/**
+ * wq_watchdog_touch - 更新watchdog的活跃时间戳（防误报）
+ * @cpu: 触摸的CPU编号，负数表示更新全局时间戳
+ *
+ * 在worker有实际进展时调用（由wq_worker_running等路径触发），
+ * 更新对应CPU或全局的touched时间戳，告知watchdog系统仍在正常运行。
+ */
 notrace void wq_watchdog_touch(int cpu)
 {
 	if (cpu >= 0)
@@ -5812,6 +6904,13 @@ notrace void wq_watchdog_touch(int cpu)
 		wq_watchdog_touched = jiffies;
 }
 
+/**
+ * wq_watchdog_set_thresh - 设置watchdog超时阈值并重置定时器
+ * @thresh: 新阈值（秒），0表示禁用watchdog
+ *
+ * 先将wq_watchdog_thresh置0并删除定时器，若新阈值非零则重新设置阈值、
+ * 重置所有touched时间戳并重新arm定时器，使新阈值立即生效。
+ */
 static void wq_watchdog_set_thresh(unsigned long thresh)
 {
 	wq_watchdog_thresh = 0;
@@ -5824,6 +6923,14 @@ static void wq_watchdog_set_thresh(unsigned long thresh)
 	}
 }
 
+/**
+ * wq_watchdog_param_set_thresh - module_param写回调：设置watchdog阈值
+ * @val: 用户写入的字符串值
+ * @kp: kernel_param描述符
+ *
+ * 将字符串解析为无符号长整数，若workqueue子系统已初始化则调用
+ * wq_watchdog_set_thresh()使其立即生效，否则仅更新全局变量供启动时使用。
+ */
 static int wq_watchdog_param_set_thresh(const char *val,
 					const struct kernel_param *kp)
 {
@@ -5850,6 +6957,12 @@ static const struct kernel_param_ops wq_watchdog_thresh_ops = {
 module_param_cb(watchdog_thresh, &wq_watchdog_thresh_ops, &wq_watchdog_thresh,
 		0644);
 
+/**
+ * wq_watchdog_init - 初始化workqueue watchdog定时器
+ *
+ * 设置TIMER_DEFERRABLE定时器并以默认阈值（wq_watchdog_thresh秒）
+ * 启动周期性检测，在workqueue子系统初始化时调用。
+ */
 static void wq_watchdog_init(void)
 {
 	timer_setup(&wq_watchdog_timer, wq_watchdog_timer_fn, TIMER_DEFERRABLE);
@@ -5862,6 +6975,14 @@ static inline void wq_watchdog_init(void) { }
 
 #endif	/* CONFIG_WQ_WATCHDOG */
 
+/**
+ * wq_numa_init - 初始化workqueue的NUMA亲和性支持
+ *
+ * 构建wq_numa_possible_cpumask表：为每个NUMA节点计算其可能的CPU掩码，
+ * 基于cpu_to_node()映射关系填充。若系统只有一个NUMA节点或
+ * wq_disable_numa为真则直接返回。失败或CPU-节点映射异常时禁用NUMA支持。
+ * 在workqueue_init_early()之后、SMP初始化完成后调用。
+ */
 static void __init wq_numa_init(void)
 {
 	cpumask_var_t *tbl;
@@ -5905,14 +7026,13 @@ static void __init wq_numa_init(void)
 }
 
 /**
- * workqueue_init_early - early init for workqueue subsystem
+ * workqueue_init_early - workqueue子系统早期初始化（第一阶段）
  *
- * This is the first half of two-staged workqueue subsystem initialization
- * and invoked as soon as the bare basics - memory allocation, cpumasks and
- * idr are up.  It sets up all the data structures and system workqueues
- * and allows early boot code to create workqueues and queue/cancel work
- * items.  Actual work item execution starts only after kthreads can be
- * created and scheduled right before early initcalls.
+ * 在内存分配、cpumask和IDR就绪后尽早调用。完成：
+ * 1) 初始化所有per-CPU worker_pool并分配ID；
+ * 2) 创建标准unbound和ordered wq的attrs模板；
+ * 3) 创建系统内置工作队列（system_wq、system_highpri_wq等）。
+ * 此后可创建工作队列和入队/取消work，但实际执行需等到kthread可创建时。
  */
 void __init workqueue_init_early(void)
 {
@@ -5984,13 +7104,14 @@ void __init workqueue_init_early(void)
 }
 
 /**
- * workqueue_init - bring workqueue subsystem fully online
+ * workqueue_init - workqueue子系统完全上线（第二阶段初始化）
  *
- * This is the latter half of two-staged workqueue subsystem initialization
- * and invoked as soon as kthreads can be created and scheduled.
- * Workqueues have been created and work items queued on them, but there
- * are no kworkers executing the work items yet.  Populate the worker pools
- * with the initial workers and enable future kworker creations.
+ * 在kthread可以被创建和调度后调用。此时工作队列已存在、work已入队，
+ * 但尚无worker在执行。本函数完成：
+ * 1) 调用wq_numa_init()初始化NUMA映射并修正per-CPU pool的节点提示；
+ * 2) 为已有工作队列更新NUMA亲和性并创建rescuer线程（WQ_MEM_RECLAIM）；
+ * 3) 为所有在线CPU的worker_pool和unbound pool创建初始worker；
+ * 4) 置wq_online=true并启动watchdog定时器。
  */
 void __init workqueue_init(void)
 {

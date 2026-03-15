@@ -7,6 +7,33 @@
  * Address space accounting code	<alan@lxorguk.ukuu.org.uk>
  */
 
+/**
+ * mm/mmap.c - 进程虚拟内存映射管理
+ *
+ * 实现Linux进程虚拟地址空间的映射管理，包括mmap/munmap/mprotect等
+ * 系统调用的核心实现，以及VMA（Virtual Memory Area）的生命周期管理。
+ *
+ * 核心数据结构：
+ *   struct vm_area_struct (VMA)
+ *     描述进程地址空间中一段连续的虚拟内存区域，记录其起止地址、
+ *     访问权限、映射的文件（或匿名映射）等信息。
+ *
+ *   mm_struct.mm_rb   - 以VMA起始地址为key的红黑树，O(log n)查找
+ *   mm_struct.mmap    - VMA按地址排序的链表，用于顺序遍历
+ *   mm_struct.vmacache- 最近访问VMA的缓存（4个槽），加速查找
+ *
+ * 按需分配（Demand Paging）：
+ *   mmap()只建立虚拟地址映射（创建VMA），并不立即分配物理内存。
+ *   第一次访问时触发缺页异常（#PF），由 handle_mm_fault() 按需分配物理页。
+ *
+ * 关键函数：
+ *   do_mmap()          - mmap系统调用核心，创建VMA并建立映射
+ *   mmap_region()      - 实际创建VMA并插入地址空间
+ *   find_vma()         - 按地址查找VMA（先查vmacache，再查红黑树）
+ *   do_munmap()        - munmap核心，拆除映射并释放VMA
+ *   vma_merge()        - 合并相邻且属性相同的VMA，减少VMA数量
+ */
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kernel.h>
@@ -171,6 +198,14 @@ void unlink_file_vma(struct vm_area_struct *vma)
 /*
  * Close a vm structure and free it, returning the next.
  */
+/**
+ * remove_vma - 销毁一个VMA并释放其资源
+ *
+ * 调用VMA的vm_ops->close()通知驱动/文件系统该映射即将消失，
+ * 释放关联文件的引用（fput），释放NUMA内存策略，最后释放
+ * vm_area_struct结构体本身。返回链表中的下一个VMA。
+ * 调用者需确保已解除所有页表映射（unmap_region/zap_page_range）。
+ */
 static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 {
 	struct vm_area_struct *next = vma->vm_next;
@@ -187,6 +222,25 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 
 static int do_brk_flags(unsigned long addr, unsigned long request, unsigned long flags,
 		struct list_head *uf);
+/**
+ * sys_brk - brk()系统调用：调整进程堆（数据段）的末端地址
+ * @brk: 期望的新堆末端地址
+ *
+ * brk() 是最简单的内存分配接口，直接扩展/收缩进程的堆区域：
+ *   - mm->start_brk：堆的起始地址（.bss段结束位置）
+ *   - mm->brk：堆的当前末端地址
+ *
+ * 执行流程：
+ *   1. 检查新brk地址的合法性（不低于start_brk，不超过RLIMIT_DATA）
+ *   2. 收缩堆（newbrk < oldbrk）：调用 do_munmap() 释放多余VMA
+ *   3. 扩展堆（newbrk > oldbrk）：
+ *      a. 检查是否可以扩展已有VMA（避免创建碎片）
+ *      b. 若需要新VMA，调用 do_brk_flags() 分配匿名页映射
+ *   4. 若设置了 MAP_POPULATE 或 VM_LOCKED，调用 mm_populate() 预分配物理页
+ *
+ * malloc()/free() 的底层实现通常通过 mmap(MAP_ANONYMOUS) 或 brk() 实现。
+ * glibc 对于小于 128KB 的分配倾向于用 brk()，大分配用 mmap()。
+ */
 SYSCALL_DEFINE1(brk, unsigned long, brk)
 {
 	unsigned long retval;
@@ -524,6 +578,23 @@ anon_vma_interval_tree_post_update_vma(struct vm_area_struct *vma)
 		anon_vma_interval_tree_insert(avc, &avc->anon_vma->rb_root);
 }
 
+/**
+ * find_vma_links - 在VMA红黑树中查找新VMA的插入位置
+ * @mm:         进程内存描述符
+ * @addr:       新映射的起始地址
+ * @end:        新映射的结束地址
+ * @pprev:      输出：新VMA的前驱VMA指针
+ * @rb_link:    输出：红黑树插入位置（父节点的left/right指针的地址）
+ * @rb_parent:  输出：红黑树父节点
+ *
+ * 在插入新VMA之前调用，完成两项工作：
+ *   1. 检查地址范围是否与已有VMA重叠（若重叠则返回 -ENOMEM）
+ *   2. 找到红黑树中的正确插入位置（二分查找，O(log N)）
+ *      - 遍历过程同时找到前驱VMA（最大的起始地址 < addr 的VMA）
+ *
+ * 找到位置后，调用 vma_link() 完成实际插入（红黑树 + 链表）。
+ * 返回0表示地址范围可用，-ENOMEM表示与已有映射冲突。
+ */
 static int find_vma_links(struct mm_struct *mm, unsigned long addr,
 		unsigned long end, struct vm_area_struct **pprev,
 		struct rb_node ***rb_link, struct rb_node **rb_parent)
@@ -602,6 +673,13 @@ munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len,
 
 	return 0;
 }
+/**
+ * count_vma_pages_range - 统计地址范围内已映射的页面数
+ *
+ * 遍历与[addr, end)范围重叠的所有VMA，累加其中属于该范围的页面数。
+ * 用于brk()扩展时检查是否覆盖了已有映射，以及mremap()时
+ * 验证目标地址范围是否空闲（或仅有允许的重叠）。
+ */
 static unsigned long count_vma_pages_range(struct mm_struct *mm,
 		unsigned long addr, unsigned long end)
 {
@@ -630,6 +708,23 @@ static unsigned long count_vma_pages_range(struct mm_struct *mm,
 	return nr_pages;
 }
 
+/**
+ * __vma_link_rb - 将VMA插入进程地址空间的红黑树
+ * @mm:        进程内存描述符
+ * @vma:       要插入的VMA
+ * @rb_link:   红黑树插入位置（由 find_vma_links() 确定）
+ * @rb_parent: 新节点的父节点
+ *
+ * VMA链接操作的红黑树部分（链表部分由调用者单独处理）：
+ *   1. 若新VMA有后继节点，更新后继节点的 vm_gap（空闲地址间隙）
+ *      否则更新 mm->highest_vm_end（最高VMA末端地址）
+ *   2. rb_insert_color_cached()：执行红黑树插入和颜色平衡
+ *   3. vma_gap_update() + vma_rb_augment_cb：沿树向上更新每个节点的
+ *      rb_subtree_gap（子树中最大空闲间隙），维护增强红黑树的不变量
+ *
+ * rb_subtree_gap 的维护使得 unmapped_area() 能以 O(log N) 查找
+ * 满足长度要求的空闲虚拟地址区间，而无需线性扫描所有VMA。
+ */
 void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 		struct rb_node **rb_link, struct rb_node *rb_parent)
 {
@@ -654,6 +749,13 @@ void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 	vma_rb_insert(vma, &mm->mm_rb);
 }
 
+/**
+ * __vma_link_file - 将VMA关联到文件的address_space映射树
+ *
+ * 若VMA映射了文件，将其插入文件的i_mmap区间树（interval tree）。
+ * 同时处理VM_DENYWRITE标志：若VMA要求独占写访问则减少文件写引用计数。
+ * 此操作使文件的mmap查询（如缺页处理、文件截断）能找到所有映射该文件的VMA。
+ */
 static void __vma_link_file(struct vm_area_struct *vma)
 {
 	struct file *file;
@@ -682,9 +784,17 @@ __vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
 	__vma_link_rb(mm, vma, rb_link, rb_parent);
 }
 
+/**
+ * vma_link - 将新VMA完整插入mm的所有数据结构
+ *
+ * 加锁版的VMA插入：若VMA映射文件则先获取i_mmap写锁，
+ * 然后调用__vma_link()同时插入mm->mm_rb红黑树和mm->mmap链表，
+ * 再调用__vma_link_file()将其加入文件的address_space区间树。
+ * 最后更新mm->map_count并释放文件映射锁。
+ */
 static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
-			struct vm_area_struct *prev, struct rb_node **rb_link,
-			struct rb_node *rb_parent)
+		struct vm_area_struct *prev, struct rb_node **rb_link,
+		struct rb_node *rb_parent)
 {
 	struct address_space *mapping = NULL;
 
@@ -706,6 +816,14 @@ static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
 /*
  * Helper for vma_adjust() in the split_vma insert case: insert a vma into the
  * mm's list and rbtree.  It has already been inserted into the interval tree.
+ */
+/**
+ * __insert_vm_struct - 将VMA插入mm数据结构（不加文件映射锁）
+ *
+ * 通过find_vma_links()找到正确插入位置，然后调用__vma_link()
+ * 插入红黑树和链表，并递增map_count。
+ * 不处理文件关联（不调用__vma_link_file），仅用于内部创建
+ * 不需要文件区间树维护的特殊VMA（如mremap的新VMA）。
  */
 static void __insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 {
@@ -735,6 +853,27 @@ static __always_inline void __vma_unlink(struct mm_struct *mm,
  * The following helper function should be used when such adjustments
  * are necessary.  The "insert" vma (if any) is to be inserted
  * before we drop the necessary locks.
+ */
+/**
+ * __vma_adjust - 调整VMA的边界范围（合并/拆分的底层实现）
+ * @vma:    要调整的目标VMA
+ * @start:  调整后的起始地址
+ * @end:    调整后的结束地址
+ * @pgoff:  调整后的文件页偏移
+ * @insert: 需要插入的新VMA（拆分场景，可为NULL）
+ * @expand: 需要扩展的VMA（合并场景，可为NULL）
+ *
+ * VMA调整的底层核心函数，被 vma_merge()、do_munmap()、mprotect() 等调用。
+ * 处理VMA边界变更时涉及的所有数据结构更新：
+ *
+ *   1. 红黑树（mm->mm_rb）：更新节点的 rb_subtree_gap（用于快速地址空间查找）
+ *   2. 链表（mm->mmap）：更新 vm_prev/vm_next 链接
+ *   3. 文件映射：更新 address_space->i_mmap 区间树
+ *   4. 匿名VMA：迁移 anon_vma 引用（exporter→importer）
+ *   5. mm_struct 统计：更新 map_count（VMA数量）
+ *
+ * 这是内核VMA管理中最复杂的函数之一，需要同时维护多种数据结构的一致性。
+ * 调用者必须持有 mm->mmap_lock 写锁。
  */
 int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
 	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert,
@@ -1154,6 +1293,28 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
  * parameter) may establish ptes with the wrong permissions of NNNN
  * instead of the right permissions of XXXX.
  */
+/**
+ * vma_merge - 尝试将新VMA与相邻的已有VMA合并
+ * @mm:    进程内存描述符
+ * @prev:  新区域前面的VMA（可为NULL）
+ * @addr:  新区域起始地址
+ * @end:   新区域结束地址
+ * @vm_flags: 新区域标志
+ * @anon_vma: 匿名VMA链表
+ * @file:  映射文件（匿名映射为NULL）
+ * @pgoff: 文件偏移
+ * @policy: NUMA内存策略
+ * @ufz:   userfaultfd相关
+ *
+ * 检查新VMA是否可以与前面(prev)或后面(next)的VMA合并：
+ *  - 地址连续
+ *  - vm_flags相同
+ *  - 同一文件映射（文件偏移连续）或同为匿名映射
+ *  - NUMA内存策略相同
+ *
+ * 合并减少VMA数量，降低内存和管理开销。
+ * 返回合并后的VMA（成功）或NULL（无法合并，需创建新VMA）。
+ */
 struct vm_area_struct *vma_merge(struct mm_struct *mm,
 			struct vm_area_struct *prev, unsigned long addr,
 			unsigned long end, unsigned long vm_flags,
@@ -1348,6 +1509,13 @@ static inline unsigned long round_hint_to_min(unsigned long hint)
 	return hint;
 }
 
+/**
+ * mlock_future_check - 检查mlock操作是否超过资源限制
+ *
+ * 若请求的映射设置了VM_LOCKED标志（MCL_FUTURE或MAP_LOCKED），
+ * 计算加上本次映射后的总锁定内存量，与RLIMIT_MEMLOCK比较。
+ * 若非特权进程超过限制则返回-EAGAIN，拒绝映射。
+ */
 static inline int mlock_future_check(struct mm_struct *mm,
 				     unsigned long flags,
 				     unsigned long len)
@@ -1400,6 +1568,38 @@ static inline bool file_mmap_ok(struct file *file, struct inode *inode,
 
 /*
  * The caller must write-lock current->mm->mmap_lock.
+ */
+/**
+ * do_mmap - mmap系统调用的核心实现
+ * @file:  映射的文件（NULL表示匿名映射）
+ * @addr:  建议的映射起始地址（0表示由内核选择）
+ * @len:   映射长度（字节）
+ * @prot:  内存保护标志（PROT_READ/WRITE/EXEC）
+ * @flags: 映射标志（MAP_SHARED/MAP_PRIVATE/MAP_ANONYMOUS等）
+ * @pgoff: 文件映射偏移量（以页为单位）
+ * @populate: 是否预填充页表（MAP_POPULATE）
+ * @uf:   userfaultfd相关（可为NULL）
+ *
+ * 执行流程：
+ *  1. 参数合法性检查（长度、对齐、权限等）
+ *  2. 查找合适的虚拟地址区间（get_unmapped_area）
+ *  3. 计算VMA标志位
+ *  4. 调用 mmap_region() 创建VMA并插入进程地址空间
+ *  5. 若指定MAP_POPULATE，预先建立物理页映射（fault-in）
+ *
+ * 注意：此函数只建立虚拟→物理的映射关系，真正的物理页
+ * 在首次访问时通过缺页中断按需分配（除非MAP_POPULATE）。
+ */
+/**
+ * do_mmap - mmap系统调用的核心实现
+ *
+ * 将文件或匿名内存映射到进程地址空间。主要流程：
+ * 1. 参数合法性校验（长度、权限、标志位）
+ * 2. 将prot/flags转换为vm_flags
+ * 3. 调用get_unmapped_area()找到可用地址空间
+ * 4. 调用mmap_region()创建VMA并建立页表映射
+ * 5. 若MAP_POPULATE或MAP_LOCKED则通知调用者预分配页面
+ * 返回映射起始地址，失败返回负数错误码。
  */
 unsigned long do_mmap(struct file *file, unsigned long addr,
 			unsigned long len, unsigned long prot,
@@ -1723,6 +1923,28 @@ static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
 	return (vm_flags & (VM_NORESERVE | VM_SHARED | VM_WRITE)) == VM_WRITE;
 }
 
+/**
+ * mmap_region - 在进程地址空间中建立新的内存映射区域
+ * @file:     被映射的文件（匿名映射时为NULL）
+ * @addr:     映射的起始虚拟地址
+ * @len:      映射长度（字节，已页面对齐）
+ * @vm_flags: VMA标志（VM_READ/VM_WRITE/VM_EXEC/VM_SHARED等）
+ * @pgoff:    文件映射的起始页偏移
+ * @uf:       userfaultfd事件列表（用于通知）
+ *
+ * 这是 do_mmap() 的核心实现，在参数验证和地址分配之后执行实际的VMA建立：
+ *
+ * 执行步骤：
+ *   1. 检查虚拟地址空间配额（may_expand_vm）
+ *   2. 若目标地址范围已有映射，先调用 do_munmap() 卸载旧映射
+ *   3. 尝试用 vma_merge() 将新映射合并到相邻VMA（避免碎片）
+ *   4. 若无法合并，分配新的 vm_area_struct 并初始化
+ *   5. 文件映射：调用 file->f_op->mmap()（如ext4_file_mmap）建立关联
+ *   6. 匿名私有映射：直接插入红黑树，按需分配页面（demand paging）
+ *   7. 若设置了 VM_LOCKED，调用 mm_populate() 立即锁定页面到内存
+ *
+ * 返回映射区域的起始虚拟地址，出错返回负错误码。
+ */
 unsigned long mmap_region(struct file *file, unsigned long addr,
 		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
 		struct list_head *uf)
@@ -1916,6 +2138,22 @@ unacct_error:
 	return error;
 }
 
+/**
+ * unmapped_area - 从低地址向高地址扫描，寻找未映射的空闲虚拟地址区间
+ * @info: 地址搜索参数（包含长度、对齐要求、搜索上下界）
+ *
+ * 通过遍历VMA红黑树，寻找满足以下条件的地址间隙（gap）：
+ *   - gap_start >= info->low_limit
+ *   - gap_end   <= info->high_limit
+ *   - gap_end - gap_start >= info->length（空间足够）
+ *   - gap_start 满足 info->align_mask 对齐要求
+ *
+ * 利用红黑树节点的 rb_subtree_gap 字段（子树中最大空闲区间长度）进行剪枝，
+ * 避免遍历不可能满足要求的子树，查找效率为 O(log N)。
+ *
+ * 用于 mmap() 的底部优先（bottom-up）地址分配策略。
+ * 返回满足条件的最低可用地址，失败返回 -ENOMEM。
+ */
 static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
 {
 	/*
@@ -2019,6 +2257,21 @@ found:
 	return gap_start;
 }
 
+/**
+ * unmapped_area_topdown - 从高地址向低地址扫描，寻找未映射的空闲虚拟地址区间
+ * @info: 地址搜索参数（长度、对齐要求、搜索上下界）
+ *
+ * 与 unmapped_area() 相反，此函数采用从高地址到低地址的搜索策略（top-down），
+ * 用于 mmap() 的顶部优先（top-down）地址分配模式。
+ *
+ * 好处：
+ *   - 将mmap区域放置在高地址，栈放置在低地址（CONFIG_ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT）
+ *   - 增大栈和堆之间的地址空间距离，减少栈溢出风险
+ *   - ASLR随机化时有更大的随机范围
+ *
+ * 同样利用红黑树节点的 rb_subtree_gap 进行 O(log N) 查找，
+ * 返回满足条件的最高可用对齐地址，失败返回 -ENOMEM。
+ */
 static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 {
 	struct mm_struct *mm = current->mm;
@@ -2126,6 +2379,21 @@ found_highest:
  * - is contained within the [low_limit, high_limit) interval;
  * - is at least the desired size.
  * - satisfies (begin_addr & align_mask) == (align_offset & align_mask)
+ */
+/**
+ * vm_unmapped_area - 查找未映射的虚拟地址区间（分发函数）
+ * @info: 地址搜索参数（长度、对齐、搜索范围、方向标志）
+ *
+ * 根据 info->flags 中的 VM_UNMAPPED_AREA_TOPDOWN 标志，
+ * 选择地址搜索方向：
+ *   - 置位（top-down）：调用 unmapped_area_topdown()，从高地址向低地址搜索
+ *     （默认用于64位进程，mmap区域从高地址向下增长）
+ *   - 清零（bottom-up）：调用 unmapped_area()，从低地址向高地址搜索
+ *     （用于32位进程或指定了低地址偏好的场景）
+ *
+ * 这是 get_unmapped_area() 调用的核心路径，为 mmap()/brk() 等
+ * 系统调用提供虚拟地址空间分配服务。
+ * 分配后触发 trace_vm_unmapped_area 跟踪点，便于性能分析。
  */
 unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info)
 {
@@ -2297,6 +2565,19 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 EXPORT_SYMBOL(get_unmapped_area);
 
 /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+/**
+ * find_vma - 在进程地址空间中查找包含或紧跟给定地址的VMA
+ * @mm:   进程的内存描述符
+ * @addr: 要查找的虚拟地址
+ *
+ * 返回第一个满足 vma->vm_end > addr 的VMA，若不存在则返回NULL。
+ * 注意：返回的VMA不一定包含addr（addr可能在VMA之前的空洞中）。
+ *
+ * 查找策略（两级缓存加速）：
+ *  1. 先查 vmacache（每进程4槽的VMA缓存），命中率很高（O(1)）
+ *  2. 缓存未命中时查红黑树 mm->mm_rb（O(log n)）
+ *  3. 找到后更新vmacache供下次使用
+ */
 struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 {
 	struct rb_node *rb_node;
@@ -2640,6 +2921,13 @@ EXPORT_SYMBOL_GPL(find_extend_vma);
  *
  * Called with the mm semaphore held.
  */
+/**
+ * remove_vma_list - 批量释放VMA链表中的所有VMA
+ *
+ * 在munmap或exit_mmap时，对一段连续的VMA链表执行批量销毁：
+ * 先更新高水位统计，再逐一调用remove_vma()释放每个VMA，
+ * 并将VM_ACCOUNT类型的页面从mm->total_vm减去（归还虚拟内存账本）。
+ */
 static void remove_vma_list(struct mm_struct *mm, struct vm_area_struct *vma)
 {
 	unsigned long nr_accounted = 0;
@@ -2662,6 +2950,26 @@ static void remove_vma_list(struct mm_struct *mm, struct vm_area_struct *vma)
  * Get rid of page table information in the indicated region.
  *
  * Called with the mm semaphore held.
+ */
+/**
+ * unmap_region - 解除指定地址范围内的所有页表映射并刷新TLB
+ * @mm:    进程的内存描述符
+ * @vma:   要解除映射的VMA链表头
+ * @prev:  前驱VMA（用于确定页表释放边界）
+ * @start: 解除映射的起始地址
+ * @end:   解除映射的结束地址
+ *
+ * do_munmap() 的子函数，在VMA从数据结构中移除后，
+ * 实际清除对应的页表项并刷新TLB：
+ *
+ *   1. lru_add_drain()：将CPU的页面LRU缓存刷入全局LRU链表
+ *   2. tlb_gather_mmu()：初始化TLB批量失效结构（mmu_gather）
+ *   3. update_hiwater_rss()：更新RSS峰值统计
+ *   4. unmap_vmas()：遍历页表，清除PTE，将页面放回LRU（通过rmap）
+ *   5. free_pgtables()：释放已清空的页表页（PMD/PUD等中间级页表）
+ *   6. tlb_finish_mmu()：触发实际的TLB刷新（shootdown IPI）
+ *
+ * 页表释放时需要考虑与相邻VMA共享的边界（避免释放仍在使用的页表页）。
  */
 static void unmap_region(struct mm_struct *mm,
 		struct vm_area_struct *vma, struct vm_area_struct *prev,
@@ -2724,6 +3032,25 @@ detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
 /*
  * __split_vma() bypasses sysctl_max_map_count checking.  We use this where it
  * has already been checked or doesn't make sense to fail.
+ */
+/**
+ * __split_vma - 在指定地址处将单个VMA分裂为两个VMA（底层实现）
+ * @mm:        进程内存描述符
+ * @vma:       要分裂的源VMA
+ * @addr:      分裂点地址（页面对齐）
+ * @new_below: true=新VMA在分裂点下方（[start, addr)），
+ *             false=新VMA在分裂点上方（[addr, end)）
+ *
+ * split_vma() 的底层实现，执行实际的VMA分裂：
+ *   1. vm_ops->split()：给驱动机会拒绝分裂（如hugetlb不可分裂）
+ *   2. vm_area_dup()：深度复制源VMA结构
+ *   3. 按 new_below 调整新旧VMA的起止地址和文件偏移
+ *   4. vma_adjust()：调整原VMA的边界（更新红黑树和相关统计）
+ *   5. vma_link()：将新VMA插入红黑树和链表
+ *   6. 若有anon_vma，调用 anon_vma_clone() 复制反向映射结构
+ *
+ * 分裂后两个VMA在逻辑上等价（相同标志、文件映射等），
+ * 只是地址范围不同，方便后续对部分范围进行不同的权限设置。
  */
 int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 		unsigned long addr, int new_below)
@@ -2788,6 +3115,26 @@ int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 /*
  * Split a vma into two pieces at address 'addr', a new vma is allocated
  * either for the first part or the tail.
+ */
+/**
+ * split_vma - 将一个VMA在指定地址处分裂为两个VMA
+ * @mm:        进程内存描述符
+ * @vma:       要分裂的源VMA
+ * @addr:      分裂点地址（必须页面对齐）
+ * @new_below: 若为真，新VMA在分裂点下方；否则在上方
+ *
+ * mprotect()、madvise()、munmap() 等系统调用操作地址范围的
+ * 中间部分时，需要先将跨越操作边界的VMA分裂。
+ *
+ * 流程：
+ *   1. 检查是否超过 sysctl_max_map_count（默认65536个VMA上限）
+ *   2. 调用 __split_vma() 执行实际分裂：
+ *      a. 分配新的 vm_area_struct
+ *      b. 复制源VMA的所有字段，然后调整边界地址
+ *      c. 若有文件映射，更新 f_op->split() 和 i_mmap 区间树
+ *      d. 将新VMA插入红黑树和链表，更新 map_count
+ *
+ * 调用者需持有 mm->mmap_lock 写锁。
  */
 int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	      unsigned long addr, int new_below)
@@ -2913,6 +3260,39 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 	return downgrade ? 1 : 0;
 }
 
+/**
+ * do_munmap - munmap系统调用的核心实现
+ * @mm:    进程的内存描述符
+ * @start: 要取消映射的起始地址（页对齐）
+ * @len:   取消映射的长度
+ * @uf:    userfaultfd相关（可为NULL）
+ *
+ * 执行流程：
+ *  1. 找到与[start, start+len)重叠的所有VMA
+ *  2. 若VMA被部分覆盖，先将其分裂为两个VMA（split_vma）
+ *  3. 调用 unmap_region() 清除对应的页表项并刷TLB
+ *  4. 从mm->mm_rb红黑树和链表中移除VMA
+ *  5. 释放VMA结构体内存
+ */
+/**
+ * do_munmap - 解除进程地址空间中指定范围的内存映射
+ * @mm:    进程内存描述符
+ * @start: 解除映射的起始地址（必须页面对齐）
+ * @len:   解除映射的长度
+ * @uf:    userfaultfd事件列表（可为NULL）
+ *
+ * munmap() 系统调用的核心实现，委托给 __do_munmap() 执行：
+ *
+ * __do_munmap() 的主要步骤：
+ *   1. 参数检查（地址对齐、范围合法性）
+ *   2. 找到地址范围内所有相关VMA
+ *   3. 若操作边界穿越VMA，先用 split_vma() 分裂边界VMA
+ *   4. detach_vmas_to_be_unmapped()：从红黑树/链表中摘除目标VMA
+ *   5. unmap_region()：清除页表项，刷新TLB
+ *   6. remove_vma()：释放VMA结构，调用 close() 回调，减少文件引用计数
+ *
+ * 调用者需持有 mm->mmap_lock 写锁（或通过 __do_munmap 降级为读锁）。
+ */
 int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 	      struct list_head *uf)
 {
@@ -3061,6 +3441,24 @@ out:
  *  this is really a simplified "do_mmap".  it only handles
  *  anonymous maps.  eventually we may be able to do some
  *  brk-specific accounting here.
+ */
+/**
+ * do_brk_flags - brk()系统调用的底层实现，扩展堆VMA
+ * @addr:  新映射区域的起始地址
+ * @len:   映射长度（字节）
+ * @flags: VMA标志（通常仅允许VM_EXEC）
+ * @uf:    userfaultfd事件列表
+ *
+ * 在 sys_brk() 确定需要扩展堆之后调用，实际建立新的匿名VMA：
+ *   1. 检查flags合法性（仅允许VM_EXEC附加标志）
+ *   2. 调用 get_unmapped_area() 验证地址可用性（MAP_FIXED方式）
+ *   3. 安全检查：munmap可能存在的旧映射，mlock配额检查
+ *   4. 尝试 vma_merge() 将新区域合并到相邻VMA（避免VMA数量爆炸）
+ *   5. 若无法合并，分配新 vm_area_struct，加入红黑树和链表
+ *   6. 更新 mm->brk，返回0表示成功
+ *
+ * 此函数也被 exec 加载器用于建立初始堆VMA。
+ * 所有通过 brk() 创建的VMA均为匿名私有映射（VM_ANONYMOUS | VM_WRITE）。
  */
 static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long flags, struct list_head *uf)
 {
@@ -3274,6 +3672,25 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 /*
  * Copy the vma structure to a new location in the same mm,
  * prior to moving page table entries, to effect an mremap move.
+ */
+/**
+ * copy_vma - 将VMA复制到新的地址（用于mremap重映射）
+ * @vmap:           指向源VMA指针的指针（可能在合并后被更新）
+ * @addr:           新映射的目标起始地址
+ * @len:            映射长度
+ * @pgoff:          文件映射的页偏移
+ * @need_rmap_locks: 输出：是否需要持有rmap锁
+ *
+ * mremap() 系统调用在移动映射时调用此函数，在目标地址建立源VMA的副本：
+ *
+ *   1. 检查目标地址是否与源VMA相邻（可以扩展而非复制）
+ *   2. 尝试 vma_merge() 将新地址范围合并到相邻VMA
+ *   3. 若无法合并，分配新 vm_area_struct，复制所有字段
+ *   4. 处理 anon_vma 共享（mremap后的匿名页仍可通过反向映射找到）
+ *   5. 若VMA绑定了文件，调用 vma->vm_ops->open() 建立新引用
+ *
+ * 成功后返回新VMA指针；失败返回 ERR_PTR(-errno)。
+ * 注意：此函数只建立VMA元数据，不移动实际的页表项（由mremap的caller完成）。
  */
 struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 	unsigned long addr, unsigned long len, pgoff_t pgoff,

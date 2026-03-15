@@ -20,6 +20,34 @@
  *  Adaptive scheduling granularity, math enhancements by Peter Zijlstra
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
+
+/**
+ * kernel/sched/fair.c - CFS完全公平调度器
+ *
+ * 实现Linux的CFS（Completely Fair Scheduler）调度类，
+ * 是普通进程（SCHED_NORMAL/SCHED_BATCH/SCHED_IDLE）的默认调度策略。
+ *
+ * 核心设计思想：
+ *   用红黑树(rbtree)按虚拟运行时间(vruntime)排序所有可运行进程，
+ *   始终选择vruntime最小（获得CPU时间最少）的进程运行，
+ *   通过这种方式保证每个进程获得与其权重(nice值)成比例的CPU时间。
+ *
+ * 关键概念：
+ *   vruntime    - 虚拟运行时间 = 实际运行时间 × (NICE_0_LOAD / 进程权重)
+ *                 高优先级进程权重大，vruntime增长慢，因此更容易被选中运行
+ *   min_vruntime- 运行队列中最小vruntime基准值（单调递增），用于新进程初始化
+ *   cfs_rq      - 每CPU的CFS运行队列，包含红黑树和统计信息
+ *   sched_entity- 调度实体，嵌入task_struct，代表一个可调度的执行单元
+ *
+ * 关键函数：
+ *   update_curr()          - 更新当前进程vruntime（每次时钟中断调用）
+ *   enqueue_entity()       - 进程变为可运行时插入红黑树
+ *   dequeue_entity()       - 进程阻塞或退出时从红黑树移除
+ *   pick_next_entity()     - 选择vruntime最小的进程（红黑树最左节点）
+ *   place_entity()         - 为新建/唤醒进程设置合适的初始vruntime
+ *   select_task_rq_fair()  - 负载均衡：为任务选择最合适的目标CPU
+ *   task_fork_fair()       - fork时设置子进程的初始vruntime
+ */
 #include "sched.h"
 
 /*
@@ -197,6 +225,14 @@ void __init sched_init_granularity(void)
 #define WMULT_CONST	(~0U)
 #define WMULT_SHIFT	32
 
+/**
+ * __update_inv_weight - 计算并缓存load_weight的倒数近似值
+ *
+ * inv_weight = WMULT_CONST / weight，用于后续乘法替代除法。
+ * 若inv_weight已计算则直接返回（缓存命中）。
+ * 处理超大权重（>=WMULT_CONST）和64位溢出情况，确保计算精度。
+ * 被__calc_delta()调用，是CFS时间折算的核心数值基础。
+ */
 static void __update_inv_weight(struct load_weight *lw)
 {
 	unsigned long w;
@@ -225,6 +261,14 @@ static void __update_inv_weight(struct load_weight *lw)
  *
  * Or, weight =< lw.weight (because lw.weight is the runqueue weight), thus
  * weight/lw.weight <= 1, and therefore our shift will also be positive.
+ */
+/**
+ * __calc_delta - 按权重比例折算运行时间（定点数乘法核心）
+ *
+ * 计算公式：delta_exec * weight / lw->weight
+ * 使用预先计算的inv_weight（lw->weight的倒数近似值）避免除法，
+ * 通过移位保证精度。处理weight过大（>32位）时的溢出情况。
+ * 被calc_delta_fair()调用，用于将实际CPU时间转换为vruntime增量。
  */
 static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
@@ -537,6 +581,19 @@ static inline int entity_before(struct sched_entity *a,
 	return (s64)(a->vruntime - b->vruntime) < 0;
 }
 
+/**
+ * update_min_vruntime - 更新CFS运行队列的 min_vruntime 基准值
+ * @cfs_rq: 目标CFS运行队列
+ *
+ * min_vruntime 是CFS的时间基准，用于：
+ *   1. 新进程入队时设置初始vruntime（防止新进程抢占所有CPU时间）
+ *   2. 进程睡眠唤醒后补偿vruntime（防止睡眠进程因长期不运行而积累过低vruntime）
+ *
+ * 计算规则：
+ *   - 取当前运行实体的vruntime 与 红黑树最左节点（最小vruntime）的较小值
+ *   - 用 max_vruntime() 保证 min_vruntime 单调递增（时间不能回退）
+ *   - 32位系统需要 smp_wmb() 防止编译器重排，保证原子性更新
+ */
 static void update_min_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -572,6 +629,22 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 /*
  * Enqueue an entity into the rb-tree:
  */
+/**
+ * __enqueue_entity - 将调度实体插入CFS红黑树（按vruntime排序）
+ * @cfs_rq: 目标CFS运行队列
+ * @se:     要插入的调度实体
+ *
+ * 以 se->vruntime 为key，将调度实体插入 cfs_rq->tasks_timeline 红黑树。
+ * vruntime最小的节点位于红黑树最左侧，是下次被调度的候选进程。
+ */
+/**
+ * __enqueue_entity - 将调度实体插入CFS红黑树
+ *
+ * 以vruntime为键，在O(log N)时间内找到正确插入位置并链入红黑树。
+ * 同时维护leftmost缓存：若新节点成为最左叶节点（vruntime最小），
+ * 则更新tasks_timeline.rb_leftmost，使__pick_first_entity()可以
+ * O(1)直接取到下一个待运行的实体。
+ */
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	struct rb_node **link = &cfs_rq->tasks_timeline.rb_root.rb_node;
@@ -602,6 +675,21 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 			       &cfs_rq->tasks_timeline, leftmost);
 }
 
+/**
+ * __dequeue_entity - 从CFS红黑树中移除调度实体
+ * @cfs_rq: 目标CFS运行队列
+ * @se:     要移除的调度实体
+ *
+ * 从 cfs_rq->tasks_timeline 红黑树中删除节点。
+ * 若移除的是最左节点（vruntime最小），则更新缓存的最左节点指针。
+ */
+/**
+ * __dequeue_entity - 将调度实体从CFS红黑树中移除
+ *
+ * 调用rb_erase_cached()从tasks_timeline红黑树中删除se->run_node，
+ * 并自动更新leftmost缓存（若被删除的正是最左节点）。
+ * 对应__enqueue_entity()，是O(log N)的树操作。
+ */
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	rb_erase_cached(&se->run_node, &cfs_rq->tasks_timeline);
@@ -617,6 +705,14 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
 	return rb_entry(left, struct sched_entity, run_node);
 }
 
+/**
+ * __pick_next_entity - 获取红黑树中vruntime最小的调度实体
+ * @se: 当前节点（从此节点的右子树继续查找）
+ *
+ * CFS调度器的核心选择逻辑：始终选择vruntime最小的进程运行，
+ * 即红黑树的最左节点（leftmost node）。
+ * 直接返回 cfs_rq->rb_leftmost 缓存值，O(1)复杂度。
+ */
 static struct sched_entity *__pick_next_entity(struct sched_entity *se)
 {
 	struct rb_node *next = rb_next(&se->run_node);
@@ -668,6 +764,14 @@ int sched_proc_update_handler(struct ctl_table *table, int write,
 /*
  * delta /= w
  */
+/**
+ * calc_delta_fair - 将实际运行时间转换为vruntime增量
+ *
+ * 对于普通优先级任务（weight==NICE_0_LOAD），vruntime增量等于
+ * 实际运行时间（1:1映射）。对于其他权重的任务，调用__calc_delta()
+ * 按照weight/NICE_0_LOAD比例折算：低优先级任务vruntime增长更快，
+ * 高优先级任务vruntime增长更慢，从而实现按比例分配CPU时间。
+ */
 static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 {
 	if (unlikely(se->load.weight != NICE_0_LOAD))
@@ -676,7 +780,21 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 	return delta;
 }
 
-/*
+/**
+ * __sched_period - 计算CFS调度周期长度
+ * @nr_running: 当前运行队列中的可运行任务数量
+ *
+ * CFS的调度周期（sched_latency）是一个时间窗口，在此期间每个可运行任务
+ * 都应至少获得一次CPU时间。
+ *
+ * 计算规则：
+ *   - 当任务数 <= sched_nr_latency（默认8）时：返回固定调度延迟
+ *     sysctl_sched_latency（默认6ms），保证低延迟
+ *   - 当任务数过多时：返回 nr_running × sysctl_sched_min_granularity
+ *     （默认0.75ms/task），防止时间片过小导致频繁切换
+ *
+ * 公式：p = (nr <= nl) ? latency : min_granularity × nr
+ *
  * The idea is to set a period in which each task runs once.
  *
  * When there are too many tasks (sched_nr_latency) we have to stretch
@@ -692,7 +810,19 @@ static u64 __sched_period(unsigned long nr_running)
 		return sysctl_sched_latency;
 }
 
-/*
+/**
+ * sched_slice - 计算调度实体的实际CPU时间片（wall-time）
+ * @cfs_rq: 目标CFS运行队列
+ * @se:     调度实体
+ *
+ * 根据调度实体的权重占整个运行队列总权重的比例，从调度周期中分配对应的时间片：
+ *   s = period × (weight / runqueue_weight)
+ *
+ * 对于组调度，需要沿sched_entity层级向上遍历，依次按照权重比例缩放。
+ * 权重由进程的nice值决定（nice=-20对应权重88761，nice=19对应权重15）。
+ *
+ * 返回值：调度实体应获得的实际CPU时间（纳秒）。
+ *
  * We calculate the wall-time slice from the period by taking a part
  * proportional to the weight.
  *
@@ -725,6 +855,13 @@ static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
  *
  * vs = s/w
  */
+/**
+ * sched_vslice - 计算调度实体的虚拟时间片
+ *
+ * 将物理时间片sched_slice()转换为对应的虚拟时间片vruntime增量。
+ * 用于place_entity()中设置新fork或唤醒任务的初始vruntime，
+ * 确保新任务获得公平的调度起点而不会立即抢占当前任务。
+ */
 static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	return calc_delta_fair(sched_slice(cfs_rq, se), se);
@@ -738,6 +875,15 @@ static unsigned long task_h_load(struct task_struct *p);
 static unsigned long capacity_of(int cpu);
 
 /* Give new sched_entity start runnable values to heavy its load in infant time */
+/**
+ * init_entity_runnable_average - 初始化调度实体的PELT运行平均值
+ *
+ * 新任务创建时调用，将sched_avg清零后设置初始负载：
+ * - 普通任务（非组实体）：load_avg初始化为满负载（scale_load_down(se->load.weight)），
+ *   使新任务被视为重型任务，避免低负载估算导致CPU频率过低影响启动性能。
+ * - 组调度实体：初始化为0，反映组内尚无实际运行历史。
+ * post_init_entity_util_avg()在之后进一步细化util_avg估算。
+ */
 void init_entity_runnable_average(struct sched_entity *se)
 {
 	struct sched_avg *sa = &se->avg;
@@ -783,6 +929,14 @@ static void attach_entity_cfs_rq(struct sched_entity *se);
  *
  * Finally, that extrapolated util_avg is clamped to the cap (util_avg_cap)
  * if util_avg > util_avg_cap.
+ */
+/**
+ * post_init_entity_util_avg - fork后根据当前CPU负载设置任务的util_avg初始值
+ *
+ * 在wake_up_new_task()调用，将新任务的util_avg估算为当前CPU剩余容量的一半，
+ * 防止新任务因初始util_avg过高导致cpufreq不必要地拉高频率（"overshoot"），
+ * 同时也避免因初始值过低导致调频反应迟钝。
+ * 若CPU已接近满载，则使用cfs_rq的平均util_avg作为初始值。
  */
 void post_init_entity_util_avg(struct task_struct *p)
 {
@@ -839,6 +993,27 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 /*
  * Update the current task's runtime statistics.
  */
+/**
+ * update_curr - 更新当前运行进程的调度统计信息和虚拟运行时间
+ * @cfs_rq: 当前CPU的CFS运行队列
+ *
+ * 在每次时钟中断、进程切换、入队/出队时被调用，完成：
+ *  1. 计算自上次更新以来的实际运行时间 delta_exec
+ *  2. 将 delta_exec 按权重折算为虚拟时间增量，累加到 curr->vruntime
+ *     权重越高(nice值越低)的进程，vruntime增长越慢，获得更多CPU时间
+ *  3. 更新 cfs_rq->min_vruntime（单调递增的队列基准vruntime）
+ *  4. 更新cgroup CPU时间统计
+ *
+ * vruntime计算公式：delta_vruntime = delta_exec × (NICE_0_LOAD / curr->weight)
+ */
+/**
+ * update_curr - 更新当前运行实体的vruntime和执行时间统计
+ *
+ * 计算自上次更新以来的实际执行时长delta_exec，按权重折算为
+ * 虚拟运行时间delta_fair并累加到se->vruntime，同时更新
+ * cfs_rq->min_vruntime基准值。若超出时间片则设置重调度标志。
+ * 还负责更新PELT运行时统计和CFS带宽控制的运行时账本。
+ */
 static void update_curr(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -874,6 +1049,13 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	account_cfs_rq_runtime(cfs_rq, delta_exec);
 }
 
+/**
+ * update_curr_fair - sched_class->update_curr接口包装函数
+ *
+ * 将当前CPU运行队列的curr任务取出其sched_entity，
+ * 委托给update_curr()完成vruntime更新和执行时间统计。
+ * 被定时器中断、抢占检查等路径调用以保持调度统计及时更新。
+ */
 static void update_curr_fair(struct rq *rq)
 {
 	update_curr(cfs_rq_of(&rq->curr->se));
@@ -1196,12 +1378,25 @@ static unsigned int task_scan_max(struct task_struct *p)
 	return max(smin, smax);
 }
 
+/**
+ * account_numa_enqueue - 任务入队时更新NUMA运行统计
+ *
+ * 递增rq->nr_numa_running（有NUMA偏好节点的任务数）和
+ * rq->nr_preferred_running（任务正在其偏好NUMA节点上运行的任务数）。
+ * 这些计数器被NUMA迁移决策使用，判断是否需要进行跨节点迁移。
+ */
 static void account_numa_enqueue(struct rq *rq, struct task_struct *p)
 {
 	rq->nr_numa_running += (p->numa_preferred_nid != NUMA_NO_NODE);
 	rq->nr_preferred_running += (p->numa_preferred_nid == task_node(p));
 }
 
+/**
+ * account_numa_dequeue - 任务出队时更新NUMA运行统计
+ *
+ * 递减rq->nr_numa_running和rq->nr_preferred_running计数器，
+ * 与account_numa_enqueue()对称，保持NUMA统计的准确性。
+ */
 static void account_numa_dequeue(struct rq *rq, struct task_struct *p)
 {
 	rq->nr_numa_running -= (p->numa_preferred_nid != NUMA_NO_NODE);
@@ -1414,6 +1609,14 @@ static inline unsigned long group_weight(struct task_struct *p, int nid,
 	return 1000 * faults / total_faults;
 }
 
+/**
+ * should_numa_migrate_memory - 判断是否应将内存页迁移到任务所在NUMA节点
+ *
+ * 基于页面访问历史（last_cpupid）和任务的NUMA组信息决定是否迁移：
+ * - 若没有NUMA组或访问来自不同进程则允许迁移（提高本地性）
+ * - 若页面最近由同一进程访问但在不同节点，则根据迁移收益判断
+ * - 考虑任务组的跨节点访问模式，避免频繁来回迁移（thrashing）
+ */
 bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
 				int src_nid, int dst_cpu)
 {
@@ -2352,6 +2555,23 @@ static int preferred_group_nid(struct task_struct *p, int nid)
 	return nid;
 }
 
+/**
+ * task_numa_placement - 基于NUMA缺页统计为任务选择最优NUMA节点
+ * @p: 要重新放置的任务
+ *
+ * NUMA自动均衡（AutoNUMA）的核心决策函数，定期（每 task_scan_max 间隔）调用：
+ *
+ * 分析：统计任务在各NUMA节点上产生的内存缺页次数（p->numa_faults[]）：
+ *   - private faults: 只有本任务访问的页面（独占内存）
+ *   - shared faults:  多任务共享的页面（NUMA组共享内存）
+ *
+ * 决策：选择缺页次数最多的节点（内存局部性最好的节点）作为 preferred_nid：
+ *   - 若任务在NUMA组中，综合考虑组内所有任务的内存分布
+ *   - 通过 numa_migrate_preferred() 触发任务迁移到最优节点
+ *
+ * 历史统计衰减：每个扫描周期将历史数据衰减50%，使统计反映近期行为。
+ * 最终目标：使任务在其内存所在的NUMA节点上运行，减少跨节点内存访问延迟。
+ */
 static void task_numa_placement(struct task_struct *p)
 {
 	int seq, nid, max_nid = NUMA_NO_NODE;
@@ -2623,6 +2843,28 @@ void task_numa_free(struct task_struct *p, bool final)
 /*
  * Got a PROT_NONE fault for a page on @node.
  */
+/**
+ * task_numa_fault - 处理NUMA内存缺页事件，更新任务的NUMA访问统计
+ * @last_cpupid: 上次访问此页面的CPU和进程ID（编码在page->_last_cpupid）
+ * @mem_node:    发生缺页的内存所在NUMA节点
+ * @pages:       缺页涉及的页数
+ * @flags:       缺页标志（TNF_MIGRATED、TNF_FAULT_LOCAL等）
+ *
+ * 由缺页处理程序（handle_mm_fault → do_numa_page）调用，
+ * 是AutoNUMA的统计收集入口：
+ *
+ * 统计更新：
+ *   - p->numa_faults[]：按节点和类型（私有/共享）累加缺页计数
+ *   - 判断访问是否为"本地访问"（CPU和内存在同一节点）
+ *   - 检查是否跨进程共享（形成NUMA group，协同放置）
+ *
+ * 决策触发：
+ *   - 若统计数据发生显著变化，调用 task_numa_placement() 重新评估节点选择
+ *   - 若NUMA组发生变化，可能触发组内所有任务的协同迁移
+ *
+ * AutoNUMA通过周期性的NUMA hint fault（故意清除PTE访问位，触发缺页统计）
+ * 来探测任务的内存访问模式，实现内存和任务的协同放置。
+ */
 void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
 {
 	struct task_struct *p = current;
@@ -2712,6 +2954,25 @@ static void reset_ptenuma_scan(struct task_struct *p)
 /*
  * The expensive part of numa migration is done from task_work context.
  * Triggered from task_tick_numa().
+ */
+/**
+ * task_numa_work - NUMA扫描工作函数（通过task_work机制异步执行）
+ * @work: task_work 回调头（嵌入在 task_struct->numa_work 中）
+ *
+ * AutoNUMA的页表扫描入口。通过 task_tick_numa() 定期触发，
+ * 在进程返回用户空间时（task_work_run）异步执行：
+ *
+ * 核心操作：扫描进程的VMA，对其中的页表项执行"NUMA hint"处理：
+ *   1. 遍历进程地址空间中的各个VMA
+ *   2. 调用 change_prot_numa()：将PTE标记为NUMA hint页（清除Present位但保留数据）
+ *   3. 下次访问这些页面时触发缺页异常 → task_numa_fault() 统计访问节点
+ *
+ * 节流机制：
+ *   - 每次扫描的页数有限（task_scan_size()），防止过多时间用于扫描
+ *   - 通过 mm->numa_scan_offset 记录上次扫描位置，下次从此继续
+ *   - 根据运行时间动态调整扫描间隔（CPU密集型任务扫描更频繁）
+ *
+ * 此机制通过主动制造缺页来收集内存访问信息，是AutoNUMA的关键设计。
  */
 static void task_numa_work(struct callback_head *work)
 {
@@ -3082,6 +3343,16 @@ static inline void
 dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }
 #endif
 
+/**
+ * reweight_entity - 动态修改调度实体的负载权重
+ *
+ * 用于task_nice()修改优先级时更新se的load.weight。步骤：
+ * 1. 若实体在运行队列上则先提交当前执行时间（update_curr）
+ * 2. 从cfs_rq中减去旧权重贡献（update_load_sub）
+ * 3. 更新se->load.weight为新权重
+ * 4. 重新将新权重加回cfs_rq并更新PELT负载统计
+ * 保证权重变更对调度公平性的影响是原子且一致的。
+ */
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
@@ -3236,6 +3507,14 @@ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq);
  * Recomputes the group entity based on the current state of its group
  * runqueue.
  */
+/**
+ * update_cfs_group - 更新组调度实体的负载权重（shares同步）
+ *
+ * 当任务组的负载发生变化时，重新计算该组调度实体se的shares权重。
+ * 在SMP场景下基于gcfs_rq->avg.load_avg动态调整，使组调度实体的
+ * 权重与其在该CPU上的实际负载比例相符，实现各CPU间的公平share分配。
+ * 被throttle/unthrottle和PELT更新路径调用。
+ */
 static void update_cfs_group(struct sched_entity *se)
 {
 	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
@@ -3324,6 +3603,14 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
  * Called within set_task_rq() right before setting a task's CPU. The
  * caller only guarantees p->pi_lock is held; no other assumptions,
  * including the state of rq->lock, should be made.
+ */
+/**
+ * set_task_rq_fair - 迁移时同步调度实体的PELT时间戳
+ *
+ * 任务从prev cfs_rq迁移到next cfs_rq时调用，用于修正
+ * sched_entity的last_update_time，使PELT统计在新队列上
+ * 继续正确衰减，避免迁移导致的统计跳变。
+ * 仅在ATTACH_AGE_LOAD特性开启时生效。
  */
 void set_task_rq_fair(struct sched_entity *se,
 		      struct cfs_rq *prev, struct cfs_rq *next)
@@ -3701,6 +3988,22 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
  * Must call update_cfs_rq_load_avg() before this, since we rely on
  * cfs_rq->avg.last_update_time being current.
  */
+/**
+ * attach_entity_load_avg - 将调度实体的负载贡献加入CFS运行队列的统计
+ * @cfs_rq: 目标CFS运行队列
+ * @se:     要附加的调度实体
+ *
+ * 当任务被唤醒或迁移到新CPU时，需要将其历史负载信息（PELT统计）
+ * 加入目标运行队列的聚合负载中。
+ *
+ * PELT（Per-Entity Load Tracking）追踪三个指标：
+ *   - load_avg:     任务的负载权重平均值（考虑可运行时间 + 等待时间）
+ *   - util_avg:     任务的CPU利用率平均值（仅考虑实际运行时间）
+ *   - runnable_avg: 可运行状态的平均时间（包含在运行队列上等待的时间）
+ *
+ * 附加前需要对齐时间窗口（align decay window），避免衰减计算出现偏差。
+ * 附加后触发 cfs_rq_util_change()，通知cpufreq governor更新频率。
+ */
 static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	/*
@@ -3755,6 +4058,20 @@ static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
  *
  * Must call update_cfs_rq_load_avg() before this, since we rely on
  * cfs_rq->avg.last_update_time being current.
+ */
+/**
+ * detach_entity_load_avg - 从CFS运行队列统计中移除调度实体的负载贡献
+ * @cfs_rq: 源CFS运行队列
+ * @se:     要分离的调度实体
+ *
+ * 与 attach_entity_load_avg() 相反操作，在任务阻塞、迁移或退出时调用：
+ *   1. dequeue_load_avg()：从队列的 load_avg 中减去实体的贡献
+ *   2. sub_positive()：从 util_avg、util_sum、runnable_avg、runnable_sum 中减去，
+ *      使用 sub_positive() 防止因浮点精度导致负数（下溢保护）
+ *   3. add_tg_cfs_propagate()：向父任务组传播负载变化（组调度场景）
+ *   4. cfs_rq_util_change()：通知cpufreq governor重新评估频率需求
+ *
+ * 正确维护队列的PELT统计对负载均衡和能效调度至关重要。
  */
 static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
@@ -3838,6 +4155,13 @@ static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
 /*
  * Synchronize entity load avg of dequeued entity without locking
  * the previous rq.
+ */
+/**
+ * sync_entity_load_avg - 将阻塞实体的PELT统计同步到当前时间
+ *
+ * 对长时间处于阻塞状态的调度实体，在其被唤醒并重新入队前调用，
+ * 通过__update_load_avg_blocked_se()将其load_avg/util_avg按时间
+ * 衰减到最新状态，避免唤醒时使用过时的负载估算值影响调度决策。
  */
 static void sync_entity_load_avg(struct sched_entity *se)
 {
@@ -4091,6 +4415,13 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq) {}
 
 #endif /* CONFIG_SMP */
 
+/**
+ * check_spread - 调试用：检测vruntime分散度是否过大
+ *
+ * 若某调度实体的vruntime与cfs_rq->min_vruntime相差超过3倍调度延迟，
+ * 则递增nr_spread_over统计计数器（仅CONFIG_SCHED_DEBUG下生效）。
+ * 该计数器用于调优：过大的分散度意味着任务间存在不公平的调度延迟。
+ */
 static void check_spread(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 #ifdef CONFIG_SCHED_DEBUG
@@ -4104,6 +4435,17 @@ static void check_spread(struct cfs_rq *cfs_rq, struct sched_entity *se)
 #endif
 }
 
+/**
+ * place_entity - 为调度实体设置初始或唤醒后的vruntime
+ * @cfs_rq:   目标CFS运行队列
+ * @se:       要设置vruntime的调度实体
+ * @initial:  1=新进程首次加入，0=从睡眠唤醒的进程
+ *
+ * 确保新加入或唤醒的进程获得公平的起始vruntime：
+ *  - 新进程(initial=1)：vruntime = min_vruntime + sched_latency（稍微延后）
+ *  - 唤醒进程(initial=0)：vruntime = max(vruntime, min_vruntime - sleep_bonus)
+ *    睡眠bonus奖励短暂睡眠的进程，使其唤醒后能较快获得CPU
+ */
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 {
@@ -4190,6 +4532,19 @@ static inline bool cfs_bandwidth_used(void);
  * CPU and an up-to-date min_vruntime on the destination CPU.
  */
 
+/**
+ * enqueue_entity - 将调度实体加入CFS运行队列
+ * @cfs_rq: 目标CFS运行队列
+ * @se:     要入队的调度实体（对应一个进程或线程组）
+ * @flags:  入队标志（ENQUEUE_WAKEUP=从睡眠唤醒，ENQUEUE_MIGRATED=CPU迁移等）
+ *
+ * 进程变为可运行状态时（fork、wake_up、迁移）调用此函数：
+ *  1. 规范化vruntime（迁移场景下调整vruntime基准）
+ *  2. 更新当前进程的运行时统计
+ *  3. place_entity() 设置合适的vruntime
+ *  4. __enqueue_entity() 插入红黑树
+ *  5. 更新负载统计（用于负载均衡）
+ */
 static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -4249,6 +4604,13 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		check_enqueue_throttle(cfs_rq);
 }
 
+/**
+ * __clear_buddies_last - 清除CFS运行队列层级中的last buddy提示
+ *
+ * 沿组调度层级向上遍历，若cfs_rq->last指向当前se则清除为NULL，
+ * 直到遇到不匹配的层级（意味着该层由其他实体持有last提示）则停止。
+ * 在实体出队或被选为下一个运行任务时调用，清理过期的buddy提示。
+ */
 static void __clear_buddies_last(struct sched_entity *se)
 {
 	for_each_sched_entity(se) {
@@ -4296,6 +4658,18 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 
+/**
+ * dequeue_entity - 从CFS运行队列移除调度实体
+ * @cfs_rq: 目标CFS运行队列
+ * @se:     要出队的调度实体
+ * @flags:  出队标志（DEQUEUE_SLEEP=进程将进入睡眠等）
+ *
+ * 进程阻塞（等待IO/锁/信号）或退出时调用：
+ *  1. 更新运行时统计（update_curr）
+ *  2. 若进程将进入睡眠，记录睡眠开始时间（用于唤醒奖励计算）
+ *  3. __dequeue_entity() 从红黑树移除节点
+ *  4. 更新负载统计
+ */
 static void
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -4348,7 +4722,23 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		update_min_vruntime(cfs_rq);
 }
 
-/*
+/**
+ * check_preempt_tick - 时钟节拍中检查当前任务是否超出时间片应被抢占
+ * @cfs_rq: CFS运行队列
+ * @curr:   当前正在运行的调度实体
+ *
+ * 在 entity_tick() 中调用，CFS时间片检查的核心逻辑：
+ *
+ * 抢占触发条件（满足其一）：
+ *   1. 运行时间超出理想时间片（delta_exec > ideal_runtime）：
+ *      ideal_runtime = sched_slice()，基于权重比例分配的CPU时间
+ *   2. vruntime与红黑树最左节点（最应运行的任务）差距过大：
+ *      delta = curr->vruntime - leftmost->vruntime > sysctl_sched_latency
+ *      这确保了调度延迟上限，防止某任务独占CPU过久
+ *
+ * 若触发抢占，调用 resched_curr() 设置 TIF_NEED_RESCHED 标志。
+ * 实际上下文切换延迟到抢占点（如中断返回、系统调用返回）才发生。
+ *
  * Preempt the current task with a newly woken task if needed:
  */
 static void
@@ -4388,6 +4778,20 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 		resched_curr(rq_of(cfs_rq));
 }
 
+/**
+ * set_next_entity - 将调度实体设置为CFS运行队列的当前运行任务
+ * @cfs_rq: CFS运行队列
+ * @se:     即将运行的调度实体
+ *
+ * 调度切换的第二步（与 put_prev_entity() 配对）：
+ *   1. 若 se 在红黑树上（仍可运行），从树上移除（运行中的任务不在树内）
+ *   2. 更新负载统计（update_load_avg，追踪任务利用率）
+ *   3. 记录开始运行时间（exec_start = rq_clock_task），用于下次update_curr计算
+ *   4. 将 se 设置为 cfs_rq->curr
+ *   5. 更新 prev_sum_exec_runtime（用于 check_preempt_tick 中的delta_exec）
+ *
+ * 调用后 cfs_rq->curr = se，进程获得CPU控制权。
+ */
 static void
 set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
@@ -4430,6 +4834,19 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se);
  * 2) pick the "next" process, since someone really wants that to run
  * 3) pick the "last" process, for cache locality
  * 4) do not run the "skip" process, if something else is available
+ */
+/**
+ * pick_next_entity - 选择CFS运行队列中下一个要运行的调度实体
+ * @cfs_rq: CFS运行队列
+ * @curr:   当前正在运行的调度实体（可能继续运行）
+ *
+ * 实现CFS的核心调度决策，按以下优先级选择：
+ *  1. 红黑树最左节点（vruntime最小，最"饥饿"的进程）
+ *  2. buddy机制的"next"进程（如刚被唤醒的伙伴进程，利用缓存局部性）
+ *  3. buddy机制的"last"进程（最近运行过，缓存仍热）
+ *  4. 跳过"skip"进程（主动让出CPU的进程）
+ *
+ * 返回选中的调度实体，调用者据此执行上下文切换。
  */
 static struct sched_entity *
 pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
@@ -4484,6 +4901,21 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 
 static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 
+/**
+ * put_prev_entity - 将当前运行实体放回CFS运行队列（调度切换前的收尾）
+ * @cfs_rq: CFS运行队列
+ * @prev:   即将被换下CPU的调度实体
+ *
+ * 在进程让出CPU（自愿或被抢占）时调用，执行以下收尾工作：
+ *   1. 若进程仍在运行队列（被抢占），调用 update_curr() 更新vruntime
+ *   2. 检查CFS带宽限流（check_cfs_rq_runtime），若超配额则限流
+ *   3. 若进程仍可运行（on_rq），将其重新插入红黑树（__enqueue_entity）
+ *   4. 更新负载统计（update_load_avg），供负载均衡使用
+ *   5. 清除 cfs_rq->curr 指针
+ *
+ * 与 set_next_entity() 配对：put_prev_entity 换下当前进程，
+ * set_next_entity 换上下一个进程。
+ */
 static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 {
 	/*
@@ -4508,6 +4940,20 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 	cfs_rq->curr = NULL;
 }
 
+/**
+ * entity_tick - 对单个调度实体执行时钟节拍处理
+ * @cfs_rq:  CFS运行队列
+ * @curr:    当前运行的调度实体
+ * @queued:  是否有hrtimer队列事件
+ *
+ * task_tick_fair() 逐层调用此函数处理CFS节拍：
+ *   1. update_curr()：更新当前实体的 vruntime 和运行时间统计
+ *   2. update_load_avg()：更新PELT（Per-Entity Load Tracking）负载平均值
+ *      - 基于指数加权移动平均（EWMA），时间窗口约 32×1ms
+ *      - 用于负载均衡、调频（cpufreq governor）决策
+ *   3. check_preempt_tick()：检查是否需要抢占当前任务
+ *   4. 若启用了CFS带宽控制（CONFIG_CFS_BANDWIDTH），检查配额是否超限
+ */
 static void
 entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 {
@@ -4598,6 +5044,13 @@ static inline u64 sched_cfs_bandwidth_slice(void)
  *
  * requires cfs_b->lock
  */
+/**
+ * __refill_cfs_bandwidth_runtime - 重置任务组的带宽配额为quota值
+ *
+ * 在每个带宽周期开始时调用，将cfs_b->runtime重置为cfs_b->quota，
+ * 使已被限流（throttled）的cfs_rq重新获得运行时间分配资格。
+ * 若quota为RUNTIME_INF（无限制）则不做任何操作。
+ */
 void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b)
 {
 	if (cfs_b->quota != RUNTIME_INF)
@@ -4610,6 +5063,13 @@ static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
 }
 
 /* returns 0 on failure to allocate runtime */
+/**
+ * __assign_cfs_rq_runtime - 从带宽池分配运行时间给cfs_rq（内部实现）
+ *
+ * 在持cfs_b->lock的情况下调用。计算需要补充的时间量（min_amount），
+ * 从全局配额runtime中扣除并加到cfs_rq->runtime_remaining中。
+ * 若配额不足则只分配剩余量，返回1表示分配成功（>0），0表示配额耗尽。
+ */
 static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 				   struct cfs_rq *cfs_rq, u64 target_runtime)
 {
@@ -4638,6 +5098,13 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 }
 
 /* returns 0 on failure to allocate runtime */
+/**
+ * assign_cfs_rq_runtime - 为cfs_rq从带宽池分配运行时间（加锁版本）
+ *
+ * 持cfs_b->lock锁，从任务组的全局带宽池中分配一个时间片
+ * （sched_cfs_bandwidth_slice，默认5ms）给指定的per-CPU cfs_rq。
+ * 若带宽池已耗尽则返回0，调用者将触发throttle_cfs_rq()限流。
+ */
 static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 {
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
@@ -4650,6 +5117,14 @@ static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 	return ret;
 }
 
+/**
+ * __account_cfs_rq_runtime - 扣除cfs_rq的运行时间配额
+ *
+ * 从cfs_rq->runtime_remaining中减去delta_exec（已执行时间）。
+ * 若剩余配额变为负值且cfs_rq尚未限流，则尝试向带宽池申请补充；
+ * 若补充失败则调用throttle_cfs_rq()对其限流。
+ * 被account_cfs_rq_runtime()在update_curr()路径中调用。
+ */
 static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
 {
 	/* dock delta_exec before expiring quota (as it could span periods) */
@@ -4738,6 +5213,14 @@ static int tg_throttle_down(struct task_group *tg, void *data)
 	return 0;
 }
 
+/**
+ * throttle_cfs_rq - 对带宽耗尽的cfs_rq执行限流
+ *
+ * 当任务组的CPU带宽配额用尽时，将对应的cfs_rq标记为throttled，
+ * 并从其父cfs_rq逐级向上将该组的任务计数从h_nr_running中减去，
+ * 使其不再参与调度直至下一个周期被unthrottle_cfs_rq()解除限流。
+ * 若在加锁后发现带宽已补充则放弃限流（竞态检查）。
+ */
 static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct rq *rq = rq_of(cfs_rq);
@@ -4807,6 +5290,14 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	return true;
 }
 
+/**
+ * unthrottle_cfs_rq - 解除对被限流cfs_rq的限制（带宽恢复）
+ *
+ * 当带宽池补充配额后，解除指定cfs_rq的throttled状态，
+ * 并将其任务计数逐级向上恢复到父cfs_rq的h_nr_running中，
+ * 使这些任务重新参与调度。若操作后当前任务需被抢占则
+ * 设置重调度标志并触发reschedule_curr()。
+ */
 void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct rq *rq = rq_of(cfs_rq);
@@ -4892,6 +5383,14 @@ unthrottle_throttle:
 		resched_curr(rq);
 }
 
+/**
+ * distribute_cfs_runtime - 将带宽池剩余时间分发给被限流的cfs_rq
+ *
+ * 在带宽周期定时器到期后（do_sched_cfs_period_timer）被调用。
+ * 遍历throttled_cfs_rq链表，逐个为被限流的cfs_rq分配运行时间，
+ * 若获得足够时间则调用unthrottle_cfs_rq()解除限流并恢复调度。
+ * 限流期间累积的运行时间（runtime_expires过期的部分）会被丢弃。
+ */
 static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
 {
 	struct cfs_rq *cfs_rq;
@@ -4938,6 +5437,15 @@ next:
  * cfs_rqs as appropriate. If there has been no activity within the last
  * period the timer is deactivated until scheduling resumes; cfs_b->idle is
  * used to track this state.
+ */
+/**
+ * do_sched_cfs_period_timer - CFS带宽控制周期定时器处理函数
+ *
+ * 每个带宽周期（cfs_b->period，默认100ms）到期时被调用。
+ * 重置全局运行时间配额（quota），处理周期溢出（overrun），
+ * 统计限流事件（nr_throttled），并调用distribute_cfs_runtime()
+ * 将新配额分发给被限流的cfs_rq以恢复其调度。
+ * 若所有cfs_rq均已满额则关闭定时器（idle=1）以节省开销。
  */
 static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
 {
@@ -5082,6 +5590,14 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
  * This is done with a timer (instead of inline with bandwidth return) since
  * it's necessary to juggle rq->locks to unthrottle their respective cfs_rqs.
  */
+/**
+ * do_sched_cfs_slack_timer - 宽限期定时器：归还空闲带宽给被限流的cfs_rq
+ *
+ * 当某个cfs_rq归还多余运行时间时启动宽限期定时器（slack timer）。
+ * 到期后检查带宽池是否积累了足够的slack，若是则调用distribute_cfs_runtime()
+ * 提前为被限流组分配运行时间，避免等到下一个完整周期才恢复调度。
+ * 这是CFS带宽控制的延迟补偿机制。
+ */
 static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
 {
 	u64 runtime = 0, slice = sched_cfs_bandwidth_slice();
@@ -5182,6 +5698,14 @@ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
 
 extern const u64 max_cfs_quota_period;
 
+/**
+ * sched_cfs_period_timer - CFS带宽控制周期高精度定时器回调
+ *
+ * 每个带宽周期（默认100ms）触发一次，调用do_sched_cfs_period_timer()
+ * 重置配额并解除被限流的cfs_rq。使用hrtimer_forward_now()处理多周期
+ * 溢出，若连续5次仍有overrun则打印警告。返回值决定定时器是否续期：
+ * idle=1时停止定时器（所有组均有充足配额），下次入队时重启。
+ */
 static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 {
 	struct cfs_bandwidth *cfs_b =
@@ -5236,6 +5760,14 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
 }
 
+/**
+ * init_cfs_bandwidth - 初始化任务组的CFS带宽控制结构
+ *
+ * 分配自旋锁、初始化运行时quota（默认RUNTIME_INF表示无限制）、
+ * 设置带宽周期（default_cfs_period，默认100ms），并初始化
+ * throttled_cfs_rq链表、period_timer高精度定时器和slack_timer。
+ * 在task_group创建时被调用。
+ */
 void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 {
 	raw_spin_lock_init(&cfs_b->lock);
@@ -5257,6 +5789,13 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
 }
 
+/**
+ * start_cfs_bandwidth - 启动CFS带宽控制的周期定时器
+ *
+ * 若period_timer尚未激活，则将其设置为从当前时间起经过一个
+ * 带宽周期后触发，并启动定时器（HRTIMER_MODE_ABS_PINNED绑定CPU）。
+ * 在首次入队该任务组的任务时被assign_cfs_rq_runtime()调用。
+ */
 void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 {
 	lockdep_assert_held(&cfs_b->lock);
@@ -5386,6 +5925,14 @@ static inline void unthrottle_offline_cfs_rqs(struct rq *rq) {}
  */
 
 #ifdef CONFIG_SCHED_HRTICK
+/**
+ * hrtick_start_fair - 为CFS任务启动高精度抢占定时器
+ *
+ * 计算当前任务剩余时间片（sched_slice减去已运行时间），设置hrtimer在
+ * 时间片耗尽时触发。hrtick精度优于HZ时钟节拍，使CFS在低负载（任务数少）
+ * 时也能精确控制调度粒度，避免时钟节拍驱动的粗粒度抢占带来的延迟。
+ * 仅在CONFIG_SCHED_HRTICK开启且有多个可运行任务时生效。
+ */
 static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 {
 	struct sched_entity *se = &p->se;
@@ -5453,6 +6000,13 @@ static inline void update_overutilized_status(struct rq *rq) { }
 #endif
 
 /* Runqueue only has SCHED_IDLE tasks enqueued */
+/**
+ * sched_idle_rq - 检查运行队列是否只有IDLE策略任务在运行
+ *
+ * 若nr_running不为0且全部都是IDLE策略任务（idle_h_nr_running == nr_running），
+ * 则认为该队列处于"调度空闲"状态。用于唤醒抢占判断：
+ * 当目标CPU只运行IDLE任务时，任何非IDLE任务都应立即抢占。
+ */
 static int sched_idle_rq(struct rq *rq)
 {
 	return unlikely(rq->nr_running == rq->cfs.idle_h_nr_running &&
@@ -5466,6 +6020,14 @@ static int sched_idle_cpu(int cpu)
 }
 #endif
 
+/**
+ * enqueue_task_fair - 将任务加入CFS就绪队列（sched_class接口）
+ *
+ * 在nr_running递增之前被调用。更新公平调度统计信息并将调度实体
+ * 插入红黑树。支持组调度：从叶节点向上逐级更新各层cfs_rq。
+ * 若遇到被限流（throttled）的cfs_rq则提前终止向上传播。
+ * 同时更新PELT负载统计、util_est估算值以及cpufreq调频提示。
+ */
 /*
  * The enqueue_task method is called before nr_running is
  * increased. Here we update the fair scheduling stats and
@@ -5580,6 +6142,24 @@ static void set_next_buddy(struct sched_entity *se);
  * The dequeue_task method is called before nr_running is
  * decreased. We remove the task from the rbtree and
  * update the fair scheduling stats:
+ */
+/**
+ * dequeue_task_fair - 将任务从CFS运行队列移除（调度类接口函数）
+ * @rq:    运行队列
+ * @p:     要出队的任务
+ * @flags: 出队标志（DEQUEUE_SLEEP=任务进入睡眠，DEQUEUE_NOCLOCK等）
+ *
+ * CFS调度类的 dequeue_task 接口，在以下场景调用：
+ *   - 任务调用 sleep()/wait() 等进入阻塞状态
+ *   - 任务被迁移到其他CPU
+ *   - 任务优先级/调度策略变更
+ *
+ * 执行步骤（对组调度需逐层向上处理）：
+ *   1. dequeue_entity()：从CFS红黑树移除调度实体，更新PELT统计
+ *   2. 若任务进入睡眠（task_sleep），清除 next/last buddy 提示
+ *   3. 更新各层 cfs_rq 的负载统计（nr_running、load_avg）
+ *   4. 若调度类的任务数清零，更新 rq 的空闲状态
+ *   5. 若从非空变为空，可能触发 hrtick 定时器更新
  */
 static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -5725,6 +6305,14 @@ static unsigned long capacity_of(int cpu)
 	return cpu_rq(cpu)->cpu_capacity;
 }
 
+/**
+ * record_wakee - 记录当前任务唤醒目标的"唤醒翻转"统计
+ *
+ * 当waker（当前任务）唤醒一个与上次不同的wakee时，递增wakee_flips计数。
+ * 每个HZ对flips计数右移1位衰减（指数衰减）。
+ * wakee_flips用于wake_wide()判断：高翻转率说明waker频繁切换唤醒对象，
+ * 适合将wakee放到远端CPU（宽唤醒），以减少LLC缓存争用。
+ */
 static void record_wakee(struct task_struct *p)
 {
 	/*
@@ -5758,6 +6346,14 @@ static void record_wakee(struct task_struct *p)
  * Waker/wakee being client/server, worker/dispatcher, interrupt source or
  * whatever is irrelevant, spread criteria is apparent partner count exceeds
  * socket size.
+ */
+/**
+ * wake_wide - 判断唤醒时是否应采用"宽唤醒"策略（跨LLC放置）
+ *
+ * 若waker（当前任务）的wakee_flips远超wakee的wakee_flips，说明
+ * waker是一个"扇出型"任务（频繁唤醒不同的任务），应将wakee放到
+ * 其他LLC域的CPU上，避免waker和多个wakee争用同一LLC缓存。
+ * factor = sd_llc_size（LLC域内CPU数），返回1表示应宽唤醒。
  */
 static int wake_wide(struct task_struct *p)
 {
@@ -5851,6 +6447,25 @@ wake_affine_weight(struct sched_domain *sd, struct task_struct *p,
 	return this_eff_load < prev_eff_load ? this_cpu : nr_cpumask_bits;
 }
 
+/**
+ * wake_affine - 判断唤醒任务是否应迁移到唤醒者所在CPU（唤醒亲和性）
+ * @sd:       调度域
+ * @p:        被唤醒的任务
+ * @this_cpu: 唤醒者当前所在CPU
+ * @prev_cpu: 被唤醒任务上次运行的CPU
+ * @sync:     是否为同步唤醒（唤醒后立即让出CPU）
+ *
+ * 唤醒亲和性（wake affine）是一种启发式优化：
+ * 将被唤醒任务放置在唤醒者相同或相邻的CPU，利用共享缓存提升性能。
+ * 典型场景：producer-consumer模型中，producer唤醒consumer后，
+ * consumer在producer的CPU上运行可以直接读取producer写入的缓存数据。
+ *
+ * 两种策略（可通过 sched_feat 动态开关）：
+ *   WA_IDLE：若唤醒者CPU空闲，将任务迁移到此CPU（cache hot）
+ *   WA_WEIGHT：基于负载权重比较，选择负载更低的CPU
+ *
+ * 返回目标CPU编号：this_cpu（迁移）或 prev_cpu（不迁移）。
+ */
 static int wake_affine(struct sched_domain *sd, struct task_struct *p,
 		       int this_cpu, int prev_cpu, int sync)
 {
@@ -5930,6 +6545,26 @@ find_idlest_group_cpu(struct sched_group *group, struct task_struct *p, int this
 	return shallowest_idle_cpu != -1 ? shallowest_idle_cpu : least_loaded_cpu;
 }
 
+/**
+ * find_idlest_cpu - 在调度域中找到负载最轻（最空闲）的CPU
+ * @sd:       要搜索的调度域
+ * @p:        待放置的任务
+ * @cpu:      当前CPU（初始候选）
+ * @prev_cpu: 任务上次运行的CPU
+ * @sd_flag:  调度域标志（如SD_BALANCE_FORK表示fork时的放置）
+ *
+ * 在 select_task_rq_fair() 的非亲和性路径中调用，
+ * 通过逐层遍历调度域找到全局负载最轻的CPU：
+ *
+ *   1. 检查任务是否可以在此调度域的CPU上运行（cpumask检查）
+ *   2. 同步任务的负载平均值（确保统计数据是最新的）
+ *   3. find_idlest_group()：找到调度域内负载最轻的调度组
+ *   4. find_idlest_group_cpu()：在该组内找到最空闲的CPU
+ *      - 优先选择完全空闲的CPU
+ *      - 次选负载最低的CPU
+ *
+ * 从最低层调度域开始，逐层向上迭代，直至找到合适的CPU。
+ */
 static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p,
 				  int cpu, int prev_cpu, int sd_flag)
 {
@@ -6209,6 +6844,26 @@ static inline bool asym_fits_capacity(int task_util, int cpu)
 
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
+ */
+/**
+ * select_idle_sibling - 为唤醒任务选择空闲的兄弟CPU（LLC共享域）
+ * @p:      被唤醒的任务
+ * @prev:   任务上次运行的CPU
+ * @target: select_task_rq_fair()初步选定的目标CPU
+ *
+ * 在 select_task_rq_fair() 确定目标CPU之后，进一步尝试在目标CPU
+ * 的LLC（最后级缓存）共享域内找到真正空闲的CPU，避免将任务放到
+ * 即将繁忙的CPU上。
+ *
+ * 搜索顺序（短路原则，找到即返回）：
+ *   1. target CPU本身空闲 → 直接返回
+ *   2. prev CPU空闲（任务上次运行过，cache仍然热）→ 返回prev
+ *   3. recently_used_cpu 空闲（任务最近访问过的CPU）→ 返回之
+ *   4. 遍历LLC域内所有CPU，找到第一个完全空闲的CPU
+ *   5. 非对称CPU算力（big.LITTLE）：选择算力匹配且空闲的CPU
+ *
+ * 目标：最小化cache miss + 避免不必要的任务迁移开销。
+ * 返回找到的空闲CPU编号，若无空闲则返回原始 target。
  */
 static int select_idle_sibling(struct task_struct *p, int prev, int target)
 {
@@ -6681,7 +7336,29 @@ fail:
 	return -1;
 }
 
-/*
+/**
+ * select_task_rq_fair - 为唤醒任务选择目标运行队列
+ *
+ * 在设置了 sd_flag 标志的调度域中为唤醒任务选择目标CPU。
+ * 实际使用场景：SD_BALANCE_WAKE（任务唤醒）、SD_BALANCE_FORK（fork负载均衡）、
+ * SD_BALANCE_EXEC（exec负载均衡）。
+ *
+ * 选择策略：
+ *   1. 如果调度域设置了 SD_WAKE_AFFINE，尝试选择与唤醒者同域的空闲兄弟CPU（缓存亲和性）
+ *   2. 否则遍历调度域层级，在空闲度最高的调度组中选择空闲度最高的CPU（全局负载均衡）
+ *
+ * 核心算法：
+ *   - want_affine：当 SD_BALANCE_WAKE 且唤醒者与目标在同一调度域时置位
+ *   - 从最低层调度域向上遍历，优先选择 SD_WAKE_AFFINE 域做亲和性检测
+ *   - find_idlest_cpu() 在非亲和性路径下找到负载最轻的CPU
+ *
+ * @p:          被唤醒的任务
+ * @prev_cpu:   任务上次运行的CPU
+ * @sd_flag:    触发此次选择的调度域标志（如 SD_BALANCE_WAKE）
+ * @wake_flags: 唤醒标志（WF_SYNC 表示同步唤醒）
+ *
+ * 返回目标CPU编号。调用时必须禁止抢占。
+ *
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the 'sd_flag' flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
@@ -6759,6 +7436,25 @@ static void detach_entity_cfs_rq(struct sched_entity *se);
  * cfs_rq_of(p) references at time of call are still valid and identify the
  * previous CPU. The caller guarantees p->pi_lock or task_rq(p)->lock is held.
  */
+/**
+ * migrate_task_rq_fair - 任务迁移到新CPU时的CFS特定处理
+ * @p:       被迁移的任务
+ * @new_cpu: 目标CPU编号
+ *
+ * 在任务被迁移（通过负载均衡或主动迁移）到新CPU时调用，
+ * 处理CFS调度器特有的迁移后状态更新：
+ *
+ * vruntime修正：
+ *   - 不同CPU的 cfs_rq->min_vruntime 可能不同
+ *   - 阻塞唤醒中的任务（TASK_WAKING）持有绝对vruntime
+ *   - 迁移时需减去旧CPU的min_vruntime，变成相对值
+ *   - enqueue_entity() 在新CPU上会再加上新CPU的min_vruntime
+ *   - 这确保任务在新CPU上不会因vruntime差异获得不公平的待遇
+ *
+ * PELT更新：
+ *   - 清空 se->avg.last_update_time，防止新CPU计算出错误的时间差
+ *   - 解附（detach）NUMA首选CPU信息，允许重新评估最优节点
+ */
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	/*
@@ -6816,6 +7512,13 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 	update_scan_period(p, new_cpu);
 }
 
+/**
+ * task_dead_fair - 任务退出时清理PELT负载统计（sched_class接口）
+ *
+ * 任务彻底退出（do_exit后）时调用，从调度实体的PELT统计中移除
+ * 该任务的负载贡献。对应attach_entity_load_avg()的反向操作，
+ * 防止已退出任务的负载数据残留在cfs_rq的load_avg中影响调度决策。
+ */
 static void task_dead_fair(struct task_struct *p)
 {
 	remove_entity_load_avg(&p->se);
@@ -6851,7 +7554,25 @@ static unsigned long wakeup_gran(struct sched_entity *se)
 	return calc_delta_fair(gran, se);
 }
 
-/*
+/**
+ * wakeup_preempt_entity - 判断唤醒任务的vruntime是否足以抢占当前任务
+ * @curr: 当前运行的调度实体
+ * @se:   待唤醒的调度实体（候选抢占者）
+ *
+ * 返回值：
+ *   -1: se 的 vruntime 远大于 curr（se落后很多，不应抢占）
+ *    0: se 的 vruntime 与 curr 相近（边界情况，不抢占）
+ *    1: se 的 vruntime 比 curr 小足够多（se更应运行，触发抢占）
+ *
+ * 判断公式：
+ *   vdiff = curr->vruntime - se->vruntime
+ *   若 vdiff < 0：se比curr运行得少，但差距不够大（返回0）
+ *   若 vdiff > wakeup_gran：差距超过唤醒粒度阈值，触发抢占（返回1）
+ *
+ * wakeup_gran（唤醒粒度）基于 sysctl_sched_wakeup_granularity（默认1ms）
+ * 按权重归一化，防止高优先级任务因vruntime略低而频繁抢占，
+ * 减少不必要的上下文切换开销。
+ *
  * Should 'se' preempt 'curr'.
  *
  *             |s1
@@ -6880,6 +7601,14 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
 	return 0;
 }
 
+/**
+ * set_last_buddy - 标记调度实体为"last"提示（抢占豁免）
+ *
+ * 将se（及其所有组调度父实体）标记为cfs_rq->last，提示调度器
+ * 在pick_next_task时优先继续运行该实体，即使其vruntime略大于
+ * 红黑树最左节点。用于减少不必要的上下文切换（缓存友好性优化）。
+ * 忽略IDLE策略任务（它们不需要此优化）。
+ */
 static void set_last_buddy(struct sched_entity *se)
 {
 	if (entity_is_task(se) && unlikely(task_has_idle_policy(task_of(se))))
@@ -6892,6 +7621,14 @@ static void set_last_buddy(struct sched_entity *se)
 	}
 }
 
+/**
+ * set_next_buddy - 标记调度实体为"next"提示（唤醒抢占优先）
+ *
+ * 将se（及其所有组调度父实体）标记为cfs_rq->next，提示调度器
+ * 下次pick_next_task时优先选择该实体运行。
+ * 用于wake_up_new_task()和yield_to_task_fair()，确保被唤醒任务
+ * 或让出对象能在下一次调度时得到优先执行机会。
+ */
 static void set_next_buddy(struct sched_entity *se)
 {
 	if (entity_is_task(se) && unlikely(task_has_idle_policy(task_of(se))))
@@ -6904,6 +7641,13 @@ static void set_next_buddy(struct sched_entity *se)
 	}
 }
 
+/**
+ * set_skip_buddy - 标记调度实体为"skip"提示（主动让出时跳过）
+ *
+ * 将se（及其所有组调度父实体）标记为cfs_rq->skip，
+ * 使pick_next_task_fair()在下次选择时跳过该实体，
+ * 配合yield_task_fair()实现sched_yield()的让出语义。
+ */
 static void set_skip_buddy(struct sched_entity *se)
 {
 	for_each_sched_entity(se)
@@ -6912,6 +7656,26 @@ static void set_skip_buddy(struct sched_entity *se)
 
 /*
  * Preempt the current task with a newly woken task if needed:
+ */
+/**
+ * check_preempt_wakeup - 检查唤醒的任务是否应抢占当前运行任务
+ * @rq:         运行队列
+ * @p:          刚被唤醒的任务（候选抢占者）
+ * @wake_flags: 唤醒标志（WF_SYNC等）
+ *
+ * 在任务唤醒时（try_to_wake_up → check_preempt_curr）调用，
+ * 决定唤醒的任务 p 是否应立即抢占正在运行的 curr。
+ *
+ * 判断逻辑：
+ *   1. 若 p 是实时任务，直接抢占（不在CFS范围）
+ *   2. 若 p 被限流（throttled），不抢占
+ *   3. 若调度域允许（SD_BALANCE_WAKE），检查NUMA/亲和性
+ *   4. 核心：调用 wakeup_preempt_entity() 比较vruntime差值：
+ *      - 若 p.vruntime + wakeup_gran < curr.vruntime，则抢占
+ *      - wakeup_gran 是一个防止过度抢占的阈值（基于调度延迟）
+ *   5. 任务数较多时（scale），设置 next_buddy 提示下次选择 p
+ *
+ * 若决定抢占，调用 resched_curr() 设置 TIF_NEED_RESCHED 标志。
  */
 static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
 {
@@ -6996,6 +7760,24 @@ preempt:
 		set_last_buddy(se);
 }
 
+/**
+ * pick_next_task_fair - CFS调度器选择下一个要运行的任务
+ * @rq:   运行队列
+ * @prev: 上一个运行的任务（将被换下CPU）
+ * @rf:   运行队列标志（用于中断锁管理）
+ *
+ * 调度器核心 schedule() 调用的关键函数，从CFS红黑树中选出下一个任务：
+ *
+ * 主要路径：
+ *   1. 快速路径（idle→fair切换）：若prev是idle任务，直接选最左节点
+ *   2. 组调度路径：沿 se→cfs_rq 层级向下遍历，逐层找最应运行的实体
+ *   3. 调用 put_prev_entity() 将 prev 放回红黑树
+ *   4. 调用 set_next_entity() 从树上摘除胜选实体，设为当前任务
+ *   5. 若启用了 newidle_balance，在选任务前尝试从其他CPU拉取任务
+ *
+ * 时间复杂度：O(log N)（红黑树深度）。
+ * 返回选中的 task_struct 指针；若CFS队列为空返回NULL（fallback到idle）。
+ */
 struct task_struct *
 pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
@@ -7148,6 +7930,13 @@ static struct task_struct *__pick_next_task_fair(struct rq *rq)
 /*
  * Account for a descheduled task:
  */
+/**
+ * put_prev_task_fair - 将当前任务换下CPU时的CFS收尾（sched_class接口）
+ *
+ * 沿组调度层级从叶节点向上逐级调用put_prev_entity()，
+ * 将每层cfs_rq的curr指针清空，并将调度实体归还到红黑树中，
+ * 使其重新参与下一轮调度选择。对应set_next_entity()的反向操作。
+ */
 static void put_prev_task_fair(struct rq *rq, struct task_struct *prev)
 {
 	struct sched_entity *se = &prev->se;
@@ -7163,6 +7952,13 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev)
  * sched_yield() is very simple
  *
  * The magic of dealing with the ->skip buddy is in pick_next_entity.
+ */
+/**
+ * yield_task_fair - 主动让出CPU（sched_yield系统调用CFS实现）
+ *
+ * 将当前任务的调度实体标记为skip_buddy，使pick_next_task_fair()
+ * 跳过它并选择下一个实体运行。若只有一个可运行任务则无效。
+ * 通过设置skip而非直接操作vruntime，避免破坏红黑树的排序不变量。
  */
 static void yield_task_fair(struct rq *rq)
 {
@@ -7195,6 +7991,13 @@ static void yield_task_fair(struct rq *rq)
 	set_skip_buddy(se);
 }
 
+/**
+ * yield_to_task_fair - 让出CPU并指定下一个运行任务（sched_yield_to实现）
+ *
+ * 将目标任务p设置为next_buddy，使调度器优先选择它运行，
+ * 然后调用yield_task_fair()让当前任务主动放弃CPU。
+ * 若目标任务不在运行队列或处于被限流的层级则直接返回false。
+ */
 static bool yield_to_task_fair(struct rq *rq, struct task_struct *p)
 {
 	struct sched_entity *se = &p->se;
@@ -7416,6 +8219,14 @@ struct lb_env {
 /*
  * Is this task likely cache-hot:
  */
+/**
+ * task_hot - 判断任务是否因缓存热度而不宜迁移
+ *
+ * 若任务最近（cache_nice_tries个调度周期内）在当前CPU上运行过，
+ * 则认为其LLC缓存数据仍然"热"，跨核迁移代价较高，返回1阻止迁移。
+ * IDLE策略任务和非CFS任务豁免此检查。
+ * cache_nice_tries可通过/proc/sys/kernel/sched_migration_cost_ns调整。
+ */
 static int task_hot(struct task_struct *p, struct lb_env *env)
 {
 	s64 delta;
@@ -7514,6 +8325,16 @@ static inline int migrate_degrades_locality(struct task_struct *p,
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
  */
 static
+/**
+ * can_migrate_task - 综合判断任务是否可以迁移到目标CPU
+ *
+ * 负载均衡中的迁移可行性检查，顺序排查以下阻止条件：
+ * 1. 任务被带宽控制throttled（cfs_rq被限流）
+ * 2. 任务的cpus_ptr不包含目标CPU（亲和性限制）
+ * 3. 任务当前正在运行（不能迁移正在执行的任务）
+ * 4. 任务缓存过热（task_hot()返回1）
+ * 全部通过则允许迁移，返回1。
+ */
 int can_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	int tsk_cache_hot;
@@ -7594,6 +8415,18 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 /*
  * detach_task() -- detach the task for the migration specified in env
  */
+/**
+ * detach_task - 将任务从源运行队列摘除，准备迁移到目标CPU
+ * @p:   要迁移的任务
+ * @env: 负载均衡环境（含源/目标CPU信息）
+ *
+ * 迁移的第一步：从源CPU的运行队列上摘除任务：
+ *   1. deactivate_task()：将任务出队（从红黑树移除，清除on_rq标志）
+ *   2. set_task_cpu()：修改 p->cpu 为目标CPU
+ *
+ * 注意：此函数执行时持有 src_rq->lock，不能执行可能睡眠的操作。
+ * 摘除后任务处于游离状态（不在任何rq上），需要尽快被 attach_task() 挂载。
+ */
 static void detach_task(struct task_struct *p, struct lb_env *env)
 {
 	lockdep_assert_held(&env->src_rq->lock);
@@ -7640,6 +8473,29 @@ static const unsigned int sched_nr_migrate_break = 32;
  * busiest_rq, as part of a balancing operation within domain "sd".
  *
  * Returns number of detached tasks if successful and 0 otherwise.
+ */
+/**
+ * detach_tasks - 从源运行队列批量摘除任务用于负载均衡迁移
+ * @env: 负载均衡环境（含不均衡量、源/目标CPU、任务筛选规则等）
+ *
+ * load_balance() 在找到最忙队列后，调用此函数从中批量摘取任务：
+ *
+ * 迁移终止条件（满足任一即停止）：
+ *   - 已消除足够的不均衡量（env->imbalance <= 0）
+ *   - 源队列任务数降至安全水位
+ *   - 已迁移任务数达到上限（loop_max）
+ *   - 连续跳过太多任务（loop_break，避免持锁时间过长）
+ *
+ * 任务筛选（can_migrate_task()）：
+ *   - 任务不能在当前CPU上运行（cpumask约束）
+ *   - 任务不能正在运行（race condition）
+ *   - 若任务具有cache亲和性且不均衡不严重，跳过
+ *
+ * 迁移模式（env->migration_type）：
+ *   migrate_load：按负载权重计算，摘除足够权重的任务
+ *   migrate_util：按利用率计算
+ *   migrate_task：按任务数计算（摘除固定数量）
+ *   migrate_misfit：只迁移大任务（misfit task）
  */
 static int detach_tasks(struct lb_env *env)
 {
@@ -8008,6 +8864,21 @@ static unsigned long task_h_load(struct task_struct *p)
 }
 #endif
 
+/**
+ * update_blocked_averages - 更新CPU上所有阻塞（非运行）调度实体的负载平均值
+ * @cpu: 目标CPU编号
+ *
+ * PELT（Per-Entity Load Tracking）使用指数衰减平均值追踪负载。
+ * 对于正在运行的实体，update_curr() 会实时更新其统计。
+ * 但对于阻塞（sleep）的实体，其历史负载需要周期性衰减，
+ * 否则已经睡眠很久的任务仍会持有虚高的负载数值，影响负载均衡决策。
+ *
+ * 此函数在 NOHZ idle 路径和周期性负载均衡中调用：
+ *   1. __update_blocked_others()：更新RT/DL/IRQ等非CFS调度类的阻塞实体
+ *   2. __update_blocked_fair()：遍历CFS运行队列层级，衰减所有阻塞实体的PELT
+ *   3. 若有实体的负载发生显著衰减（decayed），触发 cpufreq 更新
+ *   4. 更新 rq->last_blocked_load_update_tick（防止重复更新）
+ */
 static void update_blocked_averages(int cpu)
 {
 	bool decayed = false, done = true;
@@ -8117,6 +8988,14 @@ static unsigned long scale_rt_capacity(int cpu)
 	return scale_irq_capacity(free, irq, max);
 }
 
+/**
+ * update_cpu_capacity - 更新CPU的有效调度容量
+ *
+ * 从arch层获取原始CPU容量（cpu_capacity_orig，反映CPU频率/算力差异），
+ * 再通过scale_rt_capacity()减去RT任务和IRQ消耗的容量，
+ * 得到可供CFS任务使用的有效容量（rq->cpu_capacity）。
+ * 结果存入调度域的groups[0].sgc->capacity，供负载均衡计算使用。
+ */
 static void update_cpu_capacity(struct sched_domain *sd, int cpu)
 {
 	unsigned long capacity = scale_rt_capacity(cpu);
@@ -9181,6 +10060,27 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
  *
  * Return:	- The busiest group if imbalance exists.
  */
+/**
+ * find_busiest_group - 在调度域中找到负载最重的调度组
+ * @env: 负载均衡环境（包含调度域、目标CPU、空闲状态等）
+ *
+ * 是 load_balance() 的核心子函数，负责确定哪个调度组（sched_group）
+ * 的负载最重，需要将其任务迁移到当前CPU所在的组。
+ *
+ * 分析步骤：
+ *   1. update_sd_lb_stats()：收集调度域中每个组的负载统计
+ *      （nr_running、load、capacity、util等）
+ *   2. 若启用了EAS（能效感知调度），委托给 find_energy_efficient_cpu()
+ *   3. 否则按负载不均衡程度（imbalance）选择最忙组
+ *
+ * 不均衡类型（migrate_type）：
+ *   migrate_load:   负载不均衡，迁移高负载任务
+ *   migrate_util:   算力利用率不均衡，迁移高利用率任务
+ *   migrate_task:   任务数不均衡，迁移任务到空闲CPU
+ *   migrate_misfit: 大任务在小核CPU上，迁移到大核
+ *
+ * 返回最忙的调度组指针，若无需均衡返回NULL。
+ */
 static struct sched_group *find_busiest_group(struct lb_env *env)
 {
 	struct sg_lb_stats *local, *busiest;
@@ -9481,6 +10381,14 @@ voluntary_active_balance(struct lb_env *env)
 	return 0;
 }
 
+/**
+ * need_active_balance - 判断是否需要主动负载均衡（停止目标CPU）
+ *
+ * 常规均衡（pull任务）失败次数过多时，通过stop_one_cpu()直接
+ * 将目标CPU停下来强制迁移任务（主动均衡）。
+ * voluntary_active_balance()检查更紧急的场景（如CPU超载、任务亲和性）。
+ * 超过cache_nice_tries+2次均衡失败也触发主动均衡。
+ */
 static int need_active_balance(struct lb_env *env)
 {
 	struct sched_domain *sd = env->sd;
@@ -9493,6 +10401,14 @@ static int need_active_balance(struct lb_env *env)
 
 static int active_load_balance_cpu_stop(void *data);
 
+/**
+ * should_we_balance - 判断当前CPU是否应执行本次均衡（避免重复均衡）
+ *
+ * 在调度域中选出一个"代表CPU"来执行均衡，通常是dst_cpu所在
+ * 调度组中第一个空闲CPU（或首个可用CPU）。只有被选中的CPU才
+ * 实际执行load_balance()，防止同一调度域的多个CPU同时竞争均衡，
+ * 减少锁争用和重复工作。
+ */
 static int should_we_balance(struct lb_env *env)
 {
 	struct sched_group *sg = env->sd->groups;
@@ -9528,6 +10444,28 @@ static int should_we_balance(struct lb_env *env)
 /*
  * Check this_cpu to ensure it is balanced within domain. Attempt to move
  * tasks if there is an imbalance.
+ */
+/**
+ * load_balance - CFS负载均衡核心函数，将任务从最繁忙CPU迁移到本CPU
+ * @this_cpu:          执行负载均衡的当前CPU
+ * @this_rq:           当前CPU的运行队列
+ * @sd:                执行均衡的调度域（如MC域、DIE域、NUMA域）
+ * @idle:              当前CPU的空闲状态（CPU_IDLE/CPU_NOT_IDLE/CPU_NEWLY_IDLE）
+ * @continue_balancing: 输出参数，指示是否需要在父调度域继续均衡
+ *
+ * 定期（由 run_rebalance_domains 触发）或CPU变空闲时执行跨CPU任务迁移：
+ *
+ * 算法：
+ *   1. 遍历调度域中所有调度组，找到负载最重的组（find_busiest_group）
+ *   2. 在最忙组中找到负载最重的CPU（find_busiest_queue）
+ *   3. 尝试将任务从最忙CPU迁移到本CPU（detach_tasks + attach_tasks）
+ *   4. 若普通迁移失败（任务被绑定等），触发 active_balance（直接在目标CPU抢占）
+ *   5. 更新 sd->nr_balance_failed 失败计数，超限时触发 active migration
+ *
+ * 层级迭代：从最低层（L1缓存共享域）到最高层（NUMA跨节点域）依次均衡，
+ * 遵循"先在近邻域均衡，再向上扩展"的原则，最小化cache miss开销。
+ *
+ * 返回迁移的任务数（ld_moved）。
  */
 static int load_balance(int this_cpu, struct rq *this_rq,
 			struct sched_domain *sd, enum cpu_idle_type idle,
@@ -9846,6 +10784,14 @@ update_next_balance(struct sched_domain *sd, unsigned long *next_balance)
  * least 1 task to be running on each physical CPU where possible, and
  * avoids physical / logical imbalances.
  */
+/**
+ * active_load_balance_cpu_stop - 主动负载均衡的stop_machine回调函数
+ *
+ * 运行在busiest CPU的stopper线程上，暂停该CPU的正常调度。
+ * 找到busiest_rq上可以迁移到target_cpu的任务，调用move_task()
+ * 完成跨CPU迁移。这是在常规pull均衡失败后的最后手段，
+ * 可突破部分缓存热度限制强制迁移以恢复负载均衡。
+ */
 static int active_load_balance_cpu_stop(void *data)
 {
 	struct rq *busiest_rq = data;
@@ -9946,6 +10892,24 @@ void update_max_interval(void)
  * and initiates a balancing operation if so.
  *
  * Balancing parameters are set up in init_sched_domains.
+ */
+/**
+ * rebalance_domains - 对当前CPU遍历所有调度域层级执行负载均衡
+ * @rq:   当前CPU的运行队列
+ * @idle: 当前CPU的空闲状态
+ *
+ * 由 run_rebalance_domains()（SCHED_SOFTIRQ处理函数）调用。
+ * 从最低层调度域（如L1缓存共享域）向最高层（NUMA跨节点域）逐层检查：
+ *
+ *   1. 计算各域的均衡间隔（interval）：空闲CPU更频繁均衡，繁忙CPU较少
+ *   2. 检查是否到达该域的均衡时间窗口（rq->next_balance）
+ *   3. 若需要序列化（避免同域多CPU同时均衡），跳过
+ *   4. 调用 load_balance() 执行实际任务迁移
+ *   5. 若某域均衡失败（continue_balancing=0），停止向上层遍历
+ *   6. 更新 rq->next_balance（下次均衡时间）
+ *
+ * 均衡间隔由调度域的 sd->min_interval/max_interval 控制，
+ * 防止负载均衡本身消耗过多CPU时间。
  */
 static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
 {
@@ -10513,6 +11477,26 @@ static inline void nohz_newidle_balance(struct rq *this_rq) { }
  *     0 - failed, no new tasks
  *   > 0 - success, new (fair) tasks present
  */
+/**
+ * newidle_balance - CPU进入空闲前尝试从其他CPU拉取任务（新空闲均衡）
+ * @this_rq: 即将空闲的当前CPU运行队列
+ * @rf:      运行队列标志
+ *
+ * 当CPU没有可运行任务、即将进入idle状态时，在进入idle之前调用此函数，
+ * 尝试从其他繁忙CPU迁移任务过来，避免CPU空转浪费：
+ *
+ * 执行策略：
+ *   1. 记录 idle_stamp（用于统计idle持续时间）
+ *   2. 遍历调度域层级，对每层调用 load_balance(CPU_NEWLY_IDLE)
+ *   3. 若成功拉取任务（pulled_task > 0），立即返回（不再idle）
+ *   4. 若均衡耗时过长（curr_cost > max_cost），停止继续尝试
+ *   5. 更新 this_rq->next_balance 防止立即重复均衡
+ *
+ * 与周期性负载均衡的区别：
+ *   - 此函数在CPU即将空闲时同步执行（在pick_next_task失败后）
+ *   - 优先从最近层（cache共享域）拉取任务，最小化cache miss
+ *   - 成功后直接返回任务，CPU不需要进入idle状态
+ */
 static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 {
 	unsigned long next_balance = jiffies + HZ;
@@ -10628,6 +11612,23 @@ out:
  * run_rebalance_domains is triggered when needed from the scheduler tick.
  * Also triggered for nohz idle balancing (with nohz_balancing_kick set).
  */
+/**
+ * run_rebalance_domains - SCHED_SOFTIRQ软中断处理函数，执行周期性负载均衡
+ * @h: softirq_action（未使用）
+ *
+ * 由 trigger_load_balance() 触发的 SCHED_SOFTIRQ 的处理函数。
+ * 在软中断上下文中执行（允许睡眠但仍在禁中断上下文），处理两种均衡：
+ *
+ *   1. NOHZ idle均衡（nohz_idle_balance）：
+ *      - 若其他CPU处于NOHZ idle状态（时钟停止），本CPU代为均衡
+ *      - 将繁忙CPU的任务迁移到idle CPU，唤醒idle CPU
+ *      - 必须在 rebalance_domains() 之前执行，给idle CPU均衡机会
+ *
+ *   2. 常规周期性均衡（rebalance_domains）：
+ *      - 遍历本CPU的所有调度域层级
+ *      - 对每层调用 load_balance() 执行任务迁移
+ *      - 根据CPU是否空闲选择不同的均衡激进程度
+ */
 static __latent_entropy void run_rebalance_domains(struct softirq_action *h)
 {
 	struct rq *this_rq = this_rq();
@@ -10653,6 +11654,18 @@ static __latent_entropy void run_rebalance_domains(struct softirq_action *h)
 /*
  * Trigger the SCHED_SOFTIRQ if it is time to do periodic load balancing.
  */
+/**
+ * trigger_load_balance - 触发负载均衡软中断（调度节拍入口）
+ * @rq: 当前CPU的运行队列
+ *
+ * 在每次时钟节拍（scheduler_tick）末尾调用，检查是否需要触发负载均衡：
+ *   1. 若CPU连接到空调度域（null domain，如CPU热插拔期间），直接返回
+ *   2. 若当前时刻 >= rq->next_balance（均衡时间窗口到期），
+ *      触发 SCHED_SOFTIRQ 软中断 → run_rebalance_domains() → load_balance()
+ *   3. 调用 nohz_balancer_kick()，在NOHZ空闲模式下踢醒其他CPU做均衡
+ *
+ * 通过软中断异步执行负载均衡，避免在时钟中断上下文中做繁重的均衡计算。
+ */
 void trigger_load_balance(struct rq *rq)
 {
 	/* Don't need to rebalance while attached to NULL domain */
@@ -10665,6 +11678,13 @@ void trigger_load_balance(struct rq *rq)
 	nohz_balancer_kick(rq);
 }
 
+/**
+ * rq_online_fair - CPU上线时CFS初始化（sched_class接口）
+ *
+ * 当CPU热插入上线时调用，更新全局调度参数sysctl并启用
+ * 任务组带宽控制定时器（update_runtime_enabled），确保
+ * 新上线CPU能够正确参与CFS调度和带宽限流机制。
+ */
 static void rq_online_fair(struct rq *rq)
 {
 	update_sysctl();
@@ -10690,6 +11710,22 @@ static void rq_offline_fair(struct rq *rq)
  * and everything must be accessed through the @rq and @curr passed in
  * parameters.
  */
+/**
+ * task_tick_fair - 时钟节拍处理（CFS调度器的定时器回调）
+ * @rq:     当前CPU的运行队列
+ * @curr:   当前正在运行的任务
+ * @queued: 是否有待处理的hrtimer队列事件
+ *
+ * 每次时钟节拍（timer tick）时由调度器核心调用，负责：
+ *   1. 沿 sched_entity 层级向上遍历（组调度），对每层调用 entity_tick()：
+ *      - 更新当前实体的 vruntime（update_curr）
+ *      - 检查是否需要抢占（check_preempt_tick）：
+ *        若当前任务运行时间超过其理想时间片，设置 TIF_NEED_RESCHED
+ *   2. NUMA负载均衡（task_tick_numa）：定期扫描任务的内存访问模式，
+ *      决定是否将任务迁移到内存所在的NUMA节点
+ *   3. 更新 misfit 状态（CPU算力不足标记）
+ *   4. 更新过载状态（overutilized，用于EAS能效调度）
+ */
 static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 {
 	struct cfs_rq *cfs_rq;
@@ -10711,6 +11747,26 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
  * called on fork with the child task as argument from the parent's context
  *  - child not yet on the tasklist
  *  - preemption disabled
+ */
+/**
+ * task_fork_fair - fork时为子进程设置初始vruntime
+ * @p: 新创建的子进程
+ *
+ * 在父进程上下文中被调用（子进程还未加入就绪队列）。
+ * 为子进程的调度实体设置合理的初始vruntime，防止子进程
+ * 因vruntime=0而立即抢占父进程（避免"fork炸弹"效应）。
+ *
+ * 策略：将子进程的vruntime设置为 max(当前min_vruntime, 父进程vruntime)，
+ * 使其不会获得不公平的CPU时间优势。
+ * 若sysctl_sched_child_runs_first=1，则交换父子vruntime使子进程先运行。
+ */
+/**
+ * task_fork_fair - fork时初始化子任务的CFS调度参数（sched_class接口）
+ *
+ * 新任务fork后调用，在父任务的cfs_rq上更新统计并调用place_entity()
+ * 为子任务设置初始vruntime。若子任务vruntime落后于父任务则对齐到父任务，
+ * 避免fork炸弹（连续fork的子任务因vruntime过小而独占CPU）。
+ * 若当前CPU非理想运行CPU则请求重调度。
  */
 static void task_fork_fair(struct task_struct *p)
 {
@@ -10801,6 +11857,13 @@ static inline bool vruntime_normalized(struct task_struct *p)
  * Propagate the changes of the sched_entity across the tg tree to make it
  * visible to the root
  */
+/**
+ * propagate_entity_cfs_rq - 将子cfs_rq的PELT变化向上传播到父实体
+ *
+ * 当叶节点cfs_rq的load_avg发生显著变化时，沿组调度层级向上
+ * 更新父调度实体的load_avg，使每一层的调度决策都能看到最新
+ * 的负载数据。通过update_tg_load_avg()同步任务组的全局负载。
+ */
 static void propagate_entity_cfs_rq(struct sched_entity *se)
 {
 	struct cfs_rq *cfs_rq;
@@ -10821,6 +11884,14 @@ static void propagate_entity_cfs_rq(struct sched_entity *se)
 static void propagate_entity_cfs_rq(struct sched_entity *se) { }
 #endif
 
+/**
+ * detach_entity_cfs_rq - 将调度实体从其cfs_rq的PELT统计中分离
+ *
+ * 在任务迁移、调度类切换或任务退出前调用。
+ * 先更新PELT统计（update_load_avg），再调用detach_entity_load_avg()
+ * 从cfs_rq->avg中减去该实体的贡献，并向上传播（propagate_entity_cfs_rq）。
+ * 与attach_entity_cfs_rq()对称，确保负载统计的一致性。
+ */
 static void detach_entity_cfs_rq(struct sched_entity *se)
 {
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
@@ -10832,6 +11903,15 @@ static void detach_entity_cfs_rq(struct sched_entity *se)
 	propagate_entity_cfs_rq(se);
 }
 
+/**
+ * attach_entity_cfs_rq - 将调度实体附加到其cfs_rq的PELT统计
+ *
+ * 在任务迁移完成、调度类切换到CFS或任务被唤醒后调用。
+ * 同步实体的PELT负载统计（update_load_avg），然后通过
+ * attach_entity_load_avg()将该实体的贡献加入cfs_rq->avg，
+ * 并更新任务组负载和传播组调度层级的负载变化。
+ * 在CONFIG_FAIR_GROUP_SCHED下还重置se->depth（组调度深度）。
+ */
 static void attach_entity_cfs_rq(struct sched_entity *se)
 {
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
@@ -10879,11 +11959,32 @@ static void attach_task_cfs_rq(struct task_struct *p)
 		se->vruntime += cfs_rq->min_vruntime;
 }
 
+/**
+ * switched_from_fair - 任务从CFS切换到其他调度类时的清理（sched_class接口）
+ *
+ * 调用detach_task_cfs_rq()将任务的PELT负载统计从当前cfs_rq中分离，
+ * 避免已离开CFS的任务继续影响CFS负载估算。
+ * 与switched_to_fair()对称，成对使用。
+ */
 static void switched_from_fair(struct rq *rq, struct task_struct *p)
 {
 	detach_task_cfs_rq(p);
 }
 
+/**
+ * switched_to_fair - 任务切换到CFS调度类时的处理
+ * @rq: 运行队列
+ * @p:  刚切换到SCHED_NORMAL/SCHED_BATCH/SCHED_IDLE的任务
+ *
+ * 当任务的调度策略从其他调度类（如RT）切换到CFS时调用：
+ *   1. attach_task_cfs_rq()：将任务的PELT统计附加到CFS运行队列
+ *   2. 若任务正在运行（rq->curr == p）：
+ *      调用 resched_curr()，强制重新调度（RT可能占用了更长时间）
+ *   3. 若任务在队列中（但非当前运行）：
+ *      调用 check_preempt_curr()，检查是否能抢占当前任务
+ *
+ * 常见场景：sched_setscheduler() 将RT任务降级为普通任务。
+ */
 static void switched_to_fair(struct rq *rq, struct task_struct *p)
 {
 	attach_task_cfs_rq(p);
@@ -10905,6 +12006,14 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
  *
  * This routine is mostly called to set cfs_rq->curr field when a task
  * migrates between groups/classes.
+ */
+/**
+ * set_next_task_fair - 将任务设置为当前运行任务（sched_class接口）
+ *
+ * pick_next_task_fair()选出任务后调用此函数完成"上CPU"的收尾工作：
+ * 将任务移到cfs_tasks链表头部（MRU顺序，优化newidle_balance扫描），
+ * 然后沿组调度层级调用set_next_entity()设置各层的curr指针。
+ * 参数first表示是否是第一次上CPU（用于hrtick初始化）。
  */
 static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 {
@@ -10929,6 +12038,14 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 	}
 }
 
+/**
+ * init_cfs_rq - 初始化CFS运行队列数据结构
+ *
+ * 将红黑树根节点清零（RB_ROOT_CACHED），将min_vruntime初始化为
+ * 一个很小的负值（-(1<<20)），使第一个任务入队时能正确设置基准。
+ * 32位系统需同步min_vruntime_copy用于无锁读取。SMP下初始化
+ * removed.lock用于保护PELT延迟移除列表。
+ */
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
@@ -10975,6 +12092,13 @@ static void task_change_group_fair(struct task_struct *p, int type)
 	}
 }
 
+/**
+ * free_fair_sched_group - 释放任务组的CFS调度资源
+ *
+ * 销毁带宽控制定时器（destroy_cfs_bandwidth），然后逐CPU释放
+ * per-CPU的cfs_rq结构体和调度实体se结构体（kfree）。
+ * 在cgroup删除路径（css_free）中调用。
+ */
 void free_fair_sched_group(struct task_group *tg)
 {
 	int i;
@@ -10992,6 +12116,14 @@ void free_fair_sched_group(struct task_group *tg)
 	kfree(tg->se);
 }
 
+/**
+ * alloc_fair_sched_group - 为新任务组分配CFS调度资源
+ *
+ * 为每个可能的CPU分配per-CPU的cfs_rq和调度实体se结构体，
+ * 并通过init_tg_cfs_entry()将每个CPU的cfs_rq和se相互关联，
+ * 同时设置初始shares权重。在cgroup创建路径（css_alloc）中调用。
+ * 失败时通过free_fair_sched_group()释放已分配资源。
+ */
 int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
 {
 	struct sched_entity *se;
@@ -11109,6 +12241,15 @@ void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
 
 static DEFINE_MUTEX(shares_mutex);
 
+/**
+ * sched_group_set_shares - 设置任务组的CPU share权重
+ *
+ * 通过/sys/fs/cgroup/cpu/cpu.shares接口调用，修改任务组的
+ * 调度权重（shares值越大获得CPU时间越多）。
+ * 对每个CPU上的cfs_rq调用reweight_entity()更新权重，
+ * 并通过update_cfs_group()同步各层组调度实体的权重。
+ * 不允许修改根cgroup（tg->se[0] == NULL）。
+ */
 int sched_group_set_shares(struct task_group *tg, unsigned long shares)
 {
 	int i;
@@ -11161,6 +12302,13 @@ void unregister_fair_sched_group(struct task_group *tg) { }
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
 
+/**
+ * get_rr_interval_fair - 返回CFS任务的时间片长度（jiffies）
+ *
+ * 供/proc/PID/sched和POSIX sched_rr_get_interval()使用。
+ * 计算当前调度周期内该任务按权重分配的时间片（sched_slice），
+ * 将其从纳秒转换为jiffies。空闲运行队列时时间片为0。
+ */
 static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task)
 {
 	struct sched_entity *se = &task->se;

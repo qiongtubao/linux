@@ -10,6 +10,16 @@
  * (C) 2011 Linux Foundation, Christoph Lameter
  */
 
+/*
+ * SLUB内存分配器 - Linux内核对象缓存分配器
+ *
+ * SLUB是Linux内核默认的slab分配器，主要特性：
+ * - 每CPU缓存：减少多处理器竞争
+ * - 部分页面链表：高效管理半满slab
+ * - 调试支持：红区、毒化、追踪等
+ * - NUMA感知：优化NUMA系统上的内存分配
+ */
+
 #include <linux/mm.h>
 #include <linux/swap.h> /* struct reclaim_state */
 #include <linux/module.h>
@@ -122,11 +132,26 @@ DEFINE_STATIC_KEY_FALSE(slub_debug_enabled);
 #endif
 #endif
 
+/**
+ * kmem_cache_debug - 检查缓存是否启用了调试功能
+ * @s: 要检查的kmem_cache结构
+ *
+ * 检查给定的slab缓存是否设置了任何调试标志
+ * 返回值: 如果启用了调试功能返回true，否则返回false
+ */
 static inline bool kmem_cache_debug(struct kmem_cache *s)
 {
 	return kmem_cache_debug_flags(s, SLAB_DEBUG_FLAGS);
 }
 
+/**
+ * fixup_red_left - 修正左侧红区指针位置
+ * @s: slab缓存结构
+ * @p: 原始指针
+ *
+ * 当启用红区调试时，调整指针位置以跳过左侧红区
+ * 返回值: 修正后的指针位置
+ */
 void *fixup_red_left(struct kmem_cache *s, void *p)
 {
 	if (kmem_cache_debug_flags(s, SLAB_RED_ZONE))
@@ -135,6 +160,14 @@ void *fixup_red_left(struct kmem_cache *s, void *p)
 	return p;
 }
 
+/**
+ * kmem_cache_has_cpu_partial - 检查缓存是否支持CPU部分对象列表
+ * @s: slab缓存结构
+ *
+ * 判断给定的slab缓存是否可以使用CPU部分对象列表优化
+ * CPU部分对象列表用于提高分配/释放性能，但在调试模式下会被禁用
+ * 返回值: 支持CPU部分对象列表返回true，否则返回false
+ */
 static inline bool kmem_cache_has_cpu_partial(struct kmem_cache *s)
 {
 #ifdef CONFIG_SLUB_CPU_PARTIAL
@@ -224,6 +257,14 @@ static inline int sysfs_slab_alias(struct kmem_cache *s, const char *p)
 							{ return 0; }
 #endif
 
+/**
+ * stat - 更新slab缓存统计计数器
+ * @s: slab缓存结构
+ * @si: 统计项目类型
+ *
+ * 在启用统计功能时，原子性地增加指定统计计数器
+ * 使用raw_cpu_inc避免中断禁用的开销，但在可抢占内核中可能存在竞争
+ */
 static inline void stat(const struct kmem_cache *s, enum stat_item si)
 {
 #ifdef CONFIG_SLUB_STATS
@@ -239,10 +280,15 @@ static inline void stat(const struct kmem_cache *s, enum stat_item si)
  * 			Core slab cache functions
  *******************************************************************/
 
-/*
- * Returns freelist pointer (ptr). With hardening, this is obfuscated
- * with an XOR of the address where the pointer is held and a per-cache
- * random number.
+/**
+ * freelist_ptr - 计算混淆后的freelist指针
+ * @s: slab缓存结构
+ * @ptr: 原始指针
+ * @ptr_addr: 指针存储地址
+ *
+ * 当启用freelist强化功能时，使用XOR和随机数对指针进行混淆
+ * 这有助于防止堆溢出攻击中的freelist篡改
+ * 返回值: 混淆后的指针值
  */
 static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr,
 				 unsigned long ptr_addr)
@@ -265,7 +311,14 @@ static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr,
 #endif
 }
 
-/* Returns the freelist pointer recorded at location ptr_addr. */
+/**
+ * freelist_dereference - 解引用freelist指针
+ * @s: slab缓存结构
+ * @ptr_addr: 指针存储地址
+ *
+ * 从指定地址读取并解混淆freelist指针
+ * 返回值: 解混淆后的真实指针
+ */
 static inline void *freelist_dereference(const struct kmem_cache *s,
 					 void *ptr_addr)
 {
@@ -273,16 +326,40 @@ static inline void *freelist_dereference(const struct kmem_cache *s,
 			    (unsigned long)ptr_addr);
 }
 
+/**
+ * get_freepointer - 获取对象的freelist指针
+ * @s: slab缓存结构
+ * @object: 对象地址
+ *
+ * 从对象中获取下一个空闲对象的指针
+ * 返回值: 下一个空闲对象的地址
+ */
 static inline void *get_freepointer(struct kmem_cache *s, void *object)
 {
 	return freelist_dereference(s, object + s->offset);
 }
 
+/**
+ * prefetch_freepointer - 预取freelist指针
+ * @s: slab缓存结构
+ * @object: 对象地址
+ *
+ * 预取对象中的freelist指针到CPU缓存，提高后续访问性能
+ */
 static void prefetch_freepointer(const struct kmem_cache *s, void *object)
 {
 	prefetch(object + s->offset);
 }
 
+/**
+ * get_freepointer_safe - 安全获取freelist指针
+ * @s: slab缓存结构
+ * @object: 对象地址
+ *
+ * 在启用debug_pagealloc的情况下，安全地获取freelist指针
+ * 使用copy_from_kernel_nofault避免访问被取消映射的页面时崩溃
+ * 返回值: freelist指针，出错时返回NULL
+ */
 static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
 {
 	unsigned long freepointer_addr;
@@ -296,6 +373,15 @@ static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
 	return freelist_ptr(s, p, freepointer_addr);
 }
 
+/**
+ * set_freepointer - 设置对象的freelist指针
+ * @s: slab缓存结构
+ * @object: 对象地址
+ * @fp: 要设置的freelist指针
+ *
+ * 在对象中设置指向下一个空闲对象的指针
+ * 在强化模式下会检查双重释放或损坏
+ */
 static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
 {
 	unsigned long freeptr_addr = (unsigned long)object + s->offset;
@@ -313,11 +399,28 @@ static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
 		__p < (__addr) + (__objects) * (__s)->size; \
 		__p += (__s)->size)
 
+/**
+ * order_objects - 计算指定页面顺序下可容纳的对象数量
+ * @order: 页面分配顺序（2^order个页面）
+ * @size: 单个对象大小
+ *
+ * 计算给定页面顺序和对象大小下，一个slab可以容纳多少个对象
+ * 返回值: 可容纳的对象数量
+ */
 static inline unsigned int order_objects(unsigned int order, unsigned int size)
 {
 	return ((unsigned int)PAGE_SIZE << order) / size;
 }
 
+/**
+ * oo_make - 创建order_objects结构
+ * @order: 页面分配顺序
+ * @size: 对象大小
+ *
+ * 将页面顺序和对象数量编码到一个结构中
+ * 高位存储order，低位存储objects数量
+ * 返回值: 编码后的order_objects结构
+ */
 static inline struct kmem_cache_order_objects oo_make(unsigned int order,
 		unsigned int size)
 {
@@ -328,18 +431,36 @@ static inline struct kmem_cache_order_objects oo_make(unsigned int order,
 	return x;
 }
 
+/**
+ * oo_order - 从order_objects结构提取页面顺序
+ * @x: order_objects结构
+ *
+ * 从编码的order_objects结构中提取页面分配顺序
+ * 返回值: 页面分配顺序
+ */
 static inline unsigned int oo_order(struct kmem_cache_order_objects x)
 {
 	return x.x >> OO_SHIFT;
 }
 
+/**
+ * oo_objects - 从order_objects结构提取对象数量
+ * @x: order_objects结构
+ *
+ * 从编码的order_objects结构中提取对象数量
+ * 返回值: slab中的对象数量
+ */
 static inline unsigned int oo_objects(struct kmem_cache_order_objects x)
 {
 	return x.x & OO_MASK;
 }
 
-/*
- * Per slab locking using the pagelock
+/**
+ * slab_lock - 锁定slab页面
+ * @page: 要锁定的页面
+ *
+ * 使用页面的PG_locked位作为自旋锁来保护slab数据结构
+ * 确保页面不是tail页面（复合页面的尾部）
  */
 static __always_inline void slab_lock(struct page *page)
 {
@@ -347,13 +468,33 @@ static __always_inline void slab_lock(struct page *page)
 	bit_spin_lock(PG_locked, &page->flags);
 }
 
+/**
+ * slab_unlock - 解锁slab页面
+ * @page: 要解锁的页面
+ *
+ * 释放页面的PG_locked位自旋锁
+ * 确保页面不是tail页面（复合页面的尾部）
+ */
 static __always_inline void slab_unlock(struct page *page)
 {
 	VM_BUG_ON_PAGE(PageTail(page), page);
 	__bit_spin_unlock(PG_locked, &page->flags);
 }
 
-/* Interrupts must be disabled (for the fallback code to work right) */
+/**
+ * __cmpxchg_double_slab - 原子双重比较交换操作（中断已禁用版本）
+ * @s: slab缓存结构
+ * @page: 目标页面
+ * @freelist_old: 期望的旧freelist值
+ * @counters_old: 期望的旧counters值
+ * @freelist_new: 新freelist值
+ * @counters_new: 新counters值
+ * @n: 操作名称（用于调试）
+ *
+ * 原子性地更新页面的freelist和counters字段，要求中断已被禁用
+ * 优先使用硬件cmpxchg_double指令，否则回退到加锁版本
+ * 返回值: 成功返回true，失败返回false
+ */
 static inline bool __cmpxchg_double_slab(struct kmem_cache *s, struct page *page,
 		void *freelist_old, unsigned long counters_old,
 		void *freelist_new, unsigned long counters_new,
@@ -391,6 +532,20 @@ static inline bool __cmpxchg_double_slab(struct kmem_cache *s, struct page *page
 	return false;
 }
 
+/**
+ * cmpxchg_double_slab - 原子双重比较交换操作
+ * @s: slab缓存结构
+ * @page: 目标页面
+ * @freelist_old: 期望的旧freelist值
+ * @counters_old: 期望的旧counters值
+ * @freelist_new: 新freelist值
+ * @counters_new: 新counters值
+ * @n: 操作名称（用于调试）
+ *
+ * 原子性地更新页面的freelist和counters字段
+ * 优先使用硬件cmpxchg_double指令，否则禁用中断后加锁操作
+ * 返回值: 成功返回true，失败返回false
+ */
 static inline bool cmpxchg_double_slab(struct kmem_cache *s, struct page *page,
 		void *freelist_old, unsigned long counters_old,
 		void *freelist_new, unsigned long counters_new,
@@ -436,11 +591,15 @@ static inline bool cmpxchg_double_slab(struct kmem_cache *s, struct page *page,
 static unsigned long object_map[BITS_TO_LONGS(MAX_OBJS_PER_PAGE)];
 static DEFINE_SPINLOCK(object_map_lock);
 
-/*
- * Determine a map of object in use on a page.
+/**
+ * get_map - 创建页面对象使用情况位图
+ * @s: slab缓存结构
+ * @page: 目标页面
  *
- * Node listlock must be held to guarantee that the page does
- * not vanish from under us.
+ * 生成页面中所有对象的使用情况位图，用于调试目的
+ * 遍历freelist链表，标记所有空闲对象在位图中的位置
+ * 必须在持有节点listlock的情况下调用，确保页面不会消失
+ * 返回值: 指向对象位图的指针
  */
 static unsigned long *get_map(struct kmem_cache *s, struct page *page)
 	__acquires(&object_map_lock)
@@ -460,12 +619,25 @@ static unsigned long *get_map(struct kmem_cache *s, struct page *page)
 	return object_map;
 }
 
+/**
+ * put_map - 释放对象位图锁
+ * @map: 位图指针（必须是object_map）
+ *
+ * 释放get_map()获取的对象位图锁，验证传入的位图指针正确性
+ */
 static void put_map(unsigned long *map) __releases(&object_map_lock)
 {
 	VM_BUG_ON(map != object_map);
 	spin_unlock(&object_map_lock);
 }
 
+/**
+ * size_from_object - 计算对象的实际大小
+ * @s: slab缓存结构
+ *
+ * 获取对象的实际大小，如果启用了红区调试则减去左侧红区填充
+ * 返回值: 对象的实际可用大小
+ */
 static inline unsigned int size_from_object(struct kmem_cache *s)
 {
 	if (s->flags & SLAB_RED_ZONE)
@@ -474,6 +646,15 @@ static inline unsigned int size_from_object(struct kmem_cache *s)
 	return s->size;
 }
 
+/**
+ * restore_red_left - 恢复左侧红区前的指针位置
+ * @s: slab缓存结构
+ * @p: 当前指针
+ *
+ * 当启用红区调试时，将指针向左移动以跳过左侧红区填充
+ * 与fixup_red_left()功能相反
+ * 返回值: 恢复后的指针位置
+ */
 static inline void *restore_red_left(struct kmem_cache *s, void *p)
 {
 	if (s->flags & SLAB_RED_ZONE)
@@ -494,17 +675,24 @@ static slab_flags_t slub_debug;
 static char *slub_debug_string;
 static int disable_higher_order_debug;
 
-/*
- * slub is about to manipulate internal object metadata.  This memory lies
- * outside the range of the allocated object, so accessing it would normally
- * be reported by kasan as a bounds error.  metadata_access_enable() is used
- * to tell kasan that these accesses are OK.
+/**
+ * metadata_access_enable - 启用元数据访问
+ *
+ * 告知KASAN这些对元数据的访问是合法的
+ * slub即将操作位于分配对象范围外的内部对象元数据
+ * 正常情况下访问这些内存会被KASAN报告为越界错误
  */
 static inline void metadata_access_enable(void)
 {
 	kasan_disable_current();
 }
 
+/**
+ * metadata_access_disable - 禁用元数据访问
+ *
+ * 重新启用KASAN对内存访问的检查
+ * 在完成元数据操作后调用，恢复正常的边界检查
+ */
 static inline void metadata_access_disable(void)
 {
 	kasan_enable_current();
@@ -514,7 +702,16 @@ static inline void metadata_access_disable(void)
  * Object debugging
  */
 
-/* Verify that a pointer has an address that is valid within a slab page */
+/**
+ * check_valid_pointer - 验证指针是否在slab页面有效范围内
+ * @s: slab缓存结构
+ * @page: slab页面
+ * @object: 要验证的对象指针
+ *
+ * 验证指针是否指向页面中的有效对象位置
+ * 检查指针是否在页面范围内且正确对齐到对象边界
+ * 返回值: 有效返回1，无效返回0
+ */
 static inline int check_valid_pointer(struct kmem_cache *s,
 				struct page *page, void *object)
 {
@@ -534,6 +731,16 @@ static inline int check_valid_pointer(struct kmem_cache *s,
 	return 1;
 }
 
+/**
+ * print_section - 打印内存区段的十六进制转储
+ * @level: 打印级别（如KERN_ERR）
+ * @text: 描述文本
+ * @addr: 内存地址
+ * @length: 打印长度
+ *
+ * 在启用元数据访问的情况下，安全地打印指定内存区段的内容
+ * 主要用于调试时显示对象、红区、填充等区域的数据
+ */
 static void print_section(char *level, char *text, u8 *addr,
 			  unsigned int length)
 {
@@ -543,17 +750,26 @@ static void print_section(char *level, char *text, u8 *addr,
 	metadata_access_disable();
 }
 
-/*
- * See comment in calculate_sizes().
+/**
+ * freeptr_outside_object - 检查freelist指针是否在对象外部
+ * @s: slab缓存结构
+ *
+ * 判断freelist指针是否存储在对象的使用区域之外
+ * 当offset大于等于inuse时，freelist指针不会覆盖对象数据
+ * 返回值: 在外部返回true，否则返回false
  */
 static inline bool freeptr_outside_object(struct kmem_cache *s)
 {
 	return s->offset >= s->inuse;
 }
 
-/*
- * Return offset of the end of info block which is inuse + free pointer if
- * not overlapping with object.
+/**
+ * get_info_end - 获取信息块的结束偏移
+ * @s: slab缓存结构
+ *
+ * 计算对象信息块的结束位置，包括使用区域和可能的freelist指针
+ * 如果freelist指针不与对象重叠，则包含指针大小
+ * 返回值: 信息块结束的字节偏移
  */
 static inline unsigned int get_info_end(struct kmem_cache *s)
 {
@@ -563,6 +779,16 @@ static inline unsigned int get_info_end(struct kmem_cache *s)
 		return s->inuse;
 }
 
+/**
+ * get_track - 获取对象的跟踪信息指针
+ * @s: slab缓存结构
+ * @object: 对象地址
+ * @alloc: 跟踪类型（TRACK_ALLOC或TRACK_FREE）
+ *
+ * 计算对象中存储分配/释放跟踪信息的位置
+ * 跟踪信息存储在对象的元数据区域中
+ * 返回值: 指向跟踪结构的指针
+ */
 static struct track *get_track(struct kmem_cache *s, void *object,
 	enum track_item alloc)
 {
@@ -573,6 +799,17 @@ static struct track *get_track(struct kmem_cache *s, void *object,
 	return p + alloc;
 }
 
+/**
+ * set_track - 设置对象的跟踪信息
+ * @s: slab缓存结构
+ * @object: 对象地址
+ * @alloc: 跟踪类型（TRACK_ALLOC或TRACK_FREE）
+ * @addr: 调用地址
+ *
+ * 在对象中记录分配或释放的跟踪信息，包括调用地址、
+ * 堆栈跟踪、CPU编号、进程ID和时间戳
+ * 如果addr为0则清空跟踪信息
+ */
 static void set_track(struct kmem_cache *s, void *object,
 			enum track_item alloc, unsigned long addr)
 {
@@ -598,6 +835,14 @@ static void set_track(struct kmem_cache *s, void *object,
 	}
 }
 
+/**
+ * init_tracking - 初始化对象的跟踪信息
+ * @s: slab缓存结构
+ * @object: 对象地址
+ *
+ * 初始化对象的分配和释放跟踪信息，将两个跟踪记录都清零
+ * 仅在启用SLAB_STORE_USER标志时执行
+ */
 static void init_tracking(struct kmem_cache *s, void *object)
 {
 	if (!(s->flags & SLAB_STORE_USER))
@@ -607,6 +852,15 @@ static void init_tracking(struct kmem_cache *s, void *object)
 	set_track(s, object, TRACK_ALLOC, 0UL);
 }
 
+/**
+ * print_track - 打印跟踪信息
+ * @s: 描述字符串
+ * @t: 跟踪结构指针
+ * @pr_time: 当前时间
+ *
+ * 打印对象分配或释放的详细跟踪信息，包括调用地址、时间差、
+ * CPU编号、进程ID以及完整的调用堆栈
+ */
 static void print_track(const char *s, struct track *t, unsigned long pr_time)
 {
 	if (!t->addr)
@@ -626,6 +880,14 @@ static void print_track(const char *s, struct track *t, unsigned long pr_time)
 #endif
 }
 
+/**
+ * print_tracking - 打印对象的完整跟踪信息
+ * @s: slab缓存结构
+ * @object: 对象地址
+ *
+ * 打印对象的分配和释放跟踪信息，用于调试内存泄漏和双重释放问题
+ * 仅在启用SLAB_STORE_USER标志时有效
+ */
 void print_tracking(struct kmem_cache *s, void *object)
 {
 	unsigned long pr_time = jiffies;
@@ -636,6 +898,13 @@ void print_tracking(struct kmem_cache *s, void *object)
 	print_track("Freed", get_track(s, object, TRACK_FREE), pr_time);
 }
 
+/**
+ * print_page_info - 打印slab页面信息
+ * @page: slab页面
+ *
+ * 打印页面的基本统计信息，包括对象总数、已使用数量、
+ * freelist指针和页面标志位，用于调试slab状态
+ */
 static void print_page_info(struct page *page)
 {
 	pr_err("INFO: Slab 0x%p objects=%u used=%u fp=0x%p flags=0x%04lx\n",
@@ -643,6 +912,15 @@ static void print_page_info(struct page *page)
 
 }
 
+/**
+ * slab_bug - 报告slab子系统错误
+ * @s: 出错的slab缓存
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ *
+ * 格式化并打印slab子系统的严重错误信息，包括缓存名称、
+ * 内核污染状态等，并设置BAD_PAGE污染标记
+ */
 static void slab_bug(struct kmem_cache *s, char *fmt, ...)
 {
 	struct va_format vaf;
@@ -659,6 +937,15 @@ static void slab_bug(struct kmem_cache *s, char *fmt, ...)
 	va_end(args);
 }
 
+/**
+ * slab_fix - 报告slab修复操作
+ * @s: 被修复的slab缓存
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ *
+ * 打印slab子系统的修复操作信息，说明为了恢复一致性
+ * 而采取的自动修复措施
+ */
 static void slab_fix(struct kmem_cache *s, char *fmt, ...)
 {
 	struct va_format vaf;
@@ -671,6 +958,17 @@ static void slab_fix(struct kmem_cache *s, char *fmt, ...)
 	va_end(args);
 }
 
+/**
+ * freelist_corrupted - 检测freelist链表损坏
+ * @s: slab缓存结构
+ * @page: slab页面
+ * @freelist: freelist指针的指针
+ * @nextfree: 下一个空闲对象指针
+ *
+ * 检查freelist链表的完整性，如果发现损坏则隔离损坏的链表
+ * 启用一致性检查时验证nextfree指针的有效性
+ * 返回值: 发现损坏返回true，否则返回false
+ */
 static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
 			       void **freelist, void *nextfree)
 {
@@ -1254,15 +1552,16 @@ out:
 	return ret;
 }
 
-/*
- * Parse a block of slub_debug options. Blocks are delimited by ';'
+/**
+ * parse_slub_debug_flags - 解析slub_debug选项块
+ * @str: 选项块的起始位置
+ * @flags: 返回解析的标志，如果未指定则返回DEBUG_DEFAULT_FLAGS
+ * @slabs: 返回slab列表的起始位置，如果没有列表则为NULL
+ * @init: 假定这是初始解析而不是per-kmem-create解析
  *
- * @str:    start of block
- * @flags:  returns parsed flags, or DEBUG_DEFAULT_FLAGS if none specified
- * @slabs:  return start of list of slabs, or NULL when there's no list
- * @init:   assume this is initial parsing and not per-kmem-create parsing
- *
- * returns the start of next block if there's any, or NULL
+ * 解析由';'分隔的slub_debug选项块，支持标志字符：
+ * f-一致性检查，z-红区，p-毒化，u-用户跟踪，t-跟踪，a-故障注入，o-避免高阶调试
+ * 返回值: 如果还有下一个块则返回其起始位置，否则返回NULL
  */
 static char *
 parse_slub_debug_flags(char *str, slab_flags_t *flags, char **slabs, bool init)
@@ -1342,6 +1641,15 @@ check_slabs:
 		return NULL;
 }
 
+/**
+ * setup_slub_debug - 设置slub调试选项
+ * @str: 内核命令行参数字符串
+ *
+ * 解析内核启动参数slub_debug的值，设置全局调试标志和特定slab的调试选项
+ * 支持格式：slub_debug=FUZ,kmalloc-256 或 slub_debug=FUZ;P,kmalloc-512
+ * 启用相应的调试功能静态分支
+ * 返回值: 总是返回1（表示参数已处理）
+ */
 static int __init setup_slub_debug(char *str)
 {
 	slab_flags_t flags;
@@ -1392,17 +1700,17 @@ out:
 
 __setup("slub_debug", setup_slub_debug);
 
-/*
- * kmem_cache_flags - apply debugging options to the cache
- * @object_size:	the size of an object without meta data
- * @flags:		flags to set
- * @name:		name of the cache
- * @ctor:		constructor function
+/**
+ * kmem_cache_flags - 为缓存应用调试选项
+ * @object_size: 不包含元数据的对象大小
+ * @flags: 要设置的标志
+ * @name: 缓存名称
+ * @ctor: 构造函数
  *
- * Debug option(s) are applied to @flags. In addition to the debug
- * option(s), if a slab name (or multiple) is specified i.e.
- * slub_debug=<Debug-Options>,<slab name1>,<slab name2> ...
- * then only the select slabs will receive the debug option(s).
+ * 将调试选项应用到@flags。除了调试选项外，如果指定了slab名称
+ * （即slub_debug=<Debug-Options>,<slab name1>,<slab name2> ...）
+ * 则只有匹配的slab才会接收调试选项
+ * 返回值: 应用调试选项后的标志
  */
 slab_flags_t kmem_cache_flags(unsigned int object_size,
 	slab_flags_t flags, const char *name,
@@ -1496,9 +1804,15 @@ static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
 }
 #endif /* CONFIG_SLUB_DEBUG */
 
-/*
- * Hooks for other subsystems that check memory allocations. In a typical
- * production configuration these hooks all should produce no code at all.
+/**
+ * kmalloc_large_node_hook - 大内存分配的子系统钩子
+ * @ptr: 分配的内存指针
+ * @size: 分配大小
+ * @flags: 分配标志
+ *
+ * 在典型的生产配置中，这些钩子不应产生任何代码
+ * 调用KASAN进行大对象标记，然后调用kmemleak进行泄漏检测
+ * 返回值: 处理后的内存指针
  */
 static inline void *kmalloc_large_node_hook(void *ptr, size_t size, gfp_t flags)
 {
@@ -1508,12 +1822,32 @@ static inline void *kmalloc_large_node_hook(void *ptr, size_t size, gfp_t flags)
 	return ptr;
 }
 
+/**
+ * kfree_hook - 大内存释放的钩子函数
+ * @x: 要释放的内存指针
+ *
+ * 在释放大内存块时调用各种子系统的清理函数
+ * 通知kmemleak释放内存，调用KASAN进行大对象释放处理
+ */
 static __always_inline void kfree_hook(void *x)
 {
 	kmemleak_free(x);
 	kasan_kfree_large(x, _RET_IP_);
 }
 
+/**
+ * slab_free_hook - slab对象释放的钩子函数
+ * @s: slab缓存结构
+ * @x: 要释放的对象指针
+ *
+ * 在释放slab对象时执行各种检查和清理：
+ * - kmemleak递归释放检测
+ * - lockdep锁检查（需要临时禁用中断）
+ * - debug对象释放检查
+ * - KCSAN竞态检测（用于检测释放后使用）
+ * - KASAN slab释放处理（可能将对象放入隔离区）
+ * 返回值: KASAN允许立即重用时返回true，否则返回false
+ */
 static __always_inline bool slab_free_hook(struct kmem_cache *s, void *x)
 {
 	kmemleak_free_recursive(x, s->flags);
@@ -1544,6 +1878,19 @@ static __always_inline bool slab_free_hook(struct kmem_cache *s, void *x)
 	return kasan_slab_free(s, x, _RET_IP_);
 }
 
+/**
+ * slab_free_freelist_hook - 批量释放freelist的钩子函数
+ * @s: slab缓存结构
+ * @head: freelist头部指针的指针
+ * @tail: freelist尾部指针的指针
+ *
+ * 处理构造的freelist的批量释放检查，重构可以立即重用的对象链表：
+ * - 遍历原始freelist中的每个对象
+ * - 可选择性地清零对象内容（init_on_free）
+ * - 对每个对象调用slab_free_hook进行检查
+ * - 重新构造允许重用的对象的freelist
+ * 返回值: 如果有对象可以重用返回true，否则返回false
+ */
 static inline bool slab_free_freelist_hook(struct kmem_cache *s,
 					   void **head, void **tail)
 {
@@ -1589,6 +1936,19 @@ static inline bool slab_free_freelist_hook(struct kmem_cache *s,
 	return *head != NULL;
 }
 
+/**
+ * setup_object - 设置新分配的slab对象
+ * @s: slab缓存结构
+ * @page: 包含对象的页面
+ * @object: 要设置的对象地址
+ *
+ * 初始化新分配的slab对象：
+ * - 设置调试信息（如果启用调试）
+ * - 初始化KASAN标记
+ * - 调用用户定义的构造函数（如果存在）
+ * - 管理KASAN对象数据的毒化/去毒化
+ * 返回值: 设置完成的对象指针
+ */
 static void *setup_object(struct kmem_cache *s, struct page *page,
 				void *object)
 {
@@ -1602,8 +1962,16 @@ static void *setup_object(struct kmem_cache *s, struct page *page,
 	return object;
 }
 
-/*
- * Slab allocation and freeing
+/**
+ * alloc_slab_page - 分配slab页面
+ * @s: slab缓存结构
+ * @flags: 分配标志（GFP_*）
+ * @node: NUMA节点ID，NUMA_NO_NODE表示当前节点
+ * @oo: 页面顺序和对象数量的编码
+ *
+ * 为slab分配页面，根据NUMA节点选择合适的分配函数
+ * 分配成功后进行slab页面计费统计
+ * 返回值: 分配的页面指针，失败时返回NULL
  */
 static inline struct page *alloc_slab_page(struct kmem_cache *s,
 		gfp_t flags, int node, struct kmem_cache_order_objects oo)
@@ -1623,7 +1991,14 @@ static inline struct page *alloc_slab_page(struct kmem_cache *s,
 }
 
 #ifdef CONFIG_SLAB_FREELIST_RANDOM
-/* Pre-initialize the random sequence cache */
+/**
+ * init_cache_random_seq - 初始化缓存的随机序列
+ * @s: slab缓存结构
+ *
+ * 为指定的slab缓存预先初始化随机序列，用于freelist随机化
+ * 创建包含对象数量个随机索引的序列，并转换为页面偏移量
+ * 返回值: 成功返回0，失败返回错误码
+ */
 static int init_cache_random_seq(struct kmem_cache *s)
 {
 	unsigned int count = oo_objects(s->oo);
@@ -1650,7 +2025,12 @@ static int init_cache_random_seq(struct kmem_cache *s)
 	return 0;
 }
 
-/* Initialize each random sequence freelist per cache */
+/**
+ * init_freelist_randomization - 初始化所有缓存的freelist随机化
+ *
+ * 遍历所有slab缓存，为每个缓存初始化随机序列freelist
+ * 在系统初始化阶段调用，提高内存分配的安全性
+ */
 static void __init init_freelist_randomization(void)
 {
 	struct kmem_cache *s;
@@ -1663,7 +2043,19 @@ static void __init init_freelist_randomization(void)
 	mutex_unlock(&slab_mutex);
 }
 
-/* Get the next entry on the pre-computed freelist randomized */
+/**
+ * next_freelist_entry - 获取预计算随机freelist的下一个条目
+ * @s: slab缓存结构
+ * @page: slab页面
+ * @pos: 当前位置指针（会被更新）
+ * @start: freelist起始地址
+ * @page_limit: 页面限制
+ * @freelist_count: freelist条目总数
+ *
+ * 从预计算的随机序列中获取下一个有效的freelist条目
+ * 如果目标页面分配失败，页面上的对象数量可能小于缓存定义的常规大小
+ * 返回值: 下一个freelist条目的地址
+ */
 static void *next_freelist_entry(struct kmem_cache *s, struct page *page,
 				unsigned long *pos, void *start,
 				unsigned long page_limit,
@@ -1685,7 +2077,15 @@ static void *next_freelist_entry(struct kmem_cache *s, struct page *page,
 	return (char *)start + idx;
 }
 
-/* Shuffle the single linked freelist based on a random pre-computed sequence */
+/**
+ * shuffle_freelist - 基于随机预计算序列重排单链表freelist
+ * @s: slab缓存结构
+ * @page: 要重排freelist的页面
+ *
+ * 使用预计算的随机序列对页面的freelist进行随机排列
+ * 提高内存分配的安全性，防止可预测的分配模式被利用
+ * 返回值: 成功重排返回true，否则返回false
+ */
 static bool shuffle_freelist(struct kmem_cache *s, struct page *page)
 {
 	void *start;
@@ -1731,6 +2131,21 @@ static inline bool shuffle_freelist(struct kmem_cache *s, struct page *page)
 }
 #endif /* CONFIG_SLAB_FREELIST_RANDOM */
 
+/**
+ * allocate_slab - 分配并初始化一个新的slab页面
+ * @s: slab缓存结构
+ * @flags: 分配标志（GFP_*）
+ * @node: NUMA节点ID
+ *
+ * 分配一个新的slab页面并完全初始化：
+ * - 尝试最优大小分配，失败时回退到最小大小
+ * - 设置页面属性和slab标记
+ * - KASAN毒化整个页面
+ * - 设置调试信息（如果启用）
+ * - 随机化或顺序构建freelist链表
+ * - 冻结页面并更新统计信息
+ * 返回值: 成功返回初始化完成的页面，失败返回NULL
+ */
 static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 {
 	struct page *page;
@@ -1811,6 +2226,17 @@ out:
 	return page;
 }
 
+/**
+ * new_slab - 分配一个新的slab页面
+ * @s: 要分配slab的缓存结构体指针
+ * @flags: 分配标志，控制内存分配行为
+ * @node: 首选的NUMA节点
+ *
+ * 返回值：成功返回新分配的页面指针，失败返回NULL
+ *
+ * 为指定缓存分配一个新的slab页面。会检查并修正不合法的
+ * 分配标志，然后调用allocate_slab进行实际的页面分配。
+ */
 static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 {
 	if (unlikely(flags & GFP_SLAB_BUG_MASK))
@@ -1820,6 +2246,18 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 		flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
 }
 
+/**
+ * __free_slab - 释放slab页面的内部实现
+ * @s: slab缓存结构
+ * @page: 要释放的页面
+ *
+ * 执行slab页面释放的实际工作：
+ * - 在调试模式下检查页面填充和所有对象状态
+ * - 清除slab相关的页面标志
+ * - 更新内存回收统计
+ * - 取消slab页面计费
+ * - 释放页面到页面分配器
+ */
 static void __free_slab(struct kmem_cache *s, struct page *page)
 {
 	int order = compound_order(page);
@@ -1844,6 +2282,13 @@ static void __free_slab(struct kmem_cache *s, struct page *page)
 	__free_pages(page, order);
 }
 
+/**
+ * rcu_free_slab - RCU回调函数用于释放slab页面
+ * @h: RCU回调头
+ *
+ * RCU延迟释放的回调函数，确保所有RCU读取端完成后再释放页面
+ * 从RCU头中获取页面指针，然后调用__free_slab进行实际释放
+ */
 static void rcu_free_slab(struct rcu_head *h)
 {
 	struct page *page = container_of(h, struct page, rcu_head);
@@ -1851,6 +2296,15 @@ static void rcu_free_slab(struct rcu_head *h)
 	__free_slab(page->slab_cache, page);
 }
 
+/**
+ * free_slab - 释放slab页面
+ * @s: slab缓存结构
+ * @page: 要释放的页面
+ *
+ * 根据缓存类型选择释放方式：
+ * - 如果是SLAB_TYPESAFE_BY_RCU类型，使用RCU延迟释放确保读取端安全
+ * - 否则立即释放页面
+ */
 static void free_slab(struct kmem_cache *s, struct page *page)
 {
 	if (unlikely(s->flags & SLAB_TYPESAFE_BY_RCU)) {
@@ -1859,14 +2313,28 @@ static void free_slab(struct kmem_cache *s, struct page *page)
 		__free_slab(s, page);
 }
 
+/**
+ * discard_slab - 丢弃slab页面
+ * @s: slab缓存结构
+ * @page: 要丢弃的页面
+ *
+ * 丢弃一个slab页面，减少节点的slab统计计数并释放页面
+ * 通常在页面变为空或需要回收时调用
+ */
 static void discard_slab(struct kmem_cache *s, struct page *page)
 {
 	dec_slabs_node(s, page_to_nid(page), page->objects);
 	free_slab(s, page);
 }
 
-/*
- * Management of partially allocated slabs.
+/**
+ * __add_partial - 将页面添加到部分slab链表（内部函数）
+ * @n: kmem_cache_node结构
+ * @page: 要添加的页面
+ * @tail: 添加位置标志
+ *
+ * 将页面添加到节点的partial链表中，根据tail参数决定添加到头部还是尾部
+ * 增加partial计数，DEACTIVATE_TO_TAIL时添加到尾部，否则添加到头部
  */
 static inline void
 __add_partial(struct kmem_cache_node *n, struct page *page, int tail)
@@ -1878,6 +2346,15 @@ __add_partial(struct kmem_cache_node *n, struct page *page, int tail)
 		list_add(&page->slab_list, &n->partial);
 }
 
+/**
+ * add_partial - 将页面添加到部分slab链表
+ * @n: kmem_cache_node结构
+ * @page: 要添加的页面
+ * @tail: 添加位置标志
+ *
+ * 在持有list_lock的情况下将页面添加到partial链表
+ * 这是__add_partial的安全包装函数
+ */
 static inline void add_partial(struct kmem_cache_node *n,
 				struct page *page, int tail)
 {
@@ -1885,6 +2362,14 @@ static inline void add_partial(struct kmem_cache_node *n,
 	__add_partial(n, page, tail);
 }
 
+/**
+ * remove_partial - 从部分slab链表中移除页面
+ * @n: kmem_cache_node结构
+ * @page: 要移除的页面
+ *
+ * 在持有list_lock的情况下从partial链表中移除页面
+ * 同时减少partial计数
+ */
 static inline void remove_partial(struct kmem_cache_node *n,
 					struct page *page)
 {
@@ -1893,11 +2378,20 @@ static inline void remove_partial(struct kmem_cache_node *n,
 	n->nr_partial--;
 }
 
-/*
- * Remove slab from the partial list, freeze it and
- * return the pointer to the freelist.
+/**
+ * acquire_slab - 从partial链表获取slab并冻结
+ * @s: slab缓存结构
+ * @n: kmem_cache_node结构
+ * @page: 要获取的页面
+ * @mode: 获取模式（是否清空freelist）
+ * @objects: 返回可用对象数量
  *
- * Returns a list of objects or NULL if it fails.
+ * 从partial链表中移除slab页面并冻结它：
+ * - 清空freelist并设置frozen位
+ * - 旧的freelist成为per-cpu分配链表
+ * - 使用原子操作确保并发安全
+ * - 从partial链表中移除页面
+ * 返回值: 成功返回freelist指针，失败返回NULL
  */
 static inline void *acquire_slab(struct kmem_cache *s,
 		struct kmem_cache_node *n, struct page *page,
@@ -1942,8 +2436,19 @@ static inline void *acquire_slab(struct kmem_cache *s,
 static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain);
 static inline bool pfmemalloc_match(struct page *page, gfp_t gfpflags);
 
-/*
- * Try to allocate a partial slab from a specific node.
+/**
+ * get_partial_node - 尝试从特定节点分配partial slab
+ * @s: slab缓存结构
+ * @n: 目标kmem_cache_node结构
+ * @c: per-CPU缓存结构
+ * @flags: 分配标志
+ *
+ * 从指定节点的partial链表中获取slab：
+ * - 检查pfmemalloc匹配性
+ * - 获取第一个slab作为CPU slab返回对象
+ * - 将额外的slab添加到CPU partial链表以备后用
+ * - 控制CPU partial链表的大小防止过度累积
+ * 返回值: 成功返回对象指针，失败返回NULL
  */
 static void *get_partial_node(struct kmem_cache *s, struct kmem_cache_node *n,
 				struct kmem_cache_cpu *c, gfp_t flags)
@@ -1991,8 +2496,18 @@ static void *get_partial_node(struct kmem_cache *s, struct kmem_cache_node *n,
 	return object;
 }
 
-/*
- * Get a page from somewhere. Search in increasing NUMA distances.
+/**
+ * get_any_partial - 从任意节点获取partial slab
+ * @s: slab缓存结构
+ * @flags: 分配标志
+ * @c: per-CPU缓存结构
+ *
+ * 按NUMA距离递增的顺序搜索partial slab：
+ * - 根据defrag_ratio控制跨节点碎片整理的频率
+ * - 遍历zone列表寻找有足够partial slab的节点
+ * - 只有当节点的partial数量超过min_partial时才尝试获取
+ * - 支持cpuset内存策略限制
+ * 返回值: 成功返回对象指针，失败返回NULL
  */
 static void *get_any_partial(struct kmem_cache *s, gfp_t flags,
 		struct kmem_cache_cpu *c)
@@ -2058,6 +2573,18 @@ static void *get_any_partial(struct kmem_cache *s, gfp_t flags,
 /*
  * Get a partial page, lock it and return it.
  */
+/**
+ * get_partial - 获取部分使用的slab页面
+ * @s: 要获取slab的缓存结构体指针
+ * @flags: 分配标志，控制内存分配行为
+ * @node: 首选的NUMA节点
+ * @c: per-CPU缓存结构体指针
+ *
+ * 返回值：成功返回可用对象指针，失败返回NULL
+ *
+ * 从部分使用的slab页面中获取对象。首先尝试从指定节点获取，
+ * 如果失败且允许跨节点分配，则尝试从其他节点获取。
+ */
 static void *get_partial(struct kmem_cache *s, gfp_t flags, int node,
 		struct kmem_cache_cpu *c)
 {
@@ -2089,28 +2616,64 @@ static void *get_partial(struct kmem_cache *s, gfp_t flags, int node,
 #define TID_STEP 1
 #endif
 
+/**
+ * next_tid - 计算下一个全局唯一事务ID
+ * @tid: 当前事务ID
+ *
+ * 为cmpxchg操作计算下一个全局唯一的事务ID用于消歧
+ * 事务ID从CPU号开始，然后按CONFIG_NR_CPUS递增
+ * 返回值: 下一个事务ID
+ */
 static inline unsigned long next_tid(unsigned long tid)
 {
 	return tid + TID_STEP;
 }
 
-#ifdef SLUB_DEBUG_CMPXCHG
+/**
+ * tid_to_cpu - 从事务ID提取CPU编号
+ * @tid: 事务ID
+ *
+ * 从事务ID中提取CPU编号，用于调试cmpxchg失败
+ * 返回值: CPU编号
+ */
 static inline unsigned int tid_to_cpu(unsigned long tid)
 {
 	return tid % TID_STEP;
 }
 
+/**
+ * tid_to_event - 从事务ID提取事件序号
+ * @tid: 事务ID
+ *
+ * 从事务ID中提取事件序号，用于调试cmpxchg失败
+ * 返回值: 事件序号
+ */
 static inline unsigned long tid_to_event(unsigned long tid)
 {
 	return tid / TID_STEP;
 }
-#endif
 
+/**
+ * init_tid - 初始化CPU的事务ID
+ * @cpu: CPU编号
+ *
+ * 为指定CPU初始化事务ID，初始值就是CPU编号
+ * 返回值: 初始化的事务ID
+ */
 static inline unsigned int init_tid(int cpu)
 {
 	return cpu;
 }
 
+/**
+ * note_cmpxchg_failure - 记录cmpxchg失败的调试信息
+ * @n: 操作名称
+ * @s: slab缓存结构
+ * @tid: 期望的事务ID
+ *
+ * 在调试模式下记录cmpxchg失败的详细信息，包括CPU变化、
+ * 事件变化等可能的原因，帮助诊断并发问题
+ */
 static inline void note_cmpxchg_failure(const char *n,
 		const struct kmem_cache *s, unsigned long tid)
 {
@@ -2135,6 +2698,13 @@ static inline void note_cmpxchg_failure(const char *n,
 	stat(s, CMPXCHG_DOUBLE_CPU_FAIL);
 }
 
+/**
+ * init_kmem_cache_cpus - 初始化slab缓存的所有CPU结构
+ * @s: slab缓存结构
+ *
+ * 为缓存的所有可能CPU初始化per-CPU结构的事务ID
+ * 每个CPU的初始事务ID设为其CPU编号
+ */
 static void init_kmem_cache_cpus(struct kmem_cache *s)
 {
 	int cpu;
@@ -2145,6 +2715,17 @@ static void init_kmem_cache_cpus(struct kmem_cache *s)
 
 /*
  * Remove the cpu slab
+ */
+/**
+ * deactivate_slab - 停用per-CPU slab页面
+ * @s: slab所属的缓存结构体指针
+ * @page: 要停用的slab页面
+ * @freelist: 页面的空闲对象链表
+ * @c: per-CPU缓存结构体指针
+ *
+ * 将per-CPU slab页面停用并根据使用情况将其放入适当的链表。
+ * 空页面会被释放，部分使用的页面放入partial链表，
+ * 满页面放入full链表。包含统计和调试支持。
  */
 static void deactivate_slab(struct kmem_cache *s, struct page *page,
 				void *freelist, struct kmem_cache_cpu *c)
@@ -2294,12 +2875,17 @@ redo:
 	c->freelist = NULL;
 }
 
-/*
- * Unfreeze all the cpu partial slabs.
+/**
+ * unfreeze_partials - 解冻所有CPU部分slab
+ * @s: slab缓存结构
+ * @c: per-CPU缓存结构
  *
- * This function must be called with interrupts disabled
- * for the cpu using c (or some other guarantee must be there
- * to guarantee no concurrent accesses).
+ * 必须在禁用中断的情况下调用此函数（或有其他保证确保不会并发访问）
+ *
+ * 将CPU部分slab链表中的所有页面解冻并移动到适当位置：
+ * - 空页面加入丢弃列表稍后释放
+ * - 非空页面加入节点的部分slab链表
+ * - 按节点分组处理以减少锁竞争
  */
 static void unfreeze_partials(struct kmem_cache *s,
 		struct kmem_cache_cpu *c)
@@ -2362,12 +2948,18 @@ static void unfreeze_partials(struct kmem_cache *s,
 #endif	/* CONFIG_SLUB_CPU_PARTIAL */
 }
 
-/*
- * Put a page that was just frozen (in __slab_free|get_partial_node) into a
- * partial page slot if available.
+/**
+ * put_cpu_partial - 将冻结的页面放入CPU部分slab插槽
+ * @s: slab缓存结构
+ * @page: 刚刚冻结的页面
+ * @drain: 是否强制排空标志
  *
- * If we did not find a slot then simply move all the partials to the
- * per node partial list.
+ * 将刚刚冻结的页面（在__slab_free或get_partial_node中）放入可用的
+ * CPU部分slab插槽。如果没有找到插槽，则将所有部分slab移动到
+ * per-node部分链表中。
+ *
+ * 维护CPU部分slab链表的页面数和对象数统计，当超过限制时
+ * 自动将现有部分slab排空到节点链表
  */
 static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 {
@@ -2421,6 +3013,14 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 #endif	/* CONFIG_SLUB_CPU_PARTIAL */
 }
 
+/**
+ * flush_slab - 刷新CPU slab
+ * @s: slab缓存结构
+ * @c: per-CPU缓存结构
+ *
+ * 停用当前CPU slab并更新事务ID，释放CPU slab资源
+ * 更新统计计数器记录CPU slab刷新操作
+ */
 static inline void flush_slab(struct kmem_cache *s, struct kmem_cache_cpu *c)
 {
 	stat(s, CPUSLAB_FLUSH);
@@ -2429,10 +3029,13 @@ static inline void flush_slab(struct kmem_cache *s, struct kmem_cache_cpu *c)
 	c->tid = next_tid(c->tid);
 }
 
-/*
- * Flush cpu slab.
+/**
+ * __flush_cpu_slab - 刷新指定CPU的slab（内部函数）
+ * @s: slab缓存结构
+ * @cpu: 目标CPU编号
  *
- * Called from IPI handler with interrupts disabled.
+ * 从IPI处理器调用，此时中断已禁用
+ * 刷新指定CPU的当前slab和所有部分slab
  */
 static inline void __flush_cpu_slab(struct kmem_cache *s, int cpu)
 {
@@ -2444,6 +3047,12 @@ static inline void __flush_cpu_slab(struct kmem_cache *s, int cpu)
 	unfreeze_partials(s, c);
 }
 
+/**
+ * flush_cpu_slab - CPU slab刷新回调函数
+ * @d: 传递的数据（slab缓存结构）
+ *
+ * 用作IPI回调函数，刷新当前CPU的slab
+ */
 static void flush_cpu_slab(void *d)
 {
 	struct kmem_cache *s = d;
@@ -2451,6 +3060,14 @@ static void flush_cpu_slab(void *d)
 	__flush_cpu_slab(s, smp_processor_id());
 }
 
+/**
+ * has_cpu_slab - 检查CPU是否有slab
+ * @cpu: CPU编号
+ * @info: 传递的信息（slab缓存结构）
+ *
+ * 检查指定CPU是否有当前slab或部分slab
+ * 返回值: 有slab返回true，否则返回false
+ */
 static bool has_cpu_slab(int cpu, void *info)
 {
 	struct kmem_cache *s = info;
@@ -2459,14 +3076,26 @@ static bool has_cpu_slab(int cpu, void *info)
 	return c->page || slub_percpu_partial(c);
 }
 
+/**
+ * flush_all - 刷新所有CPU的slab
+ * @s: slab缓存结构
+ *
+ * 对每个有CPU slab的CPU发送IPI，刷新其slab缓存
+ * 使用条件IPI，只对实际有slab的CPU执行操作以提高效率
+ */
 static void flush_all(struct kmem_cache *s)
 {
 	on_each_cpu_cond(has_cpu_slab, flush_cpu_slab, s, 1);
 }
 
-/*
- * Use the cpu notifier to insure that the cpu slabs are flushed when
- * necessary.
+/**
+ * slub_cpu_dead - CPU下线回调函数
+ * @cpu: 下线的CPU编号
+ *
+ * 使用CPU通知器确保在必要时刷新CPU slab
+ * 当CPU下线时，将该CPU上的所有slab缓存刷新到节点链表
+ * 防止CPU下线后丢失slab中的对象
+ * 返回值: 总是返回0表示成功处理
  */
 static int slub_cpu_dead(unsigned int cpu)
 {
@@ -2483,9 +3112,14 @@ static int slub_cpu_dead(unsigned int cpu)
 	return 0;
 }
 
-/*
- * Check if the objects in a per cpu structure fit numa
- * locality expectations.
+/**
+ * node_match - 检查页面是否符合NUMA局部性期望
+ * @page: 要检查的页面
+ * @node: 期望的NUMA节点
+ *
+ * 检查per-CPU结构中的对象是否符合NUMA局部性期望
+ * 在NUMA系统中，确保对象分配在预期的节点上
+ * 返回值: 匹配返回1，不匹配返回0
  */
 static inline int node_match(struct page *page, int node)
 {
@@ -2496,19 +3130,38 @@ static inline int node_match(struct page *page, int node)
 	return 1;
 }
 
-#ifdef CONFIG_SLUB_DEBUG
+/**
+ * count_free - 计算页面中空闲对象数量
+ * @page: 要计算的页面
+ *
+ * 返回值: 页面中空闲对象的数量
+ */
 static int count_free(struct page *page)
 {
 	return page->objects - page->inuse;
 }
 
+/**
+ * node_nr_objs - 获取节点中对象总数
+ * @n: kmem_cache_node结构
+ *
+ * 原子性地读取节点中的对象总数
+ * 返回值: 节点中的对象总数
+ */
 static inline unsigned long node_nr_objs(struct kmem_cache_node *n)
 {
 	return atomic_long_read(&n->total_objects);
 }
-#endif /* CONFIG_SLUB_DEBUG */
 
-#if defined(CONFIG_SLUB_DEBUG) || defined(CONFIG_SYSFS)
+/**
+ * count_partial - 统计部分slab的指定信息
+ * @n: kmem_cache_node结构
+ * @get_count: 获取计数的回调函数
+ *
+ * 遍历节点的partial链表，对每个页面调用get_count函数并累加结果
+ * 在持有自旋锁的情况下操作，确保链表遍历的原子性
+ * 返回值: 累加的计数结果
+ */
 static unsigned long count_partial(struct kmem_cache_node *n,
 					int (*get_count)(struct page *))
 {
@@ -2522,8 +3175,19 @@ static unsigned long count_partial(struct kmem_cache_node *n,
 	spin_unlock_irqrestore(&n->list_lock, flags);
 	return x;
 }
-#endif /* CONFIG_SLUB_DEBUG || CONFIG_SYSFS */
 
+/**
+ * slab_out_of_memory - 报告slab分配器内存不足
+ * @s: 无法分配的slab缓存
+ * @gfpflags: 分配标志
+ * @nid: 尝试分配的节点ID
+ *
+ * 当slab分配器无法分配内存时打印详细的调试信息：
+ * - 使用速率限制避免日志泛洪
+ * - 显示缓存信息（名称、对象大小、缓冲区大小、分配顺序）
+ * - 显示每个节点的slab统计（slab数量、对象数量、空闲数量）
+ * - 如果调试增加了最小顺序会给出提示
+ */
 static noinline void
 slab_out_of_memory(struct kmem_cache *s, gfp_t gfpflags, int nid)
 {
@@ -2561,6 +3225,22 @@ slab_out_of_memory(struct kmem_cache *s, gfp_t gfpflags, int nid)
 #endif
 }
 
+/**
+ * new_slab_objects - 获取新的slab对象
+ * @s: slab缓存结构
+ * @flags: 分配标志
+ * @node: 首选NUMA节点
+ * @pc: per-CPU缓存指针的指针
+ *
+ * 尝试获取新的slab对象，优先从partial链表获取，失败则分配新slab：
+ * 1. 首先尝试从partial slab获取对象
+ * 2. 如果失败则分配全新的slab页面
+ * 3. 如果当前CPU已有页面则先刷新
+ * 4. 设置新页面为当前CPU slab并返回freelist
+ *
+ * 警告：如果缓存有构造函数且要求零初始化，这是不兼容的
+ * 返回值: 成功返回freelist，失败返回NULL
+ */
 static inline void *new_slab_objects(struct kmem_cache *s, gfp_t flags,
 			int node, struct kmem_cache_cpu **pc)
 {
@@ -2596,6 +3276,16 @@ static inline void *new_slab_objects(struct kmem_cache *s, gfp_t flags,
 	return freelist;
 }
 
+/**
+ * pfmemalloc_match - 检查页面是否匹配pfmemalloc要求
+ * @page: 要检查的页面
+ * @gfpflags: 分配标志
+ *
+ * 检查页面的pfmemalloc状态是否与分配标志匹配：
+ * - 如果页面标记为pfmemalloc，检查分配标志是否允许pfmemalloc
+ * - 普通页面总是匹配
+ * 返回值: 匹配返回true，否则返回false
+ */
 static inline bool pfmemalloc_match(struct page *page, gfp_t gfpflags)
 {
 	if (unlikely(PageSlabPfmemalloc(page)))
@@ -2604,15 +3294,17 @@ static inline bool pfmemalloc_match(struct page *page, gfp_t gfpflags)
 	return true;
 }
 
-/*
- * Check the page->freelist of a page and either transfer the freelist to the
- * per cpu freelist or deactivate the page.
+/**
+ * get_freelist - 检查并获取页面的freelist
+ * @s: slab缓存结构
+ * @page: 要检查的页面
  *
- * The page is still frozen if the return value is not NULL.
+ * 检查页面的freelist并将其传输到per-cpu freelist或停用页面
+ * 必须在禁用中断的情况下调用此函数
  *
- * If this function returns NULL then the page has been unfrozen.
- *
- * This function must be called with interrupt disabled.
+ * 如果返回值不为NULL，页面仍然是冻结的
+ * 如果此函数返回NULL，页面已被解冻
+ * 返回值: freelist指针或NULL
  */
 static inline void *get_freelist(struct kmem_cache *s, struct page *page)
 {
@@ -2656,6 +3348,22 @@ static inline void *get_freelist(struct kmem_cache *s, struct page *page)
  *
  * Version of __slab_alloc to use when we know that interrupts are
  * already disabled (which is the case for bulk allocation).
+ */
+/**
+ * ___slab_alloc - SLUB分配器的最慢路径（中断已禁用版本）
+ * @s: 要分配对象的缓存结构体指针
+ * @gfpflags: 分配标志，控制内存分配行为
+ * @node: 首选的NUMA节点ID
+ * @addr: 返回地址，用于调试和追踪分配调用
+ * @c: per-CPU缓存结构体指针
+ *
+ * 返回值：成功返回分配的对象指针，失败返回NULL
+ *
+ * 这是在中断已禁用情况下的慢路径分配函数，主要用于批量分配。
+ * 分配策略的优先级顺序：
+ * 1. 尝试使用当前slab页面的常规空闲链表
+ * 2. 回退到部分slab链表，获取第一个对象并移动其余到无锁链表
+ * 3. 最慢路径：分配新的slab页面（涉及页面分配器调用）
  */
 static void *___slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
 			  unsigned long addr, struct kmem_cache_cpu *c)
@@ -2762,6 +3470,19 @@ new_slab:
  * Another one that disabled interrupt and compensates for possible
  * cpu changes by refetching the per cpu area pointer.
  */
+/**
+ * __slab_alloc - SLUB分配器的慢路径分配函数
+ * @s: 要分配对象的缓存结构体指针
+ * @gfpflags: 分配标志，控制内存分配行为
+ * @node: 首选的NUMA节点
+ * @addr: 返回地址，用于调试和追踪
+ * @c: per-CPU缓存结构体指针
+ *
+ * 返回值：成功返回分配的对象指针，失败返回NULL
+ *
+ * 当快路径分配失败时调用此函数。会禁用中断以避免竞争，
+ * 然后调用___slab_alloc进行实际的慢路径分配处理。
+ */
 static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
 			  unsigned long addr, struct kmem_cache_cpu *c)
 {
@@ -2783,9 +3504,14 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
 	return p;
 }
 
-/*
- * If the object has been wiped upon free, make sure it's fully initialized by
- * zeroing out freelist pointer.
+/**
+ * maybe_wipe_obj_freeptr - 可能清除对象的freelist指针
+ * @s: slab缓存结构
+ * @obj: 要处理的对象
+ *
+ * 如果对象在释放时被清零，确保通过清零freelist指针来完全初始化
+ * 当启用init_on_free时，对象内容会被清零，但freelist指针位置
+ * 需要特别处理以确保分配时的一致性
  */
 static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,
 						   void *obj)
@@ -2803,6 +3529,21 @@ static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,
  * If not then __slab_alloc is called for slow processing.
  *
  * Otherwise we can simply pick the next object from the lockless free list.
+ */
+/**
+ * slab_alloc_node - 从指定NUMA节点的slab缓存中分配对象（内联快速路径）
+ * @s: 要分配对象的缓存结构体指针
+ * @gfpflags: 分配标志，控制内存分配行为（如__GFP_ZERO等）
+ * @node: 首选的NUMA节点ID，NUMA_NO_NODE表示不指定节点
+ * @addr: 返回地址，用于调试和追踪分配调用
+ *
+ * 返回值：成功返回分配的对象指针，失败返回NULL
+ *
+ * 这是SLUB分配器的核心快速路径函数，被内联到kmalloc等分配函数中。
+ * 快速路径优化：
+ * 1. 首先尝试使用per-CPU无锁空闲链表
+ * 2. 如果快速路径失败，则调用__slab_alloc慢路径处理
+ * 3. 支持NUMA节点亲和性和对象组控制
  */
 static __always_inline void *slab_alloc_node(struct kmem_cache *s,
 		gfp_t gfpflags, int node, unsigned long addr)
@@ -2893,12 +3634,33 @@ redo:
 	return object;
 }
 
+/**
+ * slab_alloc - 从slab缓存中分配对象（简化接口）
+ * @s: 要分配对象的缓存结构体指针
+ * @gfpflags: 分配标志，控制内存分配行为
+ * @addr: 返回地址，用于调试和追踪分配调用
+ *
+ * 返回值：成功返回分配的对象指针，失败返回NULL
+ *
+ * 这是slab_alloc_node的简化版本，不指定NUMA节点，
+ * 让内核自动选择合适的节点进行分配。
+ */
 static __always_inline void *slab_alloc(struct kmem_cache *s,
 		gfp_t gfpflags, unsigned long addr)
 {
 	return slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr);
 }
 
+/**
+ * kmem_cache_alloc - 从指定的对象缓存中分配对象
+ * @s: 要分配对象的缓存结构体指针
+ * @gfpflags: 分配标志，控制内存分配行为
+ *
+ * 返回值：成功返回分配的对象指针，失败返回NULL
+ *
+ * 这是SLUB分配器的主要分配函数，从指定缓存分配一个对象。
+ * 会尝试从per-CPU缓存快速分配，失败时走慢路径。
+ */
 void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
 {
 	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
@@ -2910,7 +3672,16 @@ void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
 }
 EXPORT_SYMBOL(kmem_cache_alloc);
 
-#ifdef CONFIG_TRACING
+/**
+ * kmem_cache_alloc_trace - 从缓存分配对象并启用追踪
+ * @s: 要分配对象的缓存结构
+ * @gfpflags: 分配标志
+ * @size: 请求的大小（用于追踪）
+ *
+ * 从指定缓存分配对象，启用kmalloc追踪并进行KASAN检查
+ * 主要用于通用kmalloc接口的实现
+ * 返回值: 成功返回对象指针，失败返回NULL
+ */
 void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
 {
 	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
@@ -2918,10 +3689,17 @@ void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
 	ret = kasan_kmalloc(s, ret, size, gfpflags);
 	return ret;
 }
-EXPORT_SYMBOL(kmem_cache_alloc_trace);
-#endif
 
-#ifdef CONFIG_NUMA
+/**
+ * kmem_cache_alloc_node - 从指定NUMA节点的缓存分配对象
+ * @s: 要分配对象的缓存结构
+ * @gfpflags: 分配标志
+ * @node: 首选的NUMA节点
+ *
+ * 从指定NUMA节点的缓存分配对象，优化NUMA系统的内存访问局部性
+ * 包含追踪支持以便性能分析
+ * 返回值: 成功返回对象指针，失败返回NULL
+ */
 void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
 {
 	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
@@ -2931,9 +3709,18 @@ void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
 
 	return ret;
 }
-EXPORT_SYMBOL(kmem_cache_alloc_node);
 
-#ifdef CONFIG_TRACING
+/**
+ * kmem_cache_alloc_node_trace - 从指定节点分配对象并启用追踪
+ * @s: 要分配对象的缓存结构
+ * @gfpflags: 分配标志
+ * @node: 首选的NUMA节点
+ * @size: 请求的大小（用于追踪）
+ *
+ * 从指定NUMA节点分配对象，启用kmalloc追踪并进行KASAN检查
+ * 结合了NUMA感知和调试追踪功能
+ * 返回值: 成功返回对象指针，失败返回NULL
+ */
 void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
 				    gfp_t gfpflags,
 				    int node, size_t size)
@@ -2946,9 +3733,6 @@ void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
 	ret = kasan_kmalloc(s, ret, size, gfpflags);
 	return ret;
 }
-EXPORT_SYMBOL(kmem_cache_alloc_node_trace);
-#endif
-#endif	/* CONFIG_NUMA */
 
 /*
  * Slow path handling. This may still be called frequently since objects
@@ -2957,6 +3741,23 @@ EXPORT_SYMBOL(kmem_cache_alloc_node_trace);
  * So we still attempt to reduce cache line usage. Just take the slab
  * lock and free the item. If there is no additional partial page
  * handling required then we can return immediately.
+ */
+/**
+ * __slab_free - slab对象释放的慢路径处理
+ * @s: 对象所属的缓存结构体指针
+ * @page: 对象所在的slab页面
+ * @head: 要释放的对象链表头指针
+ * @tail: 要释放的对象链表尾指针
+ * @cnt: 要释放的对象数量
+ * @addr: 调用者地址，用于调试和追踪
+ *
+ * 处理无法通过快速路径释放的对象。尽管是慢路径，但在大多数工作负载中
+ * 仍可能被频繁调用，因为对象的生命周期通常比CPU slab更长。
+ *
+ * 优化策略：
+ * 1. 减少缓存行使用 - 仅获取slab锁并释放对象
+ * 2. 无需额外部分页面处理时立即返回
+ * 3. 处理页面状态转换（空闲、部分、满）
  */
 static void __slab_free(struct kmem_cache *s, struct page *page,
 			void *head, void *tail, int cnt,
@@ -3087,6 +3888,22 @@ slab_empty:
  * same page) possible by specifying head and tail ptr, plus objects
  * count (cnt). Bulk free indicated by tail pointer being set.
  */
+/**
+ * do_slab_free - 执行实际的slab对象释放操作（快速路径优化）
+ * @s: 对象所属的缓存结构体指针
+ * @page: 对象所在的slab页面
+ * @head: 要释放的对象链表头指针
+ * @tail: 要释放的对象链表尾指针（NULL表示单个对象）
+ * @cnt: 要释放的对象数量
+ * @addr: 调用者地址，用于调试和追踪
+ *
+ * 这是强制内联的快速释放路径函数，用于生成高效的kfree和kmem_cache_free。
+ *
+ * 快速路径条件：释放到当前CPU的slab页面（通常是刚分配的对象）
+ * 快速路径失败时：回退到__slab_free进行慢路径处理
+ *
+ * 支持批量释放：通过head/tail指针指定空闲链表，所有对象必须在同一页面
+ */
 static __always_inline void do_slab_free(struct kmem_cache *s,
 				struct page *page, void *head, void *tail,
 				int cnt, unsigned long addr)
@@ -3131,6 +3948,19 @@ redo:
 
 }
 
+/**
+ * slab_free - 释放对象到slab缓存（支持批量释放）
+ * @s: 对象所属的缓存结构体指针
+ * @page: 对象所在的slab页面
+ * @head: 要释放的对象链表头指针
+ * @tail: 要释放的对象链表尾指针（NULL表示单个对象）
+ * @cnt: 要释放的对象数量
+ * @addr: 调用者地址，用于调试和追踪
+ *
+ * 这是SLUB释放器的主要入口函数，支持单个或批量对象释放。
+ * 在KASAN启用时，会先处理空闲链表钩子来延迟对象重用，
+ * 然后调用do_slab_free进行实际的释放操作。
+ */
 static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
 				      void *head, void *tail, int cnt,
 				      unsigned long addr)
@@ -3150,6 +3980,14 @@ void ___cache_free(struct kmem_cache *cache, void *x, unsigned long addr)
 }
 #endif
 
+/**
+ * kmem_cache_free - 释放对象回对象缓存
+ * @s: 对象所属的缓存结构体指针
+ * @x: 要释放的对象指针
+ *
+ * 将对象释放回SLUB缓存。会尝试快速释放到per-CPU缓存，
+ * 失败时走慢路径处理。包含调试和追踪支持。
+ */
 void kmem_cache_free(struct kmem_cache *s, void *x)
 {
 	s = cache_from_obj(s, x);
@@ -3160,6 +3998,17 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
 }
 EXPORT_SYMBOL(kmem_cache_free);
 
+/**
+ * detached_freelist - 分离的释放列表结构
+ * @page: 对象所在的页面
+ * @tail: 释放列表的尾指针
+ * @freelist: 释放列表的头指针
+ * @cnt: 列表中对象的数量
+ * @s: 对象所属的slab缓存
+ *
+ * 用于批量释放操作的临时结构，将属于同一页面的对象
+ * 组织成单独的释放列表以便高效批量处理
+ */
 struct detached_freelist {
 	struct page *page;
 	void *tail;
@@ -3168,17 +4017,20 @@ struct detached_freelist {
 	struct kmem_cache *s;
 };
 
-/*
- * This function progressively scans the array with free objects (with
- * a limited look ahead) and extract objects belonging to the same
- * page.  It builds a detached freelist directly within the given
- * page/objects.  This can happen without any need for
- * synchronization, because the objects are owned by running process.
- * The freelist is build up as a single linked list in the objects.
- * The idea is, that this detached freelist can then be bulk
- * transferred to the real freelist(s), but only requiring a single
- * synchronization primitive.  Look ahead in the array is limited due
- * to performance reasons.
+/**
+ * build_detached_freelist - 构建分离的释放列表
+ * @s: slab缓存结构
+ * @size: 对象数组大小
+ * @p: 要释放的对象指针数组
+ * @df: 输出的分离释放列表结构
+ *
+ * 渐进式扫描对象数组（有限前瞻），提取属于同一页面的对象
+ * 在给定的页面/对象内直接构建分离的释放列表，无需同步
+ * 因为对象属于运行进程所有。释放列表作为对象中的单链表构建
+ *
+ * 核心思想是这个分离的释放列表可以批量传输到真实的释放列表，
+ * 只需要一个同步原语。由于性能考虑，数组中的前瞻是有限的
+ * 返回值: 处理的对象数量
  */
 static inline
 int build_detached_freelist(struct kmem_cache *s, size_t size,
@@ -3251,7 +4103,17 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
 	return first_skipped_index;
 }
 
-/* Note that interrupts must be enabled when calling this function. */
+/**
+ * kmem_cache_free_bulk - 批量释放对象到缓存
+ * @s: 对象所属的缓存结构
+ * @size: 要释放的对象数量
+ * @p: 对象指针数组
+ *
+ * 批量释放对象回slab缓存以提高性能。通过构建分离的释放列表
+ * 将属于同一页面的对象组织在一起，然后批量释放以减少锁开销
+ *
+ * 注意：调用此函数时必须启用中断
+ */
 void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
 {
 	if (WARN_ON(!size))
@@ -3268,9 +4130,25 @@ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
 		slab_free(df.s, df.page, df.freelist, df.tail, df.cnt,_RET_IP_);
 	} while (likely(size));
 }
-EXPORT_SYMBOL(kmem_cache_free_bulk);
 
-/* Note that interrupts must be enabled when calling this function. */
+/**
+ * kmem_cache_alloc_bulk - 从缓存批量分配对象
+ * @s: 要分配对象的缓存结构
+ * @flags: 分配标志
+ * @size: 要分配的对象数量
+ * @p: 用于返回对象指针的数组
+ *
+ * 批量分配对象以提高性能。在禁用本地中断的情况下从per-CPU slab
+ * 消耗对象，这样可以保护免受PREEMPT和中断处理器调用正常快速路径的影响
+ *
+ * 优化策略：
+ * - 优先从per-CPU freelist快速分配
+ * - freelist为空时调用慢路径重新填充
+ * - 支持init_on_alloc的零初始化
+ *
+ * 注意：调用此函数时必须启用中断
+ * 返回值: 成功分配的对象数量
+ */
 int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
 			  void **p)
 {
@@ -3341,7 +4219,6 @@ error:
 	__kmem_cache_free_bulk(s, i, p);
 	return 0;
 }
-EXPORT_SYMBOL(kmem_cache_alloc_bulk);
 
 
 /*
@@ -3367,30 +4244,19 @@ static unsigned int slub_min_order;
 static unsigned int slub_max_order = PAGE_ALLOC_COSTLY_ORDER;
 static unsigned int slub_min_objects;
 
-/*
- * Calculate the order of allocation given an slab object size.
+/**
+ * slab_order - 计算给定参数下的slab分配顺序
+ * @size: 对象大小
+ * @min_objects: 最少对象数量
+ * @max_order: 最大分配顺序
+ * @fract_leftover: 允许的剩余空间分数
  *
- * The order of allocation has significant impact on performance and other
- * system components. Generally order 0 allocations should be preferred since
- * order 0 does not cause fragmentation in the page allocator. Larger objects
- * be problematic to put into order 0 slabs because there may be too much
- * unused space left. We go to a higher order if more than 1/16th of the slab
- * would be wasted.
+ * 计算分配顺序对性能和系统组件有重大影响。一般来说应该优先选择
+ * 0阶分配，因为0阶不会在页面分配器中造成碎片。较大的对象放入
+ * 0阶slab可能有问题，因为可能会留下太多未使用空间。如果slab
+ * 浪费超过1/16，我们会使用更高的顺序
  *
- * In order to reach satisfactory performance we must ensure that a minimum
- * number of objects is in one slab. Otherwise we may generate too much
- * activity on the partial lists which requires taking the list_lock. This is
- * less a concern for large slabs though which are rarely used.
- *
- * slub_max_order specifies the order where we begin to stop considering the
- * number of objects in a slab as critical. If we reach slub_max_order then
- * we try to keep the page order as low as possible. So we accept more waste
- * of space in favor of a small page order.
- *
- * Higher order allocations also allow the placement of more objects in a
- * slab and thereby reduce object handling overhead. If the user has
- * requested a higher mininum order then we start with that one instead of
- * the smallest order which will fit the object.
+ * 返回值: 计算出的分配顺序
  */
 static inline unsigned int slab_order(unsigned int size,
 		unsigned int min_objects, unsigned int max_order,
@@ -3417,6 +4283,21 @@ static inline unsigned int slab_order(unsigned int size,
 	return order;
 }
 
+/**
+ * calculate_order - 计算slab的最佳分配顺序
+ * @size: 对象大小
+ *
+ * 尝试为slab找到最佳配置，通过首先尝试生成最佳配置的布局
+ * 然后逐渐回退的方式工作
+ *
+ * 算法策略：
+ * 1. 首先增加slab中可接受的浪费空间
+ * 2. 然后减少slab中所需的最少对象数量
+ * 3. 如果无法放置多个对象，尝试放置单个对象
+ * 4. 最后使用MAX_ORDER进行强制分配
+ *
+ * 返回值: 计算出的分配顺序，失败时返回-ENOSYS
+ */
 static inline int calculate_order(unsigned int size)
 {
 	unsigned int order;
@@ -3468,6 +4349,15 @@ static inline int calculate_order(unsigned int size)
 	return -ENOSYS;
 }
 
+/**
+ * init_kmem_cache_node - 初始化kmem_cache_node结构
+ * @n: 要初始化的节点结构
+ *
+ * 初始化slab缓存节点的各种字段：
+ * - 设置partial slab计数为0
+ * - 初始化列表锁和partial链表
+ * - 在调试模式下初始化slab和对象计数器以及full链表
+ */
 static void
 init_kmem_cache_node(struct kmem_cache_node *n)
 {
@@ -3481,6 +4371,15 @@ init_kmem_cache_node(struct kmem_cache_node *n)
 #endif
 }
 
+/**
+ * alloc_kmem_cache_cpus - 为slab缓存分配per-CPU结构
+ * @s: slab缓存结构
+ *
+ * 分配并初始化slab缓存的per-CPU结构：
+ * - 必须对齐到双字边界以支持双重cmpxchg指令
+ * - 分配per-CPU内存并初始化所有CPU的结构
+ * 返回值: 成功返回1，失败返回0
+ */
 static inline int alloc_kmem_cache_cpus(struct kmem_cache *s)
 {
 	BUILD_BUG_ON(PERCPU_DYNAMIC_EARLY_SIZE <
@@ -4429,6 +5328,16 @@ __kmem_cache_alias(const char *name, unsigned int size, unsigned int align,
 	return s;
 }
 
+/**
+ * __kmem_cache_create - 创建新的对象缓存
+ * @s: 要初始化的缓存结构体指针
+ * @flags: 缓存创建标志
+ *
+ * 返回值：成功返回0，失败返回错误码
+ *
+ * SLUB分配器的缓存创建函数。初始化缓存结构，设置对象大小、
+ * 对齐方式等参数，并在系统启动完成后注册到sysfs。
+ */
 int __kmem_cache_create(struct kmem_cache *s, slab_flags_t flags)
 {
 	int err;

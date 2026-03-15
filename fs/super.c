@@ -51,12 +51,17 @@ static char *sb_writers_name[SB_FREEZE_LEVELS] = {
 	"sb_internal",
 };
 
-/*
- * One thing we have to be careful of with a per-sb shrinker is that we don't
- * drop the last active reference to the superblock from within the shrinker.
- * If that happens we could trigger unregistering the shrinker from within the
- * shrinker path and that leads to deadlock on the shrinker_rwsem. Hence we
- * take a passive reference to the superblock to avoid this from occurring.
+/**
+ * super_cache_scan - 超级块缓存扫描函数
+ * @shrink: 收缩器结构
+ * @sc: 收缩控制参数
+ *
+ * 对于每个超级块的收缩器，我们必须注意不要在收缩器内部释放
+ * 超级块的最后一个活跃引用。如果发生这种情况，我们可能会在
+ * 收缩器路径内触发注销收缩器，这会导致shrinker_rwsem死锁。
+ * 因此我们获取超级块的被动引用以避免这种情况发生。
+ *
+ * 返回值: 释放的对象数量
  */
 static unsigned long super_cache_scan(struct shrinker *shrink,
 				      struct shrink_control *sc)
@@ -115,6 +120,17 @@ static unsigned long super_cache_scan(struct shrinker *shrink,
 	return freed;
 }
 
+/**
+ * super_cache_count - 统计超级块缓存对象数量
+ * @shrink: 收缩器结构
+ * @sc: 收缩控制参数
+ *
+ * 统计超级块中可收缩的缓存对象总数，包括dentry缓存、inode缓存
+ * 和文件系统特定的缓存对象。我们不使用trylock_super()因为它
+ * 是性能瓶颈，所以我们会暴露在部分设置状态下。
+ *
+ * 返回值: 可收缩的对象总数
+ */
 static unsigned long super_cache_count(struct shrinker *shrink,
 				       struct shrink_control *sc)
 {
@@ -154,6 +170,13 @@ static unsigned long super_cache_count(struct shrinker *shrink,
 	return total_objects;
 }
 
+/**
+ * destroy_super_work - 超级块销毁工作函数
+ * @work: 工作队列项
+ *
+ * 在工作队列上下文中执行超级块的最终销毁工作，包括释放
+ * 每CPU读写信号量和超级块结构本身。
+ */
 static void destroy_super_work(struct work_struct *work)
 {
 	struct super_block *s = container_of(work, struct super_block,
@@ -165,6 +188,13 @@ static void destroy_super_work(struct work_struct *work)
 	kfree(s);
 }
 
+/**
+ * destroy_super_rcu - RCU回调中的超级块销毁
+ * @head: RCU回调头
+ *
+ * 在RCU宽限期后通过工作队列调度超级块的最终销毁。
+ * 这确保了所有可能持有对超级块引用的RCU读端临界区都已完成。
+ */
 static void destroy_super_rcu(struct rcu_head *head)
 {
 	struct super_block *s = container_of(head, struct super_block, rcu);
@@ -172,6 +202,14 @@ static void destroy_super_rcu(struct rcu_head *head)
 	schedule_work(&s->destroy_work);
 }
 
+/**
+ * destroy_unused_super - 销毁未使用的超级块
+ * @s: 要销毁的超级块
+ *
+ * 释放一个从未被任何人看到的超级块。这用于在分配后但在
+ * 实际使用前发生错误时清理超级块。直接调用destroy_super_work
+ * 因为不需要延迟处理。
+ */
 /* Free a superblock that has never been seen by anyone */
 static void destroy_unused_super(struct super_block *s)
 {
@@ -189,13 +227,15 @@ static void destroy_unused_super(struct super_block *s)
 }
 
 /**
- *	alloc_super	-	create new superblock
- *	@type:	filesystem type superblock should belong to
- *	@flags: the mount flags
- *	@user_ns: User namespace for the super_block
+ * alloc_super - 创建新的超级块
+ * @type: 超级块所属的文件系统类型
+ * @flags: 挂载标志
+ * @user_ns: 超级块的用户命名空间
  *
- *	Allocates and initializes a new &struct super_block.  alloc_super()
- *	returns a pointer new superblock or %NULL if allocation had failed.
+ * 分配并初始化一个新的 &struct super_block。alloc_super()
+ * 返回一个指向新超级块的指针，如果分配失败则返回 %NULL。
+ *
+ * 返回值: 成功返回超级块指针，失败返回NULL
  */
 static struct super_block *alloc_super(struct file_system_type *type, int flags,
 				       struct user_namespace *user_ns)
@@ -282,6 +322,13 @@ fail:
 
 /* Superblock refcounting  */
 
+/**
+ * __put_super - 减少超级块引用计数
+ * @s: 超级块
+ *
+ * 减少超级块的引用计数。调用者必须持有sb_lock。
+ * 当引用计数归零时，执行清理并通过RCU延迟销毁超级块。
+ */
 /*
  * Drop a superblock's refcount.  The caller must hold sb_lock.
  */
@@ -301,6 +348,13 @@ static void __put_super(struct super_block *s)
 }
 
 /**
+ * put_super - 释放超级块的临时引用
+ * @sb: 要释放的超级块
+ *
+ * 释放一个临时引用，如果没有剩余引用则释放超级块。
+ * 这是__put_super的线程安全版本，会获取必要的锁。
+ */
+/**
  *	put_super	-	drop a temporary reference to superblock
  *	@sb: superblock in question
  *
@@ -315,6 +369,15 @@ static void put_super(struct super_block *sb)
 }
 
 
+/**
+ * deactivate_locked_super - 停用锁定的超级块
+ * @s: 要停用的超级块
+ *
+ * 释放超级块的一个活跃引用，如果没有其他活跃引用则将其转换为
+ * 临时引用。在这种情况下，我们告诉文件系统驱动程序关闭它并
+ * 释放我们刚刚获得的临时引用。调用者持有超级块的独占锁，
+ * 该锁在函数返回时被释放。
+ */
 /**
  *	deactivate_locked_super	-	drop an active reference to superblock
  *	@s: superblock to deactivate
@@ -352,12 +415,13 @@ void deactivate_locked_super(struct super_block *s)
 EXPORT_SYMBOL(deactivate_locked_super);
 
 /**
- *	deactivate_super	-	drop an active reference to superblock
- *	@s: superblock to deactivate
+ * deactivate_super - 释放超级块的活跃引用
+ * @s: 要停用的超级块
  *
- *	Variant of deactivate_locked_super(), except that superblock is *not*
- *	locked by caller.  If we are going to drop the final active reference,
- *	lock will be acquired prior to that.
+ * deactivate_locked_super()的变体，区别是超级块没有被调用者锁定。
+ * 如果我们要释放最后一个活跃引用，会在此之前获取锁。
+ *
+ * 返回值: 无
  */
 void deactivate_super(struct super_block *s)
 {
@@ -370,17 +434,17 @@ void deactivate_super(struct super_block *s)
 EXPORT_SYMBOL(deactivate_super);
 
 /**
- *	grab_super - acquire an active reference
- *	@s: reference we are trying to make active
+ * grab_super - 获取活跃引用
+ * @s: 尝试激活的引用
  *
- *	Tries to acquire an active reference.  grab_super() is used when we
- * 	had just found a superblock in super_blocks or fs_type->fs_supers
- *	and want to turn it into a full-blown active reference.  grab_super()
- *	is called with sb_lock held and drops it.  Returns 1 in case of
- *	success, 0 if we had failed (superblock contents was already dead or
- *	dying when grab_super() had been called).  Note that this is only
- *	called for superblocks not in rundown mode (== ones still on ->fs_supers
- *	of their type), so increment of ->s_count is OK here.
+ * 尝试获取一个活跃引用。grab_super()用于当我们刚刚在super_blocks
+ * 或fs_type->fs_supers中找到一个超级块并希望将其转换为完整的活跃引用时。
+ * grab_super()在持有sb_lock的情况下调用并释放它。成功时返回1，
+ * 失败时返回0（当grab_super()被调用时超级块内容已经死亡或正在死亡）。
+ * 注意这仅对不在关闭模式下的超级块调用（== 仍在其类型的->fs_supers上的超级块），
+ * 因此在这里增加->s_count是可以的。
+ *
+ * 返回值: 成功返回1，失败返回0
  */
 static int grab_super(struct super_block *s) __releases(sb_lock)
 {
@@ -396,6 +460,21 @@ static int grab_super(struct super_block *s) __releases(sb_lock)
 	return 0;
 }
 
+/**
+ * trylock_super - 尝试获取超级块共享锁
+ * @sb: 尝试锁定的超级块
+ *
+ * 尝试防止文件系统关闭。这在我们无法获取活跃引用但需要确保
+ * 在我们工作时文件系统不会关闭的地方使用。如果无法获取s_umount
+ * 或者我们失去了竞争且文件系统已进入关闭状态，则返回false。
+ * 成功时返回true并以读模式持有s_umount锁。成功返回时，调用者
+ * 必须在完成后释放s_umount锁。
+ *
+ * 注意：与get_super()等不同，这个函数不会增加->s_count。
+ * 这样做是安全的，因为我们可以使用trylock而不是down_read()。
+ *
+ * 返回值: 成功返回true，失败返回false
+ */
 /*
  *	trylock_super - try to grab ->s_umount shared
  *	@sb: reference we are trying to grab
@@ -425,6 +504,18 @@ bool trylock_super(struct super_block *sb)
 	return false;
 }
 
+/**
+ * generic_shutdown_super - ->kill_sb()的通用帮助函数
+ * @sb: 要关闭的超级块
+ *
+ * generic_shutdown_super()在超级块关闭时执行所有与文件系统无关的工作。
+ * 典型的->kill_sb()应该从超级块中挑选出所有需要销毁的文件系统特定对象，
+ * 调用generic_shutdown_super()并释放上述对象。注意：dentries和inodes
+ * 已经被处理，不需要特定的处理。
+ *
+ * 调用此函数后，文件系统不能再更改或重新排列属于此super_block的dentries
+ * 集合，也不能更改dentries到inodes的附件。
+ */
 /**
  *	generic_shutdown_super	-	common helper for ->kill_sb()
  *	@sb: superblock to kill
@@ -482,6 +573,16 @@ void generic_shutdown_super(struct super_block *sb)
 
 EXPORT_SYMBOL(generic_shutdown_super);
 
+/**
+ * mount_capable - 检查是否有挂载权限
+ * @fc: 文件系统上下文
+ *
+ * 检查当前进程是否有权限挂载指定的文件系统。如果文件系统类型
+ * 不支持用户命名空间挂载，则需要CAP_SYS_ADMIN权限。否则，
+ * 在相应的用户命名空间中需要CAP_SYS_ADMIN权限。
+ *
+ * 返回值: 有权限返回true，无权限返回false
+ */
 bool mount_capable(struct fs_context *fc)
 {
 	if (!(fc->fs_type->fs_flags & FS_USERNS_MOUNT))
@@ -490,6 +591,23 @@ bool mount_capable(struct fs_context *fc)
 		return ns_capable(fc->user_ns, CAP_SYS_ADMIN);
 }
 
+/**
+ * sget_fc - 查找或创建超级块
+ * @fc: 文件系统上下文
+ * @test: 比较回调函数
+ * @set: 设置回调函数
+ *
+ * 使用存储在文件系统上下文中的参数和两个回调函数查找或创建超级块。
+ *
+ * 如果匹配到现有的超级块，则返回该超级块，其引用计数已增加，
+ * 调用者必须转移或丢弃该引用。
+ *
+ * 如果没有匹配，将分配一个新的超级块并执行基本初始化
+ * (设置s_type、s_fs_info和s_id，并调用set()回调)，
+ * 超级块将被发布并以部分构造状态返回，SB_BORN和SB_ACTIVE尚未设置。
+ *
+ * 返回值: 成功返回超级块指针，失败返回错误指针
+ */
 /**
  * sget_fc - Find or create a superblock
  * @fc:	Filesystem context.
@@ -566,12 +684,15 @@ share_extant_sb:
 EXPORT_SYMBOL(sget_fc);
 
 /**
- *	sget	-	find or create a superblock
- *	@type:	  filesystem type superblock should belong to
- *	@test:	  comparison callback
- *	@set:	  setup callback
- *	@flags:	  mount flags
- *	@data:	  argument to each of them
+ * sget - 查找或创建超级块
+ * @type: 超级块所属的文件系统类型
+ * @test: 比较回调函数
+ * @set: 设置回调函数
+ * @flags: 挂载标志
+ * @data: 传递给回调函数的参数
+ *
+ * 在现有的超级块列表中查找匹配的超级块，如果没有找到则创建一个新的。
+ * 返回值: 成功返回超级块指针，失败返回错误指针
  */
 struct super_block *sget(struct file_system_type *type,
 			int (*test)(struct super_block *,void *),
@@ -633,6 +754,13 @@ retry:
 }
 EXPORT_SYMBOL(sget);
 
+/**
+ * drop_super - 释放超级块的共享锁和引用
+ * @sb: 要释放的超级块
+ *
+ * 释放超级块的共享s_umount锁并减少其引用计数。
+ * 通常与get_super()或类似函数配对使用。
+ */
 void drop_super(struct super_block *sb)
 {
 	up_read(&sb->s_umount);
@@ -641,6 +769,13 @@ void drop_super(struct super_block *sb)
 
 EXPORT_SYMBOL(drop_super);
 
+/**
+ * drop_super_exclusive - 释放超级块的独占锁和引用
+ * @sb: 要释放的超级块
+ *
+ * 释放超级块的独占s_umount锁并减少其引用计数。
+ * 通常与需要独占访问的操作配对使用。
+ */
 void drop_super_exclusive(struct super_block *sb)
 {
 	up_write(&sb->s_umount);
@@ -648,6 +783,13 @@ void drop_super_exclusive(struct super_block *sb)
 }
 EXPORT_SYMBOL(drop_super_exclusive);
 
+/**
+ * __iterate_supers - 遍历所有超级块并调用函数
+ * @f: 要对每个超级块调用的函数
+ *
+ * 扫描超级块列表并对每个活跃的超级块调用给定函数。
+ * 这是一个内部函数，不提供锁定保护给回调函数。
+ */
 static void __iterate_supers(void (*f)(struct super_block *))
 {
 	struct super_block *sb, *p = NULL;
@@ -670,6 +812,14 @@ static void __iterate_supers(void (*f)(struct super_block *))
 		__put_super(p);
 	spin_unlock(&sb_lock);
 }
+/**
+ * iterate_supers - 对所有活跃超级块调用函数
+ * @f: 要调用的函数
+ * @arg: 传递给函数的参数
+ *
+ * 扫描超级块列表并对每个活跃的超级块调用给定函数，
+ * 传递锁定的超级块和给定的参数。确保超级块在回调期间保持锁定状态。
+ */
 /**
  *	iterate_supers - call function for all active superblocks
  *	@f: function to call
@@ -704,6 +854,15 @@ void iterate_supers(void (*f)(struct super_block *, void *), void *arg)
 	spin_unlock(&sb_lock);
 }
 
+/**
+ * iterate_supers_type - 对指定类型的超级块调用函数
+ * @type: 文件系统类型
+ * @f: 要调用的函数
+ * @arg: 传递给函数的参数
+ *
+ * 扫描超级块列表并对给定类型的每个活跃超级块调用给定函数，
+ * 传递锁定的超级块和给定的参数。
+ */
 /**
  *	iterate_supers_type - call function for superblocks of given type
  *	@type: fs type
@@ -740,6 +899,16 @@ void iterate_supers_type(struct file_system_type *type,
 
 EXPORT_SYMBOL(iterate_supers_type);
 
+/**
+ * __get_super - 获取块设备的超级块(内部函数)
+ * @bdev: 块设备
+ * @excl: 是否需要独占锁
+ *
+ * 扫描超级块列表，查找挂载在指定块设备上的文件系统的超级块。
+ * 根据excl参数决定获取共享锁还是独占锁。
+ *
+ * 返回值: 成功返回超级块指针，未找到返回NULL
+ */
 static struct super_block *__get_super(struct block_device *bdev, bool excl)
 {
 	struct super_block *sb;
@@ -777,11 +946,13 @@ rescan:
 }
 
 /**
- *	get_super - get the superblock of a device
- *	@bdev: device to get the superblock for
+ * get_super - 获取设备的超级块
+ * @bdev: 要获取超级块的设备
  *
- *	Scans the superblock list and finds the superblock of the file system
- *	mounted on the device given. %NULL is returned if no match is found.
+ * 扫描超级块列表，查找挂载在指定设备上的文件系统的超级块。
+ * 如果没有找到匹配项则返回 %NULL。
+ *
+ * 返回值: 成功返回超级块指针，未找到返回NULL
  */
 struct super_block *get_super(struct block_device *bdev)
 {
@@ -789,6 +960,16 @@ struct super_block *get_super(struct block_device *bdev)
 }
 EXPORT_SYMBOL(get_super);
 
+/**
+ * __get_super_thawed - 获取已解冻的超级块(内部函数)
+ * @bdev: 块设备
+ * @excl: 是否需要独占锁
+ *
+ * 循环获取超级块直到它处于解冻状态。如果超级块被冻结，
+ * 会等待直到它解冻后再返回。
+ *
+ * 返回值: 成功返回解冻的超级块指针，未找到返回NULL
+ */
 static struct super_block *__get_super_thawed(struct block_device *bdev,
 					      bool excl)
 {
@@ -807,6 +988,16 @@ static struct super_block *__get_super_thawed(struct block_device *bdev,
 }
 
 /**
+ * get_super_thawed - 获取设备的已解冻超级块
+ * @bdev: 要获取超级块的设备
+ *
+ * 扫描超级块列表，查找挂载在指定设备上的文件系统的超级块。
+ * 超级块在解冻后返回(如果没有被冻结则立即返回)。
+ * 如果没有找到匹配项则返回%NULL。
+ *
+ * 返回值: 成功返回解冻的超级块指针，未找到返回NULL
+ */
+/**
  *	get_super_thawed - get thawed superblock of a device
  *	@bdev: device to get the superblock for
  *
@@ -822,6 +1013,16 @@ struct super_block *get_super_thawed(struct block_device *bdev)
 EXPORT_SYMBOL(get_super_thawed);
 
 /**
+ * get_super_exclusive_thawed - 以独占模式获取设备的已解冻超级块
+ * @bdev: 要获取超级块的设备
+ *
+ * 扫描超级块列表，查找挂载在指定设备上的文件系统的超级块。
+ * 超级块在解冻后返回(如果没有被冻结则立即返回)，并且以独占模式
+ * 持有s_umount信号量。如果没有找到匹配项则返回%NULL。
+ *
+ * 返回值: 成功返回解冻的超级块指针(独占锁定)，未找到返回NULL
+ */
+/**
  *	get_super_exclusive_thawed - get thawed superblock of a device
  *	@bdev: device to get the superblock for
  *
@@ -836,6 +1037,16 @@ struct super_block *get_super_exclusive_thawed(struct block_device *bdev)
 }
 EXPORT_SYMBOL(get_super_exclusive_thawed);
 
+/**
+ * get_active_super - 获取设备超级块的活跃引用
+ * @bdev: 要获取超级块的设备
+ *
+ * 扫描超级块列表，查找挂载在指定设备上的文件系统的超级块。
+ * 返回带有活跃引用的超级块，如果没有找到则返回%NULL。
+ * 与get_super()不同，这会获取活跃引用而不是临时引用。
+ *
+ * 返回值: 成功返回带活跃引用的超级块指针，未找到返回NULL
+ */
 /**
  * get_active_super - get an active reference to the superblock of a device
  * @bdev: device to get the superblock for
@@ -867,6 +1078,15 @@ restart:
 	return NULL;
 }
 
+/**
+ * user_get_super - 根据设备号获取超级块
+ * @dev: 设备号
+ *
+ * 扫描超级块列表，查找挂载在指定设备号上的文件系统的超级块。
+ * 这是用户空间接口使用的函数，通过设备号而不是block_device结构查找。
+ *
+ * 返回值: 成功返回超级块指针，未找到返回NULL
+ */
 struct super_block *user_get_super(dev_t dev)
 {
 	struct super_block *sb;
@@ -894,6 +1114,15 @@ rescan:
 	return NULL;
 }
 
+/**
+ * reconfigure_super - 请求文件系统更改超级块参数
+ * @fc: 超级块和配置信息
+ *
+ * 更改活跃超级块的配置参数。这包括处理只读/读写状态的改变、
+ * 安全选项的更新等。函数会进行各种检查以确保重新配置的安全性。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /**
  * reconfigure_super - asks filesystem to change superblock parameters
  * @fc: The superblock and configuration
@@ -987,6 +1216,13 @@ cancel_readonly:
 	return retval;
 }
 
+/**
+ * do_emergency_remount_callback - 紧急重新挂载回调函数
+ * @sb: 要重新挂载的超级块
+ *
+ * 对单个超级块执行紧急重新挂载为只读模式。这通常在系统
+ * 紧急情况下调用，以防止数据损坏。
+ */
 static void do_emergency_remount_callback(struct super_block *sb)
 {
 	down_write(&sb->s_umount);
@@ -1005,6 +1241,13 @@ static void do_emergency_remount_callback(struct super_block *sb)
 	up_write(&sb->s_umount);
 }
 
+/**
+ * do_emergency_remount - 执行紧急重新挂载工作
+ * @work: 工作队列项
+ *
+ * 工作队列函数，遍历所有超级块并将它们重新挂载为只读模式。
+ * 这是紧急情况下保护数据的最后手段。
+ */
 static void do_emergency_remount(struct work_struct *work)
 {
 	__iterate_supers(do_emergency_remount_callback);
@@ -1012,6 +1255,13 @@ static void do_emergency_remount(struct work_struct *work)
 	printk("Emergency Remount complete\n");
 }
 
+/**
+ * emergency_remount - 启动紧急重新挂载
+ *
+ * 在系统紧急情况下调用，异步地将所有文件系统重新挂载为只读模式。
+ * 这有助于防止在系统即将崩溃或出现严重问题时的数据损坏。
+ * 使用工作队列确保操作不会阻塞调用者。
+ */
 void emergency_remount(void)
 {
 	struct work_struct *work;
@@ -1023,6 +1273,13 @@ void emergency_remount(void)
 	}
 }
 
+/**
+ * do_thaw_all_callback - 解冻单个超级块的回调函数
+ * @sb: 要解冻的超级块
+ *
+ * 对单个超级块执行紧急解冻操作。这包括解冻底层块设备
+ * 和超级块本身的冻结状态。
+ */
 static void do_thaw_all_callback(struct super_block *sb)
 {
 	down_write(&sb->s_umount);
@@ -1034,6 +1291,13 @@ static void do_thaw_all_callback(struct super_block *sb)
 	}
 }
 
+/**
+ * do_thaw_all - 执行解冻所有文件系统的工作
+ * @work: 工作队列项
+ *
+ * 工作队列函数，遍历所有超级块并强制解冻它们。
+ * 这通常通过SysRq触发，用于紧急解冻所有冻结的文件系统。
+ */
 static void do_thaw_all(struct work_struct *work)
 {
 	__iterate_supers(do_thaw_all_callback);
@@ -1041,6 +1305,12 @@ static void do_thaw_all(struct work_struct *work)
 	printk(KERN_WARNING "Emergency Thaw complete\n");
 }
 
+/**
+ * emergency_thaw_all - 强制解冻每个冻结的文件系统
+ *
+ * 通过SysRq用于紧急解冻所有文件系统。在系统管理员需要
+ * 快速解除所有文件系统冻结状态的紧急情况下使用。
+ */
 /**
  * emergency_thaw_all -- forcibly thaw every frozen filesystem
  *
@@ -1059,6 +1329,16 @@ void emergency_thaw_all(void)
 
 static DEFINE_IDA(unnamed_dev_ida);
 
+/**
+ * get_anon_bdev - 为没有块设备的文件系统分配一个虚拟块设备
+ * @p: 指向dev_t的指针
+ *
+ * 不使用真实块设备的文件系统可以调用此函数来分配一个虚拟块设备。
+ * 许多用户空间实用程序认为FSID为0是无效的，所以总是返回至少为1的值。
+ *
+ * 上下文: 任何上下文。经常在持有sb_lock时调用。
+ * 返回值: 成功返回0，没有可用的匿名bdev返回-EMFILE，内存分配失败返回-ENOMEM
+ */
 /**
  * get_anon_bdev - Allocate a block device for filesystems which don't have one.
  * @p: Pointer to a dev_t.
@@ -1090,18 +1370,43 @@ int get_anon_bdev(dev_t *p)
 }
 EXPORT_SYMBOL(get_anon_bdev);
 
+/**
+ * free_anon_bdev - 释放匿名块设备号
+ * @dev: 要释放的设备号
+ *
+ * 释放之前通过get_anon_bdev()分配的虚拟块设备号，
+ * 使其可以被其他文件系统重新使用。
+ */
 void free_anon_bdev(dev_t dev)
 {
 	ida_free(&unnamed_dev_ida, MINOR(dev));
 }
 EXPORT_SYMBOL(free_anon_bdev);
 
+/**
+ * set_anon_super - 为超级块设置匿名设备号
+ * @s: 超级块
+ * @data: 未使用的数据参数
+ *
+ * 为不使用真实块设备的文件系统设置匿名设备号。
+ * 这是sget()函数使用的标准set回调函数。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int set_anon_super(struct super_block *s, void *data)
 {
 	return get_anon_bdev(&s->s_dev);
 }
 EXPORT_SYMBOL(set_anon_super);
 
+/**
+ * kill_anon_super - 销毁匿名超级块
+ * @sb: 要销毁的超级块
+ *
+ * 销毁一个使用匿名设备号的超级块。执行通用关闭操作后
+ * 释放分配的匿名设备号。这是不使用真实块设备的文件系统
+ * 的标准kill_sb回调函数。
+ */
 void kill_anon_super(struct super_block *sb)
 {
 	dev_t dev = sb->s_dev;
@@ -1110,6 +1415,14 @@ void kill_anon_super(struct super_block *sb)
 }
 EXPORT_SYMBOL(kill_anon_super);
 
+/**
+ * kill_litter_super - 销毁临时文件系统超级块
+ * @sb: 要销毁的超级块
+ *
+ * 销毁一个临时文件系统的超级块，这种文件系统通常用于测试
+ * 或临时用途。首先清理所有dentry，然后调用kill_anon_super
+ * 完成销毁过程。d_genocide确保所有目录项都被移除。
+ */
 void kill_litter_super(struct super_block *sb)
 {
 	if (sb->s_root)
@@ -1118,22 +1431,76 @@ void kill_litter_super(struct super_block *sb)
 }
 EXPORT_SYMBOL(kill_litter_super);
 
+/**
+ * set_anon_super_fc - 为文件系统上下文设置匿名超级块
+ * @sb: 超级块
+ * @fc: 文件系统上下文
+ *
+ * set_anon_super的文件系统上下文版本，用于新的挂载API。
+ * 为超级块分配匿名设备号。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int set_anon_super_fc(struct super_block *sb, struct fs_context *fc)
 {
 	return set_anon_super(sb, NULL);
 }
 EXPORT_SYMBOL(set_anon_super_fc);
 
+/**
+ * test_keyed_super - 基于键值测试超级块
+ * @sb: 要测试的超级块
+ * @fc: 文件系统上下文
+ *
+ * 比较超级块的s_fs_info与文件系统上下文中的s_fs_info，
+ * 用于识别具有特定键的超级块。
+ *
+ * 返回值: 匹配返回非零值，不匹配返回0
+ */
 static int test_keyed_super(struct super_block *sb, struct fs_context *fc)
 {
 	return sb->s_fs_info == fc->s_fs_info;
 }
 
+/**
+ * test_single_super - 单一超级块测试函数
+ * @s: 超级块
+ * @fc: 文件系统上下文
+ *
+ * 总是返回1，用于只允许存在单个实例的文件系统类型。
+ * 这确保了只有一个该类型的超级块存在于系统中。
+ *
+ * 返回值: 总是返回1
+ */
 static int test_single_super(struct super_block *s, struct fs_context *fc)
 {
 	return 1;
 }
 
+/**
+ * vfs_get_super - 获取带搜索键的超级块
+ * @fc: 持有参数的文件系统上下文
+ * @keying: 如何区分超级块
+ * @fill_super: 初始化新超级块的帮助函数
+ *
+ * 搜索超级块，如果未找到则创建一个新的。搜索条件由@keying控制。
+ * 如果搜索失败，创建新超级块并调用@fill_super()初始化它。
+ *
+ * @keying可以取以下值之一：
+ *
+ * (1) vfs_get_single_super - 系统中只能存在一个此类型的超级块。
+ *     通常用于特殊系统文件系统。
+ *
+ * (2) vfs_get_keyed_super - 可以存在多个超级块，但它们必须有
+ *     不同的键(键在s_fs_info中)。搜索相同键会找到该键的超级块。
+ *
+ * (3) vfs_get_independent_super - 可以存在多个超级块且无键。
+ *     每次调用都会得到一个新超级块。
+ *
+ * 除非我们获取的是内核内部挂载或子挂载的超级块，否则sget_fc()会进行权限检查。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /**
  * vfs_get_super - Get a superblock with a search key set in s_fs_info.
  * @fc: The filesystem context holding the parameters
@@ -1214,6 +1581,16 @@ error:
 }
 EXPORT_SYMBOL(vfs_get_super);
 
+/**
+ * get_tree_nodev - 获取无设备文件系统树
+ * @fc: 文件系统上下文
+ * @fill_super: 超级块初始化函数
+ *
+ * 为不需要块设备的文件系统获取超级块树。每次调用都创建
+ * 一个独立的超级块实例。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int get_tree_nodev(struct fs_context *fc,
 		  int (*fill_super)(struct super_block *sb,
 				    struct fs_context *fc))
@@ -1222,6 +1599,16 @@ int get_tree_nodev(struct fs_context *fc,
 }
 EXPORT_SYMBOL(get_tree_nodev);
 
+/**
+ * get_tree_single - 获取单例文件系统树
+ * @fc: 文件系统上下文
+ * @fill_super: 超级块初始化函数
+ *
+ * 为只允许单个实例存在的文件系统获取超级块树。
+ * 系统中只能有一个该类型的超级块。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int get_tree_single(struct fs_context *fc,
 		  int (*fill_super)(struct super_block *sb,
 				    struct fs_context *fc))
@@ -1230,6 +1617,16 @@ int get_tree_single(struct fs_context *fc,
 }
 EXPORT_SYMBOL(get_tree_single);
 
+/**
+ * get_tree_single_reconf - 获取可重新配置的单例文件系统树
+ * @fc: 文件系统上下文
+ * @fill_super: 超级块初始化函数
+ *
+ * 类似get_tree_single，但支持重新配置现有的单例超级块。
+ * 如果超级块已存在，会尝试重新配置它而不是失败。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int get_tree_single_reconf(struct fs_context *fc,
 		  int (*fill_super)(struct super_block *sb,
 				    struct fs_context *fc))
@@ -1238,6 +1635,17 @@ int get_tree_single_reconf(struct fs_context *fc,
 }
 EXPORT_SYMBOL(get_tree_single_reconf);
 
+/**
+ * get_tree_keyed - 获取基于键的文件系统树
+ * @fc: 文件系统上下文
+ * @fill_super: 超级块初始化函数
+ * @key: 用于区分超级块的键值
+ *
+ * 为使用键值区分不同实例的文件系统获取超级块树。
+ * 具有相同键的挂载会共享同一个超级块。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int get_tree_keyed(struct fs_context *fc,
 		  int (*fill_super)(struct super_block *sb,
 				    struct fs_context *fc),
@@ -1250,6 +1658,16 @@ EXPORT_SYMBOL(get_tree_keyed);
 
 #ifdef CONFIG_BLOCK
 
+/**
+ * set_bdev_super - 为超级块设置块设备
+ * @s: 超级块
+ * @data: 块设备指针
+ *
+ * 将块设备与超级块关联，设置相应的设备号和后备设备信息。
+ * 如果块设备队列支持稳定写入，则设置相应标志。
+ *
+ * 返回值: 总是返回0
+ */
 static int set_bdev_super(struct super_block *s, void *data)
 {
 	s->s_bdev = data;
@@ -1261,16 +1679,46 @@ static int set_bdev_super(struct super_block *s, void *data)
 	return 0;
 }
 
+/**
+ * set_bdev_super_fc - 文件系统上下文版本的set_bdev_super
+ * @s: 超级块
+ * @fc: 文件系统上下文
+ *
+ * set_bdev_super的文件系统上下文版本，用于新挂载API。
+ *
+ * 返回值: set_bdev_super的返回值
+ */
 static int set_bdev_super_fc(struct super_block *s, struct fs_context *fc)
 {
 	return set_bdev_super(s, fc->sget_key);
 }
 
+/**
+ * test_bdev_super_fc - 文件系统上下文版本的块设备超级块测试
+ * @s: 要测试的超级块
+ * @fc: 文件系统上下文
+ *
+ * 比较超级块的块设备与文件系统上下文中的sget_key，
+ * 用于识别使用特定块设备的超级块。
+ *
+ * 返回值: 匹配返回非零值，不匹配返回0
+ */
 static int test_bdev_super_fc(struct super_block *s, struct fs_context *fc)
 {
 	return s->s_bdev == fc->sget_key;
 }
 
+/**
+ * get_tree_bdev - 基于单个块设备获取超级块
+ * @fc: 持有参数的文件系统上下文
+ * @fill_super: 初始化新超级块的帮助函数
+ *
+ * 为基于单个块设备的文件系统获取超级块。这是大多数传统
+ * 文件系统使用的方法。函数处理设备打开、冻结检查、
+ * 超级块创建或重用等复杂逻辑。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /**
  * get_tree_bdev - Get a superblock based on a single block device
  * @fc: The filesystem context holding the parameters
@@ -1357,11 +1805,33 @@ int get_tree_bdev(struct fs_context *fc,
 }
 EXPORT_SYMBOL(get_tree_bdev);
 
+/**
+ * test_bdev_super - 测试块设备超级块
+ * @s: 要测试的超级块
+ * @data: 块设备指针
+ *
+ * 比较超级块的块设备与给定的块设备指针，
+ * 用于旧挂载API中识别特定块设备的超级块。
+ *
+ * 返回值: 匹配返回非零值，不匹配返回0
+ */
 static int test_bdev_super(struct super_block *s, void *data)
 {
 	return (void *)s->s_bdev == data;
 }
 
+/**
+ * mount_bdev - 挂载块设备上的文件系统
+ * @fs_type: 文件系统类型
+ * @flags: 挂载标志
+ * @dev_name: 设备名称
+ * @data: 文件系统特定数据
+ * @fill_super: 初始化超级块的回调函数
+ *
+ * 在指定的块设备上挂载文件系统。这是大多数传统文件系统使用的挂载方法。
+ *
+ * 返回值: 成功返回根目录dentry，失败返回错误指针
+ */
 struct dentry *mount_bdev(struct file_system_type *fs_type,
 	int flags, const char *dev_name, void *data,
 	int (*fill_super)(struct super_block *, void *, int))
@@ -1437,6 +1907,13 @@ error:
 }
 EXPORT_SYMBOL(mount_bdev);
 
+/**
+ * kill_block_super - 销毁块设备文件系统超级块
+ * @sb: 要销毁的超级块
+ *
+ * 销毁一个基于块设备的文件系统超级块。执行通用关闭操作，
+ * 同步块设备，然后释放块设备。确保设备以独占模式释放。
+ */
 void kill_block_super(struct super_block *sb)
 {
 	struct block_device *bdev = sb->s_bdev;
@@ -1452,6 +1929,17 @@ void kill_block_super(struct super_block *sb)
 EXPORT_SYMBOL(kill_block_super);
 #endif
 
+/**
+ * mount_nodev - 挂载不需要块设备的文件系统
+ * @fs_type: 文件系统类型
+ * @flags: 挂载标志
+ * @data: 文件系统特定数据
+ * @fill_super: 初始化超级块的回调函数
+ *
+ * 挂载不需要底层块设备的文件系统，如proc、sysfs等虚拟文件系统。
+ *
+ * 返回值: 成功返回根目录dentry，失败返回错误指针
+ */
 struct dentry *mount_nodev(struct file_system_type *fs_type,
 	int flags, void *data,
 	int (*fill_super)(struct super_block *, void *, int))
@@ -1472,6 +1960,17 @@ struct dentry *mount_nodev(struct file_system_type *fs_type,
 }
 EXPORT_SYMBOL(mount_nodev);
 
+/**
+ * reconfigure_single - 重新配置单例超级块
+ * @s: 超级块
+ * @flags: 新的挂载标志
+ * @data: 挂载数据
+ *
+ * 重新配置一个单例文件系统的超级块。创建文件系统上下文
+ * 并解析挂载数据，然后调用reconfigure_super执行实际的重新配置。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 static int reconfigure_single(struct super_block *s,
 			      int flags, void *data)
 {
@@ -1497,11 +1996,33 @@ out:
 	return ret;
 }
 
+/**
+ * compare_single - 单例超级块比较函数
+ * @s: 超级块
+ * @p: 比较参数(未使用)
+ *
+ * 用于单例文件系统的比较函数，总是返回1表示匹配。
+ * 这确保了单例文件系统总是重用现有的超级块。
+ *
+ * 返回值: 总是返回1
+ */
 static int compare_single(struct super_block *s, void *p)
 {
 	return 1;
 }
 
+/**
+ * mount_single - 挂载单例文件系统
+ * @fs_type: 文件系统类型
+ * @flags: 挂载标志
+ * @data: 文件系统特定数据
+ * @fill_super: 初始化超级块的回调函数
+ *
+ * 挂载一个单例文件系统，系统中只能存在一个该类型的实例。
+ * 如果超级块已存在，则尝试重新配置它；否则创建新的超级块。
+ *
+ * 返回值: 成功返回根目录dentry，失败返回错误指针
+ */
 struct dentry *mount_single(struct file_system_type *fs_type,
 	int flags, void *data,
 	int (*fill_super)(struct super_block *, void *, int))
@@ -1527,6 +2048,16 @@ struct dentry *mount_single(struct file_system_type *fs_type,
 }
 EXPORT_SYMBOL(mount_single);
 
+/**
+ * vfs_get_tree - 获取可挂载的根目录
+ * @fc: 超级块配置上下文
+ *
+ * 调用文件系统来获取或创建一个超级块，该超级块稍后可以用于挂载。
+ * 文件系统将用于挂载的根目录指针放在@fc->root中。执行必要的
+ * 安全检查和验证，确保超级块正确配置。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /**
  * vfs_get_tree - Get the mountable root
  * @fc: The superblock configuration context.
@@ -1590,6 +2121,18 @@ int vfs_get_tree(struct fs_context *fc)
 }
 EXPORT_SYMBOL(vfs_get_tree);
 
+/**
+ * super_setup_bdi_name - 为超级块设置私有BDI(带名称)
+ * @sb: 超级块
+ * @fmt: 名称格式字符串
+ * @...: 格式参数
+ *
+ * 为给定的超级块设置私有的后备设备信息(BDI)。它会在
+ * generic_shutdown_super()中自动清理。使用指定的格式
+ * 字符串创建BDI名称。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /*
  * Setup private BDI for given superblock. It gets automatically cleaned up
  * in generic_shutdown_super().
@@ -1618,6 +2161,16 @@ int super_setup_bdi_name(struct super_block *sb, char *fmt, ...)
 }
 EXPORT_SYMBOL(super_setup_bdi_name);
 
+/**
+ * super_setup_bdi - 为超级块设置私有BDI
+ * @sb: 超级块
+ *
+ * 为给定的超级块设置私有的后备设备信息(BDI)。它会在
+ * generic_shutdown_super()中自动清理。使用文件系统类型名称
+ * 和序列号生成BDI名称。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /*
  * Setup private BDI for given superblock. I gets automatically cleaned up
  * in generic_shutdown_super().
@@ -1632,6 +2185,14 @@ int super_setup_bdi(struct super_block *sb)
 EXPORT_SYMBOL(super_setup_bdi);
 
 /**
+ * sb_wait_write - 等待文件系统的所有写入者完成
+ * @sb: 等待的超级块
+ * @level: 等待的写入者类型(普通写入者 vs 页面错误)
+ *
+ * 此函数等待直到给定文件系统没有指定类型的写入者。
+ * 用于文件系统冻结过程中确保所有写入操作完成。
+ */
+/**
  * sb_wait_write - wait until all writers to given file system finish
  * @sb: the super for which we wait
  * @level: type of writers we wait for (normal vs page fault)
@@ -1644,6 +2205,14 @@ static void sb_wait_write(struct super_block *sb, int level)
 	percpu_down_write(sb->s_writers.rw_sem + level-1);
 }
 
+/**
+ * lockdep_sb_freeze_release - 释放超级块冻结的lockdep锁
+ * @sb: 超级块
+ *
+ * 我们即将返回用户空间并忘记这些锁，锁的所有权转移给
+ * thaw_super()的调用者来执行unlock()。释放所有冻结级别的
+ * percpu读写信号量的lockdep信息。
+ */
 /*
  * We are going to return to userspace and forget about these locks, the
  * ownership goes to the caller of thaw_super() which does unlock().
@@ -1656,6 +2225,13 @@ static void lockdep_sb_freeze_release(struct super_block *sb)
 		percpu_rwsem_release(sb->s_writers.rw_sem + level, 0, _THIS_IP_);
 }
 
+/**
+ * lockdep_sb_freeze_acquire - 获取超级块冻结的lockdep锁
+ * @sb: 超级块
+ *
+ * 告诉lockdep我们在调用->unfreeze_fs(sb)之前持有这些锁。
+ * 获取所有冻结级别的percpu读写信号量的lockdep信息。
+ */
 /*
  * Tell lockdep we are holding these locks before we call ->unfreeze_fs(sb).
  */
@@ -1667,6 +2243,13 @@ static void lockdep_sb_freeze_acquire(struct super_block *sb)
 		percpu_rwsem_acquire(sb->s_writers.rw_sem + level, 0, _THIS_IP_);
 }
 
+/**
+ * sb_freeze_unlock - 解锁超级块的所有冻结级别
+ * @sb: 超级块
+ *
+ * 从最高冻结级别到最低级别依次释放所有写入者信号量，
+ * 完成超级块的解冻过程。
+ */
 static void sb_freeze_unlock(struct super_block *sb)
 {
 	int level;
@@ -1675,6 +2258,33 @@ static void sb_freeze_unlock(struct super_block *sb)
 		percpu_up_write(sb->s_writers.rw_sem + level);
 }
 
+/**
+ * freeze_super - 锁定文件系统并强制其进入一致状态
+ * @sb: 要锁定的超级块
+ *
+ * 同步超级块以确保文件系统一致，并调用文件系统的freeze_fs。
+ * 在没有首先解冻文件系统的情况下对此函数的后续调用将返回-EBUSY。
+ *
+ * 在此函数期间，sb->s_writers.frozen经历以下值：
+ *
+ * SB_UNFROZEN: 文件系统正常，所有写入正常进行。
+ *
+ * SB_FREEZE_WRITE: 文件系统正在冻结过程中。新的写入应该被阻塞，
+ * 但页面错误仍然被允许。我们等待所有写入完成然后进入下一阶段。
+ *
+ * SB_FREEZE_PAGEFAULT: 冻结继续。现在页面错误也被阻塞，但内部
+ * 文件系统线程仍可修改文件系统(虽然不应该弄脏新页面或inode)，
+ * 回写可以运行等。等待所有运行的页面错误后我们同步文件系统，
+ * 这将清理所有脏页面和inode。
+ *
+ * SB_FREEZE_FS: 文件系统被冻结。现在所有内部文件系统修改源都被
+ * 阻塞。这通常通过阻塞新事务来实现。所有内部写入者完成后我们
+ * 调用->freeze_fs()完成文件系统冻结。然后转换到SB_FREEZE_COMPLETE状态。
+ *
+ * sb->s_writers.frozen由sb->s_umount保护。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 /**
  * freeze_super - lock the filesystem and force it into a consistent state
  * @sb: the super to lock
@@ -1772,6 +2382,16 @@ int freeze_super(struct super_block *sb)
 EXPORT_SYMBOL(freeze_super);
 
 /**
+ * thaw_super_locked - 解锁文件系统(内部函数)
+ * @sb: 要解冻的超级块
+ *
+ * 在freeze_super()之后解锁文件系统并将其标记为可写。
+ * 这是thaw_super的内部实现，假设调用者已经持有s_umount锁。
+ * 逐步撤销冻结过程中设置的各种限制。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
+/**
  * thaw_super -- unlock filesystem
  * @sb: the super to thaw
  *
@@ -1812,6 +2432,15 @@ out:
 	return 0;
 }
 
+/**
+ * thaw_super - 解冻文件系统
+ * @sb: 要解冻的超级块
+ *
+ * 在freeze_super()之后解锁文件系统并将其标记为可写。
+ * 获取s_umount锁后调用thaw_super_locked执行实际的解冻操作。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int thaw_super(struct super_block *sb)
 {
 	down_write(&sb->s_umount);

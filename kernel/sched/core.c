@@ -6,6 +6,20 @@
  *
  *  Copyright (C) 1991-2002  Linus Torvalds
  */
+
+/*
+ * Linux进程调度器核心实现
+ *
+ * 本文件是Linux内核调度子系统的核心，实现：
+ * - 进程调度框架（调度类机制）
+ * - 上下文切换（context_switch）
+ * - 运行队列管理（rq结构体）
+ * - 调度器初始化
+ * - CPU热插拔与调度
+ * - 调度器统计与负载均衡触发
+ * - 实时/普通/空闲调度类的统一接口
+ */
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 #undef CREATE_TRACE_POINTS
@@ -174,8 +188,14 @@ int sysctl_sched_rt_runtime = 950000;
  *
  */
 
-/*
- * __task_rq_lock - lock the rq @p resides on.
+/**
+ * __task_rq_lock - 锁定任务所在的运行队列
+ * @p: 目标任务
+ * @rf: 运行队列标志
+ *
+ * 获取任务p所在运行队列的锁。调用前必须已持有p->pi_lock。
+ * 如果任务正在迁移，会等待迁移完成后重新尝试获取锁。
+ * 返回值: 锁定的运行队列指针
  */
 struct rq *__task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	__acquires(rq->lock)
@@ -198,8 +218,14 @@ struct rq *__task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	}
 }
 
-/*
- * task_rq_lock - lock p->pi_lock and lock the rq @p resides on.
+/**
+ * task_rq_lock - 锁定任务的pi_lock和所在运行队列
+ * @p: 目标任务
+ * @rf: 运行队列标志
+ *
+ * 先获取任务的pi_lock，然后获取任务所在运行队列的锁。
+ * 处理任务迁移期间的竞态条件，确保锁定的运行队列是正确的。
+ * 返回值: 锁定的运行队列指针
  */
 struct rq *task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	__acquires(p->pi_lock)
@@ -244,6 +270,14 @@ struct rq *task_rq_lock(struct task_struct *p, struct rq_flags *rf)
  * RQ-clock updating methods:
  */
 
+/**
+ * update_rq_clock_task - 更新运行队列的任务时钟
+ * @rq: 运行队列
+ * @delta: 时间增量
+ *
+ * 更新运行队列的任务时钟，考虑中断时间和窃取时间的影响。
+ * 确保时钟单调递增，处理IRQ时间统计和准虚拟化时间记账。
+ */
 static void update_rq_clock_task(struct rq *rq, s64 delta)
 {
 /*
@@ -298,6 +332,13 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 	update_rq_clock_pelt(rq, delta);
 }
 
+/**
+ * update_rq_clock - 更新运行队列时钟
+ * @rq: 运行队列
+ *
+ * 更新运行队列的时钟值，包括系统时钟和任务时钟。
+ * 处理时钟更新标志，避免重复更新，确保时钟的准确性。
+ */
 void update_rq_clock(struct rq *rq)
 {
 	s64 delta;
@@ -320,6 +361,15 @@ void update_rq_clock(struct rq *rq)
 	update_rq_clock_task(rq, delta);
 }
 
+/**
+ * rq_csd_init - 初始化运行队列的跨CPU单播数据结构
+ * @rq: 运行队列
+ * @csd: 跨CPU单播数据结构
+ * @func: 回调函数
+ *
+ * 初始化用于SMP系统中跨CPU通信的单播数据结构，
+ * 设置回调函数和相关参数。
+ */
 static inline void
 rq_csd_init(struct rq *rq, call_single_data_t *csd, smp_call_func_t func)
 {
@@ -333,15 +383,26 @@ rq_csd_init(struct rq *rq, call_single_data_t *csd, smp_call_func_t func)
  * Use HR-timers to deliver accurate preemption points.
  */
 
+/**
+ * hrtick_clear - 清除高分辨率调度tick定时器
+ * @rq: 运行队列
+ *
+ * 如果高分辨率tick定时器处于活动状态，则取消它。
+ * 用于停止精确的抢占时间点控制。
+ */
 static void hrtick_clear(struct rq *rq)
 {
 	if (hrtimer_active(&rq->hrtick_timer))
 		hrtimer_cancel(&rq->hrtick_timer);
 }
 
-/*
- * High-resolution timer tick.
- * Runs from hardirq context with interrupts disabled.
+/**
+ * hrtick - 高分辨率timer tick处理函数
+ * @timer: 高分辨率定时器
+ *
+ * 在硬中断上下文中运行，处理高分辨率调度tick。
+ * 更新运行队列时钟并调用当前任务调度类的tick处理函数。
+ * 返回值: HRTIMER_NORESTART表示不重启定时器
  */
 static enum hrtimer_restart hrtick(struct hrtimer *timer)
 {
@@ -360,6 +421,13 @@ static enum hrtimer_restart hrtick(struct hrtimer *timer)
 
 #ifdef CONFIG_SMP
 
+/**
+ * __hrtick_restart - 重启高分辨率tick定时器
+ * @rq: 运行队列
+ *
+ * 重新启动运行队列的高分辨率tick定时器，
+ * 使用之前设置的到期时间。
+ */
 static void __hrtick_restart(struct rq *rq)
 {
 	struct hrtimer *timer = &rq->hrtick_timer;
@@ -367,8 +435,12 @@ static void __hrtick_restart(struct rq *rq)
 	hrtimer_start_expires(timer, HRTIMER_MODE_ABS_PINNED_HARD);
 }
 
-/*
- * called from hardirq (IPI) context
+/**
+ * __hrtick_start - 从硬中断上下文启动高分辨率tick
+ * @arg: 运行队列参数
+ *
+ * 从硬中断(IPI)上下文调用，用于在远程CPU上启动高分辨率tick定时器。
+ * 获取运行队列锁后重启定时器。
  */
 static void __hrtick_start(void *arg)
 {
@@ -380,10 +452,14 @@ static void __hrtick_start(void *arg)
 	rq_unlock(rq, &rf);
 }
 
-/*
- * Called to set the hrtick timer state.
+/**
+ * hrtick_start - 启动高分辨率tick定时器
+ * @rq: 运行队列
+ * @delay: 延迟时间(纳秒)
  *
- * called with rq->lock held and irqs disabled
+ * 设置高分辨率tick定时器状态，在指定延迟后触发。
+ * 防止设置过短的时间片（最小10000ns）避免定时器DoS。
+ * 如果是本地CPU直接重启，否则通过IPI异步调用。
  */
 void hrtick_start(struct rq *rq, u64 delay)
 {
@@ -425,6 +501,13 @@ void hrtick_start(struct rq *rq, u64 delay)
 
 #endif /* CONFIG_SMP */
 
+/**
+ * hrtick_rq_init - 初始化运行队列的高分辨率tick
+ * @rq: 运行队列
+ *
+ * 初始化运行队列的高分辨率tick定时器和相关的跨CPU调用结构。
+ * 设置定时器为单调时钟模式，绑定回调函数。
+ */
 static void hrtick_rq_init(struct rq *rq)
 {
 #ifdef CONFIG_SMP
@@ -462,10 +545,13 @@ static inline void hrtick_rq_init(struct rq *rq)
 })
 
 #if defined(CONFIG_SMP) && defined(TIF_POLLING_NRFLAG)
-/*
- * Atomically set TIF_NEED_RESCHED and test for TIF_POLLING_NRFLAG,
- * this avoids any races wrt polling state changes and thereby avoids
- * spurious IPIs.
+/**
+ * set_nr_and_not_polling - 原子设置需要重新调度标志
+ * @p: 目标任务
+ *
+ * 原子地设置TIF_NEED_RESCHED并测试TIF_POLLING_NRFLAG。
+ * 避免轮询状态变化的竞态条件，从而避免虚假的IPI。
+ * 返回值: 如果任务不在轮询状态返回true，否则返回false
  */
 static bool set_nr_and_not_polling(struct task_struct *p)
 {
@@ -473,11 +559,13 @@ static bool set_nr_and_not_polling(struct task_struct *p)
 	return !(fetch_or(&ti->flags, _TIF_NEED_RESCHED) & _TIF_POLLING_NRFLAG);
 }
 
-/*
- * Atomically set TIF_NEED_RESCHED if TIF_POLLING_NRFLAG is set.
+/**
+ * set_nr_if_polling - 在轮询时设置重新调度标志
+ * @p: 目标任务
  *
- * If this returns true, then the idle task promises to call
- * sched_ttwu_pending() and reschedule soon.
+ * 如果设置了TIF_POLLING_NRFLAG则原子地设置TIF_NEED_RESCHED。
+ * 如果返回true，则空闲任务承诺调用sched_ttwu_pending()并很快重新调度。
+ * 返回值: 成功设置标志返回true，否则返回false
  */
 static bool set_nr_if_polling(struct task_struct *p)
 {
@@ -512,6 +600,15 @@ static bool set_nr_if_polling(struct task_struct *p)
 #endif
 #endif
 
+/**
+ * __wake_q_add - 将任务添加到唤醒队列的内部实现
+ * @head: 唤醒队列头
+ * @task: 要添加的任务
+ *
+ * 原子地获取任务，如果wake_q已经非空表示已被排队。
+ * 使用显式的内存屏障确保待处理的唤醒能观察到我们的待处理状态。
+ * 返回值: 成功添加返回true，已在队列中返回false
+ */
 static bool __wake_q_add(struct wake_q_head *head, struct task_struct *task)
 {
 	struct wake_q_node *node = &task->wake_q;
@@ -577,6 +674,14 @@ void wake_q_add_safe(struct wake_q_head *head, struct task_struct *task)
 		put_task_struct(task);
 }
 
+/**
+ * wake_up_q - 批量唤醒队列中的所有任务
+ * @head: 唤醒队列头
+ *
+ * 遍历唤醒队列，逐个唤醒其中的所有任务。
+ * wake_up_process()执行完整的内存屏障，与wake_q_add()中的排队操作配对。
+ * 确保不会遗漏任何唤醒操作。
+ */
 void wake_up_q(struct wake_q_head *head)
 {
 	struct wake_q_node *node = head->first;
@@ -599,12 +704,12 @@ void wake_up_q(struct wake_q_head *head)
 	}
 }
 
-/*
- * resched_curr - mark rq's current task 'to be rescheduled now'.
+/**
+ * resched_curr - 标记运行队列当前任务需要重新调度
+ * @rq: 运行队列
  *
- * On UP this means the setting of the need_resched flag, on SMP it
- * might also involve a cross-CPU call to trigger the scheduler on
- * the target CPU.
+ * 在UP系统上设置need_resched标志，在SMP系统上可能还涉及
+ * 跨CPU调用以触发目标CPU上的调度器。
  */
 void resched_curr(struct rq *rq)
 {
@@ -630,6 +735,13 @@ void resched_curr(struct rq *rq)
 		trace_sched_wake_idle_without_ipi(cpu);
 }
 
+/**
+ * resched_cpu - 重新调度指定CPU
+ * @cpu: 目标CPU编号
+ *
+ * 获取指定CPU运行队列的锁，如果CPU在线或是当前CPU，
+ * 则标记其当前任务需要重新调度。
+ */
 void resched_cpu(int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -643,13 +755,13 @@ void resched_cpu(int cpu)
 
 #ifdef CONFIG_SMP
 #ifdef CONFIG_NO_HZ_COMMON
-/*
- * In the semi idle case, use the nearest busy CPU for migrating timers
- * from an idle CPU.  This is good for power-savings.
+/**
+ * get_nohz_timer_target - 获取NOHZ定时器迁移目标CPU
  *
- * We don't do similar optimization for completely idle system, as
- * selecting an idle CPU will add more delays to the timers than intended
- * (as that CPU's timer base may not be uptodate wrt jiffies etc).
+ * 在半空闲情况下，使用最近的繁忙CPU来从空闲CPU迁移定时器。
+ * 这有利于节能。不对完全空闲的系统做类似优化，因为选择
+ * 空闲CPU会给定时器增加超出预期的延迟。
+ * 返回值: 目标CPU编号
  */
 int get_nohz_timer_target(void)
 {
@@ -684,15 +796,14 @@ unlock:
 	return cpu;
 }
 
-/*
- * When add_timer_on() enqueues a timer into the timer wheel of an
- * idle CPU then this timer might expire before the next timer event
- * which is scheduled to wake up that CPU. In case of a completely
- * idle system the next event might even be infinite time into the
- * future. wake_up_idle_cpu() ensures that the CPU is woken up and
- * leaves the inner idle loop so the newly added timer is taken into
- * account when the CPU goes back to idle and evaluates the timer
- * wheel for the next timer event.
+/**
+ * wake_up_idle_cpu - 唤醒空闲CPU
+ * @cpu: 目标CPU编号
+ *
+ * 当add_timer_on()将定时器加入空闲CPU的定时器轮时，
+ * 该定时器可能在下一个唤醒该CPU的定时器事件之前到期。
+ * 确保CPU被唤醒并离开内部空闲循环，以便新添加的定时器
+ * 在CPU回到空闲状态时被考虑进去。
  */
 static void wake_up_idle_cpu(int cpu)
 {
@@ -707,6 +818,14 @@ static void wake_up_idle_cpu(int cpu)
 		trace_sched_wake_idle_without_ipi(cpu);
 }
 
+/**
+ * wake_up_full_nohz_cpu - 唤醒full NOHZ CPU
+ * @cpu: 目标CPU编号
+ *
+ * 只需要目标CPU调用irq_exit()并重新评估下一个tick。
+ * 如果需要，稍后可以用空IRQ进一步优化。
+ * 返回值: 成功处理返回true，否则返回false
+ */
 static bool wake_up_full_nohz_cpu(int cpu)
 {
 	/*
@@ -727,10 +846,12 @@ static bool wake_up_full_nohz_cpu(int cpu)
 	return false;
 }
 
-/*
- * Wake up the specified CPU.  If the CPU is going offline, it is the
- * caller's responsibility to deal with the lost wakeup, for example,
- * by hooking into the CPU_DEAD notifier like timers and hrtimers do.
+/**
+ * wake_up_nohz_cpu - 唤醒指定的NOHZ CPU
+ * @cpu: 目标CPU编号
+ *
+ * 唤醒指定的CPU。如果CPU正在下线，调用者有责任处理
+ * 丢失的唤醒，例如通过挂钩到CPU_DEAD通知器（如定时器和hrtimers）。
  */
 void wake_up_nohz_cpu(int cpu)
 {
@@ -738,6 +859,13 @@ void wake_up_nohz_cpu(int cpu)
 		wake_up_idle_cpu(cpu);
 }
 
+/**
+ * nohz_csd_func - NOHZ跨CPU调用处理函数
+ * @info: 运行队列信息
+ *
+ * 释放rq::nohz_csd，设置空闲均衡状态。
+ * 如果CPU空闲且不需要重新调度，则触发调度软中断。
+ */
 static void nohz_csd_func(void *info)
 {
 	struct rq *rq = info;
@@ -760,6 +888,15 @@ static void nohz_csd_func(void *info)
 #endif /* CONFIG_NO_HZ_COMMON */
 
 #ifdef CONFIG_NO_HZ_FULL
+/**
+ * sched_can_stop_tick - 判断调度器是否可以停止tick
+ * @rq: 运行队列
+ *
+ * 检查当前运行队列状态，判断是否可以停止调度tick。
+ * Deadline任务即使只有一个也需要tick。
+ * 多个RR任务需要tick来实现实际的RR行为。
+ * 返回值: 可以停止tick返回true，否则返回false
+ */
 bool sched_can_stop_tick(struct rq *rq)
 {
 	int fifo_nr_running;
@@ -802,11 +939,16 @@ bool sched_can_stop_tick(struct rq *rq)
 
 #if defined(CONFIG_RT_GROUP_SCHED) || (defined(CONFIG_FAIR_GROUP_SCHED) && \
 			(defined(CONFIG_SMP) || defined(CONFIG_CFS_BANDWIDTH)))
-/*
- * Iterate task_group tree rooted at *from, calling @down when first entering a
- * node and @up when leaving it for the final time.
+/**
+ * walk_tg_tree_from - 遍历任务组树
+ * @from: 起始任务组
+ * @down: 首次进入节点时的回调函数
+ * @up: 最后离开节点时的回调函数
+ * @data: 传递给回调函数的数据
  *
- * Caller must hold rcu_lock or sufficient equivalent.
+ * 从指定任务组开始遍历任务组树，首次进入节点时调用down回调，
+ * 最后离开节点时调用up回调。调用者必须持有rcu_lock或足够的等价锁。
+ * 返回值: 回调函数的返回值
  */
 int walk_tg_tree_from(struct task_group *from,
 			     tg_visitor down, tg_visitor up, void *data)
@@ -839,12 +981,28 @@ out:
 	return ret;
 }
 
+/**
+ * tg_nop - 任务组空操作函数
+ * @tg: 任务组
+ * @data: 数据参数
+ *
+ * 用于任务组树遍历的空操作回调函数，总是返回0。
+ * 返回值: 始终返回0
+ */
 int tg_nop(struct task_group *tg, void *data)
 {
 	return 0;
 }
 #endif
 
+/**
+ * set_load_weight - 设置任务的负载权重
+ * @p: 目标任务
+ * @update_load: 是否更新负载
+ *
+ * 根据任务的静态优先级设置负载权重。SCHED_IDLE任务获得最小权重。
+ * SCHED_OTHER任务在改变权重时需要更新其负载。
+ */
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
 	int prio = p->static_prio - MAX_RT_PRIO;
@@ -936,11 +1094,26 @@ DEFINE_STATIC_KEY_FALSE(sched_uclamp_used);
 #define for_each_clamp_id(clamp_id) \
 	for ((clamp_id) = 0; (clamp_id) < UCLAMP_CNT; (clamp_id)++)
 
+/**
+ * uclamp_bucket_id - 获取uclamp值对应的桶ID
+ * @clamp_value: uclamp值
+ *
+ * 将uclamp值映射到对应的桶ID，用于uclamp的量化管理。
+ * 返回值: 桶ID
+ */
 static inline unsigned int uclamp_bucket_id(unsigned int clamp_value)
 {
 	return clamp_value / UCLAMP_BUCKET_DELTA;
 }
 
+/**
+ * uclamp_none - 获取uclamp类型的默认值
+ * @clamp_id: uclamp类型ID
+ *
+ * 返回指定uclamp类型的默认值。
+ * UCLAMP_MIN默认为0，UCLAMP_MAX默认为SCHED_CAPACITY_SCALE。
+ * 返回值: 默认的uclamp值
+ */
 static inline unsigned int uclamp_none(enum uclamp_id clamp_id)
 {
 	if (clamp_id == UCLAMP_MIN)
@@ -948,6 +1121,14 @@ static inline unsigned int uclamp_none(enum uclamp_id clamp_id)
 	return SCHED_CAPACITY_SCALE;
 }
 
+/**
+ * uclamp_se_set - 设置uclamp调度实体的值
+ * @uc_se: uclamp调度实体
+ * @value: uclamp值
+ * @user_defined: 是否为用户定义
+ *
+ * 设置uclamp调度实体的值、桶ID和用户定义标志。
+ */
 static inline void uclamp_se_set(struct uclamp_se *uc_se,
 				 unsigned int value, bool user_defined)
 {
@@ -956,6 +1137,16 @@ static inline void uclamp_se_set(struct uclamp_se *uc_se,
 	uc_se->user_defined = user_defined;
 }
 
+/**
+ * uclamp_idle_value - 获取空闲时的uclamp值
+ * @rq: 运行队列
+ * @clamp_id: uclamp类型ID
+ * @clamp_value: 当前clamp值
+ *
+ * 避免当进入空闲状态时（丢弃max-clamp）被阻塞的利用率推高频率，
+ * 通过保留最后已知的max-clamp来实现。
+ * 返回值: 空闲时的uclamp值
+ */
 static inline unsigned int
 uclamp_idle_value(struct rq *rq, enum uclamp_id clamp_id,
 		  unsigned int clamp_value)
@@ -973,6 +1164,14 @@ uclamp_idle_value(struct rq *rq, enum uclamp_id clamp_id,
 	return uclamp_none(UCLAMP_MIN);
 }
 
+/**
+ * uclamp_idle_reset - 重置空闲时的uclamp值
+ * @rq: 运行队列
+ * @clamp_id: uclamp类型ID
+ * @clamp_value: clamp值
+ *
+ * 仅在退出空闲状态时重置max-clamp保持状态。
+ */
 static inline void uclamp_idle_reset(struct rq *rq, enum uclamp_id clamp_id,
 				     unsigned int clamp_value)
 {
@@ -983,6 +1182,16 @@ static inline void uclamp_idle_reset(struct rq *rq, enum uclamp_id clamp_id,
 	WRITE_ONCE(rq->uclamp[clamp_id].value, clamp_value);
 }
 
+/**
+ * uclamp_rq_max_value - 获取运行队列中uclamp的最大值
+ * @rq: 运行队列
+ * @clamp_id: uclamp类型ID
+ * @clamp_value: 当前clamp值
+ *
+ * 由于min和max clamps都是最大聚合的，找到具有任务的最顶层桶。
+ * 如果没有任务，返回默认clamp值。
+ * 返回值: 运行队列中的最大uclamp值
+ */
 static inline
 unsigned int uclamp_rq_max_value(struct rq *rq, enum uclamp_id clamp_id,
 				   unsigned int clamp_value)
@@ -1309,6 +1518,14 @@ uclamp_update_active(struct task_struct *p, enum uclamp_id clamp_id)
 }
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
+/**
+ * uclamp_update_active_tasks - 更新cgroup中所有活跃任务的uclamp设置
+ * @css: cgroup子系统状态
+ * @clamps: 要更新的clamp类型掩码
+ *
+ * 遍历指定cgroup中的所有任务，更新它们的利用率限制设置。
+ * 根据clamps掩码决定更新UCLAMP_MIN还是UCLAMP_MAX。
+ */
 static inline void
 uclamp_update_active_tasks(struct cgroup_subsys_state *css,
 			   unsigned int clamps)
@@ -1327,6 +1544,14 @@ uclamp_update_active_tasks(struct cgroup_subsys_state *css,
 	css_task_iter_end(&it);
 }
 
+/**
+ * uclamp_update_root_tg - 更新根任务组的uclamp设置
+ *
+ * 将系统级的uclamp设置应用到根任务组，包括：
+ * - 设置UCLAMP_MIN为sysctl_sched_uclamp_util_min
+ * - 设置UCLAMP_MAX为sysctl_sched_uclamp_util_max
+ * - 更新所有相关的有效值
+ */
 static void cpu_util_update_eff(struct cgroup_subsys_state *css);
 static void uclamp_update_root_tg(void)
 {
@@ -1345,6 +1570,18 @@ static void uclamp_update_root_tg(void)
 static void uclamp_update_root_tg(void) { }
 #endif
 
+/**
+ * sysctl_sched_uclamp_handler - 处理uclamp系统参数设置
+ * @table: sysctl表项
+ * @write: 是否为写操作
+ * @buffer: 数据缓冲区
+ * @lenp: 数据长度指针
+ * @ppos: 文件位置指针
+ *
+ * 处理用户空间对uclamp相关sysctl参数的读写操作。
+ * 验证参数有效性，更新系统默认值，并同步到相关任务。
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int sysctl_sched_uclamp_handler(struct ctl_table *table, int write,
 				void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -1410,6 +1647,17 @@ done:
 	return result;
 }
 
+/**
+ * uclamp_validate - 验证uclamp调度属性
+ * @p: 目标任务
+ * @attr: 调度属性
+ *
+ * 验证用户设置的uclamp值是否有效：
+ * - 检查UCLAMP_MIN <= UCLAMP_MAX
+ * - 检查值不超过SCHED_CAPACITY_SCALE
+ * - 启用uclamp功能的静态分支
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 static int uclamp_validate(struct task_struct *p,
 			   const struct sched_attr *attr)
 {
@@ -1438,6 +1686,16 @@ static int uclamp_validate(struct task_struct *p,
 	return 0;
 }
 
+/**
+ * __setscheduler_uclamp - 设置任务的uclamp参数
+ * @p: 目标任务
+ * @attr: 调度属性
+ *
+ * 根据调度属性设置任务的利用率限制参数：
+ * - 在调度类变更时重置为默认值
+ * - RT任务默认获得100%的boost值
+ * - 应用用户指定的UTIL_CLAMP_MIN/MAX值
+ */
 static void __setscheduler_uclamp(struct task_struct *p,
 				  const struct sched_attr *attr)
 {
@@ -1479,6 +1737,14 @@ static void __setscheduler_uclamp(struct task_struct *p,
 	}
 }
 
+/**
+ * uclamp_fork - 初始化fork的任务的uclamp设置
+ * @p: 新fork的任务
+ *
+ * 初始化新fork任务的uclamp状态：
+ * - 将所有uclamp.active标志设为false
+ * - 如果设置了sched_reset_on_fork，重置为默认值
+ */
 static void uclamp_fork(struct task_struct *p)
 {
 	enum uclamp_id clamp_id;
@@ -1499,11 +1765,25 @@ static void uclamp_fork(struct task_struct *p)
 	}
 }
 
+/**
+ * uclamp_post_fork - fork后的uclamp后续处理
+ * @p: 新fork的任务
+ *
+ * 在任务fork完成后更新RT任务的默认最小利用率设置。
+ */
 static void uclamp_post_fork(struct task_struct *p)
 {
 	uclamp_update_util_min_rt_default(p);
 }
 
+/**
+ * init_uclamp_rq - 初始化运行队列的uclamp设置
+ * @rq: 运行队列
+ *
+ * 初始化运行队列的利用率限制相关数据结构：
+ * - 设置所有clamp类型的默认值
+ * - 清空uclamp标志
+ */
 static void __init init_uclamp_rq(struct rq *rq)
 {
 	enum uclamp_id clamp_id;
@@ -1518,6 +1798,15 @@ static void __init init_uclamp_rq(struct rq *rq)
 	rq->uclamp_flags = 0;
 }
 
+/**
+ * init_uclamp - 初始化uclamp子系统
+ *
+ * 系统启动时初始化利用率限制功能：
+ * - 为所有CPU初始化运行队列的uclamp设置
+ * - 为init任务设置默认uclamp值
+ * - 设置系统默认的最大clamp值
+ * - 初始化根任务组的uclamp设置
+ */
 static void __init init_uclamp(void)
 {
 	struct uclamp_se uc_max = {};
@@ -1558,62 +1847,114 @@ static inline void uclamp_post_fork(struct task_struct *p) { }
 static inline void init_uclamp(void) { }
 #endif /* CONFIG_UCLAMP_TASK */
 
+/*
+ * enqueue_task - 将任务加入运行队列
+ * @rq: 运行队列
+ * @p: 要入队的任务
+ * @flags: 入队标志 (ENQUEUE_WAKEUP, ENQUEUE_RESTORE等)
+ *
+ * 此函数是调度器核心操作之一，负责：
+ * - 更新运行队列时钟
+ * - 记录调度统计信息
+ * - 更新PSI (Pressure Stall Information) 统计
+ * - 调用具体调度类的入队方法
+ */
 static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	if (!(flags & ENQUEUE_NOCLOCK))
-		update_rq_clock(rq);
+		update_rq_clock(rq);  /* 更新运行队列时钟 */
 
 	if (!(flags & ENQUEUE_RESTORE)) {
-		sched_info_queued(rq, p);
-		psi_enqueue(p, flags & ENQUEUE_WAKEUP);
+		sched_info_queued(rq, p);  /* 记录调度统计信息 */
+		psi_enqueue(p, flags & ENQUEUE_WAKEUP);  /* 更新PSI压力统计 */
 	}
 
-	uclamp_rq_inc(rq, p);
-	p->sched_class->enqueue_task(rq, p, flags);
-}
-
-static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
-{
-	if (!(flags & DEQUEUE_NOCLOCK))
-		update_rq_clock(rq);
-
-	if (!(flags & DEQUEUE_SAVE)) {
-		sched_info_dequeued(rq, p);
-		psi_dequeue(p, flags & DEQUEUE_SLEEP);
-	}
-
-	uclamp_rq_dec(rq, p);
-	p->sched_class->dequeue_task(rq, p, flags);
-}
-
-void activate_task(struct rq *rq, struct task_struct *p, int flags)
-{
-	enqueue_task(rq, p, flags);
-
-	p->on_rq = TASK_ON_RQ_QUEUED;
-}
-
-void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
-{
-	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
-
-	dequeue_task(rq, p, flags);
+	uclamp_rq_inc(rq, p);  /* 增加运行队列的利用率限制计数 */
+	p->sched_class->enqueue_task(rq, p, flags);  /* 调用具体调度类的入队方法 */
 }
 
 /*
- * __normal_prio - return the priority that is based on the static prio
+ * dequeue_task - 从运行队列移除任务
+ * @rq: 运行队列
+ * @p: 要出队的任务
+ * @flags: 出队标志 (DEQUEUE_SLEEP, DEQUEUE_SAVE等)
+ *
+ * 此函数与enqueue_task相对应，负责：
+ * - 更新运行队列时钟
+ * - 记录调度统计信息
+ * - 更新PSI统计
+ * - 调用具体调度类的出队方法
+ */
+static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+{
+	if (!(flags & DEQUEUE_NOCLOCK))
+		update_rq_clock(rq);  /* 更新运行队列时钟 */
+
+	if (!(flags & DEQUEUE_SAVE)) {
+		sched_info_dequeued(rq, p);  /* 记录出队统计信息 */
+		psi_dequeue(p, flags & DEQUEUE_SLEEP);  /* 更新PSI压力统计 */
+	}
+
+	uclamp_rq_dec(rq, p);  /* 减少运行队列的利用率限制计数 */
+	p->sched_class->dequeue_task(rq, p, flags);  /* 调用具体调度类的出队方法 */
+}
+
+/*
+ * activate_task - 激活任务（使其可运行）
+ * @rq: 运行队列
+ * @p: 要激活的任务
+ * @flags: 激活标志
+ *
+ * 将任务从不可运行状态转为可运行状态，包括：
+ * - 将任务加入运行队列
+ * - 设置任务的on_rq状态为QUEUED
+ */
+void activate_task(struct rq *rq, struct task_struct *p, int flags)
+{
+	enqueue_task(rq, p, flags);  /* 将任务加入运行队列 */
+
+	p->on_rq = TASK_ON_RQ_QUEUED;  /* 标记任务在运行队列中 */
+}
+
+/*
+ * deactivate_task - 停用任务
+ * @rq: 运行队列
+ * @p: 要停用的任务
+ * @flags: 停用标志
+ *
+ * 将任务从可运行状态转为不可运行状态：
+ * - 根据flags设置on_rq状态（睡眠或迁移）
+ * - 将任务从运行队列中移除
+ */
+void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
+{
+	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;  /* 设置任务状态：睡眠(0)或迁移中 */
+
+	dequeue_task(rq, p, flags);  /* 从运行队列中移除任务 */
+}
+
+/**
+ * __normal_prio - 返回基于静态优先级的普通优先级
+ * @p: 目标任务
+ *
+ * 返回任务的静态优先级，不考虑RT继承等动态因素。
+ * 返回值: 任务的静态优先级
  */
 static inline int __normal_prio(struct task_struct *p)
 {
 	return p->static_prio;
 }
 
-/*
- * Calculate the expected normal priority: i.e. priority
- * without taking RT-inheritance into account. Might be
- * boosted by interactivity modifiers. Changes upon fork,
- * setprio syscalls, and whenever the interactivity
- * estimator recalculates.
+/**
+ * normal_prio - 计算预期的普通优先级
+ * @p: 目标任务
+ *
+ * 计算不考虑RT继承的预期普通优先级。可能被交互性修饰符提升。
+ * 在fork、setprio系统调用和交互性估算器重新计算时会发生变化。
+ * - Deadline任务: MAX_DL_PRIO-1
+ * - RT任务: MAX_RT_PRIO-1 - rt_priority
+ * - 普通任务: 静态优先级
+ * 返回值: 计算出的普通优先级
  */
 static inline int normal_prio(struct task_struct *p)
 {
@@ -1628,12 +1969,13 @@ static inline int normal_prio(struct task_struct *p)
 	return prio;
 }
 
-/*
- * Calculate the current priority, i.e. the priority
- * taken into account by the scheduler. This value might
- * be boosted by RT tasks, or might be boosted by
- * interactivity modifiers. Will be RT if the task got
- * RT-boosted. If not then it returns p->normal_prio.
+/**
+ * effective_prio - 计算当前有效优先级
+ * @p: 目标任务
+ *
+ * 计算调度器实际使用的当前优先级。此值可能被RT任务或交互性修饰符提升。
+ * 如果任务被RT-boost，则返回RT优先级；否则返回normal_prio。
+ * 返回值: 有效的调度优先级
  */
 static int effective_prio(struct task_struct *p)
 {
@@ -1649,22 +1991,29 @@ static int effective_prio(struct task_struct *p)
 }
 
 /**
- * task_curr - is this task currently executing on a CPU?
- * @p: the task in question.
+ * task_curr - 检查任务是否正在CPU上执行
+ * @p: 要检查的任务
  *
- * Return: 1 if the task is currently executing. 0 otherwise.
+ * 返回值: 如果任务当前正在执行返回1，否则返回0
  */
 inline int task_curr(const struct task_struct *p)
 {
 	return cpu_curr(task_cpu(p)) == p;
 }
 
-/*
- * switched_from, switched_to and prio_changed must _NOT_ drop rq->lock,
- * use the balance_callback list if you want balancing.
+/**
+ * check_class_changed - 检查调度类或优先级变化
+ * @rq: 运行队列
+ * @p: 目标任务
+ * @prev_class: 之前的调度类
+ * @oldprio: 之前的优先级
  *
- * this means any call to check_class_changed() must be followed by a call to
- * balance_callback().
+ * 检查任务的调度类或优先级是否发生了变化，并调用相应的回调函数：
+ * - 如果调度类改变：调用旧类的switched_from和新类的switched_to
+ * - 如果优先级改变或是DL任务：调用当前类的prio_changed
+ *
+ * 注意：switched_from、switched_to和prio_changed不能释放rq->lock，
+ * 如需负载均衡请使用balance_callback列表。
  */
 static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 				       const struct sched_class *prev_class,
@@ -1679,26 +2028,49 @@ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 		p->sched_class->prio_changed(rq, p, oldprio);
 }
 
+/*
+ * check_preempt_curr - 检查是否需要抢占当前任务
+ * @rq: 运行队列
+ * @p: 新来的任务
+ * @flags: 抢占检查标志
+ *
+ * 此函数决定新任务是否应该抢占当前正在运行的任务：
+ * - 如果新任务和当前任务属于同一调度类，调用该调度类的抢占检查方法
+ * - 如果新任务的调度类优先级更高，直接标记需要重调度
+ * - 优化运行队列时钟更新，避免无用的连续更新
+ */
 void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
 {
 	if (p->sched_class == rq->curr->sched_class)
-		rq->curr->sched_class->check_preempt_curr(rq, p, flags);
+		rq->curr->sched_class->check_preempt_curr(rq, p, flags);  /* 同调度类内部抢占检查 */
 	else if (p->sched_class > rq->curr->sched_class)
-		resched_curr(rq);
+		resched_curr(rq);  /* 高优先级调度类直接抢占 */
 
 	/*
 	 * A queue event has occurred, and we're going to schedule.  In
 	 * this case, we can save a useless back to back clock update.
+	 *
+	 * 队列事件已发生，即将进行调度。在这种情况下，
+	 * 可以避免无用的连续时钟更新。
 	 */
 	if (task_on_rq_queued(rq->curr) && test_tsk_need_resched(rq->curr))
-		rq_clock_skip_update(rq);
+		rq_clock_skip_update(rq);  /* 跳过下次时钟更新以优化性能 */
 }
 
 #ifdef CONFIG_SMP
 
-/*
- * Per-CPU kthreads are allowed to run on !active && online CPUs, see
- * __set_cpus_allowed_ptr() and select_fallback_rq().
+/**
+ * is_cpu_allowed - 检查任务是否可以在指定CPU上运行
+ * @p: 目标任务
+ * @cpu: CPU编号
+ *
+ * 检查任务是否被允许在指定CPU上运行：
+ * - 首先检查CPU是否在任务的cpus_ptr掩码中
+ * - 对于每CPU内核线程：只要CPU在线即可
+ * - 对于普通任务：CPU必须处于活跃状态
+ *
+ * 每CPU内核线程被允许在!active && online的CPU上运行。
+ * 返回值: 允许运行返回true，否则返回false
  */
 static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 {
@@ -1725,10 +2097,20 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
  *    is done.
  */
 
-/*
- * move_queued_task - move a queued task to new rq.
+/**
+ * move_queued_task - 将队列中的任务移动到新的运行队列
+ * @rq: 当前运行队列
+ * @rf: 运行队列标志
+ * @p: 要移动的任务
+ * @new_cpu: 目标CPU
  *
- * Returns (locked) new rq. Old rq's lock is released.
+ * 将已入队的任务从当前运行队列移动到目标CPU的运行队列：
+ * 1. 从当前队列中停用任务
+ * 2. 设置任务的新CPU
+ * 3. 在目标队列中激活任务
+ * 4. 检查是否需要抢占
+ *
+ * 返回值: 返回锁定的新运行队列，旧队列的锁被释放
  */
 static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 				   struct task_struct *p, int new_cpu)
@@ -1754,14 +2136,20 @@ struct migration_arg {
 	int dest_cpu;
 };
 
-/*
- * Move (not current) task off this CPU, onto the destination CPU. We're doing
- * this because either it can't run here any more (set_cpus_allowed()
- * away from this CPU, or CPU going down), or because we're
- * attempting to rebalance this task on exec (sched_exec).
+/**
+ * __migrate_task - 迁移任务到目标CPU
+ * @rq: 当前运行队列
+ * @rf: 运行队列标志
+ * @p: 要迁移的任务
+ * @dest_cpu: 目标CPU
  *
- * So we race with normal scheduler movements, but that's OK, as long
- * as the task is no longer on this CPU.
+ * 将非当前任务从当前CPU迁移到目标CPU。在以下情况下需要迁移：
+ * - set_cpus_allowed()将当前CPU排除在外
+ * - CPU下线
+ * - 在exec时重新平衡任务(sched_exec)
+ *
+ * 与正常调度器移动存在竞争，但只要任务不再在当前CPU上即可。
+ * 返回值: 返回目标运行队列
  */
 static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
 				 struct task_struct *p, int dest_cpu)
@@ -1776,10 +2164,22 @@ static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
 	return rq;
 }
 
-/*
- * migration_cpu_stop - this will be executed by a highprio stopper thread
- * and performs thread migration by bumping thread off CPU then
- * 'pushing' onto another runqueue.
+/**
+ * migration_cpu_stop - 高优先级stopper线程执行的任务迁移
+ * @data: migration_arg结构体指针
+ *
+ * 此函数由高优先级stopper线程执行，通过以下步骤完成线程迁移：
+ * 1. 将线程从CPU上移除
+ * 2. "推"到另一个运行队列
+ *
+ * 迁移工作原理：
+ * 1. 在目标CPU上使用stop_one_cpu()调用migration_cpu_stop()
+ * 2. stopper开始运行（隐式强制被迁移线程离开CPU）
+ * 3. 检查被迁移任务是否仍在错误的运行队列中
+ * 4. 如果在错误队列，迁移线程将其移除并放入正确队列
+ * 5. stopper完成，stop_one_cpu()返回，迁移完成
+ *
+ * 返回值: 成功返回0
  */
 static int migration_cpu_stop(void *data)
 {
@@ -1820,9 +2220,15 @@ static int migration_cpu_stop(void *data)
 	return 0;
 }
 
-/*
- * sched_class::set_cpus_allowed must do the below, but is not required to
- * actually call this function.
+/**
+ * set_cpus_allowed_common - 设置任务的CPU亲和性掩码
+ * @p: 目标任务
+ * @new_mask: 新的CPU掩码
+ *
+ * 调度类的set_cpus_allowed方法必须执行以下操作，
+ * 但不要求实际调用此函数。
+ * - 复制CPU掩码到任务的cpus_mask
+ * - 更新允许的CPU数量
  */
 void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask)
 {
@@ -1830,6 +2236,16 @@ void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_ma
 	p->nr_cpus_allowed = cpumask_weight(new_mask);
 }
 
+/**
+ * do_set_cpus_allowed - 执行CPU亲和性设置
+ * @p: 目标任务
+ * @new_mask: 新的CPU掩码
+ *
+ * 为任务设置新的CPU亲和性掩码，处理运行和入队状态：
+ * - 如果任务已入队：先出队，设置亲和性，再入队
+ * - 如果任务正在运行：调用put_prev_task和set_next_task
+ * - 调用调度类的set_cpus_allowed方法
+ */
 void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 {
 	struct rq *rq = task_rq(p);
@@ -1859,14 +2275,25 @@ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 		set_next_task(rq, p);
 }
 
-/*
- * Change a given task's CPU affinity. Migrate the thread to a
- * proper CPU and schedule it away if the CPU it's executing on
- * is removed from the allowed bitmask.
+/**
+ * __set_cpus_allowed_ptr - 修改任务的CPU亲和性
+ * @p: 目标任务
+ * @new_mask: 新的CPU掩码
+ * @check: 是否检查PF_NO_SETAFFINITY标志
  *
- * NOTE: the caller must have a valid reference to the task, the
- * task must not exit() & deallocate itself prematurely. The
- * call is not atomic; no spinlocks may be held.
+ * 修改给定任务的CPU亲和性。如果任务正在执行的CPU被从允许的位掩码中
+ * 移除，则将线程迁移到合适的CPU并调度走。
+ *
+ * 注意：调用者必须持有对任务的有效引用，任务不能过早exit()和释放自己。
+ * 此调用不是原子的；不能持有自旋锁。
+ *
+ * 处理过程：
+ * - 检查新掩码是否与当前掩码相同
+ * - 选择随机CPU帮助负载均衡
+ * - 处理内核线程的特殊情况
+ * - 如果需要迁移，使用migration_cpu_stop或move_queued_task
+ *
+ * 返回值: 成功返回0，失败返回负错误码
  */
 static int __set_cpus_allowed_ptr(struct task_struct *p,
 				  const struct cpumask *new_mask, bool check)
@@ -1951,6 +2378,18 @@ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
 }
 EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
 
+/**
+ * set_task_cpu - 设置任务所在的CPU
+ * @p: 目标任务
+ * @new_cpu: 新的CPU编号
+ *
+ * 设置任务的CPU归属，包括调试检查和相关更新：
+ * - 检查任务状态和锁定状态
+ * - 检查目标CPU是否在线
+ * - 调用调度类的migrate_task_rq回调
+ * - 更新迁移计数和相关统计
+ * - 记录迁移跟踪事件
+ */
 void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 {
 #ifdef CONFIG_SCHED_DEBUG
@@ -2004,6 +2443,15 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 }
 
 #ifdef CONFIG_NUMA_BALANCING
+/**
+ * __migrate_swap_task - 交换迁移单个任务
+ * @p: 要迁移的任务
+ * @cpu: 目标CPU
+ *
+ * 将任务迁移到指定CPU，用于NUMA平衡中的任务交换：
+ * - 如果任务在运行队列中：停用->设置CPU->激活->检查抢占
+ * - 如果任务未运行：设置wake_cpu，在唤醒时使用新CPU
+ */
 static void __migrate_swap_task(struct task_struct *p, int cpu)
 {
 	if (task_on_rq_queued(p)) {
@@ -2039,6 +2487,18 @@ struct migration_swap_arg {
 	int src_cpu, dst_cpu;
 };
 
+/**
+ * migrate_swap_stop - 执行任务交换迁移的停止函数
+ * @data: migration_swap_arg结构体指针
+ *
+ * 在CPU停止机制下执行两个任务的交换迁移：
+ * - 验证源和目标CPU都处于活跃状态
+ * - 检查任务仍在预期的CPU上
+ * - 验证CPU亲和性允许交换
+ * - 执行双向任务迁移
+ *
+ * 返回值: 成功返回0，失败返回-EAGAIN
+ */
 static int migrate_swap_stop(void *data)
 {
 	struct migration_swap_arg *arg = data;
@@ -2080,8 +2540,17 @@ unlock:
 	return ret;
 }
 
-/*
- * Cross migrate two tasks
+/**
+ * migrate_swap - 交换迁移两个任务
+ * @cur: 当前任务
+ * @p: 要交换的任务
+ * @target_cpu: 目标CPU
+ * @curr_cpu: 当前CPU
+ *
+ * 在两个CPU之间交换两个任务的位置，用于NUMA平衡优化。
+ * 执行预检查后使用stop_two_cpus确保原子性操作。
+ *
+ * 返回值: 成功返回0，失败返回负错误码
  */
 int migrate_swap(struct task_struct *cur, struct task_struct *p,
 		int target_cpu, int curr_cpu)
@@ -2120,21 +2589,20 @@ out:
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
-/*
- * wait_task_inactive - wait for a thread to unschedule.
+/**
+ * wait_task_inactive - 等待线程取消调度
+ * @p: 目标任务
+ * @match_state: 期望的任务状态
  *
- * If @match_state is nonzero, it's the @p->state value just checked and
- * not expected to change.  If it changes, i.e. @p might have woken up,
- * then return zero.  When we succeed in waiting for @p to be off its CPU,
- * we return a positive number (its total switch count).  If a second call
- * a short while later returns the same number, the caller can be sure that
- * @p has remained unscheduled the whole time.
+ * 如果@match_state非零，它是刚检查过的@p->state值，不期望改变。
+ * 如果状态改变（即@p可能被唤醒），返回零。当成功等待@p离开其CPU时，
+ * 返回正数（其总切换计数）。如果短时间后的第二次调用返回相同数字，
+ * 调用者可以确信@p在整个期间都保持未调度状态。
  *
- * The caller must ensure that the task *will* unschedule sometime soon,
- * else this function might spin for a *long* time. This function can't
- * be called with interrupts off, or it may introduce deadlock with
- * smp_call_function() if an IPI is sent by the same process we are
- * waiting to become inactive.
+ * 调用者必须确保任务*将*很快取消调度，否则此函数可能旋转*很长*时间。
+ * 此函数不能在中断关闭时调用，否则可能与smp_call_function()产生死锁。
+ *
+ * 返回值: 成功时返回任务的切换计数，状态改变时返回0
  */
 unsigned long wait_task_inactive(struct task_struct *p, long match_state)
 {
@@ -2228,18 +2696,16 @@ unsigned long wait_task_inactive(struct task_struct *p, long match_state)
 	return ncsw;
 }
 
-/***
- * kick_process - kick a running thread to enter/exit the kernel
- * @p: the to-be-kicked thread
+/**
+ * kick_process - 踢一个运行中的线程进入/退出内核
+ * @p: 要被踢的线程
  *
- * Cause a process which is running on another CPU to enter
- * kernel-mode, without any delay. (to get signals handled.)
+ * 使运行在另一个CPU上的进程进入内核模式，无任何延迟。
+ * （用于处理信号。）
  *
- * NOTE: this function doesn't have to take the runqueue lock,
- * because all it wants to ensure is that the remote task enters
- * the kernel. If the IPI races and the task has been migrated
- * to another CPU then no harm is done and the purpose has been
- * achieved as well.
+ * 注意：此函数不需要获取运行队列锁，因为它只想确保远程任务
+ * 进入内核。如果IPI竞争且任务已迁移到另一个CPU，则不会造成
+ * 伤害，目的同样达到了。
  */
 void kick_process(struct task_struct *p)
 {
@@ -2253,27 +2719,22 @@ void kick_process(struct task_struct *p)
 }
 EXPORT_SYMBOL_GPL(kick_process);
 
-/*
- * ->cpus_ptr is protected by both rq->lock and p->pi_lock
+/**
+ * select_fallback_rq - 为任务选择备用运行队列
+ * @cpu: 原始CPU
+ * @p: 目标任务
  *
- * A few notes on cpu_active vs cpu_online:
+ * CPU亲和性说明：
+ * - ->cpus_ptr受rq->lock和p->pi_lock保护
+ * - cpu_active必须是cpu_online的子集
+ * - CPU启动时：允许每CPU内核线程在online&&!active的CPU上运行
+ * - CPU关闭时：清除cpu_active()以屏蔽调度域，避免负载均衡器
+ *   在即将移除的CPU上放置新任务
  *
- *  - cpu_active must be a subset of cpu_online
+ * 备用选择不能选择!active的CPU，可以假设任何active CPU都在线。
+ * 选择策略：同节点优先 -> cpuset允许 -> 所有可能CPU
  *
- *  - on CPU-up we allow per-CPU kthreads on the online && !active CPU,
- *    see __set_cpus_allowed_ptr(). At this point the newly online
- *    CPU isn't yet part of the sched domains, and balancing will not
- *    see it.
- *
- *  - on CPU-down we clear cpu_active() to mask the sched domains and
- *    avoid the load balancer to place new tasks on the to be removed
- *    CPU. Existing tasks will remain running there and will be taken
- *    off.
- *
- * This means that fallback selection must not select !active CPUs.
- * And can assume that any active CPU must be online. Conversely
- * select_task_rq() below may allow selection of !active CPUs in order
- * to satisfy the above rules.
+ * 返回值: 选择的备用CPU编号
  */
 static int select_fallback_rq(int cpu, struct task_struct *p)
 {
@@ -2344,8 +2805,24 @@ out:
 	return dest_cpu;
 }
 
-/*
- * The caller (fork, wakeup) owns p->pi_lock, ->cpus_ptr is stable.
+/**
+ * select_task_rq - 为任务选择运行队列
+ * @p: 目标任务
+ * @cpu: 建议的CPU
+ * @sd_flags: 调度域标志
+ * @wake_flags: 唤醒标志
+ *
+ * 调用者（fork、wakeup）拥有p->pi_lock，->cpus_ptr是稳定的。
+ *
+ * 选择策略：
+ * - 如果任务允许多CPU：调用调度类的select_task_rq方法
+ * - 如果只允许一个CPU：使用cpus_ptr中的任意CPU
+ * - 如果选择的CPU不被允许：使用备用选择策略
+ *
+ * 为了不在阻塞任务上调用set_task_cpu()，需要依赖ttwu()
+ * 将任务放置在有效的->cpus_ptr CPU上。
+ *
+ * 返回值: 选择的CPU编号
  */
 static inline
 int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags)
@@ -2373,6 +2850,18 @@ int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags)
 	return cpu;
 }
 
+/**
+ * sched_set_stop_task - 设置CPU的停止任务
+ * @cpu: 目标CPU编号
+ * @stop: 停止任务指针
+ *
+ * 为指定CPU设置停止任务：
+ * - 如果stop非空：设置为SCHED_FIFO最高优先级，使用stop调度类
+ * - 如果有旧的停止任务：重置为RT调度类让其正常退出
+ *
+ * 停止任务看起来像SCHED_FIFO任务，用户空间了解且不会混淆。
+ * 这使得PI多少能正常工作，但停止工作不应依赖PI。
+ */
 void sched_set_stop_task(int cpu, struct task_struct *stop)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
@@ -2413,6 +2902,18 @@ static inline int __set_cpus_allowed_ptr(struct task_struct *p,
 
 #endif /* CONFIG_SMP */
 
+/**
+ * ttwu_stat - 记录try_to_wake_up的统计信息
+ * @p: 被唤醒的任务
+ * @cpu: 目标CPU
+ * @wake_flags: 唤醒标志
+ *
+ * 记录任务唤醒的各种统计信息：
+ * - 本地唤醒 vs 远程唤醒
+ * - 调度域内唤醒统计
+ * - 迁移唤醒计数
+ * - 同步唤醒计数
+ */
 static void
 ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
 {
@@ -2452,8 +2953,18 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
 		__schedstat_inc(p->se.statistics.nr_wakeups_sync);
 }
 
-/*
- * Mark the task runnable and perform wakeup-preemption.
+/**
+ * ttwu_do_wakeup - 标记任务为可运行并执行唤醒抢占
+ * @rq: 运行队列
+ * @p: 被唤醒的任务
+ * @wake_flags: 唤醒标志
+ * @rf: 运行队列标志
+ *
+ * 完成任务唤醒的最后步骤：
+ * - 检查是否需要抢占当前任务
+ * - 设置任务状态为TASK_RUNNING
+ * - 调用调度类的task_woken回调
+ * - 更新空闲平衡统计信息
  */
 static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 			   struct rq_flags *rf)
@@ -2487,6 +2998,19 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 #endif
 }
 
+/**
+ * ttwu_do_activate - 激活被唤醒的任务
+ * @rq: 运行队列
+ * @p: 被唤醒的任务
+ * @wake_flags: 唤醒标志
+ * @rf: 运行队列标志
+ *
+ * 激活被唤醒的任务：
+ * - 如果任务贡献负载统计，减少nr_uninterruptible计数
+ * - 处理迁移标志和IO等待状态
+ * - 调用activate_task将任务加入运行队列
+ * - 调用ttwu_do_wakeup完成唤醒过程
+ */
 static void
 ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 		 struct rq_flags *rf)
@@ -2512,30 +3036,27 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 	ttwu_do_wakeup(rq, p, wake_flags, rf);
 }
 
-/*
- * Consider @p being inside a wait loop:
+/**
+ * ttwu_runnable - 处理已在运行队列中的任务唤醒
+ * @p: 目标任务
+ * @wake_flags: 唤醒标志
  *
+ * 考虑@p在等待循环中的情况：
  *   for (;;) {
  *      set_current_state(TASK_UNINTERRUPTIBLE);
- *
- *      if (CONDITION)
- *         break;
- *
+ *      if (CONDITION) break;
  *      schedule();
  *   }
  *   __set_current_state(TASK_RUNNING);
  *
- * between set_current_state() and schedule(). In this case @p is still
- * runnable, so all that needs doing is change p->state back to TASK_RUNNING in
- * an atomic manner.
+ * 在set_current_state()和schedule()之间。此时@p仍可运行，
+ * 只需以原子方式将p->state改回TASK_RUNNING即可。
  *
- * By taking task_rq(p)->lock we serialize against schedule(), if @p->on_rq
- * then schedule() must still happen and p->state can be changed to
- * TASK_RUNNING. Otherwise we lost the race, schedule() has happened, and we
- * need to do a full wakeup with enqueue.
+ * 通过获取task_rq(p)->lock与schedule()串行化，如果p->on_rq
+ * 那么schedule()必须仍然发生，p->state可以改为TASK_RUNNING。
+ * 否则我们错过了竞争，schedule()已发生，需要完整唤醒并入队。
  *
- * Returns: %true when the wakeup is done,
- *          %false otherwise.
+ * 返回值: 唤醒完成时返回%true，否则返回%false
  */
 static int ttwu_runnable(struct task_struct *p, int wake_flags)
 {
@@ -2555,7 +3076,16 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 	return ret;
 }
 
-#ifdef CONFIG_SMP
+/**
+ * sched_ttwu_pending - 处理待处理的try_to_wake_up操作
+ * @arg: 链接列表节点
+ *
+ * 处理通过wakelist排队的待唤醒任务：
+ * - 清除ttwu_pending标志（允许误报但不允许漏报）
+ * - 遍历wakelist中的所有任务
+ * - 对每个任务调用ttwu_do_activate进行激活
+ * - 处理CPU迁移和远程唤醒标志
+ */
 void sched_ttwu_pending(void *arg)
 {
 	struct llist_node *llist = arg;
@@ -2589,6 +3119,13 @@ void sched_ttwu_pending(void *arg)
 	rq_unlock_irqrestore(rq, &rf);
 }
 
+/**
+ * send_call_function_single_ipi - 发送单个CPU函数调用IPI
+ * @cpu: 目标CPU
+ *
+ * 向目标CPU发送函数调用IPI，如果目标CPU在轮询模式下
+ * 则直接设置重新调度标志，否则发送真正的IPI。
+ */
 void send_call_function_single_ipi(int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -2599,11 +3136,15 @@ void send_call_function_single_ipi(int cpu)
 		trace_sched_wake_idle_without_ipi(cpu);
 }
 
-/*
- * Queue a task on the target CPUs wake_list and wake the CPU via IPI if
- * necessary. The wakee CPU on receipt of the IPI will queue the task
- * via sched_ttwu_wakeup() for activation so the wakee incurs the cost
- * of the wakeup instead of the waker.
+/**
+ * __ttwu_queue_wakelist - 将任务加入目标CPU的唤醒列表
+ * @p: 要唤醒的任务
+ * @cpu: 目标CPU
+ * @wake_flags: 唤醒标志
+ *
+ * 将任务排队到目标CPU的wake_list并在必要时通过IPI唤醒CPU。
+ * 被唤醒的CPU收到IPI后将通过sched_ttwu_wakeup()排队任务进行激活，
+ * 因此被唤醒方承担唤醒成本而不是唤醒方。
  */
 static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 {
@@ -2615,6 +3156,15 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 	__smp_call_single_queue(cpu, &p->wake_entry.llist);
 }
 
+/**
+ * wake_up_if_idle - 如果CPU空闲则唤醒它
+ * @cpu: 目标CPU
+ *
+ * 检查指定CPU是否空闲，如果空闲则唤醒它：
+ * - 如果CPU在轮询模式：设置重新调度标志
+ * - 否则：发送重新调度IPI
+ * 用于确保空闲CPU能及时响应工作请求。
+ */
 void wake_up_if_idle(int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -2639,11 +3189,31 @@ out:
 	rcu_read_unlock();
 }
 
+/**
+ * cpus_share_cache - 检查两个CPU是否共享缓存
+ * @this_cpu: 第一个CPU
+ * @that_cpu: 第二个CPU
+ *
+ * 通过比较Last Level Cache ID来判断两个CPU是否共享缓存。
+ * 返回值: 共享缓存返回true，否则返回false
+ */
 bool cpus_share_cache(int this_cpu, int that_cpu)
 {
 	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
 }
 
+/**
+ * ttwu_queue_cond - 检查是否应该使用wakelist队列
+ * @cpu: 目标CPU
+ * @wake_flags: 唤醒标志
+ *
+ * 决定是否使用wakelist进行任务唤醒的条件：
+ * 1. 如果CPU不共享缓存：使用wakelist避免访问远程数据
+ * 2. 如果任务正在取消调度且目标CPU只有<=1个运行任务：
+ *    使用wakelist将激活工作转移到即将空闲的CPU
+ *
+ * 返回值: 应该使用wakelist返回true，否则返回false
+ */
 static inline bool ttwu_queue_cond(int cpu, int wake_flags)
 {
 	/*
@@ -2665,6 +3235,19 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
 	return false;
 }
 
+/**
+ * ttwu_queue_wakelist - 尝试使用wakelist队列任务
+ * @p: 要唤醒的任务
+ * @cpu: 目标CPU
+ * @wake_flags: 唤醒标志
+ *
+ * 如果满足条件且启用了TTWU_QUEUE特性，则将任务排队到wakelist：
+ * - 检查是否满足wakelist使用条件
+ * - 同步跨CPU时钟
+ * - 将任务加入目标CPU的wakelist
+ *
+ * 返回值: 使用了wakelist返回true，否则返回false
+ */
 static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 {
 	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(cpu, wake_flags)) {
@@ -2688,6 +3271,16 @@ static inline bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_
 
 #endif /* CONFIG_SMP */
 
+/**
+ * ttwu_queue - 将任务排队等待唤醒
+ * @p: 要唤醒的任务
+ * @cpu: 目标CPU
+ * @wake_flags: 唤醒标志
+ *
+ * try_to_wake_up的排队部分，决定使用哪种方式唤醒任务：
+ * - 优先尝试使用wakelist（异步IPI方式）
+ * - 如果不满足wakelist条件，直接在目标CPU上激活任务
+ */
 static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -2785,6 +3378,24 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
  * accesses to the task state; see try_to_wake_up() and set_current_state().
  */
 
+/**
+ * try_to_wake_up - 唤醒睡眠进程
+ * @p: 要唤醒的线程
+ * @state: 可以被唤醒的任务状态掩码
+ * @wake_flags: 唤醒修饰标志 (WF_*)
+ *
+ * 概念上执行：如果 (@state & @p->state) 则 @p->state = TASK_RUNNING
+ *
+ * 此函数是进程唤醒的核心实现：
+ * - 原子性地检查和更新任务状态
+ * - 如果任务未在运行队列中，将其重新加入
+ * - 处理CPU选择和任务迁移
+ * - 与schedule()函数原子性地协作
+ * - 使用内存屏障确保正确的内存序
+ *
+ * 返回: 如果@p->state发生改变则返回%true（实际发生了唤醒），
+ *       否则返回%false
+ */
 /**
  * try_to_wake_up - wake up a thread
  * @p: the thread to be awakened
@@ -2988,22 +3599,20 @@ out:
 }
 
 /**
- * try_invoke_on_locked_down_task - Invoke a function on task in fixed state
- * @p: Process for which the function is to be invoked.
- * @func: Function to invoke.
- * @arg: Argument to function.
+ * try_invoke_on_locked_down_task - 在固定状态下的任务上调用函数
+ * @p: 要调用函数的进程
+ * @func: 要调用的函数
+ * @arg: 函数参数
  *
- * If the specified task can be quickly locked into a definite state
- * (either sleeping or on a given runqueue), arrange to keep it in that
- * state while invoking @func(@arg).  This function can use ->on_rq and
- * task_curr() to work out what the state is, if required.  Given that
- * @func can be invoked with a runqueue lock held, it had better be quite
- * lightweight.
+ * 如果指定任务可以快速锁定到确定状态（睡眠或在给定运行队列上），
+ * 安排在调用@func(@arg)时保持该状态。此函数可以使用->on_rq和
+ * task_curr()来确定状态（如果需要）。由于@func可能在持有运行队列锁
+ * 时被调用，它最好非常轻量级。
  *
- * Returns:
- *	@false if the task slipped out from under the locks.
- *	@true if the task was locked onto a runqueue or is sleeping.
- *		However, @func can override this by returning @false.
+ * 返回值:
+ * @false: 任务从锁下滑出
+ * @true: 任务被锁定在运行队列上或正在睡眠
+ *        但是，@func可以通过返回@false来覆盖此值
  */
 bool try_invoke_on_locked_down_task(struct task_struct *p, bool (*func)(struct task_struct *t, void *arg), void *arg)
 {
@@ -3033,6 +3642,17 @@ bool try_invoke_on_locked_down_task(struct task_struct *p, bool (*func)(struct t
 	return ret;
 }
 
+/*
+ * wake_up_process - 唤醒指定的进程
+ * @p: 要被唤醒的进程
+ *
+ * 尝试唤醒指定的进程并将其移动到可运行进程集合中。
+ * 这是对try_to_wake_up()函数的简单封装，使用TASK_NORMAL状态。
+ *
+ * 返回值：1表示进程被唤醒，0表示进程已经在运行状态
+ *
+ * 此函数在访问任务状态前会执行完整的内存屏障。
+ */
 /**
  * wake_up_process - Wake up a specific process
  * @p: The process to be woken up.
@@ -3050,16 +3670,35 @@ int wake_up_process(struct task_struct *p)
 }
 EXPORT_SYMBOL(wake_up_process);
 
+/**
+ * wake_up_state - 唤醒处于指定状态的进程
+ * @p: 要被唤醒的进程
+ * @state: 可以被唤醒的任务状态掩码
+ *
+ * 尝试唤醒处于指定状态的进程。与wake_up_process()不同，
+ * 此函数允许指定自定义的状态掩码，而不仅仅是TASK_NORMAL。
+ *
+ * 返回值: 进程被唤醒返回1，进程已经运行返回0
+ */
 int wake_up_state(struct task_struct *p, unsigned int state)
 {
 	return try_to_wake_up(p, state, 0);
 }
 
-/*
- * Perform scheduler related setup for a newly forked process p.
- * p is forked by current.
+/**
+ * __sched_fork - 新fork进程的调度器基本设置
+ * @clone_flags: clone标志
+ * @p: 新fork的进程
  *
- * __sched_fork() is basic setup used by init_idle() too:
+ * 对新fork的进程执行与调度器相关的基本设置。
+ * p是由current fork出来的。init_idle()也会使用这个函数。
+ *
+ * 初始化内容：
+ * - 调度实体(se)的基本字段
+ * - deadline任务的定时器和参数
+ * - RT任务的运行列表和时间片
+ * - 抢占通知器列表
+ * - NUMA平衡相关设置
  */
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
@@ -3110,6 +3749,13 @@ DEFINE_STATIC_KEY_FALSE(sched_numa_balancing);
 
 #ifdef CONFIG_NUMA_BALANCING
 
+/**
+ * set_numabalancing_state - 设置NUMA平衡状态
+ * @enabled: 是否启用NUMA平衡
+ *
+ * 启用或禁用NUMA平衡功能的静态分支。
+ * NUMA平衡可以自动迁移任务和内存页面到最佳NUMA节点。
+ */
 void set_numabalancing_state(bool enabled)
 {
 	if (enabled)
@@ -3119,6 +3765,18 @@ void set_numabalancing_state(bool enabled)
 }
 
 #ifdef CONFIG_PROC_SYSCTL
+/**
+ * sysctl_numa_balancing - NUMA平衡的sysctl处理函数
+ * @table: sysctl表项
+ * @write: 是否为写操作
+ * @buffer: 数据缓冲区
+ * @lenp: 数据长度指针
+ * @ppos: 文件位置指针
+ *
+ * 处理/proc/sys/kernel/numa_balancing的读写操作。
+ * 允许管理员运行时启用/禁用NUMA平衡功能。
+ * 返回值: 成功返回0，失败返回负错误码
+ */
 int sysctl_numa_balancing(struct ctl_table *table, int write,
 			  void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -3146,6 +3804,13 @@ int sysctl_numa_balancing(struct ctl_table *table, int write,
 DEFINE_STATIC_KEY_FALSE(sched_schedstats);
 static bool __initdata __sched_schedstats = false;
 
+/**
+ * set_schedstats - 设置调度统计状态
+ * @enabled: 是否启用调度统计
+ *
+ * 启用或禁用调度统计功能的静态分支。
+ * 调度统计提供详细的调度器性能数据，但会增加一定开销。
+ */
 static void set_schedstats(bool enabled)
 {
 	if (enabled)
@@ -3154,6 +3819,13 @@ static void set_schedstats(bool enabled)
 		static_branch_disable(&sched_schedstats);
 }
 
+/**
+ * force_schedstat_enabled - 强制启用调度统计
+ *
+ * 当内核profiling需要时强制启用调度统计功能。
+ * 如果调度统计未启用，打印信息并启用它。
+ * 用于确保性能分析工具能获得必要的调度数据。
+ */
 void force_schedstat_enabled(void)
 {
 	if (!schedstat_enabled()) {
@@ -3219,6 +3891,19 @@ static inline void init_schedstats(void) {}
 #endif /* CONFIG_SCHEDSTATS */
 
 /*
+ * sched_fork - fork()/clone()时的调度器设置
+ * @clone_flags: clone系统调用的标志
+ * @p: 新创建的子进程
+ *
+ * 此函数在进程fork/clone时被调用，负责初始化子进程的调度相关属性：
+ * - 将进程状态设为TASK_NEW，防止被调度运行
+ * - 继承父进程的调度策略和优先级
+ * - 处理优先级重置标志（sched_reset_on_fork）
+ * - 初始化调度类相关数据结构
+ * - 设置初始CPU亲和性和负载权重
+ *
+ * 返回值：成功返回0，失败返回负数错误码
+ *
  * fork()/clone()-time setup:
  */
 int sched_fork(unsigned long clone_flags, struct task_struct *p)
@@ -3303,11 +3988,27 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	return 0;
 }
 
+/**
+ * sched_post_fork - fork后的调度器后续处理
+ * @p: 新fork的任务
+ *
+ * 在sched_fork()完成后进行的额外调度器设置，
+ * 主要处理uclamp的后续初始化工作。
+ */
 void sched_post_fork(struct task_struct *p)
 {
 	uclamp_post_fork(p);
 }
 
+/**
+ * to_ratio - 计算运行时间与周期的比率
+ * @period: 周期时间
+ * @runtime: 运行时间
+ *
+ * 将运行时间和周期转换为带宽比率，用于deadline调度器。
+ * 如果runtime是无限大，返回满带宽；如果period为0，返回0。
+ * 返回值: 以BW_SHIFT位精度表示的带宽比率
+ */
 unsigned long to_ratio(u64 period, u64 runtime)
 {
 	if (runtime == RUNTIME_INF)
@@ -3324,12 +4025,19 @@ unsigned long to_ratio(u64 period, u64 runtime)
 	return div64_u64(runtime << BW_SHIFT, period);
 }
 
-/*
- * wake_up_new_task - wake up a newly created task for the first time.
+/**
+ * wake_up_new_task - 首次唤醒新创建的任务
+ * @p: 新创建的任务
  *
- * This function will do some initial scheduler statistics housekeeping
- * that must be done for every newly created context, then puts the task
- * on the runqueue and wakes it.
+ * 此函数为每个新创建的上下文执行必要的初始调度器统计记录，
+ * 然后将任务放到运行队列并唤醒它。
+ *
+ * 主要工作：
+ * - 设置任务状态为TASK_RUNNING
+ * - Fork负载均衡：选择合适的CPU
+ * - 初始化利用率平均值
+ * - 激活任务并检查抢占
+ * - 调用调度类的task_woken回调
  */
 void wake_up_new_task(struct task_struct *p)
 {
@@ -3376,12 +4084,24 @@ void wake_up_new_task(struct task_struct *p)
 
 static DEFINE_STATIC_KEY_FALSE(preempt_notifier_key);
 
+/**
+ * preempt_notifier_inc - 增加抢占通知器引用计数
+ *
+ * 启用抢占通知器功能的静态分支。
+ * 当有模块需要监听抢占事件时调用。
+ */
 void preempt_notifier_inc(void)
 {
 	static_branch_inc(&preempt_notifier_key);
 }
 EXPORT_SYMBOL_GPL(preempt_notifier_inc);
 
+/**
+ * preempt_notifier_dec - 减少抢占通知器引用计数
+ *
+ * 减少抢占通知器功能的静态分支引用。
+ * 当模块不再需要监听抢占事件时调用。
+ */
 void preempt_notifier_dec(void)
 {
 	static_branch_dec(&preempt_notifier_key);
@@ -3389,8 +4109,11 @@ void preempt_notifier_dec(void)
 EXPORT_SYMBOL_GPL(preempt_notifier_dec);
 
 /**
- * preempt_notifier_register - tell me when current is being preempted & rescheduled
- * @notifier: notifier struct to register
+ * preempt_notifier_register - 注册抢占通知器
+ * @notifier: 要注册的通知器结构体
+ *
+ * 告诉调度器当前进程被抢占和重新调度时通知我。
+ * 将通知器添加到当前任务的抢占通知器列表中。
  */
 void preempt_notifier_register(struct preempt_notifier *notifier)
 {
@@ -3402,10 +4125,11 @@ void preempt_notifier_register(struct preempt_notifier *notifier)
 EXPORT_SYMBOL_GPL(preempt_notifier_register);
 
 /**
- * preempt_notifier_unregister - no longer interested in preemption notifications
- * @notifier: notifier struct to unregister
+ * preempt_notifier_unregister - 注销抢占通知器
+ * @notifier: 要注销的通知器结构体
  *
- * This is *not* safe to call from within a preemption notifier.
+ * 不再对抢占通知感兴趣。从当前任务的通知器列表中移除指定通知器。
+ * 注意：*不能*在抢占通知器回调函数内调用此函数。
  */
 void preempt_notifier_unregister(struct preempt_notifier *notifier)
 {
@@ -3413,6 +4137,13 @@ void preempt_notifier_unregister(struct preempt_notifier *notifier)
 }
 EXPORT_SYMBOL_GPL(preempt_notifier_unregister);
 
+/**
+ * __fire_sched_in_preempt_notifiers - 触发调度进入通知器
+ * @curr: 当前任务
+ *
+ * 遍历当前任务的所有抢占通知器，调用它们的sched_in回调函数。
+ * 用于通知任务被调度运行时的事件。
+ */
 static void __fire_sched_in_preempt_notifiers(struct task_struct *curr)
 {
 	struct preempt_notifier *notifier;
@@ -3421,12 +4152,27 @@ static void __fire_sched_in_preempt_notifiers(struct task_struct *curr)
 		notifier->ops->sched_in(notifier, raw_smp_processor_id());
 }
 
+/**
+ * fire_sched_in_preempt_notifiers - 触发调度进入通知器
+ * @curr: 当前任务
+ *
+ * 如果抢占通知器功能已启用，则调用内部函数触发所有
+ * sched_in回调。这是一个内联函数，用于优化性能。
+ */
 static __always_inline void fire_sched_in_preempt_notifiers(struct task_struct *curr)
 {
 	if (static_branch_unlikely(&preempt_notifier_key))
 		__fire_sched_in_preempt_notifiers(curr);
 }
 
+/**
+ * __fire_sched_out_preempt_notifiers - 触发调度离开通知器
+ * @curr: 当前任务（即将被切换出去）
+ * @next: 下一个任务（即将被调度进入）
+ *
+ * 遍历当前任务的所有抢占通知器，调用它们的sched_out回调函数。
+ * 用于通知任务被抢占切换出去时的事件。
+ */
 static void
 __fire_sched_out_preempt_notifiers(struct task_struct *curr,
 				   struct task_struct *next)
@@ -3459,6 +4205,14 @@ fire_sched_out_preempt_notifiers(struct task_struct *curr,
 
 #endif /* CONFIG_PREEMPT_NOTIFIERS */
 
+/**
+ * prepare_task - 准备即将运行的任务
+ * @next: 即将运行的任务
+ *
+ * 在切换到新任务前设置其运行状态：
+ * - 设置任务的on_cpu标志为1，表示任务正在CPU上运行
+ * - 这个设置在实际切换前完成，确保任何运行的任务都有此标志
+ */
 static inline void prepare_task(struct task_struct *next)
 {
 #ifdef CONFIG_SMP
@@ -3472,6 +4226,16 @@ static inline void prepare_task(struct task_struct *next)
 #endif
 }
 
+/**
+ * finish_task - 完成前一个任务的清理工作
+ * @prev: 前一个任务（刚被切换出去）
+ *
+ * 这必须是此CPU对@prev的最后一次引用。在清除p->on_cpu后，
+ * 任务可以被移动到不同的CPU。必须确保在切换完全完成前不会发生这种情况。
+ *
+ * 特别是，finish_task_switch()中对prev->state的加载必须在此之前发生。
+ * 与try_to_wake_up()中的smp_cond_load_acquire()配对。
+ */
 static inline void finish_task(struct task_struct *prev)
 {
 #ifdef CONFIG_SMP
@@ -3490,6 +4254,17 @@ static inline void finish_task(struct task_struct *prev)
 #endif
 }
 
+/**
+ * prepare_lock_switch - 准备锁切换
+ * @rq: 运行队列
+ * @next: 下一个任务
+ * @rf: 运行队列标志
+ *
+ * 准备运行队列锁的特殊切换处理：
+ * - 由于运行队列锁将由下一个任务释放（这是无效的锁操作，
+ *   但在调度器中是明显的特例），所以在这里提前进行lockdep释放
+ * - 在DEBUG模式下设置锁的新拥有者
+ */
 static inline void
 prepare_lock_switch(struct rq *rq, struct task_struct *next, struct rq_flags *rf)
 {
@@ -3507,6 +4282,13 @@ prepare_lock_switch(struct rq *rq, struct task_struct *next, struct rq_flags *rf
 #endif
 }
 
+/**
+ * finish_lock_switch - 完成锁切换
+ * @rq: 运行队列
+ *
+ * 如果正在跟踪自旋锁依赖关系，需要修复运行队列锁，
+ * 该锁从prev"继承"到current。完成lockdep记录并释放运行队列锁。
+ */
 static inline void finish_lock_switch(struct rq *rq)
 {
 	/*
@@ -3531,17 +4313,21 @@ static inline void finish_lock_switch(struct rq *rq)
 #endif
 
 /**
- * prepare_task_switch - prepare to switch tasks
- * @rq: the runqueue preparing to switch
- * @prev: the current task that is being switched out
- * @next: the task we are going to switch to.
+ * prepare_task_switch - 准备任务切换
+ * @rq: 正在准备切换的运行队列
+ * @prev: 当前正在被切换出的任务
+ * @next: 我们即将切换到的任务
  *
- * This is called with the rq lock held and interrupts off. It must
- * be paired with a subsequent finish_task_switch after the context
- * switch.
+ * 此函数在持有rq锁且中断关闭的情况下调用。它必须与
+ * 上下文切换后的finish_task_switch配对。
  *
- * prepare_task_switch sets up locking and calls architecture specific
- * hooks.
+ * prepare_task_switch设置锁定并调用架构特定的钩子：
+ * - 准备代码覆盖率跟踪
+ * - 记录调度信息
+ * - 触发性能事件
+ * - 处理RCU序列抢占
+ * - 触发抢占通知器
+ * - 准备任务和架构特定设置
  */
 static inline void
 prepare_task_switch(struct rq *rq, struct task_struct *prev,
@@ -3557,23 +4343,21 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 }
 
 /**
- * finish_task_switch - clean up after a task-switch
- * @prev: the thread we just switched away from.
+ * finish_task_switch - 任务切换后的清理工作
+ * @prev: 我们刚刚切换出去的线程
  *
- * finish_task_switch must be called after the context switch, paired
- * with a prepare_task_switch call before the context switch.
- * finish_task_switch will reconcile locking set up by prepare_task_switch,
- * and do any other architecture-specific cleanup actions.
+ * finish_task_switch必须在上下文切换后调用，与上下文切换前的
+ * prepare_task_switch调用配对。finish_task_switch将协调
+ * prepare_task_switch设置的锁定，并执行任何其他架构特定的清理操作。
  *
- * Note that we may have delayed dropping an mm in context_switch(). If
- * so, we finish that here outside of the runqueue lock. (Doing it
- * with the lock held can cause deadlocks; see schedule() for
- * details.)
+ * 注意我们可能在context_switch()中延迟了mm的删除。如果是这样，
+ * 我们在运行队列锁外完成它。（持有锁执行会导致死锁；详见schedule()）
  *
- * The context switch have flipped the stack from under us and restored the
- * local variables which were saved when this task called schedule() in the
- * past. prev == current is still correct but we need to recalculate this_rq
- * because prev may have moved to another CPU.
+ * 上下文切换已经翻转了栈并恢复了当此任务在过去调用schedule()时
+ * 保存的本地变量。prev == current仍然正确，但我们需要重新计算
+ * this_rq，因为prev可能已移动到另一个CPU。
+ *
+ * 返回值: 当前运行队列指针
  */
 static struct rq *finish_task_switch(struct task_struct *prev)
 	__releases(rq->lock)
@@ -3658,7 +4442,14 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 
 #ifdef CONFIG_SMP
 
-/* rq->lock is NOT held, but preemption is disabled */
+/**
+ * __balance_callback - 执行负载均衡回调函数
+ * @rq: 运行队列
+ *
+ * rq->lock未持有，但抢占已禁用。
+ * 执行运行队列上排队的所有负载均衡回调函数。
+ * 这些回调通常用于在调度决策后进行负载重新分布。
+ */
 static void __balance_callback(struct rq *rq)
 {
 	struct callback_head *head, *next;
@@ -3679,6 +4470,13 @@ static void __balance_callback(struct rq *rq)
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 }
 
+/**
+ * balance_callback - 负载均衡回调入口函数
+ * @rq: 运行队列
+ *
+ * 检查运行队列是否有待处理的负载均衡回调，
+ * 如果有则调用__balance_callback执行它们。
+ */
 static inline void balance_callback(struct rq *rq)
 {
 	if (unlikely(rq->balance_callback))
@@ -3694,8 +4492,20 @@ static inline void balance_callback(struct rq *rq)
 #endif
 
 /**
- * schedule_tail - first thing a freshly forked thread must call.
- * @prev: the thread we just switched away from.
+ * schedule_tail - 新fork线程必须首先调用的函数
+ * @prev: 我们刚刚切换出去的线程
+ *
+ * 新任务开始时带有FORK_PREEMPT_COUNT，详见相关代码和finish_task_switch()。
+ *
+ * finish_task_switch()将释放rq->lock()并降低preempt_count，
+ * preempt_enable()最终会启用抢占（在PREEMPT_COUNT内核上）。
+ *
+ * 主要工作：
+ * - 完成任务切换清理
+ * - 执行负载均衡回调
+ * - 启用抢占
+ * - 设置子进程TID
+ * - 重新计算待处理信号
  */
 asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	__releases(rq->lock)
@@ -3722,6 +4532,21 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 }
 
 /*
+ * context_switch - 执行上下文切换
+ * @rq: 运行队列
+ * @prev: 上一个任务
+ * @next: 下一个要运行的任务
+ * @rf: 运行队列锁标志
+ *
+ * 这是调度器的核心函数，负责在两个任务间进行上下文切换：
+ * - 切换内存管理上下文（MM）
+ * - 切换寄存器状态和堆栈
+ * - 处理用户态/内核态间的切换
+ * - 管理TLB和内存屏障
+ *
+ * 返回: 完成切换后的运行队列指针
+ */
+/*
  * context_switch - switch to the new MM and the new thread's register state.
  */
 static __always_inline struct rq *
@@ -3738,22 +4563,29 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	arch_start_context_switch(prev);
 
 	/*
+	 * 内存管理切换规则：
+	 * kernel -> kernel   lazy + transfer active  (内核到内核：延迟+转移活跃)
+	 *   user -> kernel   lazy + mmgrab() active  (用户到内核：延迟+获取引用)
+	 *
+	 * kernel ->   user   switch + mmdrop() active (内核到用户：切换+释放引用)
+	 *   user ->   user   switch                   (用户到用户：直接切换)
+	 *
 	 * kernel -> kernel   lazy + transfer active
 	 *   user -> kernel   lazy + mmgrab() active
 	 *
 	 * kernel ->   user   switch + mmdrop() active
 	 *   user ->   user   switch
 	 */
-	if (!next->mm) {                                // to kernel
-		enter_lazy_tlb(prev->active_mm, next);
+	if (!next->mm) {                                // to kernel (切换到内核线程)
+		enter_lazy_tlb(prev->active_mm, next);  /* 进入延迟TLB模式 */
 
-		next->active_mm = prev->active_mm;
-		if (prev->mm)                           // from user
-			mmgrab(prev->active_mm);
+		next->active_mm = prev->active_mm;  /* 内核线程复用前一个进程的内存管理结构 */
+		if (prev->mm)                           // from user (从用户进程切换)
+			mmgrab(prev->active_mm);  /* 增加内存管理结构的引用计数 */
 		else
-			prev->active_mm = NULL;
-	} else {                                        // to user
-		membarrier_switch_mm(rq, prev->active_mm, next->mm);
+			prev->active_mm = NULL;  /* 前一个也是内核线程，清空active_mm */
+	} else {                                        // to user (切换到用户进程)
+		membarrier_switch_mm(rq, prev->active_mm, next->mm);  /* 内存屏障处理 */
 		/*
 		 * sys_membarrier() requires an smp_mb() between setting
 		 * rq->curr / membarrier_switch_mm() and returning to userspace.
@@ -3782,11 +4614,12 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	return finish_task_switch(prev);
 }
 
-/*
- * nr_running and nr_context_switches:
+/**
+ * nr_running - 获取系统中可运行任务的总数
  *
- * externally visible scheduler statistics: current number of runnable
- * threads, total number of context switches performed since bootup.
+ * 对外可见的调度器统计信息：当前可运行线程数量。
+ * 遍历所有在线CPU，统计它们运行队列中的任务数量。
+ * 返回值: 系统中所有可运行任务的总数
  */
 unsigned long nr_running(void)
 {
@@ -3798,18 +4631,16 @@ unsigned long nr_running(void)
 	return sum;
 }
 
-/*
- * Check if only the current task is running on the CPU.
+/**
+ * single_task_running - 检查当前CPU是否只运行一个任务
  *
- * Caution: this function does not check that the caller has disabled
- * preemption, thus the result might have a time-of-check-to-time-of-use
- * race.  The caller is responsible to use it correctly, for example:
+ * 注意：此函数不检查调用者是否禁用了抢占，因此结果可能存在
+ * 检查时间到使用时间的竞态。调用者有责任正确使用，例如：
+ * - 从不可抢占的代码段调用
+ * - 从绑定到单个CPU的线程调用
+ * - 在非常短的迭代循环中使用（如轮询循环）
  *
- * - from a non-preemptible section (of course)
- *
- * - from a thread that is bound to a single CPU
- *
- * - in a loop with very short iterations (e.g. a polling loop)
+ * 返回值: 如果当前CPU只有一个运行任务返回true，否则返回false
  */
 bool single_task_running(void)
 {
@@ -3817,6 +4648,13 @@ bool single_task_running(void)
 }
 EXPORT_SYMBOL(single_task_running);
 
+/**
+ * nr_context_switches - 获取系统启动以来的上下文切换总数
+ *
+ * 对外可见的调度器统计信息：自启动以来执行的上下文切换总数。
+ * 遍历所有可能的CPU，统计它们的切换次数。
+ * 返回值: 系统启动以来的上下文切换总数
+ */
 unsigned long long nr_context_switches(void)
 {
 	int i;
@@ -3828,48 +4666,38 @@ unsigned long long nr_context_switches(void)
 	return sum;
 }
 
-/*
- * Consumers of these two interfaces, like for example the cpuidle menu
- * governor, are using nonsensical data. Preferring shallow idle state selection
- * for a CPU that has IO-wait which might not even end up running the task when
- * it does become runnable.
+/**
+ * nr_iowait_cpu - 获取指定CPU的IO等待任务数
+ * @cpu: CPU编号
+ *
+ * 这两个接口的消费者（如cpuidle菜单调控器）使用的是无意义的数据。
+ * 为有IO等待的CPU偏向浅空闲状态选择，即使任务在变为可运行时
+ * 可能根本不会在该CPU上运行。
+ *
+ * 返回值: 指定CPU上的IO等待任务数量
  */
-
 unsigned long nr_iowait_cpu(int cpu)
 {
 	return atomic_read(&cpu_rq(cpu)->nr_iowait);
 }
 
-/*
- * IO-wait accounting, and how its mostly bollocks (on SMP).
+/**
+ * nr_iowait - 获取系统总的IO等待任务数
  *
- * The idea behind IO-wait account is to account the idle time that we could
- * have spend running if it were not for IO. That is, if we were to improve the
- * storage performance, we'd have a proportional reduction in IO-wait time.
+ * IO等待记账及其在SMP上的问题：
  *
- * This all works nicely on UP, where, when a task blocks on IO, we account
- * idle time as IO-wait, because if the storage were faster, it could've been
- * running and we'd not be idle.
+ * IO等待记账的想法是记录我们本可以用来运行的空闲时间（如果没有IO的话）。
+ * 也就是说，如果我们改进存储性能，IO等待时间会按比例减少。
  *
- * This has been extended to SMP, by doing the same for each CPU. This however
- * is broken.
+ * 这在UP上工作良好，当任务阻塞在IO上时，我们将空闲时间记为IO等待，
+ * 因为如果存储更快，它可能正在运行而我们不会空闲。
  *
- * Imagine for instance the case where two tasks block on one CPU, only the one
- * CPU will have IO-wait accounted, while the other has regular idle. Even
- * though, if the storage were faster, both could've ran at the same time,
- * utilising both CPUs.
+ * 这已扩展到SMP，对每个CPU都这样做。然而这是有问题的。
+ * 在SMP上当前的IO等待记账是一个下限（因为计算不足）。
+ * 而且这些数字是按CPU提供的，有时被按CPU解释，这是无意义的。
  *
- * This means, that when looking globally, the current IO-wait accounting on
- * SMP is a lower bound, by reason of under accounting.
- *
- * Worse, since the numbers are provided per CPU, they are sometimes
- * interpreted per CPU, and that is nonsensical. A blocked task isn't strictly
- * associated with any one particular CPU, it can wake to another CPU than it
- * blocked on. This means the per CPU IO-wait number is meaningless.
- *
- * Task CPU affinities can make all that even more 'interesting'.
+ * 返回值: 系统中所有CPU的IO等待任务总数
  */
-
 unsigned long nr_iowait(void)
 {
 	unsigned long i, sum = 0;
@@ -3882,9 +4710,16 @@ unsigned long nr_iowait(void)
 
 #ifdef CONFIG_SMP
 
-/*
- * sched_exec - execve() is a valuable balancing opportunity, because at
- * this point the task has the smallest effective memory and cache footprint.
+/**
+ * sched_exec - execve是一个宝贵的均衡机会
+ *
+ * execve()是一个宝贵的负载均衡机会，因为此时任务具有
+ * 最小的有效内存和缓存占用。在exec时重新选择CPU可以
+ * 获得更好的性能和负载分布。
+ *
+ * 主要工作：
+ * - 调用调度类的select_task_rq选择最佳CPU
+ * - 如果选中的CPU不是当前CPU，执行任务迁移
  */
 void sched_exec(void)
 {
@@ -3916,11 +4751,13 @@ DEFINE_PER_CPU(struct kernel_cpustat, kernel_cpustat);
 EXPORT_PER_CPU_SYMBOL(kstat);
 EXPORT_PER_CPU_SYMBOL(kernel_cpustat);
 
-/*
- * The function fair_sched_class.update_curr accesses the struct curr
- * and its field curr->exec_start; when called from task_sched_runtime(),
- * we observe a high rate of cache misses in practice.
- * Prefetching this data results in improved performance.
+/**
+ * prefetch_curr_exec_start - 预取当前任务的执行开始时间
+ * @p: 目标任务
+ *
+ * fair_sched_class.update_curr函数访问结构体curr及其字段curr->exec_start；
+ * 当从task_sched_runtime()调用时，在实践中观察到很高的缓存未命中率。
+ * 预取这些数据可以提高性能。
  */
 static inline void prefetch_curr_exec_start(struct task_struct *p)
 {
@@ -3933,10 +4770,19 @@ static inline void prefetch_curr_exec_start(struct task_struct *p)
 	prefetch(&curr->exec_start);
 }
 
-/*
- * Return accounted runtime for the task.
- * In case the task is currently running, return the runtime plus current's
- * pending runtime that have not been accounted yet.
+/**
+ * task_sched_runtime - 返回任务的计入运行时间
+ * @p: 目标任务
+ *
+ * 返回任务的计入运行时间。如果任务当前正在运行，
+ * 返回运行时间加上当前尚未计入的待处理运行时间。
+ *
+ * 在64位SMP系统上的优化：
+ * - 64位不需要锁来原子读取64位值
+ * - 当任务的delta_exec为0时有优化机会
+ * - 读取->on_cpu是有竞态的，但这是可接受的
+ *
+ * 返回值: 任务的总运行时间（纳秒）
  */
 unsigned long long task_sched_runtime(struct task_struct *p)
 {
@@ -3978,32 +4824,44 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 }
 
 /*
+ * scheduler_tick - 调度器定时器中断处理函数
+ *
+ * 此函数由定时器代码以HZ频率调用，在中断禁用状态下执行。
+ *
+ * 主要功能：
+ * - 更新运行队列时钟
+ * - 调用当前任务所属调度类的 task_tick 方法
+ * - 更新CPU负载和热压力信息
+ * - 更新PSI（压力停滞信息）统计
+ * - 在SMP系统中触发负载均衡
+ * - 检查是否需要设置重调度标志
+ *
  * This function gets called by the timer code, with HZ frequency.
  * We call it with interrupts disabled.
  */
 void scheduler_tick(void)
 {
-	int cpu = smp_processor_id();
-	struct rq *rq = cpu_rq(cpu);
-	struct task_struct *curr = rq->curr;
+	int cpu = smp_processor_id();  /* 获取当前CPU编号 */
+	struct rq *rq = cpu_rq(cpu);  /* 获取当前CPU的运行队列 */
+	struct task_struct *curr = rq->curr;  /* 获取当前运行的任务 */
 	struct rq_flags rf;
 	unsigned long thermal_pressure;
 
-	arch_scale_freq_tick();
-	sched_clock_tick();
+	arch_scale_freq_tick();  /* 架构相关的频率缩放处理 */
+	sched_clock_tick();  /* 调度器时钟tick处理 */
 
-	rq_lock(rq, &rf);
+	rq_lock(rq, &rf);  /* 获取运行队列锁 */
 
-	update_rq_clock(rq);
-	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
-	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
-	curr->sched_class->task_tick(rq, curr, 0);
-	calc_global_load_tick(rq);
-	psi_task_tick(rq);
+	update_rq_clock(rq);  /* 更新运行队列时钟 */
+	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));  /* 获取热压力信息 */
+	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);  /* 更新热负载平均值 */
+	curr->sched_class->task_tick(rq, curr, 0);  /* 调用当前任务调度类的tick处理 */
+	calc_global_load_tick(rq);  /* 计算全局负载tick */
+	psi_task_tick(rq);  /* 更新PSI任务tick统计 */
 
-	rq_unlock(rq, &rf);
+	rq_unlock(rq, &rf);  /* 释放运行队列锁 */
 
-	perf_event_task_tick();
+	perf_event_task_tick();  /* 性能事件任务tick处理 */
 
 #ifdef CONFIG_SMP
 	rq->idle_balance = idle_cpu(cpu);
@@ -4048,6 +4906,22 @@ struct tick_work {
 
 static struct tick_work __percpu *tick_work_cpu;
 
+/**
+ * sched_tick_remote - 远程调度tick处理函数
+ * @work: 工作结构体
+ *
+ * 仅在远程CPU似乎以full dynticks模式运行时处理tick。
+ * 检查本质上是有竞态的，但丢失一个tick或多一个tick都不是大问题，
+ * 因为调度器tick以时间无关的方式更新统计信息和检查时间片，
+ * 无论它何时运行。
+ *
+ * 主要工作：
+ * - 检查远程CPU是否停止了tick
+ * - 更新运行队列时钟
+ * - 调用当前任务的task_tick方法
+ * - 计算NOHZ远程负载
+ * - 重新排队下次执行（每秒一次）
+ */
 static void sched_tick_remote(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
@@ -4103,6 +4977,16 @@ out_requeue:
 		queue_delayed_work(system_unbound_wq, dwork, HZ);
 }
 
+/**
+ * sched_tick_start - 启动CPU的远程调度tick
+ * @cpu: 目标CPU编号
+ *
+ * 为指定CPU启动远程调度tick处理：
+ * - 检查CPU是否需要tick处理（非housekeeping CPU）
+ * - 初始化tick工作结构体
+ * - 将延迟工作排队到系统无绑定工作队列
+ * - 状态转换：OFFLINE -> RUNNING
+ */
 static void sched_tick_start(int cpu)
 {
 	int os;
@@ -4124,6 +5008,16 @@ static void sched_tick_start(int cpu)
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
+/**
+ * sched_tick_stop - 停止CPU的远程调度tick
+ * @cpu: 目标CPU编号
+ *
+ * 为指定CPU停止远程调度tick处理：
+ * - 检查CPU是否需要tick处理（非housekeeping CPU）
+ * - 将tick工作状态设置为OFFLINING
+ * - 不取消工作，因为这会搞乱状态机
+ * - 状态转换：RUNNING -> OFFLINING
+ */
 static void sched_tick_stop(int cpu)
 {
 	struct tick_work *twork;
@@ -4142,6 +5036,15 @@ static void sched_tick_stop(int cpu)
 }
 #endif /* CONFIG_HOTPLUG_CPU */
 
+/**
+ * sched_tick_offload_init - 初始化调度tick卸载功能
+ *
+ * 初始化用于NOHZ full模式的tick工作结构体：
+ * - 为每个CPU分配tick_work结构体
+ * - 用于在远程CPU上处理调度tick
+ *
+ * 返回值: 成功返回0，失败时BUG_ON
+ */
 int __init sched_tick_offload_init(void)
 {
 	tick_work_cpu = alloc_percpu(struct tick_work);
@@ -4156,9 +5059,12 @@ static inline void sched_tick_stop(int cpu) { }
 
 #if defined(CONFIG_PREEMPTION) && (defined(CONFIG_DEBUG_PREEMPT) || \
 				defined(CONFIG_TRACE_PREEMPT_TOGGLE))
-/*
- * If the value passed in is equal to the current preempt count
- * then we just disabled preemption. Start timing the latency.
+/**
+ * preempt_latency_start - 开始记录抢占延迟
+ * @val: 抢占计数值
+ *
+ * 如果传入的值等于当前抢占计数，说明我们刚刚禁用了抢占。
+ * 开始计时延迟并记录调用位置用于调试。
  */
 static inline void preempt_latency_start(int val)
 {
@@ -4171,6 +5077,17 @@ static inline void preempt_latency_start(int val)
 	}
 }
 
+/**
+ * preempt_count_add - 增加抢占计数
+ * @val: 要增加的值
+ *
+ * 增加当前任务的抢占计数，禁用抢占：
+ * - 检查下溢（DEBUG模式）
+ * - 检查自旋锁计数是否即将溢出
+ * - 开始抢占延迟计时（如果启用）
+ *
+ * 用于临界区保护，防止任务被抢占。
+ */
 void preempt_count_add(int val)
 {
 #ifdef CONFIG_DEBUG_PREEMPT
@@ -4193,9 +5110,12 @@ void preempt_count_add(int val)
 EXPORT_SYMBOL(preempt_count_add);
 NOKPROBE_SYMBOL(preempt_count_add);
 
-/*
- * If the value passed in equals to the current preempt count
- * then we just enabled preemption. Stop timing the latency.
+/**
+ * preempt_latency_stop - 停止记录抢占延迟
+ * @val: 抢占计数值
+ *
+ * 如果传入的值等于当前抢占计数，说明我们刚刚启用了抢占。
+ * 停止延迟计时并记录相关跟踪信息。
  */
 static inline void preempt_latency_stop(int val)
 {
@@ -4203,6 +5123,17 @@ static inline void preempt_latency_stop(int val)
 		trace_preempt_on(CALLER_ADDR0, get_lock_parent_ip());
 }
 
+/**
+ * preempt_count_sub - 减少抢占计数
+ * @val: 要减少的值
+ *
+ * 减少当前任务的抢占计数，可能启用抢占：
+ * - 检查下溢和自旋锁部分下溢（DEBUG模式）
+ * - 停止抢占延迟计时（如果启用）
+ * - 减少实际的抢占计数
+ *
+ * 当抢占计数为0时，任务可以被抢占。
+ */
 void preempt_count_sub(int val)
 {
 #ifdef CONFIG_DEBUG_PREEMPT
@@ -4230,6 +5161,14 @@ static inline void preempt_latency_start(int val) { }
 static inline void preempt_latency_stop(int val) { }
 #endif
 
+/**
+ * get_preempt_disable_ip - 获取抢占禁用位置
+ * @p: 目标任务
+ *
+ * 获取任务禁用抢占时的指令指针，用于调试。
+ * 仅在CONFIG_DEBUG_PREEMPT启用时有效。
+ * 返回值: 禁用抢占的指令指针，未启用调试时返回0
+ */
 static inline unsigned long get_preempt_disable_ip(struct task_struct *p)
 {
 #ifdef CONFIG_DEBUG_PREEMPT
@@ -4239,8 +5178,16 @@ static inline unsigned long get_preempt_disable_ip(struct task_struct *p)
 #endif
 }
 
-/*
- * Print scheduling while atomic bug:
+/**
+ * __schedule_bug - 打印原子上下文中调度的错误信息
+ * @prev: 前一个任务
+ *
+ * 在原子上下文中调用schedule()时打印详细的错误信息：
+ * - 打印任务信息和抢占计数
+ * - 显示持有的锁
+ * - 显示中断跟踪事件
+ * - 显示抢占禁用位置
+ * - 根据配置可能触发panic
  */
 static noinline void __schedule_bug(struct task_struct *prev)
 {
@@ -4269,8 +5216,19 @@ static noinline void __schedule_bug(struct task_struct *prev)
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
 }
 
-/*
- * Various schedule()-time debugging checks and statistics:
+/**
+ * schedule_debug - 各种schedule()时的调试检查和统计
+ * @prev: 前一个任务
+ * @preempt: 是否为抢占调度
+ *
+ * 在调度时进行各种调试检查：
+ * - 检查任务栈是否损坏
+ * - 检查影子栈是否损坏
+ * - 检查非阻塞代码段中的调度
+ * - 检查原子上下文中的调度
+ * - RCU睡眠检查
+ * - 记录性能分析数据
+ * - 更新调度统计
  */
 static inline void schedule_debug(struct task_struct *prev, bool preempt)
 {
@@ -4302,6 +5260,18 @@ static inline void schedule_debug(struct task_struct *prev, bool preempt)
 	schedstat_inc(this_rq()->sched_count);
 }
 
+/**
+ * put_prev_task_balance - 在put_prev_task前进行负载均衡
+ * @rq: 运行队列
+ * @prev: 前一个任务
+ * @rf: 运行队列标志
+ *
+ * 在put_prev_task()之前必须进行负载均衡传递，确保当我们释放
+ * rq->lock时，任务处于与获取rq->lock之前相同的状态。
+ *
+ * 一旦我们知道有@class优先级或更高优先级的可运行任务，
+ * 就可以终止平衡传递。
+ */
 static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
 				  struct rq_flags *rf)
 {
@@ -4324,8 +5294,22 @@ static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
 	put_prev_task(rq, prev);
 }
 
-/*
- * Pick up the highest-prio task:
+/**
+ * pick_next_task - 选择下一个要运行的最高优先级任务
+ * @rq: 运行队列
+ * @prev: 前一个任务
+ * @rf: 运行队列标志
+ *
+ * 选择运行队列中优先级最高的任务：
+ *
+ * 优化：如果所有任务都在fair调度类中，可以直接调用该函数，
+ * 但仅当@prev任务不是更高调度类时，否则它们会失去从其他CPU
+ * 拉入更多工作的机会。
+ *
+ * 如果fair调度类没有可运行任务，则选择idle任务。
+ * 如果优化不适用，则遍历所有调度类寻找可运行任务。
+ *
+ * 返回值: 选择的下一个任务，idle类应该总有可运行任务
  */
 static inline struct task_struct *
 pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
@@ -4368,6 +5352,23 @@ restart:
 	BUG();
 }
 
+/*
+ * __schedule - 调度器主函数
+ * @preempt: 是否为抢占式调度
+ *
+ * 这是Linux调度器的核心函数，负责：
+ * - 选择下一个要运行的任务
+ * - 处理任务状态转换
+ * - 执行上下文切换
+ * - 管理运行队列锁和中断
+ * - 处理抢占和信号
+ *
+ * 调用路径：
+ * - schedule() -> __schedule(false)  // 主动调度
+ * - preempt_schedule() -> __schedule(true)  // 抢占调度
+ *
+ * 警告：必须在禁用抢占的情况下调用！
+ */
 /*
  * __schedule() is the main scheduler function.
  *
@@ -4534,6 +5535,18 @@ static void __sched notrace __schedule(bool preempt)
 	balance_callback(rq);
 }
 
+/**
+ * do_task_dead - 处理任务死亡
+ *
+ * 处理任务的最终死亡过程：
+ * - 设置特殊状态TASK_DEAD，在finish_task_switch()中触发最终的put_task_struct
+ * - 告诉冻结器忽略我们
+ * - 调用__schedule(false)进行最后的调度
+ * - 如果从调度返回则是BUG（不应该发生）
+ * - 进入无限循环避免"noreturn函数确实返回"警告
+ *
+ * 注意：此函数永远不会返回
+ */
 void __noreturn do_task_dead(void)
 {
 	/* Causes final put_task_struct in finish_task_switch(): */
@@ -4550,6 +5563,21 @@ void __noreturn do_task_dead(void)
 		cpu_relax();
 }
 
+/**
+ * sched_submit_work - 任务睡眠前的工作队列处理
+ * @tsk: 即将睡眠的任务
+ *
+ * 如果一个工作线程要睡眠，通知并询问工作队列是否要唤醒一个任务
+ * 来维持并发性。由于此函数在schedule()上下文内调用，我们禁用抢占
+ * 以避免在可能的kworker唤醒中再次调用schedule()，并且因为
+ * wq_worker_sleeping()需要它。
+ *
+ * 处理的工作线程类型：
+ * - PF_WQ_WORKER: 普通工作队列工作线程
+ * - PF_IO_WORKER: IO工作线程
+ *
+ * 如果任务被PI阻塞则直接返回。
+ */
 static inline void sched_submit_work(struct task_struct *tsk)
 {
 	unsigned int task_flags;
@@ -4586,6 +5614,16 @@ static inline void sched_submit_work(struct task_struct *tsk)
 		blk_schedule_flush_plug(tsk);
 }
 
+/**
+ * sched_update_worker - 更新工作线程状态
+ * @tsk: 目标任务
+ *
+ * 通知工作队列系统任务已恢复运行：
+ * - PF_WQ_WORKER: 调用wq_worker_running()通知普通工作队列
+ * - PF_IO_WORKER: 调用io_wq_worker_running()通知IO工作队列
+ *
+ * 用于维护工作队列的并发控制和负载管理。
+ */
 static void sched_update_worker(struct task_struct *tsk)
 {
 	if (tsk->flags & (PF_WQ_WORKER | PF_IO_WORKER)) {
@@ -4596,29 +5634,47 @@ static void sched_update_worker(struct task_struct *tsk)
 	}
 }
 
+/*
+ * schedule - 主动调度函数
+ *
+ * 这是用户空间可见的主要调度入口点，用于主动让出CPU。
+ * 当进程需要等待资源、完成I/O操作或主动让出CPU时调用。
+ *
+ * 执行流程：
+ * - 处理工作队列相关的睡眠通知
+ * - 禁用抢占并调用核心调度函数 __schedule()
+ * - 循环直到不再需要重调度
+ * - 更新工作队列状态
+ *
+ * 与抢占调度不同，这是由进程主动发起的调度。
+ */
 asmlinkage __visible void __sched schedule(void)
 {
 	struct task_struct *tsk = current;
 
-	sched_submit_work(tsk);
+	sched_submit_work(tsk);  /* 处理工作队列睡眠前的准备工作 */
 	do {
-		preempt_disable();
-		__schedule(false);
-		sched_preempt_enable_no_resched();
-	} while (need_resched());
-	sched_update_worker(tsk);
+		preempt_disable();  /* 禁用抢占 */
+		__schedule(false);  /* 调用核心调度函数，false表示非抢占调度 */
+		sched_preempt_enable_no_resched();  /* 重新启用抢占但不立即检查重调度 */
+	} while (need_resched());  /* 如果仍需要重调度则继续循环 */
+	sched_update_worker(tsk);  /* 更新工作队列状态 */
 }
 EXPORT_SYMBOL(schedule);
 
-/*
- * synchronize_rcu_tasks() makes sure that no task is stuck in preempted
- * state (have scheduled out non-voluntarily) by making sure that all
- * tasks have either left the run queue or have gone into user space.
- * As idle tasks do not do either, they must not ever be preempted
- * (schedule out non-voluntarily).
+/**
+ * schedule_idle - 空闲任务专用的调度函数
  *
- * schedule_idle() is similar to schedule_preempt_disable() except that it
- * never enables preemption because it does not call sched_submit_work().
+ * synchronize_rcu_tasks()确保没有任务卡在抢占状态（非主动调度出去），
+ * 通过确保所有任务要么离开了运行队列要么进入了用户空间。
+ * 由于空闲任务两者都不做，它们绝不能被抢占（非主动调度出去）。
+ *
+ * schedule_idle()类似于schedule_preempt_disable()，除了它从不启用抢占，
+ * 因为它不调用sched_submit_work()。
+ *
+ * 由于跳过了sched_submit_work()调用（对空闲任务来说该函数是空操作，
+ * 因为任务处于TASK_RUNNING状态），确保不要在当前任务可能处于其他状态
+ * 的地方使用此函数。注意，空闲任务始终处于TASK_RUNNING状态。
  */
 void __sched schedule_idle(void)
 {
@@ -4635,7 +5691,18 @@ void __sched schedule_idle(void)
 	} while (need_resched());
 }
 
-#ifdef CONFIG_CONTEXT_TRACKING
+/**
+ * schedule_user - 用户上下文调度函数
+ *
+ * 在用户上下文中调用的调度函数，处理RCU上下文切换：
+ *
+ * 如果我们在随机调用set_need_resched()后到达这里，或者被远程唤醒
+ * 但IPI尚未到达，我们还没有退出RCU空闲模式。在找到更好的解决方案之前，
+ * 在这里手动执行。
+ *
+ * 注意：此函数有错误的调用者。理想情况下，如果prev_state != CONTEXT_USER
+ * 我们应该发出警告，但这会触发得太频繁，目前没有意义。
+ */
 asmlinkage __visible void __sched schedule_user(void)
 {
 	/*
@@ -4654,18 +5721,48 @@ asmlinkage __visible void __sched schedule_user(void)
 }
 #endif
 
-/**
+/*
+ * schedule_preempt_disabled - 在抢占禁用状态下调用的调度函数
+ *
+ * 这个函数在抢占已被禁用的上下文中调用，用于安全地进行调度。
+ *
+ * 执行流程：
+ * - 启用抢占但不立即检查重调度
+ * - 调用主调度函数
+ * - 重新禁用抢占
+ *
+ * 注意：preempt_count必须为1（即只有一层抢占禁用）
+ *
+ * 返回时抢占仍处于禁用状态。主要用于需要在抢占禁用的上下文中
+ * 进行调度的特殊场景，如某些锁操作或中断处理。
+ *
  * schedule_preempt_disabled - called with preemption disabled
  *
  * Returns with preemption disabled. Note: preempt_count must be 1
  */
 void __sched schedule_preempt_disabled(void)
 {
-	sched_preempt_enable_no_resched();
-	schedule();
-	preempt_disable();
+	sched_preempt_enable_no_resched();  /* 启用抢占但不立即检查重调度 */
+	schedule();  /* 调用主调度函数 */
+	preempt_disable();  /* 重新禁用抢占 */
 }
 
+/**
+ * preempt_schedule_common - 抢占调度的通用实现
+ *
+ * 抢占调度的核心实现，处理函数跟踪器的递归问题：
+ *
+ * 由于函数跟踪器可以跟踪preempt_count_sub()，并且它也使用
+ * preempt_enable/disable_notrace()，如果设置了NEED_RESCHED，
+ * 函数跟踪器调用的preempt_enable_notrace()将再次调用此函数
+ * 并导致无限递归。
+ *
+ * 在函数跟踪器可以跟踪之前，必须在这里禁用抢占。将preempt_disable()
+ * 分解为两个调用：一个禁用抢占而不用担心被跟踪，另一个仍记录抢占延迟
+ * （也可以被函数跟踪器跟踪）。
+ *
+ * 循环检查是否错过了调度和当前之间的抢占机会。
+ */
 static void __sched notrace preempt_schedule_common(void)
 {
 	do {
@@ -4804,6 +5901,18 @@ EXPORT_SYMBOL(default_wake_function);
 
 #ifdef CONFIG_RT_MUTEXES
 
+/**
+ * __rt_effective_prio - 计算实时有效优先级（内部辅助函数）
+ * @pi_task: 优先级继承的捐赠者任务
+ * @prio: 任务的基础优先级
+ *
+ * 返回值: 计算后的有效优先级值
+ *
+ * 功能说明：
+ * - 在优先级继承场景中计算任务的实际有效优先级
+ * - 如果存在优先级继承任务，选择两者中较高的优先级
+ * - 用于实时互斥锁的优先级继承逻辑
+ */
 static inline int __rt_effective_prio(struct task_struct *pi_task, int prio)
 {
 	if (pi_task)
@@ -4812,6 +5921,18 @@ static inline int __rt_effective_prio(struct task_struct *pi_task, int prio)
 	return prio;
 }
 
+/**
+ * rt_effective_prio - 计算实时有效优先级
+ * @p: 目标任务
+ * @prio: 任务的基础优先级
+ *
+ * 返回值: 计算后的有效优先级值
+ *
+ * 功能说明：
+ * - 获取任务的优先级继承信息并计算有效优先级
+ * - 通过rt_mutex_get_top_task获取最高优先级的等待任务
+ * - 调用__rt_effective_prio完成实际的优先级计算
+ */
 static inline int rt_effective_prio(struct task_struct *p, int prio)
 {
 	struct task_struct *pi_task = rt_mutex_get_top_task(p);
@@ -4820,6 +5941,22 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
 }
 
 /*
+ * rt_mutex_setprio - 设置任务的当前优先级
+ * @p: 要提升优先级的任务
+ * @pi_task: 优先级继承的捐赠者任务
+ *
+ * 此函数改变任务的'有效'优先级，但不触及 ->normal_prio（与__setscheduler()不同）。
+ *
+ * 由rt_mutex代码用于实现优先级继承逻辑：
+ * - 当高优先级任务等待低优先级任务持有的互斥锁时
+ * - 临时提升低优先级任务的优先级以防止优先级倒置
+ * - 只有在任务优先级确实发生变化时才会被调用
+ *
+ * 优先级继承机制确保：
+ * - 防止高优先级任务被低优先级任务无限期阻塞
+ * - 维护实时系统的可预测性
+ * - 在锁释放后恢复原始优先级
+ *
  * rt_mutex_setprio - set the current priority of a task
  * @p: task to boost
  * @pi_task: donor task
@@ -4955,6 +6092,25 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
 }
 #endif
 
+/*
+ * set_user_nice - 设置进程的nice值
+ * @p: 要设置nice值的进程
+ * @nice: 新的nice值 (范围: -20 到 +19)
+ *
+ * 此函数修改进程的nice值，从而影响其调度优先级：
+ * - nice值越低，优先级越高 (-20是最高优先级)
+ * - nice值越高，优先级越低 (+19是最低优先级)
+ * - 只影响CFS(完全公平调度器)管理的普通进程
+ * - 实时进程不受nice值影响
+ *
+ * 函数执行过程：
+ * - 获取运行队列锁
+ * - 检查进程当前状态(在队列中/正在运行)
+ * - 暂时移出运行队列(如果需要)
+ * - 更新优先级和负载权重
+ * - 重新加入运行队列
+ * - 检查是否需要重调度
+ */
 void set_user_nice(struct task_struct *p, long nice)
 {
 	bool queued, running;
@@ -5009,10 +6165,18 @@ out_unlock:
 }
 EXPORT_SYMBOL(set_user_nice);
 
-/*
- * can_nice - check if a task can reduce its nice value
- * @p: task
- * @nice: nice value
+/**
+ * can_nice - 检查任务是否可以降低其nice值
+ * @p: 目标任务
+ * @nice: 要设置的nice值
+ *
+ * 返回值: 如果允许设置返回非零值，否则返回0
+ *
+ * 功能说明：
+ * - 检查任务是否有权限设置指定的nice值
+ * - nice值越低优先级越高，需要更高权限
+ * - 检查RLIMIT_NICE资源限制或CAP_SYS_NICE权限
+ * - 将nice值范围[19,-20]转换为rlimit格式[1,40]进行检查
  */
 int can_nice(const struct task_struct *p, const int nice)
 {
@@ -5025,7 +6189,19 @@ int can_nice(const struct task_struct *p, const int nice)
 
 #ifdef __ARCH_WANT_SYS_NICE
 
-/*
+/**
+ * sys_nice - 改变当前进程的优先级（系统调用）
+ * @increment: 优先级增量
+ *
+ * 返回值: 成功时返回新的nice值，失败时返回负数错误码
+ *
+ * 功能说明：
+ * - 通过nice系统调用改变当前进程的nice值
+ * - increment为正数时降低优先级，为负数时提高优先级
+ * - 比sys_setpriority更简单但功能有限的接口
+ * - 只能设置当前进程，不能设置其他进程
+ * - 需要检查权限和资源限制
+ *
  * sys_nice - change the priority of the current process.
  * @increment: priority increment
  *
@@ -5058,6 +6234,19 @@ SYSCALL_DEFINE1(nice, int, increment)
 
 #endif
 
+/*
+ * task_prio - 返回给定任务的优先级值
+ * @p: 要查询的任务
+ *
+ * 返回用户在/proc中看到的优先级值：
+ * - 实时任务：偏移-200 (显示为负值，数值越小优先级越高)
+ * - 普通任务：以0为中心，范围从-16到+15
+ *   (对应nice值-20到+19)
+ *
+ * 这个函数将内核内部优先级转换为用户空间可见的优先级表示。
+ *
+ * 返回值：用户空间可见的优先级值
+ */
 /**
  * task_prio - return the priority value of a given task.
  * @p: the task in question.
@@ -5072,6 +6261,17 @@ int task_prio(const struct task_struct *p)
 }
 
 /**
+ * idle_cpu - 检查指定CPU当前是否空闲
+ * @cpu: 要检查的处理器编号
+ *
+ * 返回值: 如果CPU当前空闲返回1，否则返回0
+ *
+ * 功能说明：
+ * - 检查CPU是否正在运行空闲任务
+ * - 验证运行队列中没有等待运行的任务
+ * - 在SMP系统中还需检查是否有待处理的唤醒操作
+ * - 用于负载均衡和任务迁移决策
+ *
  * idle_cpu - is a given CPU idle currently?
  * @cpu: the processor in question.
  *
@@ -5096,6 +6296,17 @@ int idle_cpu(int cpu)
 }
 
 /**
+ * available_idle_cpu - 检查指定CPU是否可用于排队新工作
+ * @cpu: 要检查的CPU编号
+ *
+ * 返回值: 如果CPU当前可用返回1，否则返回0
+ *
+ * 功能说明：
+ * - 检查CPU是否空闲且可以接受新任务
+ * - 除了基本的空闲检查，还要确保CPU未被抢占
+ * - 在虚拟化环境中，被抢占的vCPU不适合接受新工作
+ * - 用于任务放置和负载均衡算法
+ *
  * available_idle_cpu - is a given CPU idle for enqueuing work.
  * @cpu: the CPU in question.
  *
@@ -5113,6 +6324,17 @@ int available_idle_cpu(int cpu)
 }
 
 /**
+ * idle_task - 返回指定CPU的空闲任务
+ * @cpu: 要查询的处理器编号
+ *
+ * 返回值: CPU @cpu的空闲任务结构体指针
+ *
+ * 功能说明：
+ * - 每个CPU都有一个专用的空闲任务(idle task)
+ * - 当CPU没有其他任务运行时，会运行空闲任务
+ * - 空闲任务负责CPU的电源管理和低功耗状态
+ * - 是调度器的最低优先级任务
+ *
  * idle_task - return the idle task for a given CPU.
  * @cpu: the processor in question.
  *
@@ -5124,6 +6346,17 @@ struct task_struct *idle_task(int cpu)
 }
 
 /**
+ * find_process_by_pid - 通过PID值查找匹配的进程
+ * @pid: 要查找的进程ID
+ *
+ * 返回值: 找到的@pid对应的任务，如果未找到则返回%NULL
+ *
+ * 功能说明：
+ * - 根据进程ID查找对应的task_struct结构
+ * - 如果pid为0，返回当前进程(current)
+ * - 使用find_task_by_vpid进行虚拟PID空间查找
+ * - 常用于系统调用中根据PID操作特定进程
+ *
  * find_process_by_pid - find a process with a matching PID value.
  * @pid: the pid in question.
  *
@@ -5140,6 +6373,20 @@ static struct task_struct *find_process_by_pid(pid_t pid)
  */
 #define SETPARAM_POLICY	-1
 
+/**
+ * __setscheduler_params - 设置调度器参数（内部辅助函数）
+ * @p: 目标任务
+ * @attr: 调度属性结构体
+ *
+ * 功能说明：
+ * - 根据调度属性设置任务的调度参数
+ * - 处理不同调度策略的参数设置：
+ *   * 截止期限调度：调用__setparam_dl设置截止期限参数
+ *   * 公平调度：设置static_prio（基于nice值）
+ *   * 实时调度：设置rt_priority
+ * - 重新计算normal_prio和负载权重
+ * - SETPARAM_POLICY(-1)表示保持当前调度策略不变
+ */
 static void __setscheduler_params(struct task_struct *p,
 		const struct sched_attr *attr)
 {
@@ -5165,7 +6412,22 @@ static void __setscheduler_params(struct task_struct *p,
 	set_load_weight(p, true);
 }
 
-/* Actually do priority change: must hold pi & rq lock. */
+/**
+ * __setscheduler - 执行优先级变更（必须持有pi锁和rq锁）
+ * @rq: 运行队列
+ * @p: 目标任务
+ * @attr: 调度属性
+ * @keep_boost: 是否保持优先级提升
+ *
+ * 功能说明：
+ * - 实际执行调度策略和优先级的变更
+ * - 如果设置了SCHED_FLAG_KEEP_PARAMS标志，则不允许改变参数
+ * - 先调用__setscheduler_params设置基本参数
+ * - 重新计算有效优先级，考虑优先级继承
+ * - keep_boost用于保持来自sched_setscheduler()的优先级提升
+ *
+ * Actually do priority change: must hold pi & rq lock.
+ */
 static void __setscheduler(struct rq *rq, struct task_struct *p,
 			   const struct sched_attr *attr, bool keep_boost)
 {
@@ -5194,7 +6456,18 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 		p->sched_class = &fair_sched_class;
 }
 
-/*
+/**
+ * check_same_owner - 检查目标进程是否与当前进程有相同的UID
+ * @p: 目标进程
+ *
+ * 返回值: 如果UID匹配返回true，否则返回false
+ *
+ * 功能说明：
+ * - 验证当前进程是否有权操作目标进程
+ * - 比较当前进程的有效用户ID(euid)与目标进程的euid或uid
+ * - 使用RCU锁保护对进程凭证的访问
+ * - 用于权限检查，防止跨用户的进程操作
+ *
  * Check the target process has a UID that matches the current process's:
  */
 static bool check_same_owner(struct task_struct *p)
@@ -5210,6 +6483,23 @@ static bool check_same_owner(struct task_struct *p)
 	return match;
 }
 
+/**
+ * __sched_setscheduler - 设置调度策略和参数的核心实现
+ * @p: 目标任务
+ * @attr: 调度属性结构体
+ * @user: 是否来自用户空间调用
+ * @pi: 是否涉及优先级继承
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ *
+ * 功能说明：
+ * - 调度器策略和参数设置的核心函数
+ * - 支持所有调度策略：SCHED_NORMAL, SCHED_FIFO, SCHED_RR, SCHED_DEADLINE等
+ * - 进行权限检查、参数验证和策略兼容性检查
+ * - 处理优先级继承和实时调度的特殊要求
+ * - 原子性地更新任务的调度参数，确保一致性
+ * - 支持SCHED_FLAG_RESET_ON_FORK等特殊标志
+ */
 static int __sched_setscheduler(struct task_struct *p,
 				const struct sched_attr *attr,
 				bool user, bool pi)
@@ -5477,6 +6767,22 @@ unlock:
 	return retval;
 }
 
+/**
+ * _sched_setscheduler - 调度器设置的内部包装函数
+ * @p: 目标任务
+ * @policy: 新的调度策略
+ * @param: 包含新RT优先级的结构体
+ * @check: 是否执行权限检查
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ *
+ * 功能说明：
+ * - __sched_setscheduler的简化接口包装函数
+ * - 将传统的sched_param转换为新的sched_attr格式
+ * - 处理SCHED_RESET_ON_FORK标志的兼容性
+ * - 默认启用优先级继承(pi=true)
+ * - 用于内核内部调用和系统调用实现
+ */
 static int _sched_setscheduler(struct task_struct *p, int policy,
 			       const struct sched_param *param, bool check)
 {
@@ -5496,6 +6802,22 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 	return __sched_setscheduler(p, &attr, check, true);
 }
 /**
+ * sched_setscheduler - 改变线程的调度策略和/或RT优先级
+ * @p: 目标任务
+ * @policy: 新的调度策略
+ * @param: 包含新RT优先级的结构体
+ *
+ * 返回值: 成功返回0，失败返回错误码
+ *
+ * 功能说明：
+ * - 改变任务的调度策略和实时优先级
+ * - 推荐使用sched_set_fifo()，请阅读其注释
+ * - 支持所有标准调度策略：NORMAL, FIFO, RR, BATCH, IDLE
+ * - 执行完整的权限检查和参数验证
+ * - 任务可能已经死亡，函数仍可安全调用
+ *
+ * 注意：此函数可能在任务已死亡时调用
+ *
  * sched_setscheduler - change the scheduling policy and/or RT priority of a thread.
  * @p: the task in question.
  * @policy: new policy.
@@ -5513,17 +6835,57 @@ int sched_setscheduler(struct task_struct *p, int policy,
 	return _sched_setscheduler(p, policy, param, true);
 }
 
+/**
+ * sched_setattr - 使用扩展调度属性设置任务调度策略
+ * @p: 目标任务
+ * @attr: 调度属性结构体
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ *
+ * 功能说明：
+ * - 使用新的sched_attr接口设置调度参数
+ * - 支持所有调度策略包括SCHED_DEADLINE
+ * - 支持UCLAMP(utilization clamping)等扩展功能
+ * - 执行完整的权限检查和优先级继承
+ */
 int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
 {
 	return __sched_setscheduler(p, attr, true, true);
 }
 
+/**
+ * sched_setattr_nocheck - 无权限检查的调度属性设置
+ * @p: 目标任务
+ * @attr: 调度属性结构体
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ *
+ * 功能说明：
+ * - 与sched_setattr相同，但跳过权限检查
+ * - 用于内核内部需要修改任务调度策略的场景
+ * - 常用于系统关键任务的调度策略设置
+ * - 调用者必须确保操作的合法性和安全性
+ */
 int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
 {
 	return __sched_setscheduler(p, attr, false, true);
 }
 
 /**
+ * sched_setscheduler_nocheck - 从内核空间改变线程的调度策略和/或RT优先级
+ * @p: 目标任务
+ * @policy: 新的调度策略
+ * @param: 包含新RT优先级的结构体
+ *
+ * 返回值: 成功返回0，失败返回错误码
+ *
+ * 功能说明：
+ * - 与sched_setscheduler相同，但不检查当前上下文是否有权限
+ * - 用于内核需要创建高优先级工作线程的场景
+ * - 例如在stop_machine()中：创建临时的高优先级工作线程，
+ *   但调用者可能没有相应的权限能力
+ * - 调用者必须确保操作的合理性和安全性
+ *
  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernelspace.
  * @p: the task in question.
  * @policy: new policy.
@@ -5542,7 +6904,19 @@ int sched_setscheduler_nocheck(struct task_struct *p, int policy,
 	return _sched_setscheduler(p, policy, param, false);
 }
 
-/*
+/**
+ * sched_set_fifo - 将任务设置为SCHED_FIFO策略
+ * @p: 目标任务
+ *
+ * 功能说明：
+ * - 将任务设置为SCHED_FIFO调度策略，优先级为MAX_RT_PRIO/2
+ * - SCHED_FIFO是一个有缺陷的调度器模型，无法进行资源管理
+ * - 这正是它仅限于特权用户使用的原因
+ * - 无法组合静态优先级工作负载 - 不能将两个正确工作的
+ *   静态优先级工作负载合并后仍期望它们正常工作
+ * - 内核创建的所有FIFO任务基本上都使用MAX_RT_PRIO/2优先级
+ * - 管理员必须配置系统，内核没有足够信息做出合理选择
+ *
  * SCHED_FIFO is a broken scheduler model; that is, it is fundamentally
  * incapable of resource management, which is the one thing an OS really should
  * be doing.
@@ -5567,7 +6941,16 @@ void sched_set_fifo(struct task_struct *p)
 }
 EXPORT_SYMBOL_GPL(sched_set_fifo);
 
-/*
+/**
+ * sched_set_fifo_low - 设置低优先级FIFO调度策略
+ * @p: 目标任务
+ *
+ * 功能说明：
+ * - 当不太关心FIFO特性，但希望优先级高于SCHED_NORMAL时使用
+ * - 设置SCHED_FIFO策略，但使用最低的实时优先级(1)
+ * - 适用于需要实时调度但对延迟要求不高的任务
+ * - 比普通任务优先级高，但不会影响高优先级实时任务
+ *
  * For when you don't much care about FIFO, but want to be above SCHED_NORMAL.
  */
 void sched_set_fifo_low(struct task_struct *p)
@@ -5577,6 +6960,18 @@ void sched_set_fifo_low(struct task_struct *p)
 }
 EXPORT_SYMBOL_GPL(sched_set_fifo_low);
 
+/**
+ * sched_set_normal - 将任务设置为SCHED_NORMAL策略
+ * @p: 目标任务
+ * @nice: nice值 (范围: -20 到 +19)
+ *
+ * 功能说明：
+ * - 将任务设置为SCHED_NORMAL调度策略并指定nice值
+ * - 使用sched_setattr_nocheck跳过权限检查
+ * - 用于内核将任务恢复为普通调度策略
+ * - nice值决定任务在CFS中的相对优先级
+ * - 通常用于清理或重置任务的调度策略
+ */
 void sched_set_normal(struct task_struct *p, int nice)
 {
 	struct sched_attr attr = {
@@ -5587,6 +6982,22 @@ void sched_set_normal(struct task_struct *p, int nice)
 }
 EXPORT_SYMBOL_GPL(sched_set_normal);
 
+/**
+ * do_sched_setscheduler - 执行调度策略设置的内部函数
+ * @pid: 目标进程ID
+ * @policy: 新的调度策略
+ * @param: 用户空间传入的调度参数
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ *
+ * 功能说明：
+ * - 系统调用sched_setscheduler()的核心实现
+ * - 从用户空间复制参数并进行验证
+ * - 通过PID查找目标进程
+ * - 使用RCU锁保护进程查找过程
+ * - 调用sched_setscheduler执行实际的策略变更
+ * - 正确处理进程引用计数
+ */
 static int
 do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
 {
@@ -6118,6 +7529,22 @@ SYSCALL_DEFINE0(sched_yield)
 }
 
 #ifndef CONFIG_PREEMPTION
+/*
+ * _cond_resched - 条件重调度点
+ *
+ * 这是一个安全的调度点，只在非抢占内核中使用。
+ * 检查是否需要重调度，如果需要则主动让出CPU。
+ *
+ * 主要用途：
+ * - 在长时间运行的内核代码中插入调度点
+ * - 防止内核态代码长时间占用CPU
+ * - 提高系统响应性
+ * - 在持有自旋锁期间不能调用
+ *
+ * 返回值：
+ * - 1: 执行了重调度
+ * - 0: 没有执行重调度
+ */
 int __sched _cond_resched(void)
 {
 	if (should_resched(0)) {
@@ -6158,6 +7585,27 @@ int __cond_resched_lock(spinlock_t *lock)
 }
 EXPORT_SYMBOL(__cond_resched_lock);
 
+/*
+ * yield - 让出当前处理器给其他线程
+ *
+ * 几乎永远不要使用此函数，99%的情况下使用它都是错误的。
+ *
+ * 调度器可以在任何时候自由选择调用任务作为最合适运行的任务，
+ * 如果从代码中移除yield()调用会导致代码崩溃，说明代码本身就有问题。
+ *
+ * 典型的错误用法：
+ *
+ * while (!event)
+ *	yield();
+ *
+ * 这种用法假设yield()会让'其他'进程运行并使event变为true。
+ * 如果当前任务是SCHED_FIFO任务，这种情况永远不会发生。
+ * 绝不要将yield()作为进度保证！！
+ *
+ * 如果要等待某事发生，请使用wait_event()。
+ * 如果要对其他进程'友好'，请使用cond_resched()。
+ * 如果仍想使用yield()，请不要使用！
+ */
 /**
  * yield - yield the current processor to other threads.
  *
@@ -6187,6 +7635,24 @@ void __sched yield(void)
 }
 EXPORT_SYMBOL(yield);
 
+/*
+ * yield_to - 向指定任务让出当前处理器
+ * @p: 目标任务
+ * @preempt: 是否允许任务抢占
+ *
+ * 将当前处理器让出给线程组中的另一个线程，
+ * 或者加速目标线程在其所在处理器上的运行。
+ *
+ * 与普通的yield()不同，这个函数有特定的目标任务，
+ * 可以更精确地控制调度行为。主要用于用户空间的协作式调度。
+ *
+ * 调用者需要确保目标任务结构体在检查之前不会消失。
+ *
+ * 返回值：
+ *	>0: 成功提升了目标任务
+ *	0: 未能提升目标任务
+ *	-ESRCH: 没有可让出的任务
+ */
 /**
  * yield_to - yield the current processor to another thread in
  * your thread group, or accelerate that thread toward the

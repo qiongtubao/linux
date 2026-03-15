@@ -5,6 +5,26 @@
  * This file contains the setup_arch() code, which handles the architecture-dependent
  * parts of early kernel initialization.
  */
+/**
+ * arch/x86/kernel/setup.c - x86架构硬件检测与初始化
+ *
+ * 实现 setup_arch() 函数，由 start_kernel() 在早期初始化阶段调用，
+ * 负责完成x86特有的硬件检测和内存布局建立工作。
+ *
+ * 主要职责：
+ *   1. 解析bootloader传递的 boot_params 结构
+ *      （包含内存布局、视频模式、命令行参数等）
+ *   2. e820内存探测：建立可用物理内存和保留内存的映射表
+ *   3. CPU特性检测（CPUID）：确定CPU支持的指令集和特性位
+ *   4. 初始化ACPI固件接口（电源管理、SMP拓扑发现）
+ *   5. 建立NUMA（非均匀内存访问）节点拓扑
+ *   6. 配置NX（No-Execute）内存保护位
+ *   7. 初始化fixmap固定虚拟地址映射
+ *   8. 为 memblock 提供物理内存信息，供早期内存分配使用
+ *
+ * 被调用位置：
+ *   start_kernel()  →  setup_arch(&command_line)  [本文件]
+ */
 #include <linux/console.h>
 #include <linux/crash_dump.h>
 #include <linux/dma-map-ops.h>
@@ -220,6 +240,14 @@ static void __init cleanup_highmap(void)
 }
 #endif
 
+/**
+ * reserve_brk - 将内核BRK区域预留给memblock
+ *
+ * 若内核在启动期间使用了BRK分配器（_brk_start ~ _brk_end），
+ * 则通过memblock_reserve()将该物理内存范围标记为已用，防止
+ * 后续内存初始化将其当作可用内存分配出去。
+ * 预留后将_brk_start清零，锁定BRK区域不再接受新分配。
+ */
 static void __init reserve_brk(void)
 {
 	if (_brk_end > _brk_start)
@@ -285,6 +313,14 @@ static void __init relocate_initrd(void)
 		relocated_ramdisk, relocated_ramdisk + ramdisk_size - 1);
 }
 
+/**
+ * early_reserve_initrd - 早期阶段预留initrd物理内存
+ *
+ * 在memblock初始化的早期阶段调用，将bootloader传递的initrd
+ * 镜像所在的物理内存区域（ramdisk_image ~ ramdisk_end）通过
+ * memblock_reserve()标记为已用，防止被其他早期分配器覆盖。
+ * 若bootloader未提供initrd则直接返回。
+ */
 static void __init early_reserve_initrd(void)
 {
 	/* Assume only end is not page aligned */
@@ -337,6 +373,23 @@ static void __init reserve_initrd(void)
 }
 #endif /* CONFIG_BLK_DEV_INITRD */
 
+/**
+ * parse_setup_data - 解析bootloader传递的扩展setup_data链表
+ *
+ * Linux引导协议支持bootloader通过 boot_params.hdr.setup_data 传递
+ * 一个链表形式的额外数据，各节点类型包括：
+ *   SETUP_E820_EXT:     扩展的e820内存映射表
+ *   SETUP_DTB:          设备树二进制（DTB）
+ *   SETUP_PCI:          PCI设备信息
+ *   SETUP_EFI:          EFI相关数据
+ *   SETUP_INDIRECT:     间接引用的大数据块
+ *
+ * 此函数遍历链表，使用 early_memremap() 临时映射每个节点
+ * （因为此时内存管理尚未完全初始化），根据类型分发处理：
+ *   - E820_EXT: 追加到e820映射表（e820__memory_setup_extended）
+ *   - DTB: 处理设备树
+ *   - 其他: 通过 memblock 保留
+ */
 static void __init parse_setup_data(void)
 {
 	struct setup_data *data;
@@ -369,6 +422,14 @@ static void __init parse_setup_data(void)
 	}
 }
 
+/**
+ * memblock_x86_reserve_range_setup_data - 预留setup_data链表的物理内存
+ *
+ * 遍历bootloader通过boot_params.hdr.setup_data传递的扩展参数链表，
+ * 对每个setup_data节点（包括间接类型SETUP_INDIRECT的额外数据块）
+ * 调用memblock_reserve()预留其物理内存，防止内核初始化时误将其
+ * 当作可用内存分配出去。parse_setup_data()在此之后读取这些数据。
+ */
 static void __init memblock_x86_reserve_range_setup_data(void)
 {
 	struct setup_data *data;
@@ -466,6 +527,22 @@ static int __init reserve_crashkernel_low(void)
 	return 0;
 }
 
+/**
+ * reserve_crashkernel - 为kdump（内核崩溃转储）预留内存
+ *
+ * kdump是一种内核崩溃调试机制：主内核崩溃时，立即在预留内存中
+ * 启动一个备用（capture）内核，捕获崩溃时的内存转储（vmcore）。
+ *
+ * 此函数解析 crashkernel= 启动参数并预留对应内存：
+ *   crashkernel=XM：         预留X兆字节（从低地址分配）
+ *   crashkernel=X,high:      在高地址（>4GB）预留
+ *   crashkernel=X,low:       在低地址预留（用于DMA等需求）
+ *   crashkernel=xM@yM：      在y地址处预留x大小（精确地址）
+ *
+ * 预留的内存通过 memblock_reserve() 标记，使主内核不使用这片内存。
+ * 启动后通过 /proc/iomem 的 "Crash kernel" 条目可查看预留位置。
+ * 需要 CONFIG_KEXEC 支持。
+ */
 static void __init reserve_crashkernel(void)
 {
 	unsigned long long crash_size, crash_base, total_mem;
@@ -663,6 +740,20 @@ static void __init trim_platform_memory_ranges(void)
 	trim_snb_memory();
 }
 
+/**
+ * trim_bios_range - 从可用内存中排除BIOS占用的特殊地址范围
+ *
+ * x86系统中某些物理地址范围被BIOS保留，不能用作普通RAM：
+ *   1. 0x000 - 0xFFF（第一个4KB）：BIOS中断向量表和BIOS数据区（BDA）
+ *      - 通常 BIOS 不在e820中标记为保留，需要手动处理
+ *      - 加上 X86_RESERVE_LOW（默认64KB）防止BIOS腐化低地址内存
+ *   2. 0xA0000 - 0xFFFFF（上层内存区域）：
+ *      - Video RAM（0xA0000-0xBFFFF）
+ *      - ROM区域（0xC0000-0xFFFFF，含BIOS ROM、Option ROM等）
+ *
+ * 通过 e820__range_update() 将这些区域从 E820_TYPE_RAM 改为
+ * E820_TYPE_RESERVED，防止内核将BIOS区域当作普通内存使用。
+ */
 static void __init trim_bios_range(void)
 {
 	/*
@@ -687,6 +778,20 @@ static void __init trim_bios_range(void)
 }
 
 /* called before trim_bios_range() to spare extra sanitize */
+/**
+ * e820_add_kernel_range - 确保内核映像所在内存范围被标记为RAM
+ *
+ * BIOS的e820内存映射应将内核所在区域（_text到_end）标记为 E820_TYPE_RAM。
+ * 但某些配置（memmap=exactmap、memmap=xxM$yyM或有缺陷的BIOS）可能
+ * 遗漏这个标记，导致内核将自己的内存视为非RAM区域，引发各种问题。
+ *
+ * 此函数检查内核占用的物理内存范围是否全部被e820标记为RAM：
+ *   - 若已正确标记：直接返回
+ *   - 若未正确标记：打印警告，并强制将该范围加入e820 RAM条目
+ *
+ * 必须在 e820__memory_setup() 之后、memblock_reserve() 之前调用，
+ * 确保内核代码/数据所在的物理内存不会被误认为MMIO或保留区域。
+ */
 static void __init e820_add_kernel_range(void)
 {
 	u64 start = __pa_symbol(_text);
@@ -763,7 +868,7 @@ dump_kernel_offset(struct notifier_block *self, unsigned long v, void *p)
  * systems (with a traditional BIOS) as well as on EFI systems.
  */
 /*
- * setup_arch - architecture-specific boot-time initializations
+ * setup_arch - x86架构特有的启动初始化（内核初始化的第一个架构相关函数）
  *
  * Note: On x86_64, fixmaps are ready for use even before this is called.
  */
@@ -776,6 +881,7 @@ void __init setup_arch(char **cmdline_p)
 	 * __end_of_kernel_reserve symbol must be explicitly reserved with a
 	 * separate memblock_reserve() or they will be discarded.
 	 */
+	/* 使用memblock保留内核映像本身占用的物理内存区域（_text到__end_of_kernel_reserve） */
 	memblock_reserve(__pa_symbol(_text),
 			 (unsigned long)__end_of_kernel_reserve - (unsigned long)_text);
 
@@ -783,8 +889,10 @@ void __init setup_arch(char **cmdline_p)
 	 * Make sure page 0 is always reserved because on systems with
 	 * L1TF its contents can be leaked to user processes.
 	 */
+	/* 保留第0页（物理地址0），防止L1TF漏洞将其内容泄漏给用户进程 */
 	memblock_reserve(0, PAGE_SIZE);
 
+	/* 保留initrd（初始内存磁盘）占用的物理内存区域 */
 	early_reserve_initrd();
 
 	/*
@@ -835,6 +943,7 @@ void __init setup_arch(char **cmdline_p)
 
 	setup_olpc_ofw_pgd();
 
+	/* 读取boot_params中的根设备号（由bootloader从内核头部填入） */
 	ROOT_DEV = old_decode_dev(boot_params.hdr.root_dev);
 	screen_info = boot_params.screen_info;
 	edid_info = boot_params.edid_info;
@@ -868,6 +977,7 @@ void __init setup_arch(char **cmdline_p)
 	x86_init.oem.arch_setup();
 
 	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
+	/* 解析BIOS e820内存映射表，建立可用内存和保留内存的完整物理内存布局 */
 	e820__memory_setup();
 	parse_setup_data();
 
@@ -912,8 +1022,10 @@ void __init setup_arch(char **cmdline_p)
 	 * again from within noexec_setup() during parsing early parameters
 	 * to honor the respective command line option.
 	 */
+	/* 配置NX（No-Execute）执行保护位，实现W^X（可写不可执行）内存策略 */
 	x86_configure_nx();
 
+	/* 解析早期内核命令行参数，处理影响早期初始化的选项（如mem=、console=） */
 	parse_early_param();
 
 	if (efi_enabled(EFI_BOOT))
@@ -1011,16 +1123,14 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	init_cache_modes();
 
-	/*
-	 * Define random base addresses for memory sections after max_pfn is
-	 * defined and before each memory section base is used.
-	 */
+	/* 为内存段（代码、数据、BSS等）随机化基地址（KASLR内核地址空间布局随机化） */
 	kernel_randomize_memory();
 
 #ifdef CONFIG_X86_32
 	/* max_low_pfn get updated here */
 	find_low_pfn_range();
 #else
+	/* 检测并启用x2APIC扩展中断控制器（支持更多CPU核心） */
 	check_x2apic();
 
 	/* How many end-of-memory variables you have, grandma! */
@@ -1036,10 +1146,12 @@ void __init setup_arch(char **cmdline_p)
 	/*
 	 * Find and reserve possible boot-time SMP configuration:
 	 */
+	/* 查找并保留SMP（多处理器）配置信息（MP表/ACPI MADT） */
 	find_smp_config();
 
 	reserve_ibft_region();
 
+	/* 为早期页表分配缓冲区 */
 	early_alloc_pgt_buf();
 
 	/*
@@ -1049,11 +1161,14 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	reserve_brk();
 
+	/* 清理内核高地址映射中的无效条目 */
 	cleanup_highmap();
 
 	memblock_set_current_limit(ISA_END_ADDRESS);
+	/* 将e820内存表导入memblock管理器，建立早期物理内存分配基础 */
 	e820__memblock_setup();
 
+	/* 保留BIOS使用的物理内存区域（低1MB中的各种BIOS数据区） */
 	reserve_bios_regions();
 
 	efi_fake_memmap();
@@ -1079,13 +1194,16 @@ void __init setup_arch(char **cmdline_p)
 			(max_pfn_mapped<<PAGE_SHIFT) - 1);
 #endif
 
+	/* 保留real mode蹦床代码区域（用于AP辅助CPU启动和ACPI睡眠唤醒） */
 	reserve_real_mode();
 
 	trim_platform_memory_ranges();
 	trim_low_memory_range();
 
+	/* 建立完整的内核直接映射页表（将所有物理内存映射到内核虚拟地址空间） */
 	init_mem_mapping();
 
+	/* 设置早期缺页异常处理（#PF），用于调试内核页表问题 */
 	idt_setup_early_pf();
 
 	/*
@@ -1126,12 +1244,15 @@ void __init setup_arch(char **cmdline_p)
 		}
 	}
 
+	/* 保留initrd（初始内存磁盘）物理内存，防止被覆盖 */
 	reserve_initrd();
 
+	/* 升级或替换ACPI表（支持通过initrd提供自定义ACPI表） */
 	acpi_table_upgrade();
 
 	vsmp_init();
 
+	/* 初始化I/O延迟机制（用于访问慢速ISA设备的端口延迟） */
 	io_delay_init();
 
 	early_platform_quirks();
@@ -1139,11 +1260,14 @@ void __init setup_arch(char **cmdline_p)
 	/*
 	 * Parse the ACPI tables for possible boot-time SMP configuration.
 	 */
+	/* 解析ACPI固件表（MADT/APIC表），获取CPU拓扑和中断路由信息 */
 	acpi_boot_table_init();
 
 	early_acpi_boot_init();
 
+	/* 初始化NUMA内存节点拓扑（从ACPI SRAT表获取CPU-内存节点映射关系） */
 	initmem_init();
+	/* 为DMA连续内存分配器预留连续物理内存区域 */
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
 
 	if (boot_cpu_has(X86_FEATURE_GBPAGES))
@@ -1153,6 +1277,7 @@ void __init setup_arch(char **cmdline_p)
 	 * Reserve memory for crash kernel after SRAT is parsed so that it
 	 * won't consume hotpluggable memory.
 	 */
+	/* 为kdump崩溃内核预留内存区域（crashkernel=参数指定大小） */
 	reserve_crashkernel();
 
 	memblock_find_dma_reserve();
@@ -1160,8 +1285,10 @@ void __init setup_arch(char **cmdline_p)
 	if (!early_xdbc_setup_hardware())
 		early_xdbc_register_console();
 
+	/* 初始化完整的内核页表（包括大页映射等最终配置） */
 	x86_init.paging.pagetable_init();
 
+	/* 初始化KASAN（内核地址净化器），建立影子内存映射 */
 	kasan_init();
 
 	/*
@@ -1174,8 +1301,10 @@ void __init setup_arch(char **cmdline_p)
 
 	tboot_probe();
 
+	/* 映射vsyscall页面（兼容旧版glibc的快速系统调用机制） */
 	map_vsyscall();
 
+	/* 探测本地APIC类型（xAPIC/x2APIC），确定中断控制器模式 */
 	generic_apic_probe();
 
 	early_quirks();
@@ -1183,6 +1312,7 @@ void __init setup_arch(char **cmdline_p)
 	/*
 	 * Read APIC and some other early information from ACPI tables.
 	 */
+	/* 从ACPI表读取APIC配置（CPU列表、I/O APIC、中断覆盖等）完成中断初始化准备 */
 	acpi_boot_init();
 	sfi_init();
 	x86_dtb_init();
@@ -1190,19 +1320,23 @@ void __init setup_arch(char **cmdline_p)
 	/*
 	 * get boot-time SMP configuration:
 	 */
+	/* 获取SMP多处理器配置（CPU数量、APIC ID映射） */
 	get_smp_config();
 
 	/*
 	 * Systems w/o ACPI and mptables might not have it mapped the local
 	 * APIC yet, but prefill_possible_map() might need to access it.
 	 */
+	/* 初始化本地APIC的固定虚拟地址映射 */
 	init_apic_mappings();
 
 	prefill_possible_map();
 
+	/* 建立CPU编号到NUMA节点的映射关系 */
 	init_cpu_to_node();
 	init_gi_nodes();
 
+	/* 初始化I/O APIC（外部设备中断控制器）的固定虚拟地址映射 */
 	io_apic_init_mappings();
 
 	x86_init.hyper.guest_late_init();

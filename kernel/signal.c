@@ -11,6 +11,18 @@
  *		to allow signals to be sent reliably.
  */
 
+/*
+ * Linux内核信号处理子系统
+ *
+ * 本文件实现了Linux信号机制的核心功能：
+ * - 信号的发送（kill/tkill/tgkill系统调用）
+ * - 信号队列管理（实时信号与普通信号）
+ * - 信号的传递与处理（do_signal）
+ * - 信号阻塞与挂起（sigprocmask/sigsuspend）
+ * - 进程组/会话信号广播
+ * - ptrace相关信号处理
+ */
+
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/init.h>
@@ -64,11 +76,23 @@ static struct kmem_cache *sigqueue_cachep;
 
 int print_fatal_signals __read_mostly;
 
+/**
+ * sig_handler - 获取任务的信号处理函数
+ * @t: 目标任务结构
+ * @sig: 信号编号
+ * 返回值：信号处理函数指针
+ */
 static void __user *sig_handler(struct task_struct *t, int sig)
 {
 	return t->sighand->action[sig - 1].sa.sa_handler;
 }
 
+/**
+ * sig_handler_ignored - 检查信号处理函数是否被忽略
+ * @handler: 信号处理函数指针
+ * @sig: 信号编号
+ * 返回值：如果信号被忽略返回true，否则返回false
+ */
 static inline bool sig_handler_ignored(void __user *handler, int sig)
 {
 	/* Is it explicitly or implicitly ignored? */
@@ -76,6 +100,13 @@ static inline bool sig_handler_ignored(void __user *handler, int sig)
 	       (handler == SIG_DFL && sig_kernel_ignore(sig));
 }
 
+/**
+ * sig_task_ignored - 检查任务是否应该忽略特定信号
+ * @t: 目标任务结构
+ * @sig: 信号编号
+ * @force: 是否强制发送信号
+ * 返回值：如果任务应该忽略信号返回true，否则返回false
+ */
 static bool sig_task_ignored(struct task_struct *t, int sig, bool force)
 {
 	void __user *handler;
@@ -98,6 +129,13 @@ static bool sig_task_ignored(struct task_struct *t, int sig, bool force)
 	return sig_handler_ignored(handler, sig);
 }
 
+/**
+ * sig_ignored - 检查信号是否被忽略（考虑阻塞和ptrace）
+ * @t: 目标任务结构
+ * @sig: 信号编号
+ * @force: 是否强制发送信号
+ * 返回值：如果信号被忽略返回true，否则返回false
+ */
 static bool sig_ignored(struct task_struct *t, int sig, bool force)
 {
 	/*
@@ -119,9 +157,13 @@ static bool sig_ignored(struct task_struct *t, int sig, bool force)
 	return sig_task_ignored(t, sig, force);
 }
 
-/*
- * Re-calculate pending state from the set of locally pending
- * signals, globally pending signals, and blocked signals.
+/**
+ * has_pending_signals - 检查是否有待处理的信号
+ * @signal: 待处理信号集合
+ * @blocked: 阻塞信号集合
+ * 返回值：如果有未阻塞的待处理信号返回true，否则返回false
+ *
+ * 重新计算待处理状态，从本地待处理信号集合、全局待处理信号和阻塞信号中计算。
  */
 static inline bool has_pending_signals(sigset_t *signal, sigset_t *blocked)
 {
@@ -151,6 +193,11 @@ static inline bool has_pending_signals(sigset_t *signal, sigset_t *blocked)
 
 #define PENDING(p,b) has_pending_signals(&(p)->signal, (b))
 
+/**
+ * recalc_sigpending_tsk - 重新计算任务的待处理信号状态
+ * @t: 目标任务结构
+ * 返回值：如果有待处理信号返回true，否则返回false
+ */
 static bool recalc_sigpending_tsk(struct task_struct *t)
 {
 	if ((t->jobctl & (JOBCTL_PENDING_MASK | JOBCTL_TRAP_FREEZE)) ||
@@ -173,12 +220,23 @@ static bool recalc_sigpending_tsk(struct task_struct *t)
  * After recalculating TIF_SIGPENDING, we need to make sure the task wakes up.
  * This is superfluous when called on current, the wakeup is a harmless no-op.
  */
+/**
+ * recalc_sigpending_and_wake - 重新计算信号挂起状态并唤醒进程
+ * @t: 目标进程
+ *
+ * 重新计算进程的信号挂起标志，如果有挂起的信号则唤醒进程
+ */
 void recalc_sigpending_and_wake(struct task_struct *t)
 {
 	if (recalc_sigpending_tsk(t))
 		signal_wake_up(t, 0);
 }
 
+/**
+ * recalc_sigpending - 重新计算当前进程的信号挂起状态
+ *
+ * 检查当前进程是否有挂起的信号需要处理
+ */
 void recalc_sigpending(void)
 {
 	if (!recalc_sigpending_tsk(current) && !freezing(current) &&
@@ -188,6 +246,11 @@ void recalc_sigpending(void)
 }
 EXPORT_SYMBOL(recalc_sigpending);
 
+/**
+ * calculate_sigpending - 计算进程的信号挂起状态
+ *
+ * 检查当前进程的信号队列，设置TIF_SIGPENDING标志
+ */
 void calculate_sigpending(void)
 {
 	/* Have any signals or users of TIF_SIGPENDING been delayed
@@ -205,6 +268,14 @@ void calculate_sigpending(void)
 	(sigmask(SIGSEGV) | sigmask(SIGBUS) | sigmask(SIGILL) | \
 	 sigmask(SIGTRAP) | sigmask(SIGFPE) | sigmask(SIGSYS))
 
+/**
+ * next_signal - 获取下一个需要处理的信号
+ * @pending: 信号挂起队列
+ * @mask: 信号掩码
+ *
+ * 从信号队列中找到下一个未被阻塞的信号
+ * 返回值: 信号编号，如果没有信号则返回0
+ */
 int next_signal(struct sigpending *pending, sigset_t *mask)
 {
 	unsigned long i, *s, *m, x;
@@ -282,6 +353,14 @@ static inline void print_dropped_signal(int sig)
  * RETURNS:
  * %true if @mask is set, %false if made noop because @task was dying.
  */
+/**
+ * task_set_jobctl_pending - 设置作业控制挂起标志
+ * @task: 目标进程
+ * @mask: 要设置的作业控制标志掩码
+ *
+ * 设置进程的作业控制相关挂起标志(如SIGSTOP、SIGTSTP等)
+ * 返回值: 成功返回true，失败返回false
+ */
 bool task_set_jobctl_pending(struct task_struct *task, unsigned long mask)
 {
 	BUG_ON(mask & ~(JOBCTL_PENDING_MASK | JOBCTL_STOP_CONSUME |
@@ -310,6 +389,12 @@ bool task_set_jobctl_pending(struct task_struct *task, unsigned long mask)
  * CONTEXT:
  * Must be called with @task->sighand->siglock held.
  */
+/**
+ * task_clear_jobctl_trapping - 清除作业控制陷阱标志
+ * @task: 目标进程
+ *
+ * 清除进程的JOBCTL_TRAPPING标志，表示陷阱处理完成
+ */
 void task_clear_jobctl_trapping(struct task_struct *task)
 {
 	if (unlikely(task->jobctl & JOBCTL_TRAPPING)) {
@@ -333,6 +418,13 @@ void task_clear_jobctl_trapping(struct task_struct *task)
  *
  * CONTEXT:
  * Must be called with @task->sighand->siglock held.
+ */
+/**
+ * task_clear_jobctl_pending - 清除作业控制挂起标志
+ * @task: 目标进程
+ * @mask: 要清除的作业控制标志掩码
+ *
+ * 清除进程指定的作业控制挂起标志
  */
 void task_clear_jobctl_pending(struct task_struct *task, unsigned long mask)
 {
@@ -389,6 +481,12 @@ static bool task_participate_group_stop(struct task_struct *task)
 	return false;
 }
 
+/**
+ * task_join_group_stop - 将进程加入组停止状态
+ * @task: 目标进程
+ *
+ * 将进程加入到进程组的停止状态中，用于作业控制
+ */
 void task_join_group_stop(struct task_struct *task)
 {
 	unsigned long mask = current->jobctl & JOBCTL_STOP_SIGMASK;
@@ -408,6 +506,16 @@ void task_join_group_stop(struct task_struct *task)
  * allocate a new signal queue record
  * - this may be called without locks if and only if t == current, otherwise an
  *   appropriate lock must be held to stop the target task from exiting
+ */
+/**
+ * __sigqueue_alloc - 分配信号队列节点
+ * @sig: 信号编号
+ * @t: 目标进程
+ * @flags: 内存分配标志
+ * @override_rlimit: 是否忽略资源限制
+ *
+ * 为实时信号分配队列节点，检查用户信号队列限制
+ * 返回值: 成功返回信号队列节点指针，失败返回NULL
  */
 static struct sigqueue *
 __sigqueue_alloc(int sig, struct task_struct *t, gfp_t flags, int override_rlimit)
@@ -458,6 +566,12 @@ static void __sigqueue_free(struct sigqueue *q)
 	kmem_cache_free(sigqueue_cachep, q);
 }
 
+/**
+ * flush_sigqueue - 清空信号队列
+ * @queue: 要清空的信号队列
+ *
+ * 释放信号队列中的所有挂起信号，清空队列
+ */
 void flush_sigqueue(struct sigpending *queue)
 {
 	struct sigqueue *q;
@@ -472,6 +586,12 @@ void flush_sigqueue(struct sigpending *queue)
 
 /*
  * Flush all pending signals for this kthread.
+ */
+/**
+ * flush_signals - 清空进程的所有信号
+ * @t: 目标进程
+ *
+ * 清空进程的私有信号队列和共享信号队列，重置信号掩码
  */
 void flush_signals(struct task_struct *t)
 {
@@ -509,6 +629,12 @@ static void __flush_itimer_signals(struct sigpending *pending)
 	sigorsets(&pending->signal, &signal, &retain);
 }
 
+/**
+ * flush_itimer_signals - 清空定时器相关信号
+ *
+ * 清空当前进程由间隔定时器(ITIMER_REAL/ITIMER_VIRTUAL/ITIMER_PROF)
+ * 产生的SIGALRM、SIGVTALRM、SIGPROF信号
+ */
 void flush_itimer_signals(void)
 {
 	struct task_struct *tsk = current;
@@ -521,6 +647,12 @@ void flush_itimer_signals(void)
 }
 #endif
 
+/**
+ * ignore_signals - 忽略进程的所有信号
+ * @t: 目标进程
+ *
+ * 将进程的所有信号处理器设置为SIG_IGN，用于内核线程等不需要处理信号的进程
+ */
 void ignore_signals(struct task_struct *t)
 {
 	int i;
@@ -535,6 +667,14 @@ void ignore_signals(struct task_struct *t)
  * Flush all handlers for a task.
  */
 
+/**
+ * flush_signal_handlers - 重置信号处理器为默认状态
+ * @t: 目标进程
+ * @force_default: 是否强制设置为默认处理器
+ *
+ * 将进程的信号处理器重置为默认状态，用于exec等场景
+ * 清除自定义信号处理器，恢复默认信号行为
+ */
 void
 flush_signal_handlers(struct task_struct *t, int force_default)
 {
@@ -552,6 +692,14 @@ flush_signal_handlers(struct task_struct *t, int force_default)
 	}
 }
 
+/**
+ * unhandled_signal - 检查信号是否未被处理
+ * @tsk: 目标进程
+ * @sig: 信号编号
+ *
+ * 检查指定信号是否未被进程处理(默认处理或忽略)
+ * 返回值: 如果信号未被处理返回true，否则返回false
+ */
 bool unhandled_signal(struct task_struct *tsk, int sig)
 {
 	void __user *handler = tsk->sighand->action[sig-1].sa.sa_handler;
@@ -625,6 +773,15 @@ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
  * expected to free it.
  *
  * All callers have to hold the siglock.
+ */
+/**
+ * dequeue_signal - 从信号队列中取出一个信号
+ * @tsk: 目标进程
+ * @mask: 信号掩码
+ * @info: 存储信号信息的结构体
+ *
+ * 从进程的信号队列中取出下一个未被阻塞的信号进行处理
+ * 返回值: 信号编号，如果没有信号则返回0
  */
 int dequeue_signal(struct task_struct *tsk, sigset_t *mask, kernel_siginfo_t *info)
 {
@@ -756,6 +913,13 @@ still_pending:
  *
  * No need to set need_resched since signal event passing
  * goes through ->blocked
+ */
+/**
+ * signal_wake_up_state - 唤醒进程以处理信号
+ * @t: 目标进程
+ * @state: 要唤醒的进程状态掩码
+ *
+ * 唤醒处于指定状态的进程，使其能够处理挂起的信号
  */
 void signal_wake_up_state(struct task_struct *t, unsigned int state)
 {
@@ -897,6 +1061,13 @@ static void ptrace_trap_notify(struct task_struct *t)
  * Returns true if the signal should be actually delivered, otherwise
  * it should be dropped.
  */
+/**
+ * prepare_signal - 为信号发送做准备工作
+ * @sig: 信号编号
+ * @p: 目标任务结构
+ * @force: 是否强制发送信号
+ * 返回值：如果信号可以发送返回true，否则返回false
+ */
 static bool prepare_signal(int sig, struct task_struct *p, bool force)
 {
 	struct signal_struct *signal = p->signal;
@@ -987,6 +1158,14 @@ static inline bool wants_signal(int sig, struct task_struct *p)
 	return task_curr(p) || !signal_pending(p);
 }
 
+/**
+ * complete_signal - 完成信号传递处理
+ * @sig: 信号编号
+ * @p: 目标任务结构
+ * @type: PID类型（进程、进程组、会话）
+ *
+ * 选择适当的线程来接收信号，并唤醒相应的进程
+ */
 static void complete_signal(int sig, struct task_struct *p, enum pid_type type)
 {
 	struct signal_struct *signal = p->signal;
@@ -1068,6 +1247,15 @@ static inline bool legacy_queue(struct sigpending *signals, int sig)
 	return (sig < SIGRTMIN) && sigismember(&signals->signal, sig);
 }
 
+/**
+ * __send_signal - 发送信号的核心实现函数
+ * @sig: 信号编号
+ * @info: 信号信息结构
+ * @t: 目标任务结构
+ * @type: PID类型（进程、进程组、会话）
+ * @force: 是否强制发送信号
+ * 返回值：成功返回0，失败返回负错误码
+ */
 static int __send_signal(int sig, struct kernel_siginfo *info, struct task_struct *t,
 			enum pid_type type, bool force)
 {
@@ -1206,6 +1394,14 @@ static inline bool has_si_pid_and_uid(struct kernel_siginfo *info)
 	return ret;
 }
 
+/**
+ * send_signal - 发送信号的高级封装函数
+ * @sig: 信号编号
+ * @info: 信号信息结构
+ * @t: 目标任务结构
+ * @type: PID类型（进程、进程组、会话）
+ * 返回值：成功返回0，失败返回负错误码
+ */
 static int send_signal(int sig, struct kernel_siginfo *info, struct task_struct *t,
 			enum pid_type type)
 {
@@ -1275,21 +1471,48 @@ static int __init setup_print_fatal_signals(char *str)
 
 __setup("print-fatal-signals=", setup_print_fatal_signals);
 
+/**
+ * __group_send_sig_info - 向进程组发送信号的内部实现
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ * @p: 进程组中的一个进程
+ *
+ * 向整个进程组(线程组)发送信号的底层实现函数
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int
 __group_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p)
 {
 	return send_signal(sig, info, p, PIDTYPE_TGID);
 }
 
+/**
+ * do_send_sig_info - 向进程发送信号信息
+ * @sig: 信号编号
+ * @info: 信号信息结构
+ * @p: 目标进程
+ * @type: PID类型（进程、进程组、会话）
+ * 返回值：成功返回0，失败返回负错误码
+ */
+/**
+ * do_send_sig_info - 向进程发送信号的核心函数
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ * @p: 目标进程
+ * @type: 信号类型(PIDTYPE_PID/PIDTYPE_TGID等)
+ *
+ * 这是信号发送的核心实现函数，负责将信号添加到目标进程的信号队列
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p,
 			enum pid_type type)
 {
 	unsigned long flags;
 	int ret = -ESRCH;
 
-	if (lock_task_sighand(p, &flags)) {
-		ret = send_signal(sig, info, p, type);
-		unlock_task_sighand(p, &flags);
+	if (lock_task_sighand(p, &flags)) {  // 获取目标进程的信号处理锁
+		ret = send_signal(sig, info, p, type);  // 在锁保护下发送信号到进程队列
+		unlock_task_sighand(p, &flags);  // 释放信号处理锁
 	}
 
 	return ret;
@@ -1305,6 +1528,15 @@ int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p
  *
  * We don't want to have recursive SIGSEGV's etc, for example,
  * that is why we also clear SIGNAL_UNKILLABLE.
+ */
+/**
+ * force_sig_info_to_task - 强制向指定进程发送信号
+ * @info: 信号信息结构体
+ * @t: 目标进程
+ *
+ * 强制向指定进程发送信号，忽略信号掩码和处理器设置
+ * 主要用于内核检测到严重错误需要强制终止特定进程的场景
+ * 返回值: 发送结果状态码
  */
 static int
 force_sig_info_to_task(struct kernel_siginfo *info, struct task_struct *t)
@@ -1337,6 +1569,19 @@ force_sig_info_to_task(struct kernel_siginfo *info, struct task_struct *t)
 	return ret;
 }
 
+/**
+ * force_sig_info - 强制发送信号给当前进程
+ * @info: 信号信息结构
+ * 返回值：成功返回0，失败返回负错误码
+ */
+/**
+ * force_sig_info - 强制发送信号给当前进程
+ * @info: 信号信息结构体
+ *
+ * 强制向当前进程发送信号，无视信号掩码和处理器设置
+ * 主要用于内核需要强制终止进程的场景
+ * 返回值: 发送结果
+ */
 int force_sig_info(struct kernel_siginfo *info)
 {
 	return force_sig_info_to_task(info, current);
@@ -1344,6 +1589,14 @@ int force_sig_info(struct kernel_siginfo *info)
 
 /*
  * Nuke all other threads in the group.
+ */
+/**
+ * zap_other_threads - 终止进程组中的其他线程
+ * @p: 目标进程
+ *
+ * 向进程组中除当前进程外的所有线程发送SIGKILL信号
+ * 用于exec系统调用和进程终止时清理其他线程
+ * 返回值: 被终止的线程数量
  */
 int zap_other_threads(struct task_struct *p)
 {
@@ -1401,6 +1654,16 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 /*
  * send signal info to all the members of a group
  */
+/**
+ * group_send_sig_info - 向进程组发送信号
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ * @p: 进程组中的一个进程
+ * @type: 信号发送类型
+ *
+ * 向整个进程组(线程组)发送信号，所有线程都会收到该信号
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int group_send_sig_info(int sig, struct kernel_siginfo *info,
 			struct task_struct *p, enum pid_type type)
 {
@@ -1421,6 +1684,15 @@ int group_send_sig_info(int sig, struct kernel_siginfo *info,
  * control characters do (^C, ^Z etc)
  * - the caller must hold at least a readlock on tasklist_lock
  */
+/**
+ * __kill_pgrp_info - 向进程组发送信号的内部函数
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ * @pgrp: 目标进程组PID
+ *
+ * 向指定进程组的所有进程发送信号，这是kill(-pid)系统调用的实现
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int __kill_pgrp_info(int sig, struct kernel_siginfo *info, struct pid *pgrp)
 {
 	struct task_struct *p = NULL;
@@ -1436,6 +1708,15 @@ int __kill_pgrp_info(int sig, struct kernel_siginfo *info, struct pid *pgrp)
 	return success ? 0 : retval;
 }
 
+/**
+ * kill_pid_info - 向指定PID发送信号
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ * @pid: 目标进程的PID结构
+ *
+ * 向指定PID的进程发送信号，这是kill()系统调用的核心实现
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int kill_pid_info(int sig, struct kernel_siginfo *info, struct pid *pid)
 {
 	int error = -ESRCH;
@@ -1502,6 +1783,16 @@ static inline bool kill_as_cred_perm(const struct cred *cred,
  * notice when this situration takes place and to store the 32bit
  * pointer in sival_int, instead of sival_addr of the sigval_t addr
  * parameter.
+ */
+/**
+ * kill_pid_usb_asyncio - USB异步I/O专用的信号发送函数
+ * @sig: 信号编号
+ * @errno: 错误码
+ * @addr: 信号值地址
+ * @pid: 目标进程PID
+ *
+ * 用于USB子系统向用户进程发送异步I/O完成信号
+ * 返回值: 发送结果状态码
  */
 int kill_pid_usb_asyncio(int sig, int errno, sigval_t addr,
 			 struct pid *pid, const struct cred *cred)
@@ -1594,6 +1885,15 @@ static int kill_something_info(int sig, struct kernel_siginfo *info, pid_t pid)
  * These are for backward compatibility with the rest of the kernel source.
  */
 
+/**
+ * send_sig_info - 向指定进程发送信号
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ * @p: 目标进程
+ *
+ * 向指定进程发送信号，会进行权限检查
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p)
 {
 	/*
@@ -1610,6 +1910,15 @@ EXPORT_SYMBOL(send_sig_info);
 #define __si_special(priv) \
 	((priv) ? SEND_SIG_PRIV : SEND_SIG_NOINFO)
 
+/**
+ * send_sig - 发送信号给指定进程
+ * @sig: 信号编号
+ * @p: 目标进程
+ * @priv: 权限标志(1表示特权操作)
+ *
+ * 向指定进程发送信号，这是一个便捷的包装函数
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int
 send_sig(int sig, struct task_struct *p, int priv)
 {
@@ -1617,6 +1926,13 @@ send_sig(int sig, struct task_struct *p, int priv)
 }
 EXPORT_SYMBOL(send_sig);
 
+/**
+ * force_sig - 强制发送信号给当前进程
+ * @sig: 信号编号
+ *
+ * 强制向当前进程发送指定信号，忽略信号掩码和处理器设置
+ * 主要用于内核检测到严重错误需要终止进程的场景
+ */
 void force_sig(int sig)
 {
 	struct kernel_siginfo info;
@@ -1637,6 +1953,13 @@ EXPORT_SYMBOL(force_sig);
  * the problem was already a SIGSEGV, we'll want to
  * make sure we don't even try to deliver the signal..
  */
+/**
+ * force_sigsegv - 强制发送SIGSEGV信号
+ * @sig: 原始信号编号(用于记录)
+ *
+ * 当信号处理器本身出现段错误时，强制发送SIGSEGV信号
+ * 这是处理信号处理过程中错误的最后手段
+ */
 void force_sigsegv(int sig)
 {
 	struct task_struct *p = current;
@@ -1650,6 +1973,16 @@ void force_sigsegv(int sig)
 	force_sig(SIGSEGV);
 }
 
+/**
+ * force_sig_fault_to_task - 强制向指定进程发送错误信号
+ * @sig: 信号编号(SIGSEGV/SIGBUS等)
+ * @code: 信号代码(如SEGV_MAPERR/SEGV_ACCERR等)
+ * @addr: 错误地址
+ * @t: 目标进程
+ *
+ * 向指定进程发送内存访问错误等故障信号
+ * 返回值: 发送结果状态码
+ */
 int force_sig_fault_to_task(int sig, int code, void __user *addr
 	___ARCH_SI_TRAPNO(int trapno)
 	___ARCH_SI_IA64(int imm, unsigned int flags, unsigned long isr)
@@ -1673,6 +2006,15 @@ int force_sig_fault_to_task(int sig, int code, void __user *addr
 	return force_sig_info_to_task(&info, t);
 }
 
+/**
+ * force_sig_fault - 强制发送错误信号给当前进程
+ * @sig: 信号编号(SIGSEGV/SIGBUS等)
+ * @code: 信号代码
+ * @addr: 错误地址
+ *
+ * 向当前进程发送内存访问错误信号
+ * 返回值: 发送结果状态码
+ */
 int force_sig_fault(int sig, int code, void __user *addr
 	___ARCH_SI_TRAPNO(int trapno)
 	___ARCH_SI_IA64(int imm, unsigned int flags, unsigned long isr))
@@ -1682,6 +2024,16 @@ int force_sig_fault(int sig, int code, void __user *addr
 				       ___ARCH_SI_IA64(imm, flags, isr), current);
 }
 
+/**
+ * send_sig_fault - 发送错误信号给指定进程
+ * @sig: 信号编号(SIGSEGV/SIGBUS等)
+ * @code: 信号代码
+ * @addr: 错误地址
+ * @t: 目标进程
+ *
+ * 向指定进程发送内存访问错误信号，会进行权限检查
+ * 返回值: 发送结果状态码
+ */
 int send_sig_fault(int sig, int code, void __user *addr
 	___ARCH_SI_TRAPNO(int trapno)
 	___ARCH_SI_IA64(int imm, unsigned int flags, unsigned long isr)
@@ -1705,6 +2057,15 @@ int send_sig_fault(int sig, int code, void __user *addr
 	return send_sig_info(info.si_signo, &info, t);
 }
 
+/**
+ * force_sig_mceerr - 强制发送内存校正错误信号
+ * @code: 错误代码(BUS_MCEERR_AR/BUS_MCEERR_AO)
+ * @addr: 错误内存地址
+ * @lsb: 最低有效位，表示错误粒度
+ *
+ * 当检测到内存ECC错误时发送SIGBUS信号给当前进程
+ * 返回值: 发送结果状态码
+ */
 int force_sig_mceerr(int code, void __user *addr, short lsb)
 {
 	struct kernel_siginfo info;
@@ -1719,6 +2080,16 @@ int force_sig_mceerr(int code, void __user *addr, short lsb)
 	return force_sig_info(&info);
 }
 
+/**
+ * send_sig_mceerr - 发送内存校正错误信号给指定进程
+ * @code: 错误代码(BUS_MCEERR_AR/BUS_MCEERR_AO)
+ * @addr: 错误内存地址
+ * @lsb: 最低有效位，表示错误粒度
+ * @t: 目标进程
+ *
+ * 向指定进程发送内存ECC错误的SIGBUS信号
+ * 返回值: 发送结果状态码
+ */
 int send_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *t)
 {
 	struct kernel_siginfo info;
@@ -1734,6 +2105,16 @@ int send_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *
 }
 EXPORT_SYMBOL(send_sig_mceerr);
 
+/**
+ * force_sig_bnderr - 强制发送内存边界错误信号
+ * @addr: 错误访问的地址
+ * @lower: 有效内存区域的下界
+ * @upper: 有效内存区域的上界
+ *
+ * 当发生内存边界检查错误时发送SIGSEGV信号给当前进程
+ * 主要用于Intel MPX(Memory Protection Extensions)功能
+ * 返回值: 发送结果状态码
+ */
 int force_sig_bnderr(void __user *addr, void __user *lower, void __user *upper)
 {
 	struct kernel_siginfo info;
@@ -1749,6 +2130,15 @@ int force_sig_bnderr(void __user *addr, void __user *lower, void __user *upper)
 }
 
 #ifdef SEGV_PKUERR
+/**
+ * force_sig_pkuerr - 强制发送保护密钥错误信号
+ * @addr: 错误访问的地址
+ * @pkey: 保护密钥值
+ *
+ * 当违反内存保护密钥权限时发送SIGSEGV信号给当前进程
+ * 用于Intel PKU(Protection Keys for Userspace)功能
+ * 返回值: 发送结果状态码
+ */
 int force_sig_pkuerr(void __user *addr, u32 pkey)
 {
 	struct kernel_siginfo info;
@@ -1766,6 +2156,15 @@ int force_sig_pkuerr(void __user *addr, u32 pkey)
 /* For the crazy architectures that include trap information in
  * the errno field, instead of an actual errno value.
  */
+/**
+ * force_sig_ptrace_errno_trap - 强制发送ptrace错误陷阱信号
+ * @errno: 错误码
+ * @addr: 陷阱地址
+ *
+ * 在ptrace过程中发生错误时发送SIGTRAP信号给当前进程
+ * 用于调试器与被调试进程的错误处理
+ * 返回值: 发送结果状态码
+ */
 int force_sig_ptrace_errno_trap(int errno, void __user *addr)
 {
 	struct kernel_siginfo info;
@@ -1778,6 +2177,22 @@ int force_sig_ptrace_errno_trap(int errno, void __user *addr)
 	return force_sig_info(&info);
 }
 
+/**
+ * kill_pgrp - 向进程组发送信号
+ * @pid: 进程组PID
+ * @sig: 信号编号
+ * @priv: 权限级别（0=用户信号，1=特权信号）
+ * 返回值：成功返回0，失败返回负错误码
+ */
+/**
+ * kill_pgrp - 向进程组发送信号
+ * @pid: 进程组的PID结构
+ * @sig: 信号编号
+ * @priv: 权限标志(1表示特权操作)
+ *
+ * 向指定进程组的所有进程发送信号，实现kill(-pgid, sig)功能
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int kill_pgrp(struct pid *pid, int sig, int priv)
 {
 	int ret;
@@ -1790,6 +2205,22 @@ int kill_pgrp(struct pid *pid, int sig, int priv)
 }
 EXPORT_SYMBOL(kill_pgrp);
 
+/**
+ * kill_pid - 向指定PID的进程发送信号
+ * @pid: 目标进程PID
+ * @sig: 信号编号
+ * @priv: 权限级别（0=用户信号，1=特权信号）
+ * 返回值：成功返回0，失败返回负错误码
+ */
+/**
+ * kill_pid - 向指定PID发送信号
+ * @pid: 目标进程的PID结构
+ * @sig: 信号编号
+ * @priv: 权限标志(1表示特权操作)
+ *
+ * 向指定PID的进程发送信号，实现kill(pid, sig)系统调用
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int kill_pid(struct pid *pid, int sig, int priv)
 {
 	return kill_pid_info(sig, __si_special(priv), pid);
@@ -1815,6 +2246,13 @@ struct sigqueue *sigqueue_alloc(void)
 	return q;
 }
 
+/**
+ * sigqueue_free - 释放信号队列节点
+ * @q: 要释放的信号队列节点
+ *
+ * 释放由__sigqueue_alloc分配的信号队列节点内存，
+ * 同时更新用户的信号队列使用计数
+ */
 void sigqueue_free(struct sigqueue *q)
 {
 	unsigned long flags;
@@ -1840,6 +2278,15 @@ void sigqueue_free(struct sigqueue *q)
 		__sigqueue_free(q);
 }
 
+/**
+ * send_sigqueue - 发送队列化的实时信号
+ * @q: 预分配的信号队列节点
+ * @pid: 目标进程PID
+ * @type: PID类型(PIDTYPE_PID/PIDTYPE_TGID等)
+ *
+ * 发送实时信号到目标进程的信号队列，用于定时器和异步I/O
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int send_sigqueue(struct sigqueue *q, struct pid *pid, enum pid_type type)
 {
 	int sig = q->info.si_signo;
@@ -1903,6 +2350,15 @@ static void do_notify_pidfd(struct task_struct *task)
  *
  * Returns true if our parent ignored us and so we've switched to
  * self-reaping.
+ */
+/**
+ * do_notify_parent - 通知父进程子进程状态变化
+ * @tsk: 状态发生变化的子进程
+ * @sig: 要发送给父进程的信号
+ *
+ * 当子进程退出或状态改变时，向父进程发送SIGCHLD等信号
+ * 用于实现wait()系统调用的进程状态通知机制
+ * 返回值: 如果父进程忽略了信号，返回true(进程自动回收)，否则返回false
  */
 bool do_notify_parent(struct task_struct *tsk, int sig)
 {
@@ -2269,6 +2725,13 @@ static void ptrace_do_notify(int signr, int exit_code, int why)
 	ptrace_stop(exit_code, why, 1, &info);
 }
 
+/**
+ * ptrace_notify - 向调试器发送ptrace通知
+ * @exit_code: 退出码或停止原因
+ *
+ * 当被调试进程遇到断点、单步执行等调试事件时，
+ * 向调试器进程发送SIGTRAP信号进行通知
+ */
 void ptrace_notify(int exit_code)
 {
 	BUG_ON((exit_code & (0x7f | ~0xffff)) != SIGTRAP);
@@ -2301,6 +2764,11 @@ void ptrace_notify(int exit_code)
  * RETURNS:
  * %false if group stop is already cancelled or ptrace trap is scheduled.
  * %true if participated in group stop.
+ */
+/**
+ * do_signal_stop - 处理SIGSTOP信号
+ * @signr: 信号编号
+ * 返回值：如果进程应该停止返回true，否则返回false
  */
 static bool do_signal_stop(int signr)
 	__releases(&current->sighand->siglock)
@@ -2524,6 +2992,22 @@ static int ptrace_signal(int signr, kernel_siginfo_t *info)
 	return signr;
 }
 
+/**
+ * get_signal - 获取待处理信号
+ * @ksig: 内核信号结构，用于存储获取的信号信息
+ * 返回值：如果获取到信号返回true，否则返回false
+ */
+/**
+ * get_signal - 获取并处理挂起的信号
+ * @ksig: 存储信号信息的结构体
+ *
+ * 这是信号处理的核心函数，从信号队列中取出信号并决定如何处理：
+ * - 执行信号处理器
+ * - 执行默认动作(终止、停止、忽略等)
+ * - 处理作业控制信号
+ *
+ * 返回值: 如果需要处理信号返回true，否则返回false
+ */
 bool get_signal(struct ksignal *ksig)
 {
 	struct sighand_struct *sighand = current->sighand;
@@ -2643,34 +3127,34 @@ relock:
 		 * so that the instruction pointer in the signal stack
 		 * frame points to the faulting instruction.
 		 */
-		signr = dequeue_synchronous_signal(&ksig->info);
+		signr = dequeue_synchronous_signal(&ksig->info);  // 优先处理同步信号(如SIGSEGV、SIGFPE等)
 		if (!signr)
-			signr = dequeue_signal(current, &current->blocked, &ksig->info);
+			signr = dequeue_signal(current, &current->blocked, &ksig->info);  // 从信号队列取出下一个未被阻塞的信号
 
 		if (!signr)
-			break; /* will return 0 */
+			break; /* will return 0 */  // 没有信号需要处理，退出循环
 
-		if (unlikely(current->ptrace) && signr != SIGKILL) {
-			signr = ptrace_signal(signr, &ksig->info);
+		if (unlikely(current->ptrace) && signr != SIGKILL) {  // 被调试进程的信号需要特殊处理
+			signr = ptrace_signal(signr, &ksig->info);  // 通知调试器，可能修改或阻止信号
 			if (!signr)
-				continue;
+				continue;  // 调试器阻止了信号，继续处理下一个
 		}
 
-		ka = &sighand->action[signr-1];
+		ka = &sighand->action[signr-1];  // 获取该信号的处理动作结构体
 
 		/* Trace actually delivered signals. */
-		trace_signal_deliver(signr, &ksig->info, ka);
+		trace_signal_deliver(signr, &ksig->info, ka);  // 追踪信号传递事件
 
-		if (ka->sa.sa_handler == SIG_IGN) /* Do nothing.  */
+		if (ka->sa.sa_handler == SIG_IGN) /* Do nothing.  */  // 信号被设置为忽略
 			continue;
-		if (ka->sa.sa_handler != SIG_DFL) {
+		if (ka->sa.sa_handler != SIG_DFL) {  // 有自定义信号处理器
 			/* Run the handler.  */
-			ksig->ka = *ka;
+			ksig->ka = *ka;  // 保存信号动作，准备执行用户处理器
 
-			if (ka->sa.sa_flags & SA_ONESHOT)
+			if (ka->sa.sa_flags & SA_ONESHOT)  // SA_ONESHOT标志：执行一次后恢复默认
 				ka->sa.sa_handler = SIG_DFL;
 
-			break; /* will return non-zero "signr" value */
+			break; /* will return non-zero "signr" value */  // 跳出循环，返回给用户态执行处理器
 		}
 
 		/*
@@ -2791,6 +3275,15 @@ static void signal_delivered(struct ksignal *ksig, int stepping)
 	tracehook_signal_handler(stepping);
 }
 
+/**
+ * signal_setup_done - 信号处理器设置完成
+ * @failed: 设置是否失败
+ * @ksig: 信号信息结构体
+ * @stepping: 是否在单步调试模式
+ *
+ * 在信号处理器设置完成后进行清理工作，
+ * 如果设置失败则发送SIGSEGV信号
+ */
 void signal_setup_done(int failed, struct ksignal *ksig, int stepping)
 {
 	if (failed)
@@ -2831,6 +3324,15 @@ static void retarget_shared_pending(struct task_struct *tsk, sigset_t *which)
 	}
 }
 
+/**
+ * exit_signals - 进程退出时的信号处理
+ * @tsk: 正在退出的进程
+ *
+ * 进程退出时进行信号相关的清理工作：
+ * - 清空信号队列
+ * - 处理组停止状态
+ * - 通知其他进程此进程即将退出
+ */
 void exit_signals(struct task_struct *tsk)
 {
 	int group_stop = 0;
@@ -2894,6 +3396,14 @@ SYSCALL_DEFINE0(restart_syscall)
 	return restart->fn(restart);
 }
 
+/**
+ * do_no_restart_syscall - 不重启系统调用的处理函数
+ * @param: 重启块参数
+ *
+ * 当系统调用被信号中断且不应该重启时调用此函数，
+ * 直接返回-EINTR错误码
+ * 返回值: -EINTR表示系统调用被中断
+ */
 long do_no_restart_syscall(struct restart_block *param)
 {
 	return -EINTR;
@@ -2918,12 +3428,26 @@ static void __set_task_blocked(struct task_struct *tsk, const sigset_t *newset)
  * It is wrong to change ->blocked directly, this helper should be used
  * to ensure the process can't miss a shared signal we are going to block.
  */
+/**
+ * set_current_blocked - 设置当前进程的信号阻塞掩码
+ * @newset: 新的信号阻塞掩码
+ *
+ * 设置当前进程的信号阻塞掩码，阻塞指定的信号
+ * 同时重新计算信号挂起状态
+ */
 void set_current_blocked(sigset_t *newset)
 {
 	sigdelsetmask(newset, sigmask(SIGKILL) | sigmask(SIGSTOP));
 	__set_current_blocked(newset);
 }
 
+/**
+ * __set_current_blocked - 内部函数：设置当前进程的信号阻塞掩码
+ * @newset: 新的信号阻塞掩码
+ *
+ * 设置当前进程的信号阻塞掩码的内部实现，
+ * 不进行额外的检查和处理
+ */
 void __set_current_blocked(const sigset_t *newset)
 {
 	struct task_struct *tsk = current;
@@ -2948,6 +3472,15 @@ void __set_current_blocked(const sigset_t *newset)
  * interface happily blocks "unblockable" signals like SIGKILL
  * and friends.
  */
+/**
+ * sigprocmask - 改变进程的信号掩码
+ * @how: 操作方式(SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK)
+ * @set: 新的信号集合
+ * @oldset: 保存旧的信号掩码
+ *
+ * 实现sigprocmask()系统调用，修改进程的信号阻塞掩码
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int sigprocmask(int how, sigset_t *set, sigset_t *oldset)
 {
 	struct task_struct *tsk = current;
@@ -2959,13 +3492,13 @@ int sigprocmask(int how, sigset_t *set, sigset_t *oldset)
 
 	switch (how) {
 	case SIG_BLOCK:
-		sigorsets(&newset, &tsk->blocked, set);
+		sigorsets(&newset, &tsk->blocked, set);  // 阻塞新信号：newset = blocked ∪ set
 		break;
 	case SIG_UNBLOCK:
-		sigandnsets(&newset, &tsk->blocked, set);
+		sigandnsets(&newset, &tsk->blocked, set);  // 解除阻塞：newset = blocked ∩ ~set
 		break;
 	case SIG_SETMASK:
-		newset = *set;
+		newset = *set;  // 直接设置新的信号掩码
 		break;
 	default:
 		return -EINVAL;
@@ -2984,6 +3517,15 @@ EXPORT_SYMBOL(sigprocmask);
  *
  * Note that it does set_restore_sigmask() in advance, so it must be always
  * paired with restore_saved_sigmask_unless() before return from syscall.
+ */
+/**
+ * set_user_sigmask - 设置用户空间的信号掩码
+ * @umask: 用户空间信号掩码指针
+ * @sigsetsize: 信号集合大小
+ *
+ * 从用户空间复制信号掩码并设置为当前进程的阻塞掩码
+ * 用于ppoll、pselect等系统调用
+ * 返回值: 成功返回0，失败返回负值错误码
  */
 int set_user_sigmask(const sigset_t __user *umask, size_t sigsetsize)
 {
@@ -3004,6 +3546,15 @@ int set_user_sigmask(const sigset_t __user *umask, size_t sigsetsize)
 }
 
 #ifdef CONFIG_COMPAT
+/**
+ * set_compat_user_sigmask - 设置兼容模式的用户信号掩码
+ * @umask: 用户空间兼容信号掩码指针
+ * @sigsetsize: 信号集合大小
+ *
+ * 32位程序在64位内核上运行时，从用户空间复制兼容格式的信号掩码
+ * 用于compat_ppoll、compat_pselect等兼容系统调用
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int set_compat_user_sigmask(const compat_sigset_t __user *umask,
 			    size_t sigsetsize)
 {
@@ -3204,6 +3755,14 @@ static inline char __user *si_expansion(const siginfo_t __user *info)
 	return ((char __user *)info) + sizeof(struct kernel_siginfo);
 }
 
+/**
+ * copy_siginfo_to_user - 将内核信号信息复制到用户空间
+ * @to: 用户空间目标地址
+ * @from: 内核信号信息结构体
+ *
+ * 将内核中的信号信息安全地复制到用户空间，处理不同架构的差异
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int copy_siginfo_to_user(siginfo_t __user *to, const kernel_siginfo_t *from)
 {
 	char __user *expansion = si_expansion(to);
@@ -3246,6 +3805,14 @@ static int __copy_siginfo_from_user(int signo, kernel_siginfo_t *to,
 	return post_copy_siginfo_from_user(to, from);
 }
 
+/**
+ * copy_siginfo_from_user - 从用户空间复制信号信息到内核
+ * @to: 内核信号信息结构体
+ * @from: 用户空间信号信息地址
+ *
+ * 从用户空间安全地复制信号信息到内核，验证数据有效性
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int copy_siginfo_from_user(kernel_siginfo_t *to, const siginfo_t __user *from)
 {
 	if (copy_from_user(to, from, sizeof(struct kernel_siginfo)))
@@ -3263,6 +3830,14 @@ int copy_siginfo_from_user(kernel_siginfo_t *to, const siginfo_t __user *from)
  * fortunately it doesn't have to.  The only valid callers for this function are
  * copy_siginfo_to_user32, which is overriden for x32 and the coredump code.
  * The latter does not care because SIGCHLD will never cause a coredump.
+ */
+/**
+ * copy_siginfo_to_external32 - 将内核信号信息转换为32位兼容格式
+ * @to: 32位兼容信号信息结构体
+ * @from: 内核信号信息结构体
+ *
+ * 将64位内核的信号信息转换为32位程序可理解的格式
+ * 用于64位内核上运行32位程序的兼容性支持
  */
 void copy_siginfo_to_external32(struct compat_siginfo *to,
 		const struct kernel_siginfo *from)
@@ -3334,6 +3909,14 @@ void copy_siginfo_to_external32(struct compat_siginfo *to,
 	}
 }
 
+/**
+ * __copy_siginfo_to_user32 - 将内核信号信息复制到32位用户空间
+ * @to: 32位用户空间目标地址
+ * @from: 内核信号信息结构体
+ *
+ * 将内核信号信息复制到32位用户空间，处理字段大小和对齐差异
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int __copy_siginfo_to_user32(struct compat_siginfo __user *to,
 			   const struct kernel_siginfo *from)
 {
@@ -3435,6 +4018,14 @@ static int __copy_siginfo_from_user32(int signo, struct kernel_siginfo *to,
 	return post_copy_siginfo_from_user32(to, &from);
 }
 
+/**
+ * copy_siginfo_from_user32 - 从32位用户空间复制信号信息到内核
+ * @to: 内核信号信息结构体
+ * @from: 32位用户空间信号信息地址
+ *
+ * 从32位用户空间复制信号信息到内核，处理格式转换和验证
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int copy_siginfo_from_user32(struct kernel_siginfo *to,
 			     const struct compat_siginfo __user *ufrom)
 {
@@ -3640,6 +4231,13 @@ COMPAT_SYSCALL_DEFINE4(rt_sigtimedwait_time32, compat_sigset_t __user *, uthese,
 #endif
 #endif
 
+/**
+ * prepare_kill_siginfo - 准备kill信号的信息结构体
+ * @sig: 信号编号
+ * @info: 信号信息结构体指针
+ *
+ * 为kill系统调用准备标准的信号信息，设置发送者PID和UID
+ */
 static inline void prepare_kill_siginfo(int sig, struct kernel_siginfo *info)
 {
 	clear_siginfo(info);
@@ -3655,19 +4253,33 @@ static inline void prepare_kill_siginfo(int sig, struct kernel_siginfo *info)
  *  @pid: the PID of the process
  *  @sig: signal to be sent
  */
+/**
+ * sys_kill - kill系统调用实现
+ * @pid: 目标进程/进程组ID
+ * @sig: 信号编号
+ * 返回值：成功返回0，失败返回负错误码
+ */
 SYSCALL_DEFINE2(kill, pid_t, pid, int, sig)
 {
 	struct kernel_siginfo info;
 
-	prepare_kill_siginfo(sig, &info);
+	prepare_kill_siginfo(sig, &info);  // 准备kill信号信息，设置发送者PID/UID
 
-	return kill_something_info(sig, &info, pid);
+	return kill_something_info(sig, &info, pid);  // 根据pid值决定发送目标(进程/进程组/所有进程)
 }
 
 /*
  * Verify that the signaler and signalee either are in the same pid namespace
  * or that the signaler's pid namespace is an ancestor of the signalee's pid
  * namespace.
+ */
+/**
+ * access_pidfd_pidns - 检查pidfd的PID命名空间访问权限
+ * @pid: 目标进程的PID结构
+ *
+ * 验证信号发送者和接收者是否在同一个PID命名空间，
+ * 或者发送者的PID命名空间是接收者的祖先命名空间
+ * 返回值: 有权限访问返回true，否则返回false
  */
 static bool access_pidfd_pidns(struct pid *pid)
 {
@@ -3685,6 +4297,15 @@ static bool access_pidfd_pidns(struct pid *pid)
 	return true;
 }
 
+/**
+ * copy_siginfo_from_user_any - 从用户空间复制信号信息(兼容模式)
+ * @kinfo: 内核信号信息结构体
+ * @info: 用户空间信号信息指针
+ *
+ * 根据当前系统调用模式(32位或64位)从用户空间复制信号信息，
+ * 自动处理兼容性转换
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 static int copy_siginfo_from_user_any(kernel_siginfo_t *kinfo, siginfo_t *info)
 {
 #ifdef CONFIG_COMPAT
@@ -3700,6 +4321,14 @@ static int copy_siginfo_from_user_any(kernel_siginfo_t *kinfo, siginfo_t *info)
 	return copy_siginfo_from_user(kinfo, info);
 }
 
+/**
+ * pidfd_to_pid - 从文件描述符获取PID结构
+ * @file: 文件结构体指针
+ *
+ * 将pidfd文件描述符转换为对应的PID结构体，
+ * 支持进程pidfd和线程组pidfd两种类型
+ * 返回值: 成功返回PID结构体指针，失败返回错误指针
+ */
 static struct pid *pidfd_to_pid(const struct file *file)
 {
 	struct pid *pid;
@@ -3738,15 +4367,15 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 	kernel_siginfo_t kinfo;
 
 	/* Enforce flags be set to 0 until we add an extension. */
-	if (flags)
+	if (flags)  // 目前不支持任何标志位，为将来扩展保留
 		return -EINVAL;
 
-	f = fdget(pidfd);
+	f = fdget(pidfd);  // 获取文件描述符结构
 	if (!f.file)
 		return -EBADF;
 
 	/* Is this a pidfd? */
-	pid = pidfd_to_pid(f.file);
+	pid = pidfd_to_pid(f.file);  // 验证这是一个有效的pidfd并获取PID结构
 	if (IS_ERR(pid)) {
 		ret = PTR_ERR(pid);
 		goto err;
@@ -3781,6 +4410,16 @@ err:
 	return ret;
 }
 
+/**
+ * do_send_specific - 向特定线程发送信号的内部实现
+ * @tgid: 线程组ID
+ * @pid: 线程ID
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ *
+ * tkill/tgkill系统调用的核心实现，向指定线程发送信号
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 static int
 do_send_specific(pid_t tgid, pid_t pid, int sig, struct kernel_siginfo *info)
 {
@@ -3811,6 +4450,15 @@ do_send_specific(pid_t tgid, pid_t pid, int sig, struct kernel_siginfo *info)
 	return error;
 }
 
+/**
+ * do_tkill - tkill操作的核心实现
+ * @tgid: 线程组ID(0表示不检查线程组)
+ * @pid: 目标线程ID
+ * @sig: 信号编号
+ *
+ * 准备tkill信号信息并发送到指定线程
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 static int do_tkill(pid_t tgid, pid_t pid, int sig)
 {
 	struct kernel_siginfo info;
@@ -3838,10 +4486,10 @@ static int do_tkill(pid_t tgid, pid_t pid, int sig)
 SYSCALL_DEFINE3(tgkill, pid_t, tgid, pid_t, pid, int, sig)
 {
 	/* This is only valid for single tasks */
-	if (pid <= 0 || tgid <= 0)
+	if (pid <= 0 || tgid <= 0)  // 检查参数有效性：PID和TGID必须为正数
 		return -EINVAL;
 
-	return do_tkill(tgid, pid, sig);
+	return do_tkill(tgid, pid, sig);  // 向指定线程组中的特定线程发送信号
 }
 
 /**
@@ -3851,15 +4499,30 @@ SYSCALL_DEFINE3(tgkill, pid_t, tgid, pid_t, pid, int, sig)
  *
  *  Send a signal to only one task, even if it's a CLONE_THREAD task.
  */
+/**
+ * sys_tkill - tkill系统调用实现
+ * @pid: 目标线程ID
+ * @sig: 信号编号
+ * 返回值：成功返回0，失败返回负错误码
+ */
 SYSCALL_DEFINE2(tkill, pid_t, pid, int, sig)
 {
 	/* This is only valid for single tasks */
-	if (pid <= 0)
+	if (pid <= 0)  // 检查PID有效性：必须为正数
 		return -EINVAL;
 
-	return do_tkill(0, pid, sig);
+	return do_tkill(0, pid, sig);  // TGID=0表示不检查线程组，直接向指定线程发送信号
 }
 
+/**
+ * do_rt_sigqueueinfo - 实时信号队列信息发送的内部实现
+ * @pid: 目标进程ID
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ *
+ * rt_sigqueueinfo系统调用的核心实现，向进程发送携带用户数据的实时信号
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 static int do_rt_sigqueueinfo(pid_t pid, int sig, kernel_siginfo_t *info)
 {
 	/* Not even root can pretend to send signals from the kernel.
@@ -3903,6 +4566,16 @@ COMPAT_SYSCALL_DEFINE3(rt_sigqueueinfo,
 }
 #endif
 
+/**
+ * do_rt_tgsigqueueinfo - 线程组实时信号队列信息发送的内部实现
+ * @tgid: 线程组ID
+ * @pid: 目标线程ID
+ * @sig: 信号编号
+ * @info: 信号信息结构体
+ *
+ * rt_tgsigqueueinfo系统调用的核心实现，向指定线程发送实时信号
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 static int do_rt_tgsigqueueinfo(pid_t tgid, pid_t pid, int sig, kernel_siginfo_t *info)
 {
 	/* This is only valid for single tasks */
@@ -3947,6 +4620,14 @@ COMPAT_SYSCALL_DEFINE4(rt_tgsigqueueinfo,
 /*
  * For kthreads only, must not be used if cloned with CLONE_SIGHAND
  */
+/**
+ * kernel_sigaction - 内核模式设置信号处理器
+ * @sig: 信号编号
+ * @action: 信号处理器函数指针
+ *
+ * 仅供内核线程使用，设置指定信号的处理器
+ * 禁止在使用CLONE_SIGHAND的进程中调用
+ */
 void kernel_sigaction(int sig, __sighandler_t action)
 {
 	spin_lock_irq(&current->sighand->siglock);
@@ -3970,6 +4651,15 @@ void __weak sigaction_compat_abi(struct k_sigaction *act,
 {
 }
 
+/**
+ * do_sigaction - 执行信号动作设置的核心函数
+ * @sig: 信号编号
+ * @act: 新的信号动作结构体
+ * @oact: 保存旧的信号动作结构体
+ *
+ * 设置或查询指定信号的处理动作，这是sigaction系统调用的核心实现
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int do_sigaction(int sig, struct k_sigaction *act, struct k_sigaction *oact)
 {
 	struct task_struct *p = current, *t;
@@ -4072,6 +4762,13 @@ SYSCALL_DEFINE2(sigaltstack,const stack_t __user *,uss, stack_t __user *,uoss)
 	return err;
 }
 
+/**
+ * restore_altstack - 恢复信号备用栈设置
+ * @uss: 用户空间信号栈结构体指针
+ *
+ * 从用户空间恢复信号备用栈的设置，用于信号处理器返回时恢复栈状态
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int restore_altstack(const stack_t __user *uss)
 {
 	stack_t new;
@@ -4083,6 +4780,15 @@ int restore_altstack(const stack_t __user *uss)
 	return 0;
 }
 
+/**
+ * __save_altstack - 保存当前信号备用栈设置到用户空间
+ * @uss: 用户空间信号栈结构体指针
+ * @sp: 当前栈指针
+ *
+ * 将当前进程的信号备用栈设置保存到用户空间，
+ * 如果启用了SS_AUTODISARM标志则自动重置栈设置
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int __save_altstack(stack_t __user *uss, unsigned long sp)
 {
 	struct task_struct *t = current;
@@ -4133,6 +4839,13 @@ COMPAT_SYSCALL_DEFINE2(sigaltstack,
 	return do_compat_sigaltstack(uss_ptr, uoss_ptr);
 }
 
+/**
+ * compat_restore_altstack - 恢复32位兼容模式的信号备用栈
+ * @uss: 32位用户空间信号栈结构体指针
+ *
+ * 32位程序在64位内核上恢复信号备用栈设置
+ * 返回值: 成功返回0，失败返回-EFAULT
+ */
 int compat_restore_altstack(const compat_stack_t __user *uss)
 {
 	int err = do_compat_sigaltstack(uss, NULL);
@@ -4140,6 +4853,14 @@ int compat_restore_altstack(const compat_stack_t __user *uss)
 	return err == -EFAULT ? err : 0;
 }
 
+/**
+ * __compat_save_altstack - 保存32位兼容模式的信号备用栈设置
+ * @uss: 32位用户空间信号栈结构体指针
+ * @sp: 当前栈指针
+ *
+ * 将当前进程的信号备用栈设置保存为32位格式到用户空间
+ * 返回值: 成功返回0，失败返回负值错误码
+ */
 int __compat_save_altstack(compat_stack_t __user *uss, unsigned long sp)
 {
 	int err;
@@ -4453,6 +5174,14 @@ SYSCALL_DEFINE0(pause)
 
 #endif
 
+/**
+ * sigsuspend - 信号挂起的核心实现
+ * @set: 临时信号掩码
+ *
+ * 临时替换进程的信号掩码并挂起进程，直到收到信号为止
+ * 实现sigsuspend系统调用的核心逻辑
+ * 返回值: 总是返回-ERESTARTNOHAND
+ */
 static int sigsuspend(sigset_t *set)
 {
 	current->saved_sigmask = current->blocked;
@@ -4522,6 +5251,12 @@ __weak const char *arch_vma_name(struct vm_area_struct *vma)
 	return NULL;
 }
 
+/**
+ * siginfo_buildtime_checks - 信号信息结构体编译时检查
+ *
+ * 在编译时检查用户态和内核态siginfo结构体的兼容性，
+ * 确保字段偏移量和大小匹配，包括32位兼容性检查
+ */
 static inline void siginfo_buildtime_checks(void)
 {
 	BUILD_BUG_ON(sizeof(struct siginfo) != SI_MAX_SIZE);
@@ -4591,11 +5326,16 @@ static inline void siginfo_buildtime_checks(void)
 #endif
 }
 
+/**
+ * signals_init - 初始化信号子系统
+ *
+ * 在内核启动时初始化信号子系统，进行编译时检查和创建信号队列缓存
+ */
 void __init signals_init(void)
 {
-	siginfo_buildtime_checks();
+	siginfo_buildtime_checks();  // 编译时检查siginfo结构体兼容性
 
-	sigqueue_cachep = KMEM_CACHE(sigqueue, SLAB_PANIC);
+	sigqueue_cachep = KMEM_CACHE(sigqueue, SLAB_PANIC);  // 创建信号队列对象缓存
 }
 
 #ifdef CONFIG_KGDB_KDB
@@ -4605,6 +5345,14 @@ void __init signals_init(void)
  * signal internals.  This function checks if the required locks are
  * available before calling the main signal code, to avoid kdb
  * deadlocks.
+ */
+/**
+ * kdb_send_sig - KDB调试器发送信号接口
+ * @t: 目标进程
+ * @sig: 信号编号
+ *
+ * 供KDB调试器使用的信号发送函数，在调试时避免死锁
+ * 会检查锁的可用性和进程状态以确保安全发送信号
  */
 void kdb_send_sig(struct task_struct *t, int sig)
 {

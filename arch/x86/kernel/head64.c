@@ -5,6 +5,33 @@
  *  Copyright (C) 2000 Andrea Arcangeli <andrea@suse.de> SuSE
  */
 
+/**
+ * arch/x86/kernel/head64.c - x86_64早期启动初始化（汇编后的第一个C入口）
+ *
+ * 本文件是x86_64架构从汇编代码过渡到C代码的桥梁。
+ * arch/x86/kernel/head_64.S 中的 startup_64 完成最基本的汇编初始化后，
+ * 跳转到本文件中的 x86_64_start_kernel() 函数。
+ *
+ * 启动链：
+ *   BIOS/UEFI
+ *   → bootloader (GRUB)
+ *   → arch/x86/boot/header.S        (实模式引导头，解压内核)
+ *   → arch/x86/kernel/head_64.S     (startup_64: 建立初始页表、进入64位长模式)
+ *   → x86_64_start_kernel()  [本文件] (第一个C函数)
+ *   → x86_64_start_reservations()   (保留特殊内存区域)
+ *   → start_kernel()                (init/main.c，通用内核初始化)
+ *
+ * 主要职责：
+ *   - 清零BSS段（全局未初始化变量区）
+ *   - 清空顶级页目录(PGD)，准备建立正式内核页表
+ *   - 检测并初始化AMD安全内存加密(SME)特性
+ *   - 设置早期IDT异常处理，捕获启动期间的CPU异常
+ *   - 复制bootloader传递的boot_params参数到内核内存
+ *   - 加载CPU微码（修复CPU硬件bug）
+ *   - 保留关键内存区域（BIOS数据、initrd等）
+ *   - 跳转到通用内核初始化入口 start_kernel()
+ */
+
 #define DISABLE_BRANCH_PROFILING
 
 /* cpu_feature_enabled() cannot be used this early */
@@ -458,6 +485,19 @@ static void __init copy_bootdata(char *real_mode_data)
 	sme_unmap_bootdata(real_mode_data);
 }
 
+/**
+ * x86_64_start_kernel - 从汇编跳入的第一个C函数
+ * @real_mode_data: bootloader传递的实模式数据区物理地址
+ *
+ * 在 head_64.S:startup_64 建立初始64位页表并设置内核栈后，
+ * 通过 initial_code 指针跳转到此函数。
+ *
+ * 此时的内存状态：
+ *   - CPU处于64位长模式
+ *   - 已建立临时恒等映射(identity mapping)和内核高地址映射
+ *   - BSS段尚未清零，全局变量不可靠
+ *   - 中断未使能，没有IDT
+ */
 asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 {
 	/*
@@ -474,13 +514,17 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 				(__START_KERNEL & PGDIR_MASK)));
 	BUILD_BUG_ON(__fix_to_virt(__end_of_fixed_addresses) <= MODULES_END);
 
+	/* 初始化CR4控制寄存器的影子变量，用于追踪CR4状态（避免每次读取CR4） */
 	cr4_init_shadow();
 
 	/* Kill off the identity-map trampoline */
+	/* 重置并清除早期恒等映射页表（启动蹦床用的临时映射），避免低地址被错误访问 */
 	reset_early_page_tables();
 
+	/* 清零BSS段（存放未初始化全局变量的内存区域），确保全局变量初始为0 */
 	clear_bss();
 
+	/* 清空顶级页目录(PGD=init_top_pgt)，准备建立正式的内核页表 */
 	clear_page(init_top_pgt);
 
 	/*
@@ -488,31 +532,52 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	 * encryption mask, so it needs to be called before anything
 	 * that may generate a page fault.
 	 */
+	/* 检测AMD安全内存加密(SME)特性，若启用则更新页表标志位以加密内存 */
 	sme_early_init();
 
+	/* 初始化KASAN（内核地址净化器）的早期数据结构，用于检测内存访问越界 */
 	kasan_early_init();
 
+	/* 设置早期IDT（中断描述符表）异常处理，捕获启动期间发生的CPU异常 */
 	idt_setup_early_handler();
 
+	/* 将bootloader传递的实模式数据(boot_params)从低内存复制到内核数据段 */
 	copy_bootdata(__va(real_mode_data));
 
 	/*
 	 * Load microcode early on BSP.
 	 */
+	/* 在引导CPU(BSP)上尽早加载CPU微码，修复CPU硬件缺陷 */
 	load_ucode_bsp();
 
 	/* set init_top_pgt kernel high mapping*/
+	/* 将早期页表的最后一项(内核高地址映射)复制到正式的顶级页目录 */
 	init_top_pgt[511] = early_top_pgt[511];
 
+	/* 保留关键内存区域，然后调用通用内核初始化入口 start_kernel() */
 	x86_64_start_reservations(real_mode_data);
 }
 
+/**
+ * x86_64_start_reservations - 保留关键内存区域并跳转到通用内核初始化
+ * @real_mode_data: bootloader传递的实模式数据区物理地址
+ *
+ * 在 x86_64_start_kernel() 的末尾被调用，完成x86特有的内存保留后，
+ * 调用 start_kernel() 进入与架构无关的通用内核初始化流程。
+ *
+ * 保留的内存区域包括：
+ *   - BIOS保留区（低1MB中的BIOS数据区、中断向量表等）
+ *   - EBDA（扩展BIOS数据区）
+ *   - initrd（初始内存磁盘，如果bootloader提供了的话）
+ */
 void __init x86_64_start_reservations(char *real_mode_data)
 {
 	/* version is always not zero if it is copied */
+	/* 如果boot_params尚未复制（version为0），则再次复制实模式数据 */
 	if (!boot_params.hdr.version)
 		copy_bootdata(__va(real_mode_data));
 
+	/* 处理x86平台特定的早期硬件怪癖（如Intel MID平台特殊初始化） */
 	x86_early_init_platform_quirks();
 
 	switch (boot_params.hdr.hardware_subarch) {
@@ -523,6 +588,7 @@ void __init x86_64_start_reservations(char *real_mode_data)
 		break;
 	}
 
+	/* 跳转到通用内核初始化，此后的代码与CPU架构无关 */
 	start_kernel();
 }
 

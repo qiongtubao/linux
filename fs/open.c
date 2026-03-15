@@ -2,6 +2,10 @@
 /*
  *  linux/fs/open.c
  *
+ *  VFS文件打开/关闭系统调用实现
+ *  提供open/close/creat/truncate/access等系统调用的VFS层实现
+ *  处理文件权限检查、文件描述符分配、文件操作初始化等
+ *
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
@@ -35,6 +39,33 @@
 
 #include "internal.h"
 
+/*
+ * do_truncate - 执行文件截断操作
+ * @dentry: 要截断的文件的dentry
+ * @length: 截断后的文件长度
+ * @time_attrs: 时间属性标志
+ * @filp: 文件指针（可选）
+ *
+ * 执行实际的文件截断操作，包括权限检查和属性更新。
+ * 在截断时会移除suid、sgid和文件能力位。
+ */
+/**
+ * do_truncate - 修改文件大小（截断或扩展）的VFS层实现
+ * @dentry:     目标文件的目录项
+ * @length:     新的文件大小（字节）
+ * @time_attrs: inode时间戳更新标志（ATTR_MTIME等）
+ * @filp:       若通过文件描述符调用，传入对应的file结构；否则为NULL
+ *
+ * truncate()/ftruncate() 系统调用的核心实现：
+ *   1. 构建 iattr 结构（包含 ATTR_SIZE 和新大小）
+ *   2. 调用 notify_change() → inode->i_op->setattr()（如ext4_setattr）
+ *      - 文件缩小：释放多余数据块，截断 page cache
+ *      - 文件扩大：创建"空洞"（sparse file），不分配实际磁盘块
+ *   3. 更新 inode 时间戳（mtime/ctime）
+ *
+ * 调用前需持有 inode->i_mutex 锁，调用者负责权限检查。
+ * 文件系统相关操作通过 inode->i_op->setattr 派发，支持多种文件系统。
+ */
 int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
 	struct file *filp)
 {
@@ -140,9 +171,25 @@ retry:
 	return error;
 }
 
+/* truncate系统调用入口 - 截断文件到指定长度 */
+/**
+ * sys_truncate - truncate()系统调用：通过路径名截断文件
+ * @path:   文件路径（用户空间字符串）
+ * @length: 新的文件大小（字节）
+ *
+ * 通过文件路径修改文件大小：
+ *   1. do_sys_truncate() → user_path()解析路径 → 权限检查
+ *   2. 检查文件类型（必须是普通文件）、写权限
+ *   3. 检查文件系统是否只读
+ *   4. 调用 do_truncate() → notify_change() → inode->i_op->setattr()
+ *
+ * 与 ftruncate() 的区别：truncate() 通过路径名访问文件，
+ * ftruncate() 通过文件描述符访问（调用者需已打开文件且有写权限）。
+ * 两者最终都调用 do_truncate() 完成实际操作。
+ */
 SYSCALL_DEFINE2(truncate, const char __user *, path, long, length)
 {
-	return do_sys_truncate(path, length);
+	return do_sys_truncate(path, length); /* 调用内核truncate实现 */
 }
 
 #ifdef CONFIG_COMPAT
@@ -477,11 +524,26 @@ SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,
 	return do_faccessat(dfd, filename, mode, flags);
 }
 
+/* access系统调用入口 - 检查文件访问权限 */
 SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
 {
-	return do_faccessat(AT_FDCWD, filename, mode, 0);
+	return do_faccessat(AT_FDCWD, filename, mode, 0); /* 调用权限检查实现 */
 }
 
+/**
+ * sys_chdir - chdir()系统调用：改变进程的当前工作目录
+ * @filename: 目标目录路径（用户空间字符串）
+ *
+ * 将进程的当前工作目录（cwd）切换到指定路径：
+ *   1. user_path_at()：解析路径，获取目标目录的 path 结构
+ *      - LOOKUP_FOLLOW：跟随符号链接
+ *      - LOOKUP_DIRECTORY：要求目标必须是目录
+ *   2. inode_permission()：检查进程是否有 MAY_EXEC（进入目录）权限
+ *   3. set_fs_pwd()：更新 current->fs->pwd 为新目录
+ *
+ * 之后所有相对路径查找（如 open("./file")）都基于新的 pwd。
+ * retry 标签处理 LOOKUP_RCU 模式下的竞争重试。
+ */
 SYSCALL_DEFINE1(chdir, const char __user *, filename)
 {
 	struct path path;
@@ -530,6 +592,24 @@ out:
 	return error;
 }
 
+/**
+ * sys_chroot - chroot()系统调用：改变进程的根目录（文件系统隔离）
+ * @filename: 新根目录路径
+ *
+ * 将进程的根目录（"/"）切换到指定目录，常用于：
+ *   - 容器/沙箱隔离（限制进程可见的文件系统树）
+ *   - 系统安装/恢复环境
+ *   - 安全隔离（chroot jail）
+ *
+ * 执行步骤：
+ *   1. 解析路径（LOOKUP_FOLLOW | LOOKUP_DIRECTORY）
+ *   2. 检查执行权限（MAY_EXEC，需要能进入该目录）
+ *   3. 检查调用者是否有 CAP_SYS_CHROOT 能力（需要root权限）
+ *   4. set_fs_root()：更新 current->fs->root 为新根目录
+ *
+ * 注意：chroot不是完整的安全隔离（可通过fd逃逸），
+ * 真正的容器隔离需配合 unshare(CLONE_NEWNS) 使用。
+ */
 SYSCALL_DEFINE1(chroot, const char __user *, filename)
 {
 	struct path path;
@@ -598,6 +678,20 @@ int vfs_fchmod(struct file *file, umode_t mode)
 	return chmod_common(&file->f_path, mode);
 }
 
+/**
+ * sys_fchmod - fchmod()系统调用：通过文件描述符修改文件权限位
+ * @fd:   打开的文件描述符
+ * @mode: 新的权限位（如 0644 = rw-r--r--）
+ *
+ * 通过已打开的文件描述符修改文件的访问权限（inode->i_mode的低12位）：
+ *   1. fdget()：从文件描述符表获取 struct file
+ *   2. vfs_fchmod()：VFS层权限修改
+ *      - 检查调用者是否为文件所有者或有 CAP_FOWNER 能力
+ *      - 调用 notify_change() → inode->i_op->setattr()
+ *      - 更新 inode->i_mode，写入磁盘（标记inode为dirty）
+ *
+ * 与 chmod()（通过路径名）相比，fchmod() 避免了TOCTOU竞争条件。
+ */
 SYSCALL_DEFINE2(fchmod, unsigned int, fd, umode_t, mode)
 {
 	struct fd f = fdget(fd);
@@ -634,9 +728,10 @@ SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename,
 	return do_fchmodat(dfd, filename, mode);
 }
 
+/* chmod系统调用入口 - 修改文件权限 */
 SYSCALL_DEFINE2(chmod, const char __user *, filename, umode_t, mode)
 {
-	return do_fchmodat(AT_FDCWD, filename, mode);
+	return do_fchmodat(AT_FDCWD, filename, mode); /* 调用权限修改实现 */
 }
 
 int chown_common(const struct path *path, uid_t user, gid_t group)
@@ -719,9 +814,10 @@ SYSCALL_DEFINE5(fchownat, int, dfd, const char __user *, filename, uid_t, user,
 	return do_fchownat(dfd, filename, user, group, flag);
 }
 
+/* chown系统调用入口 - 修改文件所有者 */
 SYSCALL_DEFINE3(chown, const char __user *, filename, uid_t, user, gid_t, group)
 {
-	return do_fchownat(AT_FDCWD, filename, user, group, 0);
+	return do_fchownat(AT_FDCWD, filename, user, group, 0); /* 调用所有者修改实现 */
 }
 
 SYSCALL_DEFINE3(lchown, const char __user *, filename, uid_t, user, gid_t, group)
@@ -760,6 +856,23 @@ SYSCALL_DEFINE3(fchown, unsigned int, fd, uid_t, user, gid_t, group)
 	return ksys_fchown(fd, user, group);
 }
 
+/*
+ * do_dentry_open - 执行文件打开的核心操作
+ * @f: 文件结构指针
+ * @inode: 要打开的inode
+ * @open: 文件系统特定的open回调函数
+ *
+ * 这是文件打开操作的核心实现函数，执行以下主要步骤：
+ * 1. 初始化文件结构的基本字段
+ * 2. 处理O_PATH标志的特殊情况
+ * 3. 获取写访问权限（如果需要）
+ * 4. 设置文件操作函数指针
+ * 5. 执行安全检查和租约检查
+ * 6. 调用文件系统特定的open函数
+ * 7. 设置读写能力标志
+ *
+ * 返回0表示成功，负值表示错误码。
+ */
 static int do_dentry_open(struct file *f,
 			  struct inode *inode,
 			  int (*open)(struct inode *, struct file *))
@@ -767,16 +880,16 @@ static int do_dentry_open(struct file *f,
 	static const struct file_operations empty_fops = {};
 	int error;
 
-	path_get(&f->f_path);
-	f->f_inode = inode;
-	f->f_mapping = inode->i_mapping;
-	f->f_wb_err = filemap_sample_wb_err(f->f_mapping);
-	f->f_sb_err = file_sample_sb_err(f);
+	path_get(&f->f_path); /* 增加路径引用计数 */
+	f->f_inode = inode; /* 设置文件的inode */
+	f->f_mapping = inode->i_mapping; /* 设置地址空间映射 */
+	f->f_wb_err = filemap_sample_wb_err(f->f_mapping); /* 采样回写错误 */
+	f->f_sb_err = file_sample_sb_err(f); /* 采样超级块错误 */
 
-	if (unlikely(f->f_flags & O_PATH)) {
-		f->f_mode = FMODE_PATH | FMODE_OPENED;
-		f->f_op = &empty_fops;
-		return 0;
+	if (unlikely(f->f_flags & O_PATH)) { /* 处理O_PATH标志 */
+		f->f_mode = FMODE_PATH | FMODE_OPENED; /* 设置为路径模式 */
+		f->f_op = &empty_fops; /* 使用空操作函数 */
+		return 0; /* O_PATH模式下直接返回 */
 	}
 
 	if (f->f_mode & FMODE_WRITE && !special_file(inode->i_mode)) {
@@ -1124,6 +1237,13 @@ struct file *file_open_name(struct filename *name, int flags, umode_t mode)
  * have to.  But in generally you should not do this, so please move
  * along, nothing to see here..
  */
+/**
+ * filp_open - 内核内部打开文件的接口（使用内核空间文件名）
+ *
+ * 供内核代码（而非用户空间系统调用）使用，通过getname_kernel()
+ * 将内核字符串封装为filename结构，再调用file_open_name()
+ * 执行实际的路径解析和文件打开。返回struct file指针或ERR_PTR错误。
+ */
 struct file *filp_open(const char *filename, int flags, umode_t mode)
 {
 	struct filename *name = getname_kernel(filename);
@@ -1149,6 +1269,14 @@ struct file *file_open_root(struct dentry *dentry, struct vfsmount *mnt,
 }
 EXPORT_SYMBOL(file_open_root);
 
+/**
+ * do_sys_openat2 - openat2系统调用的核心实现（支持扩展open标志）
+ *
+ * 解析open_how参数（flags、mode、resolve标志），调用build_open_flags()
+ * 转换为内部open_flags结构，再通过do_filp_open()执行路径解析和
+ * 文件打开，最后将struct file安装到进程文件描述符表并返回fd。
+ * 是open/openat/openat2系统调用的统一后端。
+ */
 static long do_sys_openat2(int dfd, const char __user *filename,
 			   struct open_how *how)
 {
@@ -1178,6 +1306,13 @@ static long do_sys_openat2(int dfd, const char __user *filename,
 	return fd;
 }
 
+/**
+ * do_sys_open - open/openat系统调用的兼容层包装
+ *
+ * 将传统open标志（flags）和模式（mode）通过build_open_how()
+ * 转换为新的open_how结构，然后调用do_sys_openat2()统一处理。
+ * 是SYSCALL_DEFINE3(open)和SYSCALL_DEFINE3(openat)的实际执行者。
+ */
 long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 {
 	struct open_how how = build_open_how(flags, mode);
@@ -1185,19 +1320,21 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 }
 
 
+/* open系统调用入口 - 打开文件并返回文件描述符 */
 SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
 {
-	if (force_o_largefile())
+	if (force_o_largefile()) /* 在64位系统上强制设置O_LARGEFILE */
 		flags |= O_LARGEFILE;
-	return do_sys_open(AT_FDCWD, filename, flags, mode);
+	return do_sys_open(AT_FDCWD, filename, flags, mode); /* 调用内核open实现 */
 }
 
+/* openat系统调用入口 - 相对于目录文件描述符打开文件 */
 SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 		umode_t, mode)
 {
-	if (force_o_largefile())
+	if (force_o_largefile()) /* 在64位系统上强制设置O_LARGEFILE */
 		flags |= O_LARGEFILE;
-	return do_sys_open(dfd, filename, flags, mode);
+	return do_sys_open(dfd, filename, flags, mode); /* 调用内核open实现 */
 }
 
 SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
@@ -1249,13 +1386,14 @@ COMPAT_SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, fla
  * For backward compatibility?  Maybe this should be moved
  * into arch/i386 instead?
  */
+/* creat系统调用入口 - 创建新文件（向后兼容接口） */
 SYSCALL_DEFINE2(creat, const char __user *, pathname, umode_t, mode)
 {
-	int flags = O_CREAT | O_WRONLY | O_TRUNC;
+	int flags = O_CREAT | O_WRONLY | O_TRUNC; /* 创建、只写、截断标志 */
 
-	if (force_o_largefile())
+	if (force_o_largefile()) /* 在64位系统上强制设置O_LARGEFILE */
 		flags |= O_LARGEFILE;
-	return do_sys_open(AT_FDCWD, pathname, flags, mode);
+	return do_sys_open(AT_FDCWD, pathname, flags, mode); /* 调用open实现 */
 }
 #endif
 
@@ -1290,11 +1428,12 @@ EXPORT_SYMBOL(filp_close);
  * releasing the fd. This ensures that one clone task can't release
  * an fd while another clone is opening it.
  */
+/* close系统调用入口 - 关闭文件描述符 */
 SYSCALL_DEFINE1(close, unsigned int, fd)
 {
-	int retval = __close_fd(current->files, fd);
+	int retval = __close_fd(current->files, fd); /* 关闭文件描述符 */
 
-	/* can't restart close syscall because file table entry was cleared */
+	/* 不能重启close系统调用，因为文件表项已被清除 */
 	if (unlikely(retval == -ERESTARTSYS ||
 		     retval == -ERESTARTNOINTR ||
 		     retval == -ERESTARTNOHAND ||

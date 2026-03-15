@@ -12,6 +12,40 @@
  *  Multiqueue VM started 5.8.00, Rik van Riel.
  */
 
+/**
+ * mm/vmscan.c - 页面回收（Page Reclaim）核心
+ *
+ * 实现Linux虚拟内存的页面回收机制，当系统内存不足时
+ * 将不常用的页面换出到交换区（swap）或直接丢弃文件缓存页。
+ *
+ * LRU页面管理策略：
+ *   每个内存zone维护两条LRU链表：
+ *   active list   - 最近访问过的"热"页面
+ *   inactive list - 候选回收的"冷"页面
+ *   访问页面时从inactive提升到active；回收时从inactive末尾淘汰。
+ *
+ * 回收触发路径：
+ *   1. 直接回收（同步）：
+ *      __alloc_pages() 分配失败 → try_to_free_pages() → shrink_zones()
+ *   2. 后台回收（异步）：
+ *      kswapd内核线程 定期检测水位线，低于low水位时开始回收
+ *   3. 内存压力回收：
+ *      memory cgroup超出限制时触发 mem_cgroup_reclaim()
+ *
+ * 水位线机制：
+ *   pages_high  - 空闲页足够，kswapd休眠
+ *   pages_low   - kswapd开始后台回收
+ *   pages_min   - 直接回收，进程分配内存时被迫等待
+ *
+ * 关键函数：
+ *   kswapd()              - 后台页面回收守护线程（每个NUMA节点一个）
+ *   try_to_free_pages()   - 同步直接回收入口
+ *   shrink_lruvec()       - 收缩LRU链表（active+inactive）
+ *   shrink_active_list()  - 将active页面降级到inactive链表
+ *   shrink_inactive_list()- 尝试回收inactive链表中的页面
+ *   shrink_page_list()    - 对候选页面列表逐页执行回收尝试
+ */
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/mm.h>
@@ -411,6 +445,26 @@ EXPORT_SYMBOL(unregister_shrinker);
 
 #define SHRINK_BATCH 128
 
+/**
+ * do_shrink_slab - 调用单个shrinker释放内核缓存对象
+ * @shrinkctl: shrinker控制参数（gfp_mask、nid、memcg等）
+ * @shrinker:  要调用的shrinker（已注册的内核对象缓存）
+ * @priority:  回收优先级
+ *
+ * shrink_slab() 的子函数，负责驱动单个shrinker完成回收任务：
+ *
+ * 扫描量计算：
+ *   total_scan = 已延迟的对象数（nr_deferred）+ 本轮分配量
+ *   本轮分配量 = freeable × (4 / seeks) >> priority
+ *   - seeks：shrinker的相对代价，越大代表回收越昂贵
+ *   - priority越低（更紧急），分配量越大
+ *
+ * 批量回收（batch_size）：每次最多扫描 SHRINK_BATCH（128）个对象，
+ * 防止单次调用持锁时间过长。
+ *
+ * 延迟机制：若本轮扫描量 > 实际回收量，差值存入 nr_deferred，
+ * 下次调用时补偿，确保回收压力持续累积直到对象被释放。
+ */
 static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 				    struct shrinker *shrinker, int priority)
 {
@@ -644,6 +698,26 @@ static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
  *
  * Returns the number of reclaimed slab objects.
  */
+/**
+ * shrink_slab - 收缩各种内核slab缓存（shrinker机制）
+ * @gfp_mask: 内存分配标志（决定是否可以等待）
+ * @nid:      目标NUMA节点
+ * @memcg:    目标内存控制组（NULL表示全局）
+ * @priority: 回收优先级（DEF_PRIORITY到0，越低越激进）
+ *
+ * 内核的slab分配器（dcache、inode cache、dentry cache等）通过注册
+ * struct shrinker 来参与内存回收。此函数遍历所有注册的shrinker并调用：
+ *
+ *   do_shrink_slab()：
+ *     - count_objects()：统计可回收对象数量
+ *     - scan_objects()：实际释放对象（如 prune_dcache_sb、prune_icache_sb）
+ *
+ * 回收顺序：先回收memcg级别的shrinker，再回收全局shrinker。
+ * shrinker延迟：本轮未能释放的配额（nr_deferred）递延到下轮。
+ * priority越低，每个shrinker被要求释放的对象数越多。
+ *
+ * 返回实际释放的对象/页面总数。
+ */
 static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 				 struct mem_cgroup *memcg,
 				 int priority)
@@ -777,6 +851,25 @@ typedef enum {
  * pageout is called by shrink_page_list() for each dirty page.
  * Calls ->writepage().
  */
+/**
+ * pageout - 将脏页写回磁盘（回收前的writeback操作）
+ * @page:    要写回的内存页
+ * @mapping: 页面对应的地址空间（文件映射）
+ *
+ * 在内存回收路径中，脏页不能直接释放，必须先将数据写回存储设备。
+ * 此函数负责触发单个页面的写回操作：
+ *   - PAGE_KEEP:    页面引用计数>1，暂不能回收，跳过
+ *   - PAGE_ACTIVATE: 写回失败或拥塞，将页面重新标记为活跃
+ *   - PAGE_SUCCESS:  成功提交writeback（异步IO）
+ *   - PAGE_CLEAN:    页面已干净（或无mapping），可直接释放
+ *
+ * 策略：
+ *   - 非阻塞场景（如kswapd）：仅对非阻塞writeback安全的页面发起写回
+ *   - 匿名页/swapcache：即使可能阻塞也强制写回（用于swap throttling）
+ *   - 无mapping的孤儿页：尝试释放其私有缓冲区
+ *
+ * 返回 pageout_t 枚举值，供 shrink_page_list() 决定页面命运。
+ */
 static pageout_t pageout(struct page *page, struct address_space *mapping)
 {
 	/*
@@ -850,6 +943,25 @@ static pageout_t pageout(struct page *page, struct address_space *mapping)
 /*
  * Same as remove_mapping, but if the page is removed from the mapping, it
  * gets returned with a refcount of 0.
+ */
+/**
+ * __remove_mapping - 从地址空间（page cache/swap cache）移除页面
+ * @mapping:     页面所属的地址空间
+ * @page:        要移除的页面
+ * @reclaimed:   是否已完成回收（用于更新workingset统计）
+ * @target_memcg: 目标内存控制组
+ *
+ * shrink_page_list() 中在页面writeback完成后调用，将页面从 page cache 移除：
+ *
+ *   1. 获取 xa_lock（保护 i_pages xarray/radix tree）
+ *   2. 检查页面引用计数：若 refcount > 2（mapping + 其他引用），放弃移除
+ *   3. 清除页面在 xarray 中的条目（对文件页）
+ *      或从 swap cache 中移除（对匿名页）
+ *   4. workingset_eviction()：更新 shadow entry，记录页面被驱逐的时间戳
+ *      （用于 workingset detection，判断页面是否值得再次激活）
+ *   5. 清除 PageSwapCache/PageUptodate 等标志
+ *
+ * 成功后页面不再与任何地址空间关联，可以被 free_pages() 释放。
  */
 static int __remove_mapping(struct address_space *mapping, struct page *page,
 			    bool reclaimed, struct mem_cgroup *target_memcg)
@@ -970,6 +1082,17 @@ int remove_mapping(struct address_space *mapping, struct page *page)
  *
  * lru_lock must not be held, interrupts must be enabled.
  */
+/**
+ * putback_lru_page - 将隔离的页面归还到LRU链表
+ * @page: 要归还的页面（之前通过 isolate_lru_page() 隔离）
+ *
+ * 当页面因某种原因无法回收（如引用计数过高、writeback失败等），
+ * 需要将其放回LRU链表，等待下次回收机会：
+ *   1. lru_cache_add()：将页面加回对应的LRU链表（活跃或非活跃）
+ *   2. put_page()：释放 isolate_lru_page() 时增加的引用计数
+ *
+ * 此函数是隔离操作的反向操作，确保页面不会因为被隔离而永远丢失。
+ */
 void putback_lru_page(struct page *page)
 {
 	lru_cache_add(page);
@@ -983,6 +1106,27 @@ enum page_references {
 	PAGEREF_ACTIVATE,
 };
 
+/**
+ * page_check_references - 检查页面的引用状态，决定是否可以回收
+ * @page: 要检查的页面
+ * @sc:   回收控制参数
+ *
+ * shrink_page_list() 中对每个非活跃页面调用此函数，
+ * 通过检查PTE访问位和页面引用标志，判断页面是否被进程活跃使用：
+ *
+ * 返回值（enum page_references）：
+ *   PAGEREF_RECLAIM：        无引用，可以直接回收
+ *   PAGEREF_RECLAIM_CLEAN:   无引用，但是干净页，可以直接丢弃（不需写回）
+ *   PAGEREF_KEEP：           有引用但不激活，保留在非活跃链表
+ *   PAGEREF_ACTIVATE：       被频繁引用，提升到活跃链表
+ *
+ * 引用计数来源：
+ *   - referenced_ptes：通过 rmap 遍历所有PTE，统计访问位置位的数量
+ *   - referenced_page：页面自身的 PG_referenced 标志（上次扫描已设置）
+ *
+ * 特殊情况：可执行文件映射的页面（VM_EXEC），只要有一个引用就激活
+ * （避免重复加载代码段）。
+ */
 static enum page_references page_check_references(struct page *page,
 						  struct scan_control *sc)
 {
@@ -1068,6 +1212,32 @@ static void page_check_dirty_writeback(struct page *page,
 
 /*
  * shrink_page_list() returns the number of reclaimed pages
+ */
+/**
+ * shrink_page_list - 对候选页面列表逐页尝试回收
+ * @page_list: 待回收的页面链表（从inactive LRU取出）
+ * @pgdat:     内存节点
+ * @sc:        回收控制参数
+ * @stat:      回收统计信息输出
+ * @ignore_references: 是否忽略引用标志强制回收
+ *
+ * 遍历页面列表，对每个页面判断是否可以回收：
+ *  - 匿名页（堆/栈）：若有swap空间则换出到交换区
+ *  - 文件缓存页（干净）：直接丢弃（下次访问重新从磁盘读入）
+ *  - 文件缓存页（脏）：写回磁盘后再丢弃（writeback）
+ *  - 被锁定/正在使用的页：跳过，放回inactive链表
+ *
+ * 返回实际回收的页面数。
+ */
+/**
+ * shrink_page_list - 对隔离出的页面列表执行实际回收操作
+ *
+ * LRU页面回收的核心处理函数。逐页检查每个页面的状态：
+ * - 匿名页：尝试加入swap cache，必要时写入swap设备
+ * - 文件页：若为脏页则触发writeback，若已完成writeback则释放
+ * - 映射页：调用try_to_unmap()解除所有PTE映射
+ * - 引用页（referenced）：重新激活（放回活跃链表）
+ * 返回成功回收的页面数，并通过stat统计各类操作计数。
  */
 static unsigned int shrink_page_list(struct list_head *page_list,
 				     struct pglist_data *pgdat,
@@ -1646,6 +1816,27 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
  *
  * returns how many pages were moved onto *@dst.
  */
+/**
+ * isolate_lru_pages - 从LRU链表中隔离一批页面用于回收
+ * @nr_to_scan:  目标扫描页数
+ * @lruvec:      LRU向量（包含各LRU链表）
+ * @dst:         隔离出来的页面存放列表
+ * @nr_scanned:  输出：实际扫描的页数（含跳过的）
+ * @sc:          回收控制参数
+ * @lru:         目标LRU链表类型（活跃/非活跃，匿名/文件）
+ *
+ * 将LRU链表中的页面移出，放入 dst 临时列表，以便后续的
+ * shrink_page_list() 对这些页面逐一做回收决策。
+ *
+ * 隔离规则：
+ *   - 跳过不属于当前回收zone的页面（NUMA zone过滤）
+ *   - 跳过正在被其他路径使用的页面（__isolate_lru_page 返回失败）
+ *   - 最多隔离 nr_to_scan 个页面（SWAP_CLUSTER_MAX 的倍数）
+ *
+ * 隔离期间清除 PageLRU 标志，使页面脱离 LRU 管理，
+ * 直到 shrink_page_list() 处理完毕后通过 putback_lru_page() 归还。
+ * 隔离阶段持有 pgdat->lru_lock 自旋锁。
+ */
 static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct list_head *dst,
 		unsigned long *nr_scanned, struct scan_control *sc,
@@ -1791,6 +1982,14 @@ int isolate_lru_page(struct page *page)
  * the LRU list will go small and be scanned faster than necessary, leading to
  * unnecessary swapping, thrashing and OOM.
  */
+/**
+ * too_many_isolated - 检查隔离页面数量是否过多
+ *
+ * 防止直接回收路径隔离过多页面导致系统内存压力恶化。
+ * kswapd和没有健全写回限流的场景豁免此检查。
+ * 比较当前隔离页面数与非活跃页面数：若isolated > inactive/2
+ * 则认为隔离过多，调用者应回退并等待隔离页面归还。
+ */
 static int too_many_isolated(struct pglist_data *pgdat, int file,
 		struct scan_control *sc)
 {
@@ -1841,6 +2040,23 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
  * Returns the number of pages moved to the given lruvec.
  */
 
+/**
+ * move_pages_to_lru - 将回收处理后的页面归还LRU链表或释放
+ * @lruvec: 目标LRU向量
+ * @list:   待处理的页面列表（由 shrink_page_list() 返回的未成功回收页）
+ *
+ * shrink_page_list() 处理完一批页面后，未能成功释放的页面需要归还LRU。
+ * 此函数遍历列表：
+ *   - 引用计数为0的页面：直接通过 __free_pages() 释放到伙伴分配器
+ *   - 其他页面：根据页面状态（活跃/非活跃标志）加入对应的LRU链表
+ *
+ * 关键操作：
+ *   1. 清除页面的 lru 指针和临时状态标志
+ *   2. 调用 lru_note_cost() 更新LRU代价统计（影响后续扫描比例）
+ *   3. 使用 add_page_to_lru_list() 批量将页面加回LRU
+ *
+ * 返回归还到LRU的页面总数（用于统计）。
+ */
 static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
 						     struct list_head *list)
 {
@@ -2006,6 +2222,28 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	return nr_reclaimed;
 }
 
+/**
+ * shrink_active_list - 将active LRU链表中的冷页降级到inactive链表
+ * @nr_to_scan: 本次扫描的页数
+ * @lruvec:     目标LRU向量
+ * @sc:         回收控制参数
+ * @lru:        目标LRU链表类型（LRU_ACTIVE_ANON或LRU_ACTIVE_FILE）
+ *
+ * 从active链表尾部取出页面，检查其访问标志(PTE Accessed bit)：
+ *   - 最近被访问过(referenced)：移回active链表头部（保留为热页）
+ *   - 未被访问：降级移入inactive链表（成为回收候选）
+ *
+ * 这实现了LRU的"第二次机会"算法，防止频繁访问的页被误回收。
+ */
+/**
+ * shrink_active_list - 扫描活跃LRU链表并将冷页降级到非活跃链表
+ *
+ * 从活跃链表隔离nr_to_scan个页面，通过page_referenced()检查访问位：
+ * - 最近被访问的页面（referenced）放回活跃链表
+ * - 长时间未访问的页面移到非活跃链表（deactivate）
+ * 同时清除PTE访问位（Referenced标志），为下次扫描提供更准确的访问信息。
+ * 通过这种"两次机会"机制防止热页被过早回收。
+ */
 static void shrink_active_list(unsigned long nr_to_scan,
 			       struct lruvec *lruvec,
 			       struct scan_control *sc,
@@ -2157,6 +2395,15 @@ unsigned long reclaim_pages(struct list_head *page_list)
 	return nr_reclaimed;
 }
 
+/**
+ * shrink_list - LRU链表收缩分发函数
+ *
+ * 根据lru类型决定调用哪个收缩函数：
+ * - 活跃链表（active）：若允许deactivate则调用shrink_active_list()
+ *   将冷页降级，否则跳过（记录skipped标志）
+ * - 非活跃链表（inactive）：直接调用shrink_inactive_list()尝试回收
+ * 这是LRU双链表回收机制的统一入口。
+ */
 static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 				 struct lruvec *lruvec, struct scan_control *sc)
 {
@@ -2199,6 +2446,23 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
  *    1TB     101        10GB
  *   10TB     320        32GB
  */
+/**
+ * inactive_is_low - 判断非活跃LRU链表是否过小（需要从活跃链表降级补充）
+ * @lruvec:       LRU向量
+ * @inactive_lru: 要检查的非活跃链表类型（匿名页或文件页）
+ *
+ * 为了保证回收效率，非活跃（inactive）LRU链表需要维持足够大的规模。
+ * 若非活跃链表过小，意味着可回收页面不足，回收效率低。
+ *
+ * 比例策略：
+ *   - inactive_ratio = sqrt(10 × total_GB)（内存越大，比例要求越高）
+ *   - 需满足：inactive × inactive_ratio >= active
+ *   - 小内存（< 1GB）：inactive_ratio = 1，即要求 inactive >= active
+ *   - 大内存（如 10GB）：inactive_ratio ≈ 10，允许更大的active/inactive比值
+ *
+ * 若返回 true（非活跃链表偏小），shrink_lruvec() 会加大活跃链表的扫描力度，
+ * 将更多活跃页降级到非活跃链表，以恢复健康的比例关系。
+ */
 static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 {
 	enum lru_list active_lru = inactive_lru + LRU_ACTIVE;
@@ -2233,6 +2497,30 @@ enum scan_balance {
  *
  * nr[0] = anon inactive pages to scan; nr[1] = anon active pages to scan
  * nr[2] = file inactive pages to scan; nr[3] = file active pages to scan
+ */
+/**
+ * get_scan_count - 计算各LRU链表本轮需要扫描的页面数量
+ * @lruvec: LRU向量（包含anon/file各活跃/非活跃链表）
+ * @sc:     内存回收控制参数
+ * @nr:     输出数组，存放每个LRU链表的扫描页数
+ *
+ * 决定本次回收轮次中，匿名页（anon）LRU和文件页（file）LRU各自扫描多少页。
+ * 核心是平衡 swap 和 pagecache 的回收比例：
+ *
+ * 扫描策略（scan_balance）：
+ *   SCAN_EQUAL:  anon和file各扫描同等数量（基准情形）
+ *   SCAN_FILE:   只扫描file LRU（无swap空间或禁用swap时）
+ *   SCAN_ANON:   只扫描anon LRU（file页面基本都是活跃的）
+ *   SCAN_FRACT:  按swappiness权重比例扫描（默认路径）
+ *
+ * swappiness（/proc/sys/vm/swappiness，默认60）控制换出匿名页的倾向：
+ *   - swappiness=0：尽量不换出匿名页，优先回收文件页缓存
+ *   - swappiness=100：积极换出匿名页和回收文件页缓存
+ *
+ * 计算公式：
+ *   ap（anon压力）= swappiness × (anon_cost / total_cost)
+ *   fp（file压力）= (200-swappiness) × (file_cost / total_cost)
+ *   各LRU扫描数 = 该LRU总页数 × (ap或fp) / (ap+fp)
  */
 static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 			   unsigned long *nr)
@@ -2422,6 +2710,20 @@ out:
 	}
 }
 
+/**
+ * shrink_lruvec - 收缩LRU向量（内存回收核心调度函数）
+ * @lruvec: 要收缩的LRU向量（包含active/inactive链表）
+ * @sc:     回收控制参数（目标回收页数、允许的操作等）
+ *
+ * 根据各LRU链表的大小和扫描比例，计算每条链表应该扫描多少页，
+ * 然后调用 shrink_list() 执行实际的扫描和回收。
+ *
+ * 处理4种LRU链表：
+ *   LRU_INACTIVE_ANON  - 不活跃的匿名页（如堆、栈）
+ *   LRU_ACTIVE_ANON    - 活跃的匿名页
+ *   LRU_INACTIVE_FILE  - 不活跃的文件缓存页
+ *   LRU_ACTIVE_FILE    - 活跃的文件缓存页
+ */
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
 	unsigned long nr[NR_LRU_LISTS];
@@ -2607,6 +2909,22 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 	return inactive_lru_pages > pages_for_compaction;
 }
 
+/**
+ * shrink_node_memcgs - 遍历NUMA节点上所有memcg并收缩其LRU链表
+ * @pgdat: NUMA节点数据结构
+ * @sc:    内存回收控制参数
+ *
+ * 在启用了内存控制组（memcg）的系统上，每个memcg维护独立的LRU链表。
+ * 此函数遍历目标memcg及其子孙memcg，对每个memcg调用 shrink_lruvec()。
+ *
+ * memcg内存保护机制：
+ *   - memory.min：硬性保护，低于此阈值的memcg跳过回收，防止OOM
+ *   - memory.low：软性保护，优先跳过，但在内存压力极大时仍可回收
+ *
+ * 通过 mem_cgroup_calculate_protection() 计算每个memcg的保护级别，
+ * 在全局内存压力和各memcg公平性之间寻找平衡。
+ * cond_resched() 防止长时间遍历导致软锁死（soft lockup）。
+ */
 static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
@@ -2664,6 +2982,24 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
 }
 
+/**
+ * shrink_node - 对单个NUMA节点执行内存回收
+ * @pgdat: 目标NUMA节点（pg_data_t）
+ * @sc:    内存回收控制参数
+ *
+ * 这是针对单个NUMA节点的回收入口。协调anon/file LRU比例、
+ * 内存压缩（compaction）和实际页面回收。
+ *
+ * 主要步骤：
+ *   1. 快速判断节点是否有足够的非活跃页可供回收
+ *   2. 调用 shrink_node_memcgs() 遍历所有memcg并回收LRU页面
+ *   3. 若回收的文件页过多，尝试回收 slab 缓存（shrink_slab）
+ *   4. 检查是否需要继续回收（should_continue_reclaim）
+ *   5. 若LRU拥塞（块设备IO落后），调用 wait_iff_congested() 等待
+ *
+ * 通过 again 标签实现多轮回收，直到达成回收目标或无法继续。
+ * kswapd 和直接回收路径都会调用此函数。
+ */
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct reclaim_state *reclaim_state = current->reclaim_state;
@@ -2896,6 +3232,22 @@ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
  * If a zone is deemed to be full of pinned pages then just give it a light
  * scan then give up on it.
  */
+/**
+ * shrink_zones - 遍历zone列表，对每个zone执行内存回收
+ * @zonelist: 按NUMA节点和zone优先级排列的zone列表
+ * @sc:       内存回收控制参数
+ *
+ * 内存回收的zone遍历层，被 do_try_to_free_pages() 调用。
+ * 按 zonelist 顺序（从高优先级zone到低优先级zone）逐个检查：
+ *
+ *   1. 跳过不适合回收的zone（cpuset限制、超出reclaim_idx等）
+ *   2. 对于高阶分配（order > PAGE_ALLOC_COSTLY_ORDER），检查内存压缩是否就绪
+ *   3. 合并相同NUMA节点的zone，对每个节点调用一次 shrink_node()
+ *   4. 统计被保护的memcg（memory.min/low）的回收情况
+ *
+ * 通过 last_pgdat 去重，确保每个NUMA节点只被处理一次
+ * （同一节点上的多个zone共享同一组LRU链表）。
+ */
 static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 {
 	struct zoneref *z;
@@ -3008,6 +3360,31 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  *
  * returns:	0, if no pages reclaimed
  * 		else, the number of pages reclaimed
+ */
+/**
+ * do_try_to_free_pages - 直接内存回收的核心循环
+ * @zonelist: 内存区域列表（按NUMA节点和zone优先级排列）
+ * @sc:       回收控制参数（包含目标回收量、gfp_mask等）
+ *
+ * 由 try_to_free_pages() 调用，执行同步直接内存回收（direct reclaim）。
+ * 当页面分配器无法从空闲链表满足分配请求时，分配路径上的进程会同步调用此函数。
+ *
+ * 回收优先级机制（priority）：
+ *   - 从 DEF_PRIORITY（12）开始，每轮降低1级
+ *   - priority越低，每个zone扫描的页面比例越大（1/2^priority）
+ *   - priority=0时扫描所有页面（最激进的回收）
+ *
+ * 循环终止条件：
+ *   1. 已回收足够页面（nr_reclaimed >= nr_to_reclaim）
+ *   2. 内存压缩已就绪（compaction_ready，可以通过压缩满足分配）
+ *   3. priority降至0仍无法回收（内存可能已耗尽，触发OOM）
+ *
+ * 每轮循环：
+ *   - vmpressure_prio()：上报内存压力事件
+ *   - shrink_zones()：扫描并回收各zone的LRU页面
+ *   - 若回收陷入困难，开启 may_writepage 允许写回
+ *
+ * 返回回收的页面数；返回0表示回收失败，分配器将触发OOM。
  */
 static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 					  struct scan_control *sc)
@@ -3146,6 +3523,29 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
  * Returns true if a fatal signal was delivered during throttling. If this
  * happens, the page allocator should not consider triggering the OOM killer.
  */
+/**
+ * throttle_direct_reclaim - 在直接内存回收路径上对进程进行限流等待
+ * @gfp_mask:  分配标志（决定是否可以等待）
+ * @zonelist:  zone列表
+ * @nodemask:  NUMA节点掩码
+ *
+ * 当直接内存回收路径变得拥塞时（如大量进程同时触发直接回收，
+ * 或kswapd已在积极回收），对进程进行限流以：
+ *   1. 防止多个进程同时竞争回收，造成"回收风暴"
+ *   2. 避免OOM Killer过早触发
+ *   3. 等待kswapd异步回收完成，减少直接回收的开销
+ *
+ * 豁免限流的情况：
+ *   - 内核线程（PF_KTHREAD）：可能持有回收所需的锁
+ *   - GFP_NOIO/GFP_NOFS：不能等待IO完成
+ *   - 任务正在被信号终止
+ *
+ * 限流机制：
+ *   - 等待 pgdat->kswapd_wait 队列（kswapd完成回收后唤醒）
+ *   - 或等待 zone->congested_wait（IO拥塞缓解后唤醒）
+ *
+ * 返回 true 表示进程已被限流（等待完成），false 表示无需限流。
+ */
 static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 					nodemask_t *nodemask)
 {
@@ -3230,6 +3630,25 @@ out:
 	return false;
 }
 
+/**
+ * try_to_free_pages - 同步直接内存回收入口
+ *
+ * 当 __alloc_pages() 无法从伙伴系统分配到页面时调用，
+ * 在调用进程的上下文中同步执行页面回收（直接回收），
+ * 直到回收了足够的页面或达到最大重试次数。
+ *
+ * 与kswapd的区别：
+ *   kswapd是后台异步回收（不阻塞进程）
+ *   try_to_free_pages是同步回收（阻塞当前分配进程直到内存够用）
+ */
+/**
+ * try_to_free_pages - 直接内存回收入口（页面分配失败时同步调用）
+ *
+ * 当__alloc_pages()分配失败后，在调用进程上下文中同步执行内存回收。
+ * 初始化scan_control（允许写回、允许unmap、允许swap），
+ * 设置回收目标为SWAP_CLUSTER_MAX（32页），调用do_try_to_free_pages()
+ * 执行真正的回收工作。若内存压力过大会触发OOM killer。
+ */
 unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 				gfp_t gfp_mask, nodemask_t *nodemask)
 {
@@ -3315,6 +3734,14 @@ unsigned long mem_cgroup_shrink_node(struct mem_cgroup *memcg,
 	return sc.nr_reclaimed;
 }
 
+/**
+ * try_to_free_mem_cgroup_pages - memcg超限时强制回收指定cgroup的页面
+ *
+ * 当memory cgroup使用量超过限制时（charge路径）被调用，
+ * 仅针对指定memcg内的页面执行回收，不影响其他cgroup。
+ * 通过mem_cgroup_scan_tasks()限定回收范围，根据may_swap
+ * 参数决定是否允许交换匿名页，返回实际回收的页面数。
+ */
 unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 					   unsigned long nr_pages,
 					   gfp_t gfp_mask,
@@ -3354,6 +3781,25 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 }
 #endif
 
+/**
+ * age_active_anon - 老化匿名页活跃LRU链表（kswapd辅助函数）
+ * @pgdat: NUMA节点
+ * @sc:    内存回收控制参数
+ *
+ * 在 kswapd 的 balance_pgdat() 循环中调用，专门处理匿名页的活跃/非活跃平衡：
+ *
+ * 触发条件：
+ *   - 系统有swap空间（无swap则匿名页无法换出，无需老化）
+ *   - 非活跃匿名页LRU链表过小（inactive_is_low() 返回 true）
+ *
+ * 执行操作：
+ *   遍历所有 memcg，对每个 memcg 的匿名页 lruvec 调用
+ *   shrink_active_list()，将活跃匿名页降级到非活跃链表，
+ *   从而补充非活跃链表，为后续的swap回收提供候选页。
+ *
+ * 注意：此函数只做"老化"（active→inactive），不实际释放页面。
+ * 实际的换出操作由后续的 shrink_page_list() 负责。
+ */
 static void age_active_anon(struct pglist_data *pgdat,
 				struct scan_control *sc)
 {
@@ -3491,6 +3937,14 @@ static bool prepare_kswapd_sleep(pg_data_t *pgdat, int order,
  * reclaim or if the lack of progress was due to pages under writeback.
  * This is used to determine if the scanning priority needs to be raised.
  */
+/**
+ * kswapd_shrink_node - kswapd对单个NUMA节点执行一轮页面回收
+ *
+ * 按各zone管理页面数量的比例分配回收目标（nr_to_reclaim），
+ * 然后调用shrink_node()对该节点进行实际回收。
+ * 是kswapd主循环balance_pgdat()中的节点级回收入口，
+ * 每次迭代尝试将节点内存水位恢复到高水位以上。
+ */
 static bool kswapd_shrink_node(pg_data_t *pgdat,
 			       struct scan_control *sc)
 {
@@ -3538,6 +3992,29 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
  * found to have free_pages <= high_wmark_pages(zone), any page in that zone
  * or lower is eligible for reclaim until at least one usable zone is
  * balanced.
+ */
+/**
+ * balance_pgdat - kswapd的核心回收循环，平衡单个NUMA节点的内存水位
+ * @pgdat:            目标NUMA节点
+ * @order:            触发此次回收的分配阶数（高阶分配需要连续页）
+ * @highest_zoneidx:  需要平衡的最高zone索引
+ *
+ * kswapd内核线程的实际工作函数。当某个zone的空闲页低于 pages_low 水位线时，
+ * alloc_pages() 会唤醒kswapd，kswapd调用此函数异步回收页面。
+ *
+ * 水位线系统（zone watermarks）：
+ *   pages_min：最低水位，低于此时直接回收路径被激活
+ *   pages_low：低水位，kswapd被唤醒
+ *   pages_high：高水位，kswapd的回收目标（恢复到此水位即停止）
+ *
+ * 回收优先级循环（DEF_PRIORITY→0）：
+ *   - 每轮降低priority，扫描更大比例的LRU链表
+ *   - 调用 shrink_node() 回收页面
+ *   - 检查是否需要内存压缩（compaction）来满足高阶分配
+ *   - 通过 boosted 机制：即使水位已满足，也额外回收一批页面作为buffer
+ *
+ * 回收完成后更新 pgdat->kswapd_order 和失败计数，
+ * 若连续失败过多则kswapd进入休眠，避免无谓消耗CPU。
  */
 static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
@@ -3858,6 +4335,23 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
  *
  * If there are applications that are active memory-allocators
  * (most normal use), this basically shouldn't matter.
+ */
+/**
+ * kswapd - 后台页面回收守护线程
+ * @p: 指向所属 pglist_data（NUMA内存节点）的指针
+ *
+ * 每个NUMA内存节点对应一个kswapd内核线程（如kswapd0、kswapd1），
+ * 负责在系统内存压力升高时异步回收页面，使空闲内存维持在水位线以上。
+ *
+ * 工作流程（无限循环）：
+ *  1. 检查所有zone的空闲页是否低于 pages_high 水位线
+ *  2. 若低于水位线，调用 balance_pgdat() 回收页面：
+ *     - shrink_lruvec() 收缩LRU链表
+ *     - 将inactive页面写回磁盘或直接丢弃（文件缓存）
+ *  3. 回收完成后，进入睡眠等待下次内存压力事件（kswapd_wait等待队列）
+ *
+ * 唤醒条件：
+ *   __alloc_pages() 分配页面失败时唤醒 wakeup_kswapd()
  */
 static int kswapd(void *p)
 {

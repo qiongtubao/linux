@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/pipe.c
+ *  Linux 管道文件系统实现
+ *
+ *  实现了UNIX管道机制，包括匿名管道和命名管道(FIFO)
+ *  提供进程间通信的基础设施
  *
  *  Copyright (C) 1991, 1992, 1999  Linus Torvalds
  */
@@ -32,13 +36,13 @@
 #include "internal.h"
 
 /*
- * The max size that a non-root user is allowed to grow the pipe. Can
- * be set by root in /proc/sys/fs/pipe-max-size
+ * 非root用户允许扩展管道的最大大小
+ * 可以由root通过 /proc/sys/fs/pipe-max-size 设置
  */
 unsigned int pipe_max_size = 1048576;
 
-/* Maximum allocatable pages per user. Hard limit is unset by default, soft
- * matches default values.
+/* 每个用户可分配的最大页面数量
+ * 硬限制默认未设置，软限制匹配默认值
  */
 unsigned long pipe_user_pages_hard;
 unsigned long pipe_user_pages_soft = PIPE_DEF_BUFFERS * INR_OPEN_CUR;
@@ -60,43 +64,83 @@ unsigned long pipe_user_pages_soft = PIPE_DEF_BUFFERS * INR_OPEN_CUR;
  * -- Manfred Spraul <manfred@colorfullife.com> 2002-05-09
  */
 
+/**
+ * pipe_lock_nested - 嵌套地锁定管道
+ * @pipe: 要锁定的管道信息结构
+ * @subclass: 锁的子类别，用于避免死锁检测器误报
+ *
+ * 在嵌套场景中获取管道的互斥锁
+ */
 static void pipe_lock_nested(struct pipe_inode_info *pipe, int subclass)
 {
-	if (pipe->files)
+	if (pipe->files)  /* 检查管道是否还有打开的文件引用 */
 		mutex_lock_nested(&pipe->mutex, subclass);
 }
 
+/**
+ * pipe_lock - 锁定管道
+ * @pipe: 要锁定的管道信息结构
+ *
+ * pipe_lock() 嵌套非管道inode锁(用于写入文件)
+ */
 void pipe_lock(struct pipe_inode_info *pipe)
 {
 	/*
-	 * pipe_lock() nests non-pipe inode locks (for writing to a file)
+	 * pipe_lock() 嵌套非管道inode锁(用于写入文件)
 	 */
 	pipe_lock_nested(pipe, I_MUTEX_PARENT);
 }
 EXPORT_SYMBOL(pipe_lock);
 
+/**
+ * pipe_unlock - 解锁管道
+ * @pipe: 要解锁的管道信息结构
+ *
+ * 释放管道的互斥锁
+ */
 void pipe_unlock(struct pipe_inode_info *pipe)
 {
-	if (pipe->files)
+	if (pipe->files)  /* 检查管道是否还有打开的文件引用 */
 		mutex_unlock(&pipe->mutex);
 }
 EXPORT_SYMBOL(pipe_unlock);
 
+/**
+ * __pipe_lock - 内部管道锁定函数
+ * @pipe: 要锁定的管道信息结构
+ *
+ * 获取管道的互斥锁，用于内部调用
+ */
 static inline void __pipe_lock(struct pipe_inode_info *pipe)
 {
 	mutex_lock_nested(&pipe->mutex, I_MUTEX_PARENT);
 }
 
+/**
+ * __pipe_unlock - 内部管道解锁函数
+ * @pipe: 要解锁的管道信息结构
+ *
+ * 释放管道的互斥锁，用于内部调用
+ */
 static inline void __pipe_unlock(struct pipe_inode_info *pipe)
 {
 	mutex_unlock(&pipe->mutex);
 }
 
+/**
+ * pipe_double_lock - 同时锁定两个管道
+ * @pipe1: 第一个管道
+ * @pipe2: 第二个管道
+ *
+ * 按地址顺序锁定两个管道，避免死锁
+ * 用于需要操作两个管道的场景(如splice操作)
+ */
 void pipe_double_lock(struct pipe_inode_info *pipe1,
 		      struct pipe_inode_info *pipe2)
 {
-	BUG_ON(pipe1 == pipe2);
+	BUG_ON(pipe1 == pipe2);  /* 两个管道不能相同 */
 
+	/* 按地址顺序锁定，确保一致的锁定顺序以避免死锁 */
 	if (pipe1 < pipe2) {
 		pipe_lock_nested(pipe1, I_MUTEX_PARENT);
 		pipe_lock_nested(pipe2, I_MUTEX_CHILD);
@@ -106,45 +150,61 @@ void pipe_double_lock(struct pipe_inode_info *pipe1,
 	}
 }
 
+/**
+ * anon_pipe_buf_release - 释放匿名管道缓冲区
+ * @pipe: 缓冲区所属的管道
+ * @buf: 要释放的缓冲区
+ *
+ * 释放匿名管道缓冲区的页面。如果没有其他人使用该页面，
+ * 且管道还没有临时页面，则将其保存为一级分配缓存。
+ * 否则只是释放我们对它的引用。
+ */
 static void anon_pipe_buf_release(struct pipe_inode_info *pipe,
 				  struct pipe_buffer *buf)
 {
 	struct page *page = buf->page;
 
 	/*
-	 * If nobody else uses this page, and we don't already have a
-	 * temporary page, let's keep track of it as a one-deep
-	 * allocation cache. (Otherwise just release our reference to it)
+	 * 如果没有其他人使用该页面，且我们还没有
+	 * 临时页面，则将其保存为一级分配缓存。
+	 * (否则只是释放我们对它的引用)
 	 */
-	if (page_count(page) == 1 && !pipe->tmp_page)
-		pipe->tmp_page = page;
+	if (page_count(page) == 1 && !pipe->tmp_page)  /* 页面引用计数为1且无临时页面 */
+		pipe->tmp_page = page;  /* 保存为临时页面供后续使用 */
 	else
-		put_page(page);
+		put_page(page);  /* 释放页面引用 */
 }
 
+/**
+ * anon_pipe_buf_try_steal - 尝试窃取匿名管道缓冲区页面
+ * @pipe: 缓冲区所属的管道
+ * @buf: 要窃取的缓冲区
+ *
+ * 尝试获取页面的所有权。成功返回true。
+ *
+ * 返回值: 成功窃取返回true，否则返回false
+ */
 static bool anon_pipe_buf_try_steal(struct pipe_inode_info *pipe,
 		struct pipe_buffer *buf)
 {
 	struct page *page = buf->page;
 
-	if (page_count(page) != 1)
+	if (page_count(page) != 1)  /* 页面引用计数不为1，无法窃取 */
 		return false;
-	memcg_kmem_uncharge_page(page, 0);
-	__SetPageLocked(page);
+	memcg_kmem_uncharge_page(page, 0);  /* 取消内存控制组计费 */
+	__SetPageLocked(page);  /* 设置页面锁定状态 */
 	return true;
 }
 
 /**
- * generic_pipe_buf_try_steal - attempt to take ownership of a &pipe_buffer
- * @pipe:	the pipe that the buffer belongs to
- * @buf:	the buffer to attempt to steal
+ * generic_pipe_buf_try_steal - 通用管道缓冲区窃取尝试
+ * @pipe: 缓冲区所属的管道
+ * @buf: 要窃取的缓冲区
  *
- * Description:
- *	This function attempts to steal the &struct page attached to
- *	@buf. If successful, this function returns 0 and returns with
- *	the page locked. The caller may then reuse the page for whatever
- *	he wishes; the typical use is insertion into a different file
- *	page cache.
+ * 描述:
+ *	此函数尝试窃取附加到@buf的&struct page。如果成功，
+ *	此函数返回0并返回时页面已锁定。调用者可以随后重用
+ *	该页面用于任何目的；典型用途是插入到不同的文件页面缓存中。
  */
 bool generic_pipe_buf_try_steal(struct pipe_inode_info *pipe,
 		struct pipe_buffer *buf)
@@ -152,12 +212,11 @@ bool generic_pipe_buf_try_steal(struct pipe_inode_info *pipe,
 	struct page *page = buf->page;
 
 	/*
-	 * A reference of one is golden, that means that the owner of this
-	 * page is the only one holding a reference to it. lock the page
-	 * and return OK.
+	 * 引用计数为1是黄金标准，这意味着该页面的所有者是
+	 * 唯一持有对它的引用。锁定页面并返回OK。
 	 */
 	if (page_count(page) == 1) {
-		lock_page(page);
+		lock_page(page);  /* 锁定页面 */
 		return true;
 	}
 	return false;
@@ -165,33 +224,32 @@ bool generic_pipe_buf_try_steal(struct pipe_inode_info *pipe,
 EXPORT_SYMBOL(generic_pipe_buf_try_steal);
 
 /**
- * generic_pipe_buf_get - get a reference to a &struct pipe_buffer
- * @pipe:	the pipe that the buffer belongs to
- * @buf:	the buffer to get a reference to
+ * generic_pipe_buf_get - 获取对&struct pipe_buffer的引用
+ * @pipe: 缓冲区所属的管道
+ * @buf: 要获取引用的缓冲区
  *
- * Description:
- *	This function grabs an extra reference to @buf. It's used in
- *	in the tee() system call, when we duplicate the buffers in one
- *	pipe into another.
+ * 描述:
+ *	此函数获取对@buf的额外引用。它在tee()系统调用中使用，
+ *	当我们将一个管道中的缓冲区复制到另一个管道时。
  */
 bool generic_pipe_buf_get(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
 {
-	return try_get_page(buf->page);
+	return try_get_page(buf->page);  /* 尝试获取页面引用 */
 }
 EXPORT_SYMBOL(generic_pipe_buf_get);
 
 /**
- * generic_pipe_buf_release - put a reference to a &struct pipe_buffer
- * @pipe:	the pipe that the buffer belongs to
- * @buf:	the buffer to put a reference to
+ * generic_pipe_buf_release - 释放对&struct pipe_buffer的引用
+ * @pipe: 缓冲区所属的管道
+ * @buf: 要释放引用的缓冲区
  *
- * Description:
- *	This function releases a reference to @buf.
+ * 描述:
+ *	此函数释放对@buf的引用。
  */
 void generic_pipe_buf_release(struct pipe_inode_info *pipe,
 			      struct pipe_buffer *buf)
 {
-	put_page(buf->page);
+	put_page(buf->page);  /* 释放页面引用 */
 }
 EXPORT_SYMBOL(generic_pipe_buf_release);
 
@@ -201,45 +259,53 @@ static const struct pipe_buf_operations anon_pipe_buf_ops = {
 	.get		= generic_pipe_buf_get,
 };
 
-/* Done while waiting without holding the pipe lock - thus the READ_ONCE() */
+/* 在等待时无需持有管道锁的情况下完成 - 因此使用READ_ONCE() */
 static inline bool pipe_readable(const struct pipe_inode_info *pipe)
 {
-	unsigned int head = READ_ONCE(pipe->head);
-	unsigned int tail = READ_ONCE(pipe->tail);
-	unsigned int writers = READ_ONCE(pipe->writers);
+	unsigned int head = READ_ONCE(pipe->head);  /* 原子读取头指针 */
+	unsigned int tail = READ_ONCE(pipe->tail);  /* 原子读取尾指针 */
+	unsigned int writers = READ_ONCE(pipe->writers);  /* 原子读取写者数量 */
 
-	return !pipe_empty(head, tail) || !writers;
+	return !pipe_empty(head, tail) || !writers;  /* 管道非空或无写者时可读 */
 }
 
+/**
+ * pipe_read - 从管道读取数据
+ * @iocb: I/O控制块
+ * @to: 目标缓冲区迭代器
+ *
+ * 从管道中读取数据到用户空间缓冲区
+ *
+ * 返回值: 成功读取的字节数，或负数错误码
+ */
 static ssize_t
 pipe_read(struct kiocb *iocb, struct iov_iter *to)
 {
-	size_t total_len = iov_iter_count(to);
-	struct file *filp = iocb->ki_filp;
-	struct pipe_inode_info *pipe = filp->private_data;
+	size_t total_len = iov_iter_count(to);  /* 请求读取的总长度 */
+	struct file *filp = iocb->ki_filp;  /* 文件指针 */
+	struct pipe_inode_info *pipe = filp->private_data;  /* 管道信息 */
 	bool was_full, wake_next_reader = false;
 	ssize_t ret;
 
-	/* Null read succeeds. */
+	/* 空读取成功返回 */
 	if (unlikely(total_len == 0))
 		return 0;
 
 	ret = 0;
-	__pipe_lock(pipe);
+	__pipe_lock(pipe);  /* 锁定管道 */
 
 	/*
-	 * We only wake up writers if the pipe was full when we started
-	 * reading in order to avoid unnecessary wakeups.
+	 * 我们只在管道在开始读取时已满的情况下唤醒写者，
+	 * 以避免不必要的唤醒。
 	 *
-	 * But when we do wake up writers, we do so using a sync wakeup
-	 * (WF_SYNC), because we want them to get going and generate more
-	 * data for us.
+	 * 但当我们确实唤醒写者时，我们使用同步唤醒(WF_SYNC)，
+	 * 因为我们希望它们立即开始并为我们生成更多数据。
 	 */
 	was_full = pipe_full(pipe->head, pipe->tail, pipe->max_usage);
 	for (;;) {
-		unsigned int head = pipe->head;
-		unsigned int tail = pipe->tail;
-		unsigned int mask = pipe->ring_size - 1;
+		unsigned int head = pipe->head;  /* 当前头位置 */
+		unsigned int tail = pipe->tail;  /* 当前尾位置 */
+		unsigned int mask = pipe->ring_size - 1;  /* 环形缓冲区掩码 */
 
 #ifdef CONFIG_WATCH_QUEUE
 		if (pipe->note_loss) {
@@ -265,88 +331,85 @@ pipe_read(struct kiocb *iocb, struct iov_iter *to)
 		}
 #endif
 
-		if (!pipe_empty(head, tail)) {
-			struct pipe_buffer *buf = &pipe->bufs[tail & mask];
-			size_t chars = buf->len;
+		if (!pipe_empty(head, tail)) {  /* 管道非空，有数据可读 */
+			struct pipe_buffer *buf = &pipe->bufs[tail & mask];  /* 获取尾部缓冲区 */
+			size_t chars = buf->len;  /* 缓冲区中的字节数 */
 			size_t written;
 			int error;
 
-			if (chars > total_len) {
-				if (buf->flags & PIPE_BUF_FLAG_WHOLE) {
+			if (chars > total_len) {  /* 缓冲区数据超过请求长度 */
+				if (buf->flags & PIPE_BUF_FLAG_WHOLE) {  /* 需要完整读取的缓冲区 */
 					if (ret == 0)
-						ret = -ENOBUFS;
+						ret = -ENOBUFS;  /* 缓冲区空间不足 */
 					break;
 				}
-				chars = total_len;
+				chars = total_len;  /* 只读取请求的长度 */
 			}
 
-			error = pipe_buf_confirm(pipe, buf);
+			error = pipe_buf_confirm(pipe, buf);  /* 确认缓冲区状态 */
 			if (error) {
 				if (!ret)
 					ret = error;
 				break;
 			}
 
+			/* 将页面数据拷贝到用户空间 */
 			written = copy_page_to_iter(buf->page, buf->offset, chars, to);
-			if (unlikely(written < chars)) {
+			if (unlikely(written < chars)) {  /* 拷贝失败 */
 				if (!ret)
-					ret = -EFAULT;
+					ret = -EFAULT;  /* 页面错误 */
 				break;
 			}
-			ret += chars;
-			buf->offset += chars;
-			buf->len -= chars;
+			ret += chars;  /* 累计读取的字节数 */
+			buf->offset += chars;  /* 更新缓冲区偏移 */
+			buf->len -= chars;  /* 减少缓冲区剩余长度 */
 
-			/* Was it a packet buffer? Clean up and exit */
+			/* 是否为数据包缓冲区？清理并退出 */
 			if (buf->flags & PIPE_BUF_FLAG_PACKET) {
 				total_len = chars;
 				buf->len = 0;
 			}
 
-			if (!buf->len) {
-				pipe_buf_release(pipe, buf);
-				spin_lock_irq(&pipe->rd_wait.lock);
+			if (!buf->len) {  /* 缓冲区已读完 */
+				pipe_buf_release(pipe, buf);  /* 释放缓冲区 */
+				spin_lock_irq(&pipe->rd_wait.lock);  /* 锁定读等待队列 */
 #ifdef CONFIG_WATCH_QUEUE
-				if (buf->flags & PIPE_BUF_FLAG_LOSS)
+				if (buf->flags & PIPE_BUF_FLAG_LOSS)  /* 标记数据丢失 */
 					pipe->note_loss = true;
 #endif
-				tail++;
+				tail++;  /* 移动尾指针 */
 				pipe->tail = tail;
-				spin_unlock_irq(&pipe->rd_wait.lock);
+				spin_unlock_irq(&pipe->rd_wait.lock);  /* 解锁读等待队列 */
 			}
-			total_len -= chars;
+			total_len -= chars;  /* 减少剩余需读取长度 */
 			if (!total_len)
-				break;	/* common path: read succeeded */
-			if (!pipe_empty(head, tail))	/* More to do? */
+				break;	/* 通用路径：读取成功完成 */
+			if (!pipe_empty(head, tail))	/* 还有更多数据？ */
 				continue;
 		}
 
-		if (!pipe->writers)
+		if (!pipe->writers)  /* 没有写者 */
 			break;
-		if (ret)
+		if (ret)  /* 已有数据读取 */
 			break;
-		if (filp->f_flags & O_NONBLOCK) {
+		if (filp->f_flags & O_NONBLOCK) {  /* 非阻塞模式 */
 			ret = -EAGAIN;
 			break;
 		}
-		__pipe_unlock(pipe);
+		__pipe_unlock(pipe);  /* 解锁管道 */
 
 		/*
-		 * We only get here if we didn't actually read anything.
+		 * 我们只有在实际上没有读取任何东西时才到这里。
 		 *
-		 * However, we could have seen (and removed) a zero-sized
-		 * pipe buffer, and might have made space in the buffers
-		 * that way.
+		 * 然而，我们可能已经看到(并移除)了一个零大小的
+		 * 管道缓冲区，并可能以这种方式在缓冲区中腾出了空间。
 		 *
-		 * You can't make zero-sized pipe buffers by doing an empty
-		 * write (not even in packet mode), but they can happen if
-		 * the writer gets an EFAULT when trying to fill a buffer
-		 * that already got allocated and inserted in the buffer
-		 * array.
+		 * 你不能通过空写(即使在数据包模式下)来制造零大小
+		 * 的管道缓冲区，但如果写者在尝试填充已经分配并
+		 * 插入到缓冲区数组中的缓冲区时得到EFAULT，就会发生这种情况。
 		 *
-		 * So we still need to wake up any pending writers in the
-		 * _very_ unlikely case that the pipe was full, but we got
-		 * no data.
+		 * 所以在管道已满但我们没有得到数据的极不可能情况下，
+		 * 我们仍然需要唤醒任何待处理的写者。
 		 */
 		if (unlikely(was_full)) {
 			wake_up_interruptible_sync_poll(&pipe->wr_wait, EPOLLOUT | EPOLLWRNORM);
@@ -354,69 +417,84 @@ pipe_read(struct kiocb *iocb, struct iov_iter *to)
 		}
 
 		/*
-		 * But because we didn't read anything, at this point we can
-		 * just return directly with -ERESTARTSYS if we're interrupted,
-		 * since we've done any required wakeups and there's no need
-		 * to mark anything accessed. And we've dropped the lock.
+		 * 但因为我们没有读取任何东西，此时我们可以
+		 * 在被中断时直接返回-ERESTARTSYS，因为我们已经
+		 * 完成了任何必需的唤醒，不需要标记任何访问。
+		 * 而且我们已经放弃了锁。
 		 */
 		if (wait_event_interruptible_exclusive(pipe->rd_wait, pipe_readable(pipe)) < 0)
 			return -ERESTARTSYS;
 
-		__pipe_lock(pipe);
+		__pipe_lock(pipe);  /* 重新锁定管道 */
 		was_full = pipe_full(pipe->head, pipe->tail, pipe->max_usage);
 		wake_next_reader = true;
 	}
-	if (pipe_empty(pipe->head, pipe->tail))
+	if (pipe_empty(pipe->head, pipe->tail))  /* 管道为空 */
 		wake_next_reader = false;
-	__pipe_unlock(pipe);
+	__pipe_unlock(pipe);  /* 解锁管道 */
 
-	if (was_full) {
+	if (was_full) {  /* 如果管道曾经满了，唤醒写者 */
 		wake_up_interruptible_sync_poll(&pipe->wr_wait, EPOLLOUT | EPOLLWRNORM);
 		kill_fasync(&pipe->fasync_writers, SIGIO, POLL_OUT);
 	}
-	if (wake_next_reader)
+	if (wake_next_reader)  /* 唤醒下一个读者 */
 		wake_up_interruptible_sync_poll(&pipe->rd_wait, EPOLLIN | EPOLLRDNORM);
-	if (ret > 0)
+	if (ret > 0)  /* 如果成功读取了数据，更新访问时间 */
 		file_accessed(filp);
 	return ret;
 }
 
+/**
+ * is_packetized - 检查文件是否为数据包模式
+ * @file: 要检查的文件
+ *
+ * 返回值: 如果文件设置了O_DIRECT标志则返回非零值
+ */
 static inline int is_packetized(struct file *file)
 {
 	return (file->f_flags & O_DIRECT) != 0;
 }
 
-/* Done while waiting without holding the pipe lock - thus the READ_ONCE() */
+/* 在等待时无需持有管道锁的情况下完成 - 因此使用READ_ONCE() */
 static inline bool pipe_writable(const struct pipe_inode_info *pipe)
 {
-	unsigned int head = READ_ONCE(pipe->head);
-	unsigned int tail = READ_ONCE(pipe->tail);
-	unsigned int max_usage = READ_ONCE(pipe->max_usage);
+	unsigned int head = READ_ONCE(pipe->head);  /* 原子读取头指针 */
+	unsigned int tail = READ_ONCE(pipe->tail);  /* 原子读取尾指针 */
+	unsigned int max_usage = READ_ONCE(pipe->max_usage);  /* 原子读取最大使用量 */
 
-	return !pipe_full(head, tail, max_usage) ||
+	return !pipe_full(head, tail, max_usage) ||  /* 管道未满或无读者时可写 */
 		!READ_ONCE(pipe->readers);
 }
 
+/**
+ * pipe_write - 向管道写入数据
+ * @iocb: I/O控制块
+ * @from: 源缓冲区迭代器
+ *
+ * 将数据从用户空间缓冲区写入管道
+ *
+ * 返回值: 成功写入的字节数，或负数错误码
+ */
 static ssize_t
 pipe_write(struct kiocb *iocb, struct iov_iter *from)
 {
-	struct file *filp = iocb->ki_filp;
-	struct pipe_inode_info *pipe = filp->private_data;
+	struct file *filp = iocb->ki_filp;  /* 文件指针 */
+	struct pipe_inode_info *pipe = filp->private_data;  /* 管道信息 */
 	unsigned int head;
 	ssize_t ret = 0;
-	size_t total_len = iov_iter_count(from);
+	size_t total_len = iov_iter_count(from);  /* 请求写入的总长度 */
 	ssize_t chars;
 	bool was_empty = false;
 	bool wake_next_writer = false;
 
-	/* Null write succeeds. */
+	/* 空写入成功返回 */
 	if (unlikely(total_len == 0))
 		return 0;
 
-	__pipe_lock(pipe);
+	__pipe_lock(pipe);  /* 锁定管道 */
 
-	if (!pipe->readers) {
-		send_sig(SIGPIPE, current, 0);
+	if (!pipe->readers) {  /* 没有读者 */
+		send_sig(SIGPIPE, current, 0);  /* 发送SIGPIPE信号 */
 		ret = -EPIPE;
 		goto out;
 	}
@@ -695,6 +773,17 @@ static void put_pipe_info(struct inode *inode, struct pipe_inode_info *pipe)
 		free_pipe_info(pipe);
 }
 
+/**
+ * pipe_release - 管道文件释放函数
+ * @inode: 管道的inode结构
+ * @file: 要释放的文件结构
+ *
+ * 当管道的读端或写端被关闭时调用此函数。
+ * 更新读者/写者计数，如果是最后一个读者或写者，
+ * 则唤醒等待的进程。
+ *
+ * 返回值: 总是返回0
+ */
 static int
 pipe_release(struct inode *inode, struct file *file)
 {
@@ -763,51 +852,65 @@ bool pipe_is_unprivileged_user(void)
 	return !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN);
 }
 
+/**
+ * alloc_pipe_info - 分配管道信息结构
+ *
+ * 为新的管道分配并初始化pipe_inode_info结构
+ * 包括缓冲区分配、用户配额检查等
+ *
+ * 返回值: 成功返回分配的pipe_inode_info指针，失败返回NULL
+ */
 struct pipe_inode_info *alloc_pipe_info(void)
 {
 	struct pipe_inode_info *pipe;
-	unsigned long pipe_bufs = PIPE_DEF_BUFFERS;
-	struct user_struct *user = get_current_user();
+	unsigned long pipe_bufs = PIPE_DEF_BUFFERS;  /* 默认缓冲区数量 */
+	struct user_struct *user = get_current_user();  /* 获取当前用户结构 */
 	unsigned long user_bufs;
-	unsigned int max_size = READ_ONCE(pipe_max_size);
+	unsigned int max_size = READ_ONCE(pipe_max_size);  /* 读取最大管道大小 */
 
 	pipe = kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL_ACCOUNT);
 	if (pipe == NULL)
 		goto out_free_uid;
 
+	/* 如果缓冲区大小超过最大值且用户没有特权，则限制缓冲区数量 */
 	if (pipe_bufs * PAGE_SIZE > max_size && !capable(CAP_SYS_RESOURCE))
 		pipe_bufs = max_size >> PAGE_SHIFT;
 
+	/* 计算用户已使用的管道缓冲区页面数 */
 	user_bufs = account_pipe_buffers(user, 0, pipe_bufs);
 
+	/* 检查软限制：非特权用户是否超过软限制 */
 	if (too_many_pipe_buffers_soft(user_bufs) && pipe_is_unprivileged_user()) {
 		user_bufs = account_pipe_buffers(user, pipe_bufs, 1);
-		pipe_bufs = 1;
+		pipe_bufs = 1;  /* 将缓冲区数量降到最小 */
 	}
 
+	/* 检查硬限制：非特权用户是否超过硬限制 */
 	if (too_many_pipe_buffers_hard(user_bufs) && pipe_is_unprivileged_user())
 		goto out_revert_acct;
 
+	/* 分配管道缓冲区数组 */
 	pipe->bufs = kcalloc(pipe_bufs, sizeof(struct pipe_buffer),
 			     GFP_KERNEL_ACCOUNT);
 
 	if (pipe->bufs) {
-		init_waitqueue_head(&pipe->rd_wait);
-		init_waitqueue_head(&pipe->wr_wait);
-		pipe->r_counter = pipe->w_counter = 1;
-		pipe->max_usage = pipe_bufs;
-		pipe->ring_size = pipe_bufs;
-		pipe->nr_accounted = pipe_bufs;
-		pipe->user = user;
-		mutex_init(&pipe->mutex);
+		/* 初始化等待队列和管道参数 */
+		init_waitqueue_head(&pipe->rd_wait);  /* 读等待队列 */
+		init_waitqueue_head(&pipe->wr_wait);  /* 写等待队列 */
+		pipe->r_counter = pipe->w_counter = 1;  /* 读写计数器 */
+		pipe->max_usage = pipe_bufs;  /* 最大使用量 */
+		pipe->ring_size = pipe_bufs;  /* 环形缓冲区大小 */
+		pipe->nr_accounted = pipe_bufs;  /* 已计费的缓冲区数 */
+		pipe->user = user;  /* 关联用户 */
+		mutex_init(&pipe->mutex);  /* 初始化互斥锁 */
 		return pipe;
 	}
 
 out_revert_acct:
-	(void) account_pipe_buffers(user, pipe_bufs, 0);
+	(void) account_pipe_buffers(user, pipe_bufs, 0);  /* 回滚账户统计 */
 	kfree(pipe);
 out_free_uid:
-	free_uid(user);
+	free_uid(user);  /* 释放用户引用 */
 	return NULL;
 }
 
@@ -890,17 +993,27 @@ fail_inode:
 	return NULL;
 }
 
+/**
+ * create_pipe_files - 创建管道文件对
+ * @res: 用于返回文件指针的数组 (res[0]为读端，res[1]为写端)
+ * @flags: 管道创建标志
+ *
+ * 创建一对文件描述符用于管道通信
+ * res[0]是读端(O_RDONLY)，res[1]是写端(O_WRONLY)
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ */
 int create_pipe_files(struct file **res, int flags)
 {
-	struct inode *inode = get_pipe_inode();
+	struct inode *inode = get_pipe_inode();  /* 获取管道inode */
 	struct file *f;
 	int error;
 
 	if (!inode)
-		return -ENFILE;
+		return -ENFILE;  /* 无法创建inode */
 
-	if (flags & O_NOTIFICATION_PIPE) {
-		error = watch_queue_init(inode->i_pipe);
+	if (flags & O_NOTIFICATION_PIPE) {  /* 通知管道 */
+		error = watch_queue_init(inode->i_pipe);  /* 初始化监视队列 */
 		if (error) {
 			free_pipe_info(inode->i_pipe);
 			iput(inode);
@@ -908,6 +1021,7 @@ int create_pipe_files(struct file **res, int flags)
 		}
 	}
 
+	/* 创建写端文件 */
 	f = alloc_file_pseudo(inode, pipe_mnt, "",
 				O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT)),
 				&pipefifo_fops);
@@ -917,8 +1031,9 @@ int create_pipe_files(struct file **res, int flags)
 		return PTR_ERR(f);
 	}
 
-	f->private_data = inode->i_pipe;
+	f->private_data = inode->i_pipe;  /* 关联管道信息 */
 
+	/* 克隆文件创建读端 */
 	res[0] = alloc_file_clone(f, O_RDONLY | (flags & O_NONBLOCK),
 				  &pipefifo_fops);
 	if (IS_ERR(res[0])) {
@@ -926,62 +1041,93 @@ int create_pipe_files(struct file **res, int flags)
 		fput(f);
 		return PTR_ERR(res[0]);
 	}
-	res[0]->private_data = inode->i_pipe;
-	res[1] = f;
-	stream_open(inode, res[0]);
+	res[0]->private_data = inode->i_pipe;  /* 关联管道信息 */
+	res[1] = f;  /* 写端文件 */
+	stream_open(inode, res[0]);  /* 设置为流模式 */
 	stream_open(inode, res[1]);
 	return 0;
 }
 
+/**
+ * __do_pipe_flags - 创建管道的内部实现
+ * @fd: 用于返回文件描述符的数组
+ * @files: 用于返回文件指针的数组
+ * @flags: 管道创建标志
+ *
+ * 创建管道并分配文件描述符，但不安装到进程的文件描述符表中
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ */
 static int __do_pipe_flags(int *fd, struct file **files, int flags)
 {
 	int error;
 	int fdw, fdr;
 
+	/* 检查标志的有效性 */
 	if (flags & ~(O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_NOTIFICATION_PIPE))
 		return -EINVAL;
 
-	error = create_pipe_files(files, flags);
+	error = create_pipe_files(files, flags);  /* 创建管道文件对 */
 	if (error)
 		return error;
 
+	/* 获取读端文件描述符 */
 	error = get_unused_fd_flags(flags);
 	if (error < 0)
 		goto err_read_pipe;
 	fdr = error;
 
+	/* 获取写端文件描述符 */
 	error = get_unused_fd_flags(flags);
 	if (error < 0)
 		goto err_fdr;
 	fdw = error;
 
-	audit_fd_pair(fdr, fdw);
-	fd[0] = fdr;
-	fd[1] = fdw;
+	audit_fd_pair(fdr, fdw);  /* 审计文件描述符对 */
+	fd[0] = fdr;  /* 读端描述符 */
+	fd[1] = fdw;  /* 写端描述符 */
 	return 0;
 
  err_fdr:
-	put_unused_fd(fdr);
+	put_unused_fd(fdr);  /* 释放读端描述符 */
  err_read_pipe:
-	fput(files[0]);
+	fput(files[0]);  /* 释放文件引用 */
 	fput(files[1]);
 	return error;
 }
 
+/**
+ * do_pipe_flags - 创建管道并安装文件描述符
+ * @fd: 用于返回文件描述符的数组
+ * @flags: 管道创建标志
+ *
+ * 创建管道并将文件描述符安装到当前进程的文件描述符表中
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
+ */
 int do_pipe_flags(int *fd, int flags)
 {
 	struct file *files[2];
 	int error = __do_pipe_flags(fd, files, flags);
 	if (!error) {
-		fd_install(fd[0], files[0]);
-		fd_install(fd[1], files[1]);
+		fd_install(fd[0], files[0]);  /* 安装读端描述符 */
+		fd_install(fd[1], files[1]);  /* 安装写端描述符 */
 	}
 	return error;
 }
 
 /*
- * sys_pipe() is the normal C calling standard for creating
- * a pipe. It's not the way Unix traditionally does this, though.
+ * sys_pipe() 是创建管道的标准C调用约定。
+ * 但这不是Unix传统的做法。
+ */
+/**
+ * do_pipe2 - pipe2系统调用的内部实现
+ * @fildes: 用户空间文件描述符数组指针
+ * @flags: 管道创建标志
+ *
+ * 实现pipe2系统调用，支持额外的标志参数
+ *
+ * 返回值: 成功返回0，失败返回负数错误码
  */
 static int do_pipe2(int __user *fildes, int flags)
 {
@@ -991,25 +1137,39 @@ static int do_pipe2(int __user *fildes, int flags)
 
 	error = __do_pipe_flags(fd, files, flags);
 	if (!error) {
+		/* 将文件描述符拷贝到用户空间 */
 		if (unlikely(copy_to_user(fildes, fd, sizeof(fd)))) {
-			fput(files[0]);
+			fput(files[0]);  /* 拷贝失败，清理资源 */
 			fput(files[1]);
 			put_unused_fd(fd[0]);
 			put_unused_fd(fd[1]);
 			error = -EFAULT;
 		} else {
-			fd_install(fd[0], files[0]);
+			fd_install(fd[0], files[0]);  /* 安装文件描述符 */
 			fd_install(fd[1], files[1]);
 		}
 	}
 	return error;
 }
 
+/**
+ * SYSCALL_DEFINE2(pipe2) - pipe2系统调用入口
+ * @fildes: 用户空间文件描述符数组指针
+ * @flags: 管道创建标志
+ *
+ * pipe2系统调用，支持O_CLOEXEC、O_NONBLOCK等标志
+ */
 SYSCALL_DEFINE2(pipe2, int __user *, fildes, int, flags)
 {
 	return do_pipe2(fildes, flags);
 }
 
+/**
+ * SYSCALL_DEFINE1(pipe) - 传统pipe系统调用入口
+ * @fildes: 用户空间文件描述符数组指针
+ *
+ * 传统的pipe系统调用，等同于flags为0的pipe2调用
+ */
 SYSCALL_DEFINE1(pipe, int __user *, fildes)
 {
 	return do_pipe2(fildes, 0);
