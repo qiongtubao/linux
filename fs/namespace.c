@@ -1214,6 +1214,7 @@ struct vfsmount *fc_mount_longterm(struct fs_context *fc)
 }
 EXPORT_SYMBOL(fc_mount_longterm);
 
+/* 只建 superblock 与它的根 dentry，还没挂进任何目录树——此时用户看不到它 */
 struct vfsmount *vfs_kern_mount(struct file_system_type *type,
 				int flags, const char *name,
 				void *data)
@@ -1852,10 +1853,16 @@ static int do_umount_root(struct super_block *sb)
 	return ret;
 }
 
+/*
+ * umount 的实体：从 mount 树上摘下来。还有进程在用（cwd、打开文件）时返回
+ * -EBUSY；MNT_DETACH 则是先摘下、等最后一个用户离开再真正释放。
+ */
 static int do_umount(struct mount *mnt, int flags)
 {
 	struct super_block *sb = mnt->mnt.mnt_sb;
 	int retval;
+
+	printk(KERN_INFO "[latte] do_umount: flags=0x%x\n", flags);
 
 	retval = security_sb_umount(&mnt->mnt, flags);
 	if (retval)
@@ -2546,6 +2553,7 @@ enum mnt_tree_flags_t {
  * Return: If @source_mnt was successfully attached 0 is returned.
  *         Otherwise a negative error code is returned.
  */
+/* 把新 mount 接到父目录的 mount 树上：从这一刻起路径解析才会走到它 */
 static int attach_recursive_mnt(struct mount *source_mnt,
 				const struct pinned_mountpoint *dest)
 {
@@ -3668,6 +3676,10 @@ static int do_new_mount_fc(struct fs_context *fc, const struct path *mountpoint,
  * create a new mount for userspace and request it to be added into the
  * namespace's tree
  */
+/*
+ * mount(2) 的主干：按 fstype 找到文件系统类型、建 fs_context、拿到 superblock，
+ * 再把它挂到 path 指定的挂载点上。
+ */
 static int do_new_mount(const struct path *path, const char *fstype,
 			int sb_flags, int mnt_flags,
 			const char *name, void *data)
@@ -3676,6 +3688,9 @@ static int do_new_mount(const struct path *path, const char *fstype,
 	struct fs_context *fc;
 	const char *subtype = NULL;
 	int err = 0;
+
+	printk(KERN_INFO "[latte] do_new_mount: %s -> %s\n",
+	       name ? name : "(none)", fstype);
 
 	if (!fstype)
 		return -EINVAL;

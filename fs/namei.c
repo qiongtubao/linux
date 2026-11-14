@@ -1622,6 +1622,7 @@ static bool __follow_mount_rcu(struct nameidata *nd, struct path *path)
 	}
 }
 
+/* 路径解析跨到挂载点：把当前 dentry 换成那个 mount 的根，路径才能继续往下走 */
 static inline int handle_mounts(struct nameidata *nd, struct dentry *dentry,
 			  struct path *path)
 {
