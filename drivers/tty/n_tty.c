@@ -1048,9 +1048,12 @@ static void eraser(u8 c, const struct tty_struct *tty)
 }
 
 
+/* 没有前台进程组就什么也不发：这是“can't access tty”下 Ctrl-C 无效的原因 */
 static void __isig(int sig, struct tty_struct *tty)
 {
 	struct pid *tty_pgrp = tty_get_pgrp(tty);
+	printk(KERN_INFO "[latte] __isig: sig=%d pgrp=%s\n",
+	       sig, tty_pgrp ? "set" : "none");
 	if (tty_pgrp) {
 		kill_pgrp(tty_pgrp, sig, 1);
 		put_pid(tty_pgrp);
@@ -1071,9 +1074,12 @@ static void __isig(int sig, struct tty_struct *tty)
  *
  * Locking: %ctrl.lock
  */
+/* 把控制字符翻译成信号，发给 tty 的前台进程组；顺手清输入输出缓冲 */
 static void isig(int sig, struct tty_struct *tty)
 {
 	struct n_tty_data *ldata = tty->disc_data;
+
+	printk(KERN_INFO "[latte] isig: sig=%d\n", sig);
 
 	if (L_NOFLSH(tty)) {
 		/* signal only */
@@ -1186,6 +1192,7 @@ static void n_tty_receive_parity_error(const struct tty_struct *tty,
 		put_tty_queue(c, ldata);
 }
 
+/* 控制字符 → 信号：投递后回显字符，并恢复被流控停住的输出 */
 static void
 n_tty_receive_signal_char(struct tty_struct *tty, int signal, u8 c)
 {
@@ -1335,6 +1342,7 @@ static bool n_tty_receive_char_canon(struct tty_struct *tty, u8 c)
 	return false;
 }
 
+/* 控制字符分派：INTR→SIGINT、QUIT→SIGQUIT、SUSP→SIGTSTP，其余是行编辑 */
 static void n_tty_receive_char_special(struct tty_struct *tty, u8 c,
 				       bool lookahead_done)
 {
@@ -1675,6 +1683,10 @@ static void __receive_buf(struct tty_struct *tty, const u8 *cp, const u8 *fp,
  *	claims non-exclusive %termios_rwsem
  *	publishes commit_head or canon_head
  */
+/*
+ * 驱动收到字节后的第一站：行规程。规范模式下攒行、处理回显、
+ * 识别控制字符（INTR/ERASE/EOF…），非规范模式则原样进缓冲。
+ */
 static size_t
 n_tty_receive_buf_common(struct tty_struct *tty, const u8 *cp, const u8 *fp,
 			 size_t count, bool flow)
@@ -1682,6 +1694,8 @@ n_tty_receive_buf_common(struct tty_struct *tty, const u8 *cp, const u8 *fp,
 	struct n_tty_data *ldata = tty->disc_data;
 	size_t n, rcvd = 0;
 	int room, overflow;
+
+	printk(KERN_INFO "[latte] n_tty_rx: %zu bytes\n", count);
 
 	down_read(&tty->termios_rwsem);
 

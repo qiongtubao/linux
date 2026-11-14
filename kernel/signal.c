@@ -1880,6 +1880,7 @@ static int kill_pgrp_info(int sig, struct kernel_siginfo *info, struct pid *pgrp
 	return ret;
 }
 
+/* 按进程组投递信号：tty 的 Ctrl-C 最终落到这里（kill(-pgrp, sig) 的内核侧） */
 int kill_pgrp(struct pid *pid, int sig, int priv)
 {
 	return kill_pgrp_info(sig, __si_special(priv), pid);
