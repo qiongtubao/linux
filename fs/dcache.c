@@ -2461,6 +2461,7 @@ struct dentry *d_hash_and_lookup(struct dentry *dir, struct qstr *name)
  * remove it from the hash queues so it can be deleted later
  */
  
+/* 名字被删除：dentry 变成 negative；inode 可能还被别的名字引用着 */
 void d_delete(struct dentry * dentry)
 {
 	struct inode *inode = dentry->d_inode;

@@ -782,6 +782,7 @@ EXPORT_SYMBOL(clear_inode);
  * the cache. This should occur atomically with setting the I_FREEING state
  * flag, so no inodes here should ever be on the LRU when being evicted.
  */
+/* 真正释放 inode：脏的话先回写，然后把对象还给 slab 缓存 */
 static void evict(struct inode *inode)
 {
 	const struct super_operations *op = inode->i_sb->s_op;
@@ -1922,6 +1923,10 @@ static void iput_final(struct inode *inode)
  *	zero, the inode is then freed and may also be destroyed.
  *
  *	Consequently, iput() can sleep.
+ */
+/*
+ * inode 引用计数减一；到 0 走 iput_final：nlink 也为 0 就 evict，
+ * 否则只挂到“无人使用”链表，等内存紧张时再回收。
  */
 void iput(struct inode *inode)
 {

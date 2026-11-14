@@ -4663,11 +4663,17 @@ SYSCALL_DEFINE1(rmdir, const char __user *, pathname)
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
+/*
+ * 删掉一个名字：i_nlink 减一；只有减到 0 且没人打开时，inode 才会真正释放。
+ */
 int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
 	       struct dentry *dentry, struct inode **delegated_inode)
 {
 	struct inode *target = dentry->d_inode;
 	int error = may_delete(idmap, dir, dentry, 0);
+
+	printk(KERN_INFO "[latte] vfs_unlink: %s (i_nlink=%u)\n",
+	       dentry->d_name.name, target ? target->i_nlink : 0);
 
 	if (error)
 		return error;
@@ -4906,6 +4912,10 @@ SYSCALL_DEFINE2(symlink, const char __user *, oldname, const char __user *, newn
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
+/*
+ * 建硬链接：新名字（dentry）指向同一个 inode，i_nlink 加一。
+ * 所以“一个文件可以有多个名字”，而 inode 只有一个。
+ */
 int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
 	     struct inode *dir, struct dentry *new_dentry,
 	     struct inode **delegated_inode)
@@ -4913,6 +4923,9 @@ int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
 	struct inode *inode = old_dentry->d_inode;
 	unsigned max_links = dir->i_sb->s_max_links;
 	int error;
+
+	printk(KERN_INFO "[latte] vfs_link: %s (i_nlink=%u)\n",
+	       new_dentry->d_name.name, inode ? inode->i_nlink : 0);
 
 	if (!inode)
 		return -ENOENT;
