@@ -1736,6 +1736,10 @@ EXPORT_SYMBOL(lookup_one_qstr_excl);
  * must be legitimized before use. If this returns NULL, then the walk
  * will no longer be in RCU mode.
  */
+/*
+ * 快路径：只在 dentry 缓存里找（RCU 遍历，不加锁）。命中就完全不用碰磁盘，
+ * 这就是“第二次打开同一个文件更快”的原因。
+ */
 static struct dentry *lookup_fast(struct nameidata *nd)
 {
 	struct dentry *dentry, *parent = nd->path.dentry;
@@ -1823,6 +1827,7 @@ again:
 	return dentry;
 }
 
+/* 慢路径：缓存没命中，调文件系统的 ->lookup 构造 dentry（可能要读盘） */
 static struct dentry *lookup_slow(const struct qstr *name,
 				  struct dentry *dir,
 				  unsigned int flags)
@@ -2131,6 +2136,7 @@ static const char *handle_dots(struct nameidata *nd, int type)
 	return NULL;
 }
 
+/* 处理一段路径：先查 dentry 缓存，未命中再问文件系统，然后进入下一级 */
 static const char *walk_component(struct nameidata *nd, int flags)
 {
 	struct dentry *dentry;
@@ -2437,6 +2443,10 @@ static inline const char *hash_name(struct nameidata *nd, const char *name, unsi
  *
  * Returns 0 and nd will have valid dentry and mnt on success.
  * Returns error and drops reference to input namei data on failure.
+ */
+/*
+ * 走完整个路径：按 '/' 切段，每段交给 walk_component()，负责 "."、
+ * ".."、连续斜杠与符号链接；走到最后一段就 set_last 停下。
  */
 static int link_path_walk(const char *name, struct nameidata *nd)
 {
@@ -3474,6 +3484,10 @@ static inline umode_t vfs_prepare_mode(struct mnt_idmap *idmap,
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
+/*
+ * 在目录里创建普通文件：权限检查、LSM 钩子，最后落到文件系统的 ->create
+ * （rootfs 是 tmpfs，所以落到 shmem_create）。
+ */
 int vfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	       struct dentry *dentry, umode_t mode, bool want_excl)
 {
@@ -3752,6 +3766,8 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 		open_flag &= ~O_TRUNC;
 	idmap = mnt_idmap(nd->path.mnt);
 	if (open_flag & O_CREAT) {
+		printk(KERN_INFO "[latte] lookup_open: create %s\n",
+		       dentry->d_name.name);
 		if (open_flag & O_EXCL)
 			open_flag &= ~O_TRUNC;
 		mode = vfs_prepare_mode(idmap, dir->d_inode, mode, mode, mode);

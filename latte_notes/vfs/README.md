@@ -1,0 +1,52 @@
+# VFS：一个路径怎么变成 inode，dentry 缓存又是什么
+
+`open("/etc/passwd")` 里那串字符要经过逐段解析才能变成可读的 inode。
+这一站看三件套（dentry / inode / file）、dentry 缓存为什么让第二次打开变快，
+并用 `dentry-state` 与 `drop_caches` 做了一次实测。
+1 份索引 + 4 篇主题文档，2 个打点。
+
+## 主题划分（按领域）
+
+| 领域 | 主题 | 文档 | 一句话 |
+|---|---|---|---|
+| 文件系统 | 路径解析 | [01-路径解析-从字符串到inode](01-路径解析-从字符串到inode.md) | 三件套 + 逐段解析 + 挂载点与符号链接 |
+| 文件系统 | 缓存 | [02-dentry缓存-为什么第二次打开快](02-dentry缓存-为什么第二次打开快.md) | 哈希表 + LRU + 引用计数；`nr_unused` 才是可回收量 |
+| 文件系统 | 代码路径 | [03-代码路径-从open到inode](03-代码路径-从open到inode.md) | walk → 最后一段 → `vfs_open`；创建走 `lookup_open` |
+| 文件系统 | 实测 | [04-实测-dentry缓存的增长与回收](04-实测-dentry缓存的增长与回收.md) | +100 个名字 = +100 个 dentry；`drop_caches` 清不动 |
+
+## 一条链
+
+```
+open("/f1")
+ └─ do_filp_open → path_openat
+     ├─ link_path_walk → walk_component
+     │    ├─ lookup_fast（查 dcache，RCU 无锁）
+     │    └─ lookup_slow（问文件系统的 ->lookup）
+     └─ lookup_open（最后一段：已存在 / O_CREAT 创建）
+         └─ vfs_open（inode + dentry → file）
+```
+
+## 打点与实测
+
+| 打点 / 读数 | 位置 | 本次值 |
+|---|---|---|
+| `lookup_open: create %s` | `fs/namei.c:3770` | 103 次（100 次 touch + 3 次启动解包） |
+| `drop_caches: value=%d` | `fs/drop_caches.c:63` | 2 次 |
+| `nr_dentry` | `/proc/sys/fs/dentry-state` | 621 → 721（+100） |
+| `nr_unused` | 同上 | 1 → 2（几乎不动） |
+
+**没在 `lookup_fast()` / `lookup_slow()` 打点**：一次 `ls` 就有几百次调用，是最热路径。
+
+## 自查 3 问
+
+1. 为什么建 100 个文件，`nr_dentry` 正好 +100？（01/02：每个名字一个 dentry 对象）
+2. `drop_caches=2` 之后 `nr_dentry` 几乎不变，怎么解释？（04：只回收无人引用的
+   dentry，本次 `nr_unused` 只有 2~3）
+3. `open(O_CREAT)` 与 `mknod()` 的创建路径有什么不同？（03：前者走 `lookup_open`，
+   后者走 `do_mknodat` → `vfs_create`/`vfs_mknod`）
+
+## 下一阶段
+
+VFS 还能往下挖：**inode 缓存与硬链接**（一个 inode 多个 dentry）、**文件系统挂载**
+（`vfsmount` 树、`follow_managed`）、**writeback**（脏页怎么回写）。也可以换域做
+**作业控制**（`Ctrl-Z`/`fg`/`bg`）或 **zram/zswap**。

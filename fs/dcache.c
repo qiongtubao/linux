@@ -896,6 +896,7 @@ locked:
  * releasing its resources. If the parent dentries were scheduled for release
  * they too may now get deleted.
  */
+/* 引用计数减一；到 0 只是挂进 LRU 等回收，不是立刻删除 */
 void dput(struct dentry *dentry)
 {
 	if (!dentry)
@@ -2250,6 +2251,7 @@ seqretry:
  * NOTE! The caller *has* to check the resulting dentry against the sequence
  * number we've returned before using any of the resulting dentry state!
  */
+/* 在父目录的 dentry 哈希桶里找子项；RCU 版可无锁读，失败让调用者降级 */
 struct dentry *__d_lookup_rcu(const struct dentry *parent,
 				const struct qstr *name,
 				unsigned *seqp)

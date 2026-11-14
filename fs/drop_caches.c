@@ -48,6 +48,7 @@ static void drop_pagecache_sb(struct super_block *sb, void *unused)
 	iput(toput_inode);
 }
 
+/* 手工丢缓存：echo 2 清 dentry 与 inode，echo 3 连页缓存一起清 */
 static int drop_caches_sysctl_handler(const struct ctl_table *table, int write,
 		void *buffer, size_t *length, loff_t *ppos)
 {
@@ -58,6 +59,9 @@ static int drop_caches_sysctl_handler(const struct ctl_table *table, int write,
 		return ret;
 	if (write) {
 		static int stfu;
+
+		printk(KERN_INFO "[latte] drop_caches: value=%d\n",
+		       sysctl_drop_caches);
 
 		if (sysctl_drop_caches & 1) {
 			lru_add_drain_all();
