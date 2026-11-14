@@ -569,6 +569,7 @@ static __init bool apic_validate_deadline_timer(void)
  * Setup the local APIC timer for this CPU. Copy the initialized values
  * of the boot CPU and register the clock event in the framework.
  */
+/* 每个 CPU 注册自己的本地 APIC 定时器：这就是 tick（时钟中断）的来源 */
 static void setup_APIC_timer(void)
 {
 	struct clock_event_device *levt = this_cpu_ptr(&lapic_events);
@@ -594,6 +595,8 @@ static void setup_APIC_timer(void)
 		clockevents_register_device(levt);
 
 	apic_update_vector(smp_processor_id(), LOCAL_TIMER_VECTOR, true);
+	printk(KERN_INFO "[latte] setup_APIC_timer: cpu%d uses %s\n",
+	       smp_processor_id(), levt->name ? levt->name : "lapic");
 }
 
 /*

@@ -315,6 +315,7 @@ static __always_inline bool call_irq_handler(int vector, struct pt_regs *regs)
  * common_interrupt() handles all normal device IRQ's (the special SMP
  * cross-CPU interrupts have their own entry points).
  */
+/* 所有普通设备 IRQ 的 C 入口：汇编桩进来后按向量号找到对应 irq_desc */
 DEFINE_IDTENTRY_IRQ(common_interrupt)
 {
 	struct pt_regs *old_regs = set_irq_regs(regs);

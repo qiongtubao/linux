@@ -190,6 +190,10 @@ bool idt_is_f00f_address(unsigned long address)
 }
 #endif
 
+/*
+ * 把一张 idt_data 表批量写进 IDT：每条记录填一个 gate_desc，
+ * sys=true 表示这些属于系统向量（异常/APIC），不是外部设备 IRQ。
+ */
 static __init void
 idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sys)
 {
@@ -226,6 +230,7 @@ void __init idt_setup_early_traps(void)
 	load_idt(&idt_descr);
 }
 
+/* 前 32 个向量是 CPU 异常/陷阱：除零、#PF、#GP、NMI 都在这里占位 */
 /**
  * idt_setup_traps - Initialize the idt table with default traps
  */
@@ -281,6 +286,10 @@ static void __init idt_map_in_cea(void)
 /**
  * idt_setup_apic_and_irq_gates - Setup APIC/SMP and normal interrupt gates
  */
+/*
+ * 装外部中断：先把 APIC 相关向量写进表，再把 FIRST_EXTERNAL_VECTOR 之后
+ * 每个向量指向 irq_entries_start 的入口桩，最后加载 IDT 并设成只读。
+ */
 void __init idt_setup_apic_and_irq_gates(void)
 {
 	int i = FIRST_EXTERNAL_VECTOR;
@@ -304,6 +313,7 @@ void __init idt_setup_apic_and_irq_gates(void)
 		set_intr_gate(i, entry);
 	}
 #endif
+	/* 装进 CPU entry area 再 lidt：加载后所有中断/异常都走新表 */
 	/* Map IDT into CPU entry area and reload it. */
 	idt_map_in_cea();
 	load_idt(&idt_descr);
@@ -311,6 +321,7 @@ void __init idt_setup_apic_and_irq_gates(void)
 	/* Make the IDT table read only */
 	set_memory_ro((unsigned long)&idt_table, 1);
 
+	printk(KERN_INFO "[latte] idt_setup_apic_and_irq_gates: IRQ gates ready\n");
 	idt_setup_done = true;
 }
 

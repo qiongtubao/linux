@@ -246,6 +246,7 @@ irqreturn_t handle_irq_event_percpu(struct irq_desc *desc)
 	return retval;
 }
 
+/* 取 irq_desc 上挂的 action 链，逐个调 handler；共享中断会有多条 action */
 irqreturn_t handle_irq_event(struct irq_desc *desc)
 {
 	irqreturn_t ret;

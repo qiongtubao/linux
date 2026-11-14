@@ -2063,6 +2063,10 @@ const void *free_nmi(unsigned int irq, void *dev_id)
  *	IRQF_TRIGGER_*		Specify active edge(s) or level
  *	IRQF_ONESHOT		Run thread_fn with interrupt line masked
  */
+/*
+ * 驱动注册中断的入口：把 handler（可选线程化 thread_fn）挂到 irq_desc
+ * 的 action 链上；共享中断靠 dev_id 区分是谁的。
+ */
 int request_threaded_irq(unsigned int irq, irq_handler_t handler,
 			 irq_handler_t thread_fn, unsigned long irqflags,
 			 const char *devname, void *dev_id)
@@ -2070,6 +2074,9 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler,
 	struct irqaction *action;
 	struct irq_desc *desc;
 	int retval;
+
+	printk(KERN_INFO "[latte] request_irq: irq=%u name=%s flags=0x%lx\n",
+	       irq, devname ? devname : "(null)", irqflags);
 
 	if (irq == IRQ_NOTCONNECTED)
 		return -ENOTCONN;

@@ -682,6 +682,7 @@ static void cond_unmask_irq(struct irq_desc *desc)
  * the associated handler has acknowledged the device, so the interrupt
  * line is back to inactive.
  */
+/* 电平触发：先屏蔽本 IRQ，处理完再放行，防止低电平期间反复进中断 */
 void handle_level_irq(struct irq_desc *desc)
 {
 	guard(raw_spinlock)(&desc->lock);
@@ -820,6 +821,7 @@ EXPORT_SYMBOL_GPL(handle_fasteoi_nmi);
  * interrupts which have arrived while the handler was running. If all
  * pending interrupts are handled, the loop is left.
  */
+/* 边沿触发：处理期间新来的边沿先挂起，本轮结束后再跑一遍 */
 void handle_edge_irq(struct irq_desc *desc)
 {
 	guard(raw_spinlock)(&desc->lock);
