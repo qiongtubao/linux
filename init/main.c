@@ -1698,12 +1698,17 @@ static noinline void __init kernel_init_freeable(void)
 	 * the work
 	 */
 	int ramdisk_command_access;
+	/* 探一次 /init 在不在：0 表示 initramfs 里真有它 */
 	ramdisk_command_access = init_eaccess(ramdisk_execute_command);
+	printk(KERN_INFO "[latte] init_eaccess(%s) = %d\n",
+	       ramdisk_execute_command, ramdisk_command_access);
+	/* 有 /init 就交给它；没有才走 prepare_namespace 挂真正的根 */
 	if (ramdisk_command_access != 0) {
 		pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
 			ramdisk_execute_command, ramdisk_command_access);
 		ramdisk_execute_command = NULL;
 		/* initramfs 里没有可用的 init，退回真正的根文件系统 */
+		printk(KERN_INFO "[latte] prepare_namespace: enter real-root path\n");
 		prepare_namespace();
 	}
 

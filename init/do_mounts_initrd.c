@@ -15,6 +15,7 @@
 unsigned long initrd_start, initrd_end;
 int initrd_below_start_ok;
 static unsigned int real_root_dev;	/* do_proc_dointvec cannot handle kdev_t */
+/* noinitrd 可以把它关掉；默认允许尝试老式 initrd */
 static int __initdata mount_initrd = 1;
 
 phys_addr_t phys_initrd_start __initdata;
@@ -70,8 +71,10 @@ static int __init early_initrd(char *p)
 }
 early_param("initrd", early_initrd);
 
+/* /linuxrc 的执行环境：换到 initrd 自己的根，脱离内核的 fs 上下文 */
 static int __init init_linuxrc(struct subprocess_info *info, struct cred *new)
 {
+	/* 复制一份 fs 上下文，后面的 chroot 只影响这个子进程 */
 	ksys_unshare(CLONE_FS | CLONE_FILES);
 	console_on_rootfs();
 	/* move initrd over / and chdir/chroot in initrd root */
@@ -82,6 +85,10 @@ static int __init init_linuxrc(struct subprocess_info *info, struct cred *new)
 	return 0;
 }
 
+/*
+ * 老式 initrd 的执行体：把 ramdisk 挂到 /root，chroot 进去跑 /linuxrc，
+ * 由它用 real-root-dev 告知真正的根在哪儿，再切回去挂真根。
+ */
 static void __init handle_initrd(char *root_device_name)
 {
 	struct subprocess_info *info;
@@ -133,8 +140,15 @@ static void __init handle_initrd(char *root_device_name)
 	}
 }
 
+/*
+ * 老式 initrd 入口：BLK_DEV_RAM 打开时才可能把镜像读进 /dev/ram0 并跑
+ * /linuxrc。本次配置没开 BLK_DEV_RAM，rd_load_image() 是返回 0 的空桩，
+ * 所以这里必然返回 false——initramfs 场景下它什么也不做。
+ */
 bool __init initrd_load(char *root_device_name)
 {
+	printk(KERN_INFO "[latte] initrd_load: mount_initrd=%d ROOT_DEV=%u\n",
+	       mount_initrd, ROOT_DEV);
 	if (mount_initrd) {
 		create_dev("/dev/ram", Root_RAM0);
 		/*
@@ -143,12 +157,14 @@ bool __init initrd_load(char *root_device_name)
 		 * in that case the ram disk is just set up here, and gets
 		 * mounted in the normal path.
 		 */
+		/* 镜像能读成 ramdisk、且根不是 ram0，才走 linuxrc 流程 */
 		if (rd_load_image("/initrd.image") && ROOT_DEV != Root_RAM0) {
 			init_unlink("/initrd.image");
 			handle_initrd(root_device_name);
 			return true;
 		}
 	}
+	/* 没有可用的老式 initrd：清掉占位文件，返回 false 让调用者挂真根 */
 	init_unlink("/initrd.image");
 	return false;
 }

@@ -129,6 +129,7 @@ __setup("rootfstype=", fs_names_setup);
 __setup("rootdelay=", root_delay_setup);
 
 /* This can return zero length strings. Caller should check */
+/* 把 "ext4,ramfs" 这类 rootfstype 列表拆成首尾相连的字符串数组 */
 static int __init split_fs_names(char *page, size_t size)
 {
 	int count = 1;
@@ -145,6 +146,7 @@ static int __init split_fs_names(char *page, size_t size)
 	return count;
 }
 
+/* 真挂一个 fs 到 /root；挂成后把 ROOT_DEV 更新成 superblock 的实际设备号 */
 static int __init do_mount_root(const char *name, const char *fs,
 				 const int flags, const void *data)
 {
@@ -162,6 +164,7 @@ static int __init do_mount_root(const char *name, const char *fs,
 		strscpy_pad(data_page, data, PAGE_SIZE);
 	}
 
+	/* 先挂到 /root，挂成了才挪到 /，避免半成品盖住当前的根 */
 	ret = init_mount(name, "/root", fs, flags, data_page);
 	if (ret)
 		goto out;
@@ -169,6 +172,7 @@ static int __init do_mount_root(const char *name, const char *fs,
 	init_chdir("/root");
 	s = current->fs->pwd.dentry->d_sb;
 	ROOT_DEV = s->s_dev;
+	/* 这条 VFS: Mounted root ... 就是根挂成功的标志 */
 	printk(KERN_INFO
 	       "VFS: Mounted root (%s filesystem)%s on device %u:%u.\n",
 	       s->s_type->name,
@@ -181,8 +185,13 @@ out:
 	return ret;
 }
 
+/*
+ * 通用挂载：先按 rootfstype（没给就列出所有块设备 fs）逐个试，
+ * -EACCES/-EINVAL 当成“这个 fs 不认”换下一个，全失败才 panic。
+ */
 void __init mount_root_generic(char *name, char *pretty_name, int flags)
 {
+	printk(KERN_INFO "[latte] mount_root_generic: ROOT_DEV=%u\n", ROOT_DEV);
 	struct page *page = alloc_page(GFP_KERNEL);
 	char *fs_names = page_address(page);
 	char *p;
@@ -233,6 +242,7 @@ retry:
 			pr_err("\n");
 		}
 
+		/* 设备在、fs 也认，但就是挂不上：无路可退，panic */
 		panic("VFS: Unable to mount root fs on %s", b);
 	}
 	if (!(flags & SB_RDONLY)) {
@@ -343,6 +353,7 @@ static bool __init fs_is_nodev(char *fstype)
 	return ret;
 }
 
+/* 不依赖设备的 fs（tmpfs/ramfs 这类）路径：只试显式给的 rootfstype */
 static int __init mount_nodev_root(char *root_device_name)
 {
 	char *fs_names, *fstype;
@@ -371,12 +382,14 @@ static int __init mount_nodev_root(char *root_device_name)
 }
 
 #ifdef CONFIG_BLOCK
+/* 块设备路径：先造出 /dev/root 节点，再交给通用挂载逐个 fs 试 */
 static void __init mount_block_root(char *root_device_name)
 {
 	int err = create_dev("/dev/root", ROOT_DEV);
 
 	if (err < 0)
 		pr_emerg("Failed to create /dev/root: %d\n", err);
+	printk(KERN_INFO "[latte] mount_block_root: /dev/root\n");
 	mount_root_generic("/dev/root", root_device_name, root_mountflags);
 }
 #else
@@ -385,8 +398,13 @@ static inline void mount_block_root(char *root_device_name)
 }
 #endif /* CONFIG_BLOCK */
 
+/*
+ * 按 ROOT_DEV 分派：NFS/CIFS 走网络，Root_Generic 走通用查找；
+ * 设备号是 0（没给 root=）时先试不依赖设备的 fs，最后退回块设备路径。
+ */
 void __init mount_root(char *root_device_name)
 {
+	printk(KERN_INFO "[latte] mount_root: ROOT_DEV=%u\n", ROOT_DEV);
 	switch (ROOT_DEV) {
 	case Root_NFS:
 		mount_nfs_root();
@@ -399,17 +417,20 @@ void __init mount_root(char *root_device_name)
 				   root_mountflags);
 		break;
 	case 0:
+		/* 没给 root=：只有显式指定 rootfstype 才试 nodev 那类 */
 		if (root_device_name && root_fs_names &&
 		    mount_nodev_root(root_device_name) == 0)
 			break;
 		fallthrough;
 	default:
+		/* 兜底：当成块设备挂（/dev/root），失败就在里面 panic */
 		mount_block_root(root_device_name);
 		break;
 	}
 }
 
 /* wait for any asynchronous scanning to complete */
+/* rootwait：轮询等根设备出现，等到了再交给 mount_root，超时也继续往下走 */
 static void __init wait_for_root(char *root_device_name)
 {
 	ktime_t end;
@@ -432,6 +453,7 @@ static void __init wait_for_root(char *root_device_name)
 
 }
 
+/* 把 root= 的字符串变成 ROOT_DEV：特殊名字给伪值，其余查真实设备号 */
 static dev_t __init parse_root_device(char *root_device_name)
 {
 	int error;
@@ -459,10 +481,18 @@ static dev_t __init parse_root_device(char *root_device_name)
 }
 
 /*
+ * 挂真正的根：等设备探测完、必要时等根设备出现、挂上根，最后把它
+ * 挪到 "/" 并 chroot 进去。只有 initramfs 里没有可用 init 时才会被
+ * kernel_init_freeable() 调到（有 /init 就直接 execve 它了）。
+ */
+/*
  * Prepare the namespace - decide what/where to mount, load ramdisks, etc.
  */
 void __init prepare_namespace(void)
 {
+	printk(KERN_INFO "[latte] prepare_namespace: root=%s\n",
+	       saved_root_name[0] ? saved_root_name : "(none)");
+	/* root_delay=N：给慢速设备留时间，N 秒后才开始找根 */
 	if (root_delay) {
 		printk(KERN_INFO "Waiting %d sec before mounting root device...\n",
 		       root_delay);
@@ -476,20 +506,30 @@ void __init prepare_namespace(void)
 	 * For example, it is not atypical to wait 5 seconds here
 	 * for the touchpad of a laptop to initialize.
 	 */
+	/* 等已知设备探测完，否则根设备可能还没出现 */
 	wait_for_device_probe();
 
+	/* 根在 RAID 上时先把阵列组起来 */
 	md_run_setup();
 
+	/* root= 解析成 ROOT_DEV：块设备号，或 Root_NFS 这类伪值 */
 	if (saved_root_name[0])
 		ROOT_DEV = parse_root_device(saved_root_name);
 
+	/* 老式 initrd：镜像里有 /linuxrc 就交给它跑，跑完再挂真根 */
+	printk(KERN_INFO "[latte] prepare_namespace: initrd_load\n");
 	if (initrd_load(saved_root_name))
 		goto out;
 
+	/* rootwait：设备可能慢，再轮询等一会儿根设备 */
 	if (root_wait)
 		wait_for_root(saved_root_name);
+	/* 真正去挂根；挂不上会在 mount_root_generic() 里直接 panic */
+	printk(KERN_INFO "[latte] prepare_namespace: mount_root\n");
 	mount_root(saved_root_name);
 out:
+	/* 换根三步：挂 devtmpfs、把当前 rootfs 挪到 /、chroot 进去 */
+	printk(KERN_INFO "[latte] prepare_namespace: devtmpfs + switch root\n");
 	devtmpfs_mount();
 	init_mount(".", "/", NULL, MS_MOVE, NULL);
 	init_chroot(".");
@@ -510,6 +550,10 @@ struct file_system_type rootfs_fs_type = {
 	.kill_sb	= kill_litter_super,
 };
 
+/*
+ * 给 rootfs 选后端：既没 root= 也没 rootfstype 时用 tmpfs，否则退回
+ * ramfs。initramfs 解压出来的东西就落在这个 rootfs 上。
+ */
 void __init init_rootfs(void)
 {
 	if (IS_ENABLED(CONFIG_TMPFS)) {
