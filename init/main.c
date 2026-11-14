@@ -1449,6 +1449,7 @@ static int run_init_process(const char *init_filename)
 	pr_debug("  with environment:\n");
 	for (p = envp_init; *p; p++)
 		pr_debug("    %s\n", *p);
+	/* 成功后 regs 已被改写，返回到用户态时直接落在程序入口 */
 	return kernel_execve(init_filename, argv_init, envp_init);
 }
 

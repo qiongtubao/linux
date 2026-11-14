@@ -579,9 +579,15 @@ start_thread_common(struct pt_regs *regs, unsigned long new_ip,
 	regs->flags	= X86_EFLAGS_IF | X86_EFLAGS_FIXED;
 }
 
+/*
+ * 把 pt_regs 改写成"用户态入口"：RIP=程序入口、RSP=新栈顶、
+ * CS/SS 换成用户段。内核随后 iretq 回用户态，第一句就是新程序。
+ */
 void
 start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
 {
+	printk(KERN_INFO "[latte] start_thread: ip=0x%lx sp=0x%lx\n",
+	       new_ip, new_sp);
 	start_thread_common(regs, new_ip, new_sp,
 			    __USER_CS, __USER_DS, 0);
 }

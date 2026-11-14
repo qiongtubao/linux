@@ -1096,6 +1096,10 @@ void __set_task_comm(struct task_struct *tsk, const char *buf, bool exec)
  * signal (via de_thread() or coredump), or will have SEGV raised
  * (after exec_mmap()) by search_binary_handler (see below).
  */
+/*
+ * "换掉进程"的地方：清旧地址空间、拆其他线程、重置信号与文件表，
+ * 成功后同一个 pid 就是新程序了。ELF 与脚本处理器最后都回到这里。
+ */
 int begin_new_exec(struct linux_binprm * bprm)
 {
 	struct task_struct *me = current;
@@ -1115,9 +1119,15 @@ int begin_new_exec(struct linux_binprm * bprm)
 	trace_sched_prepare_exec(current, bprm);
 
 	/*
+	 * 过了这一行错误就都是致命的：旧地址空间马上要拆，
+	 * 没有再回用户态继续跑老程序的机会
+	 */
+	/*
 	 * Ensure all future errors are fatal.
 	 */
 	bprm->point_of_no_return = true;
+	printk(KERN_INFO "[latte] begin_new_exec: %s (comm=%s)\n",
+	       bprm->filename, current->comm);
 
 	/* Make this the only thread in the thread group */
 	retval = de_thread(me);
@@ -1667,6 +1677,7 @@ static int search_binary_handler(struct linux_binprm *bprm)
 			continue;
 		read_unlock(&binfmt_lock);
 
+		printk(KERN_INFO "[latte] binfmt try: %s\n", bprm->filename);
 		retval = fmt->load_binary(bprm);
 
 		read_lock(&binfmt_lock);
@@ -1681,6 +1692,10 @@ static int search_binary_handler(struct linux_binprm *bprm)
 	return -ENOEXEC;
 }
 
+/*
+ * 格式分派的循环：允许 binfmt 重写目标（例如脚本把 bprm 换成解释器），
+ * 所以同一份 execve 可能连续加载好几个文件；最多 5 层防环。
+ */
 /* binfmt handlers will call back into begin_new_exec() on success. */
 static int exec_binprm(struct linux_binprm *bprm)
 {
@@ -1727,6 +1742,10 @@ static int exec_binprm(struct linux_binprm *bprm)
 	return 0;
 }
 
+/*
+ * execve 的中段：准备凭据、做安全检查、标记"正在 execve"，
+ * 然后交给 exec_binprm() 去按文件格式挑选处理器。
+ */
 static int bprm_execve(struct linux_binprm *bprm)
 {
 	int retval;
@@ -1751,6 +1770,8 @@ static int bprm_execve(struct linux_binprm *bprm)
 	if (retval || bprm->is_check)
 		goto out;
 
+	printk(KERN_INFO "[latte] bprm_execve: %s going to exec_binprm\n",
+	       bprm->filename);
 	retval = exec_binprm(bprm);
 	if (retval < 0)
 		goto out;
@@ -1781,6 +1802,10 @@ out:
 	return retval;
 }
 
+/*
+ * 用户态 execve(2) 与内核态 kernel_execve() 共用的收尾：把 argv/envp
+ * 压进新用户栈、统计个数，然后交给 bprm_execve() 去真正换掉进程。
+ */
 static int do_execveat_common(int fd, struct filename *filename,
 			      struct user_arg_ptr argv,
 			      struct user_arg_ptr envp,
@@ -1857,6 +1882,8 @@ static int do_execveat_common(int fd, struct filename *filename,
 			     current->comm, bprm->filename);
 	}
 
+	printk(KERN_INFO "[latte] do_execveat_common: argc=%d envc=%d going to bprm_execve\n",
+	       bprm->argc, bprm->envc);
 	retval = bprm_execve(bprm);
 out_free:
 	free_bprm(bprm);
@@ -1866,6 +1893,11 @@ out_ret:
 	return retval;
 }
 
+/*
+ * 内核态发起 execve 的唯一入口：1 号进程就是从这里跨进用户态的。
+ * 前提是当前进程不能带 PF_KTHREAD——kernel_init 由 user_mode_thread()
+ * 创建（kernel_thread() 才会打 kthread 标记），所以这里通过。
+ */
 int kernel_execve(const char *kernel_filename,
 		  const char *const *argv, const char *const *envp)
 {
@@ -1874,9 +1906,13 @@ int kernel_execve(const char *kernel_filename,
 	int fd = AT_FDCWD;
 	int retval;
 
+	/* 纯内核线程没有用户地址空间，execve 没有意义，直接拒绝 */
 	/* It is non-sense for kernel threads to call execve */
 	if (WARN_ON_ONCE(current->flags & PF_KTHREAD))
 		return -EINVAL;
+
+	printk(KERN_INFO "[latte] kernel_execve: %s (PF_KTHREAD=%d)\n",
+	       kernel_filename, !!(current->flags & PF_KTHREAD));
 
 	filename = getname_kernel(kernel_filename);
 	if (IS_ERR(filename))
@@ -1916,6 +1952,9 @@ int kernel_execve(const char *kernel_filename,
 	retval = copy_strings_kernel(bprm->argc, argv, bprm);
 	if (retval < 0)
 		goto out_free;
+
+	printk(KERN_INFO "[latte] kernel_execve: strings ready, argc=%d envc=%d\n",
+	       bprm->argc, bprm->envc);
 
 	retval = bprm_execve(bprm);
 out_free:

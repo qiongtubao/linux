@@ -829,6 +829,10 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
 	return ret == -ENOENT ? 0 : ret;
 }
 
+/*
+ * ELF 处理器：校验 ELF 头、按 PT_LOAD 映射各段、算出入口地址，
+ * 最后交给 START_THREAD() 设好 RIP/RSP，一个用户态进程就"装好了"。
+ */
 static int load_elf_binary(struct linux_binprm *bprm)
 {
 	struct file *interpreter = NULL; /* to shut gcc up */
@@ -869,6 +873,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	elf_phdata = load_elf_phdrs(elf_ex, bprm->file);
 	if (!elf_phdata)
 		goto out;
+
+	/* 魔数、类型、架构都认了，下面开始按段映射 */
+	printk(KERN_INFO "[latte] load_elf_binary: %s type=%s\n",
+	       bprm->filename,
+	       elf_ex->e_type == ET_DYN ? "ET_DYN(可重定位)" : "ET_EXEC(固定地址)");
 
 	elf_ppnt = elf_phdata;
 	for (i = 0; i < elf_ex->e_phnum; i++, elf_ppnt++) {
@@ -1251,6 +1260,7 @@ out_free_interp:
 	end_data += load_bias;
 
 	if (interpreter) {
+		/* 动态链接：入口在解释器里，由它加载完主程序再跳过去 */
 		elf_entry = load_elf_interp(interp_elf_ex,
 					    interpreter,
 					    load_bias, interp_elf_phdata,
@@ -1276,6 +1286,7 @@ out_free_interp:
 		kfree(interp_elf_ex);
 		kfree(interp_elf_phdata);
 	} else {
+		/* 静态链接（本次的 busybox）：入口就是 ELF 头的 e_entry */
 		elf_entry = e_entry;
 		if (BAD_ADDR(elf_entry)) {
 			retval = -EINVAL;
@@ -1376,6 +1387,9 @@ out_free_interp:
 #endif
 
 	finalize_exec(bprm);
+	/* bprm->p 是内核替用户摆好的新栈顶：argv/envp/auxv 都在那儿 */
+	printk(KERN_INFO "[latte] START_THREAD: ip=0x%lx sp=0x%lx\n",
+	       elf_entry, bprm->p);
 	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
 	retval = 0;
 out:
