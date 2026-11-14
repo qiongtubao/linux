@@ -241,12 +241,15 @@ void __weak release_thread(struct task_struct *dead_task)
 {
 }
 
+/* 真正回收：从进程表摘掉、释放 task_struct 与内核栈（父进程 wait 后才走到） */
 void release_task(struct task_struct *p)
 {
 	struct release_task_post post;
 	struct task_struct *leader;
 	struct pid *thread_pid;
 	int zap_leader;
+
+	printk(KERN_INFO "[latte] release_task: %s\n", p->comm);
 repeat:
 	memset(&post, 0, sizeof(post));
 
@@ -734,6 +737,7 @@ static void forget_original_parent(struct task_struct *father,
  * Send signals to all our closest relatives so that they know
  * to properly mourn us..
  */
+/* 退出通知：给父进程发 SIGCHLD；父进程不要了就把孩子过继给 init（1 号） */
 static void exit_notify(struct task_struct *tsk, int group_dead)
 {
 	bool autoreap;
@@ -894,10 +898,16 @@ static void synchronize_group_exit(struct task_struct *tsk, long code)
 		coredump_task_exit(tsk, core_state);
 }
 
+/*
+ * 进程退出的总入口：记退出码、通知父进程、释放文件/内存/信号等资源，
+ * 最后把自己变成僵尸（Z）并让出 CPU——task_struct 等父进程来收。
+ */
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
+
+	printk(KERN_INFO "[latte] do_exit: %s code=%ld\n", tsk->comm, code);
 
 	WARN_ON(irqs_disabled());
 	WARN_ON(tsk->plug);
@@ -1696,6 +1706,7 @@ notask:
 	return retval;
 }
 
+/* wait4 的实体：等子进程状态变化（退出/停止/继续），WNOHANG 则不阻塞 */
 static long do_wait(struct wait_opts *wo)
 {
 	int retval;
