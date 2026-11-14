@@ -1010,6 +1010,7 @@ void __ref free_initmem(void)
 }
 
 #ifdef CONFIG_BLK_DEV_INITRD
+/* x86 覆盖 weak 版：释放经 free_init_pages() 落到 free_reserved_area() */
 void __init free_initrd_mem(unsigned long start, unsigned long end)
 {
 	/*
@@ -1021,6 +1022,7 @@ void __init free_initrd_mem(unsigned long start, unsigned long end)
 	 *   - relocate_initrd()
 	 * So here We can do PAGE_ALIGN() safely to get partial page to be freed
 	 */
+	printk(KERN_INFO "[latte] free_initrd_mem -> free_reserved_area\n");
 	free_init_pages("initrd", start, PAGE_ALIGN(end));
 }
 #endif
