@@ -9,7 +9,7 @@
 | 领域 | 一句话解释 | 已有的文档 |
 |---|---|---|
 | **启动** | 按下电源后，谁把内核叫醒；内核把自己和外设准备到什么程度；最后把控制权交给谁 | `init-process.md`、`initramfs-rootfs.md`、`root-mount/01`、`04`、`06`、`07`、`execve/01`、`05` |
-| **内存** | 物理内存怎么记账、页怎么分配与回收、内存里的“文件系统” | `mm-core-init.md`、`root-mount/03`、`execve/03` |
+| **内存** | 三层记账（memblock/buddy/slab）、页分配与回收、内存里的“文件系统” | `mm-core-init.md`、`memory/01`~`05`、`root-mount/03`、`execve/03` |
 | **磁盘与文件系统** | 块设备/分区/文件系统/挂载到底是什么，内核怎么把磁盘上的东西变成 `/` | `root-mount/02`、`05`、`execve/04` |
 | **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve` 那一步跨过什么 | `init-process.md`、`root-mount/04`、`execve/02`、`06` |
 | **设备与中断** | 设备号与 `/dev`、console 与 tty、printk 怎么落到串口、中断与 IDT | `devices/01`~`06`、`interrupts/01`~`05` |
@@ -24,6 +24,7 @@
 6. `execve/` —— 找到 `/init` 之后：怎么把它变成用户态 1 号进程（1 索引 + 6 篇）
 7. `devices/` —— 反身自问：这些日志和 `/dev` 节点是谁弄出来的（1 索引 + 6 篇）
 8. `interrupts/` —— 硬件怎么打断内核：IDT 装表 → 进门 → 驱动 handler（1 索引 + 5 篇）
+9. `memory/` —— 页怎么分配、对象怎么缓存、紧张时谁去回收（1 索引 + 5 篇）
 
 ## 每篇主题文档的固定骨架
 

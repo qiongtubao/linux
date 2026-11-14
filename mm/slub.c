@@ -8511,6 +8511,7 @@ void __init kmem_cache_init(void)
 	/* Able to allocate the per node structures */
 	/* 到这一步只保证 kmem_cache_node 可用，别的还不行 */
 	slab_state = PARTIAL;
+	printk(KERN_INFO "[latte] kmem_cache_init: bootstrap caches ready\n");
 
 	/* 现在轮到 kmem_cache 自己：大小要含每 node 的指针数组 */
 	create_boot_cache(kmem_cache, "kmem_cache",

@@ -4348,6 +4348,9 @@ __perform_reclaim(gfp_t gfp_mask, unsigned int order,
 	unsigned int noreclaim_flag;
 	unsigned long progress;
 
+	/* 进入同步回收：期间申请内存不再触发新一轮回收，防止递归 */
+	printk(KERN_INFO "[latte] direct reclaim: order=%u\n", order);
+
 	cond_resched();
 
 	/* We now go into synchronous reclaim */
@@ -4366,6 +4369,7 @@ __perform_reclaim(gfp_t gfp_mask, unsigned int order,
 	return progress;
 }
 
+/* 直接回收：在当前进程上下文同步回收页，会阻塞、会等 I/O */
 /* The really slow allocator path where we enter direct reclaim */
 static inline struct page *
 __alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,
@@ -4640,6 +4644,10 @@ check_retry_cpuset(int cpuset_mems_cookie, struct alloc_context *ac)
 	return false;
 }
 
+/*
+ * 快路径失败后的慢路径：唤醒 kswapd、自己下场回收、内存压缩，实在不行 OOM。
+ * “内存紧张时到底发生了什么”，入口在这里。
+ */
 static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)

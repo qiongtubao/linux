@@ -6070,6 +6070,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, partial)));
 }
 
+/* 真正干活的地方：按优先级扫 LRU、回收页，并收缩 slab（shrink_slab） */
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long nr_reclaimed, nr_scanned, nr_node_reclaimed;
@@ -6380,6 +6381,7 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  * returns:	0, if no pages reclaimed
  * 		else, the number of pages reclaimed
  */
+/* 回收总控：先缩 slab，再反复 shrink_node，直到回收够或优先级用尽 */
 static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 					  struct scan_control *sc)
 {
@@ -6609,6 +6611,10 @@ out:
 	return false;
 }
 
+/*
+ * 分配器的同步回收（direct reclaim）：快路径失败后当前进程自己下场扫一圈。
+ * 与 kswapd 的区别是它有量：扫够 SWAP_CLUSTER_MAX 页就收手，不追求回到水位。
+ */
 unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 				gfp_t gfp_mask, nodemask_t *nodemask)
 {
@@ -6994,6 +7000,10 @@ clear_reclaim_active(pg_data_t *pgdat, int highest_zoneidx)
  * or lower is eligible for reclaim until at least one usable zone is
  * balanced.
  */
+/*
+ * 一次回收循环：在给定 order 下逐 zone 扫描，直到回到水位或没得回收。
+ * kswapd 在后台调它，allocator 在紧急时也会直接调。
+ */
 static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	int i;
@@ -7009,6 +7019,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 		.order = order,
 		.may_unmap = 1,
 	};
+	printk(KERN_INFO "[latte] balance_pgdat: order=%d\n", order);
 
 	set_task_reclaim_state(current, &sc.reclaim_state);
 	psi_memstall_enter(&pflags);
@@ -7323,6 +7334,10 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
  * If there are applications that are active memory-allocators
  * (most normal use), this basically shouldn't matter.
  */
+/*
+ * 每个 node 一个后台回收线程：水位低于 min 时被唤醒，把页扫回 free 列表。
+ * 它自己带 PF_MEMALLOC，所以回收途中申请内存不会被再拉进回收（防递归）。
+ */
 static int kswapd(void *p)
 {
 	unsigned int alloc_order, reclaim_order;
@@ -7343,6 +7358,8 @@ static int kswapd(void *p)
 	 * trying to free the first piece of memory in the first place).
 	 */
 	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
+	printk(KERN_INFO "[latte] kswapd: node%d reclaim thread ready\n",
+	       pgdat->node_id);
 	set_freezable();
 
 	WRITE_ONCE(pgdat->kswapd_order, 0);
