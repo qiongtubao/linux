@@ -1,55 +1,53 @@
-# 根文件系统切换：`/init` 不存在时内核怎么办
+# 根文件系统切换：一次“没有 `/init`”的开机
 
-上一站（`latte_notes/initramfs-rootfs.md`）讲清了 `/init` 是怎么被解进 rootfs 的。
-这一站反过来问：**如果 initramfs 里没有 `/init`，内核怎么办？** 答案是
-`prepare_namespace()` → `mount_root()` 去挂一个真正的根；挂不上就 panic。
-6 个主题、每个主题一份文档，代码注释与打点同步落地。
+上一站（`latte_notes/initramfs-rootfs.md`）讲 `/init` 是怎么被解进内存根的。这一站
+反过来问：**万一内存根里没有 `/init`，内核怎么办？** 答案是一条岔路：去挂真正的根
+（磁盘/网络），挂不上就 panic。
 
-## 主题划分（按依赖顺序读）
+本页只做索引与实验记录，概念细节在 7 篇主题文档里，每篇都按
+“你已知的概念 → 内核里对应什么 → 代码在哪 → 实测证据”展开。
 
-| # | 主题 | 文档 | 一句话 | 依赖 |
-|---|---|---|---|---|
-| 1 | 岔路口 | [01-rdinit-gate.md](01-rdinit-gate.md) | `init_eaccess("/init")` 一行返回值决定两条路 | — |
-| 2 | 挂根的固定动作 | [02-prepare-namespace.md](02-prepare-namespace.md) | `prepare_namespace()` 里六个“该等的先等” | 1 |
-| 3 | `ROOT_DEV` 分派 | [03-mount-root-dispatch.md](03-mount-root-dispatch.md) | 网络/通用/块设备三条挂法 + 两轮重试 | 2 |
-| 4 | 老式 initrd | [04-old-initrd-path.md](04-old-initrd-path.md) | `initrd_load()` 为什么这次是空转 | 2 |
-| 5 | 换根三步 | [05-switch-root-steps.md](05-switch-root-steps.md) | `devtmpfs` + `MS_MOVE` + `chroot` 把新根变成 `/` | 3 |
-| 6 | 失败面 | [06-failure-modes.md](06-failure-modes.md) | “挂不上根”和“没有 init”是两条 panic | 3、5 |
+## 主题划分（按领域）
 
-依赖关系：01 是唯一入口；02 是它唯一的下游；03/04 是 02 的两个分支；05 是 03 的
-成功收尾；06 是 03 的失败收尾。所以乱序读也只需要记住这一条主线。
+| 领域 | 主题 | 文档 | 一句话 |
+|---|---|---|---|
+| 启动 | 全景 | [01-启动-从BIOS到init](01-启动-从BIOS到init.md) | 开机的五个阶段 + 本次实测时间轴 |
+| 磁盘与文件系统 | 磁盘、分区、文件系统、根 | [02-磁盘-块设备分区与根](02-磁盘-块设备分区与根.md) | 块设备/超级块/挂载/`root=` 到底是什么 |
+| 内存 | 内存里的根 | [03-内存-ramfs与initramfs](03-内存-ramfs与initramfs.md) | 为什么 `/` 一开始在内存里，不靠磁盘 |
+| 启动 | 岔路 | [04-岔路-有init还是没init](04-岔路-有init还是没init.md) | `init_eaccess("/init")` 一行返回值决定两条路 |
+| 磁盘与文件系统 | 挂真根 | [05-挂真根-等设备与重试](05-挂真根-等设备与重试.md) | 六个等待 + `ROOT_DEV` 分派 + 两轮重试 |
+| 启动 | 换根 | [06-换根-新根变成斜杠](06-换根-新根变成斜杠.md) | `MS_MOVE` + `chroot` 把新根变成 `/` |
+| 启动 + 磁盘 | 失败面与历史包袱 | [07-失败面与老式initrd](07-失败面与老式initrd.md) | 两条 panic；老式 initrd 为何空转 |
+
+读法建议：01 先建立时间感，02、03 补“磁盘 vs 内存”的常识，04 是分水岭，
+05、06 是分水岭右侧的两步，07 是右侧的失败面。
 
 ## 全景
 
 ```
-kernel_init_freeable()
- └─ init_eaccess("/init")                ← 只判存在 + 可访问
-     ├─ 0     → 什么都不做，稍后 kernel_init() execve /init
-     └─ != 0  → ramdisk_execute_command = NULL
-                 └─ prepare_namespace()
-                      ├─ root_delay / wait_for_device_probe / md_run_setup
-                      ├─ parse_root_device(root=) → ROOT_DEV
-                      ├─ initrd_load()      ← BLK_DEV_RAM=n 时恒 false
-                      ├─ wait_for_root()    ← rootwait 才有
-                      ├─ mount_root()       ← 按 ROOT_DEV 分派，挂不上就 panic
-                      └─ out: devtmpfs_mount / MS_MOVE / init_chroot
+BIOS/UEFI → bootloader → 内核进场 → 内核初始化（内存/驱动/initcall）
+                                              ↓
+                                    initramfs 解进内存根（上一站）
+                                              ↓
+                              init_eaccess("/init")     ← 分水岭
+                              ├─ =0  → execve /init     → 用户态 1 号进程
+                              └─ ≠0  → prepare_namespace()
+                                          ├─ 等设备/认设备号（05）
+                                          ├─ mount_root() 挂真根（05）
+                                          │     └─ 失败 → panic（07）
+                                          └─ 换根三步（06）→ 从真根找 init
 ```
 
-## 实测对照（同一内核、两个 initramfs）
+## 实验：同一内核，两个 initramfs
 
-镜像 A = `bb_initramfs.cpio`（自带 `/init`，2195968 字节）；
-镜像 B = 从同一份 rootfs 去掉 `init` 重新打包（2195456 字节）。
-
-| 观察点 | A | B |
+| | 镜像 A | 镜像 B |
 |---|---|---|
+| 内容 | `bb_initramfs.cpio`（含 `/init`） | 同一 rootfs 去掉 `init` 重新打包 |
+| 大小 | 2195968 字节 | 2195456 字节 |
 | `init_eaccess(/init)` | `0` | `-2`（ENOENT） |
-| `check access ... ignoring` 警告 | 无 | 有 |
-| `prepare_namespace()` | **未调用**（0 条打点） | 调用（9 条打点） |
-| 结局 | `Run /init as init process` → busybox shell | `VFS: Cannot open root device ""` → panic |
-| 时间线 | 3.79s 探路 → 4.16s execve | 3.57s 探路 → 3.80s panic |
-| `devtmpfs + switch root` 打点 | 无（没走这条路） | 无（panic 在它之前） |
-
-**一行返回值，两条启动路径**——这就是这一站最想传达的东西。
+| `prepare_namespace()` | 未调用（0 条打点） | 调用（9 条打点） |
+| 结局 | `Run /init` → busybox shell | `VFS: Cannot open root device ""` → panic |
+| 时间 | 3.79s 探路 → 4.16s execve | 3.57s 探路 → 3.80s panic |
 
 ## 复现
 
@@ -58,16 +56,18 @@ cd /home/dong/Documents/github/linux
 make -j16 bzImage
 CMD="console=ttyS0 earlyprintk=serial nokaslr ignore_loglevel panic=1"
 
+# A：自带 /init
 timeout 40 qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd bb_initramfs.cpio \
   -append "$CMD" -nographic -m 2G -no-reboot > /tmp/latte-rootA.log 2>&1
 
+# B：去掉 init 的对照镜像
 rm -rf /tmp/noinit && cp -a bb_rootfs /tmp/noinit && rm -f /tmp/noinit/init
 ( cd /tmp/noinit && find . | cpio -o -H newc --quiet ) > /tmp/bb_noinit.cpio
 timeout 40 qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd /tmp/bb_noinit.cpio \
   -append "$CMD" -nographic -m 2G -no-reboot > /tmp/latte-rootB.log 2>&1
 ```
 
-`panic=1` + `-no-reboot` 让 B 的 panic 自己退出 QEMU，不用等超时。
+`panic=1` + `-no-reboot` 让 B 的 panic 自己退出 QEMU，不用干等超时。
 
 ## 打点清单（10 个）
 
@@ -84,19 +84,17 @@ timeout 40 qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd /tmp/bb_noin
 | `mount_root_generic: ROOT_DEV=%u` | — | 1（`0`） |
 | `prepare_namespace: devtmpfs + switch root` | — | — |
 
-最后一行两列都空：A 没走这条路，B 在上一行之后 panic 了。**打点链断在哪里，就是
-死在哪里。**
+最后两列都空的那条，是判断“有没有走到换根”的关键：A 没走这条路，B 在它之前 panic。
 
 ## 自查 3 问
 
-1. 有 `/init` 时，`prepare_namespace()` 为什么一次都不被调用？——因为调用它的条件
-   就是 `init_eaccess("/init") != 0`（主题一）。
-2. 本次 `initrd_load()` 打了点却什么也没做，为什么？——`CONFIG_BLK_DEV_RAM` 没开，
-   `rd_load_image()` 是 `return 0` 的空桩（主题四）。
-3. 怎么从日志区分“没有根”和“没有 init”？——前者是 `VFS: Unable to mount root fs`，
-   后者是 `No working init found`（主题六）。
+1. 有 `/init` 时，`prepare_namespace()` 为什么一次都不被调用？（04）
+2. `initrd_load()` 打了点却什么也没做，为什么？（07：`BLK_DEV_RAM` 没开，
+   `rd_load_image()` 是空桩）
+3. 怎么从日志区分“没有根”和“没有 init”？（07：`VFS: Unable to mount root fs`
+   vs `No working init found`）
 
 ## 下一阶段
 
 真根挂上之后接棒的是根文件系统里的 `/sbin/init`（systemd/sysvinit/脚本），那是
-用户态的故事；内核侧还有一个方向是回到 mm 看这些页之后怎么被回收。
+用户态的故事；内核侧还可以回到内存看这些页之后怎么被回收。
