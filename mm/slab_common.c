@@ -652,6 +652,10 @@ EXPORT_SYMBOL_GPL(kmem_dump_obj);
 #endif
 
 /* Create a cache during boot when no slab services are available yet */
+/*
+ * 启动期建缓存的统一入口：只做“能建出来”这件事，建不出来就 panic，
+ * 因为启动早期没有别的办法分配内存。
+ */
 void __init create_boot_cache(struct kmem_cache *s, const char *name,
 		unsigned int size, slab_flags_t flags,
 		unsigned int useroffset, unsigned int usersize)
@@ -665,6 +669,7 @@ void __init create_boot_cache(struct kmem_cache *s, const char *name,
 	 * power-of-two divisor of the size. For power-of-two sizes,
 	 * it is the size itself.
 	 */
+	/* kmalloc 档位按“size 的最大 2 的幂因子”对齐，省内存 */
 	if (flags & SLAB_KMALLOC)
 		align = max(align, 1U << (ffs(size) - 1));
 	kmem_args.align = calculate_alignment(flags, align, size);
@@ -674,12 +679,14 @@ void __init create_boot_cache(struct kmem_cache *s, const char *name,
 	kmem_args.usersize = usersize;
 #endif
 
+	/* 真正建缓存；启动期失败等于系统起不来 */
 	err = do_kmem_cache_create(s, name, size, &kmem_args, flags);
 
 	if (err)
 		panic("Creation of kmalloc slab %s size=%u failed. Reason %d\n",
 					name, size, err);
 
+	/* refcount = -1 表示暂不参与合并，避免和自己别名冲突 */
 	s->refcount = -1;	/* Exempt from merging for now */
 }
 
@@ -947,6 +954,11 @@ new_kmalloc_cache(int idx, enum kmalloc_cache_type type)
 }
 
 /*
+ * 建好 kmalloc-8 到 kmalloc-8k 的各个档位（x86_64 / 4K 页），并按
+ * KMALLOC_NORMAL / CGROUP / RECLAIM 分三类：memcg 记账用、可回收用；
+ * 未开对应配置时这三类互为别名，不会重复建缓存。
+ */
+/*
  * Create the kmalloc array. Some of the regular kmalloc arrays
  * may already have been created because they were needed to
  * enable allocations for slab creation.
@@ -959,14 +971,17 @@ void __init create_kmalloc_caches(void)
 	/*
 	 * Including KMALLOC_CGROUP if CONFIG_MEMCG defined
 	 */
+	/* NORMAL / CGROUP / RECLAIM 三类，逐个把档位补齐 */
 	for (type = KMALLOC_NORMAL; type < NR_KMALLOC_TYPES; type++) {
 		/* Caches that are NOT of the two-to-the-power-of size. */
+		/* 这两档不是 2 的幂（96、192 字节），得单独建 */
 		if (KMALLOC_MIN_SIZE <= 32)
 			new_kmalloc_cache(1, type);
 		if (KMALLOC_MIN_SIZE <= 64)
 			new_kmalloc_cache(2, type);
 
 		/* Caches that are of the two-to-the-power-of size. */
+		/* 剩下的都是 2 的幂：64B 一直建到 8K */
 		for (i = KMALLOC_SHIFT_LOW; i <= KMALLOC_SHIFT_HIGH; i++)
 			new_kmalloc_cache(i, type);
 	}
@@ -975,6 +990,7 @@ void __init create_kmalloc_caches(void)
 #endif
 
 	/* Kmalloc array is now usable */
+	/* 推到 UP：从这一刻起 kmalloc() 才敢被调用 */
 	slab_state = UP;
 
 	if (IS_ENABLED(CONFIG_SLAB_BUCKETS))

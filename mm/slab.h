@@ -351,9 +351,13 @@ static inline int objs_per_slab(const struct kmem_cache *cache,
  * allocated from slab caches themselves.
  */
 enum slab_state {
+	/* 还没有任何 slab 功能，启动最早的一段就是这状态 */
 	DOWN,			/* No slab functionality yet */
+	/* 只有 kmem_cache_node 能分配，刚好够建别的缓存 */
 	PARTIAL,		/* SLUB: kmem_cache_node available */
+	/* kmalloc 档位已就绪，debug 记账等附加功能还没好 */
 	UP,			/* Slab caches usable but not all extras yet */
+	/* 全部就绪，附加功能也都能用了 */
 	FULL			/* Everything is working */
 };
 

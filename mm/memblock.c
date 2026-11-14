@@ -2196,6 +2196,10 @@ static void __init free_unused_memmap(void)
 #endif
 }
 
+/*
+ * 把 [start, end) 这段页帧按最大对齐切成大块交给 buddy：
+ * 块越大，之后合并成大页、分配大页都越省事。
+ */
 static void __init __free_pages_memory(unsigned long start, unsigned long end)
 {
 	int order;
@@ -2208,29 +2212,36 @@ static void __init __free_pages_memory(unsigned long start, unsigned long end)
 		 * MAX_PAGE_ORDER-aligned, set order to MAX_PAGE_ORDER for
 		 * the case.
 		 */
+		/* 起点对齐到什么程度，就一次放多大：起点低位决定 order */
 		if (start)
 			order = min_t(int, MAX_PAGE_ORDER, __ffs(start));
 		else
 			order = MAX_PAGE_ORDER;
 
+		/* 剩下不够一块就降一档，保证不越过 end */
 		while (start + (1UL << order) > end)
 			order--;
 
+		/* 真正把这一块挂进 buddy free_area */
 		memblock_free_pages(pfn_to_page(start), start, order);
 
 		start += (1UL << order);
 	}
 }
 
+/* 把一段物理区间转成页帧区间后交给上面，返回实际放掉的页数 */
 static unsigned long __init __free_memory_core(phys_addr_t start,
 				 phys_addr_t end)
 {
+	/* 向内取整：不足一页的头尾留给别人，避免踩到相邻区间 */
 	unsigned long start_pfn = PFN_UP(start);
 	unsigned long end_pfn = PFN_DOWN(end);
 
+	/* 没有 HIGHMEM 时，直接映射区之上不该进 buddy，裁到 max_low_pfn */
 	if (!IS_ENABLED(CONFIG_HIGHMEM) && end_pfn > max_low_pfn)
 		end_pfn = max_low_pfn;
 
+	/* 裁完发现是空区间，直接返回 0 页 */
 	if (start_pfn >= end_pfn)
 		return 0;
 
@@ -2288,14 +2299,20 @@ repeat:
 	}
 }
 
+/*
+ * 遍历所有“非 reserved”的物理内存区间，逐块释放进 buddy，
+ * 是 memblock 记账本跨到 buddy 空闲页货架的桥梁，返回总页数。
+ */
 static unsigned long __init free_low_memory_core_early(void)
 {
 	unsigned long count = 0;
 	phys_addr_t start, end;
 	u64 i;
 
+	/* 热插拔标记先清掉，否则这些区间会被当成不可分配 */
 	memblock_clear_hotplug(0, -1);
 
+	/* 给 reserved 区的 struct page 补上 node id，并标 reserved */
 	memmap_init_reserved_pages();
 
 	/*
@@ -2303,6 +2320,7 @@ static unsigned long __init free_low_memory_core_early(void)
 	 *  because in some case like Node0 doesn't have RAM installed
 	 *  low ram will be on Node1
 	 */
+	/* 只遍历可分配区间，逐段交给 __free_memory_core() */
 	for_each_free_mem_range(i, NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end,
 				NULL)
 		count += __free_memory_core(start, end);
@@ -2333,6 +2351,13 @@ void __init reset_all_zones_managed_pages(void)
 	reset_managed_pages_done = 1;
 }
 
+/*
+ * 把 memblock 记账本里所有“可分配”内存一次性交给 buddy，是 memblock
+ * 退场、buddy 上岗的那一步。
+ * memblock 自己的数据结构要到后面 page_alloc_init_late() 里的
+ * memblock_discard() 才彻底消失。
+ */
+
 /**
  * memblock_free_all - release free pages to the buddy allocator
  */
@@ -2340,11 +2365,16 @@ void __init memblock_free_all(void)
 {
 	unsigned long pages;
 
+	/* memmap 数组自己占掉的页也要还给 buddy */
 	free_unused_memmap();
+	/* zone 的 managed 计数清零，等下重新累计真实可用页数 */
 	reset_all_zones_managed_pages();
 
+	/* KHO 只保留 scratch 区，其余预留不再占坑 */
 	memblock_clear_kho_scratch_only();
 	pages = free_low_memory_core_early();
+	printk(KERN_INFO "[latte] memblock_free_all: %lu pages -> buddy\n", pages);
+	/* 把这次的页数累进 totalram_pages，/proc/meminfo 才有数 */
 	totalram_pages_add(pages);
 }
 

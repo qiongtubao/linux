@@ -5256,6 +5256,12 @@ vmap_node_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 	return SHRINK_STOP;
 }
 
+/*
+ * 把 vmalloc 的虚拟地址区间建成真正可分配的空间：建 vmap_area 缓存、
+ * 初始化每 CPU 的 vmap 队列、把启动期已有的 vmlist 映射接手过来。
+ * 此前只有少量早期映射，本函数跑完（vmap_initialized = true）
+ * vmalloc() / vmap() 才可用，是内存管理闭环的最后一块。
+ */
 void __init vmalloc_init(void)
 {
 	struct shrinker *vmap_node_shrinker;
@@ -5267,8 +5273,10 @@ void __init vmalloc_init(void)
 	/*
 	 * Create the cache for vmap_area objects.
 	 */
+	/* 依赖上一步 slab 已经 UP，这里才敢用 KMEM_CACHE */
 	vmap_area_cachep = KMEM_CACHE(vmap_area, SLAB_PANIC);
 
+	/* 每个 CPU 一套：延迟 vfree 的链表和 vmap 块队列 */
 	for_each_possible_cpu(i) {
 		struct vmap_block_queue *vbq;
 		struct vfree_deferred *p;
@@ -5285,9 +5293,11 @@ void __init vmalloc_init(void)
 	/*
 	 * Setup nodes before importing vmlist.
 	 */
+	/* 先按 NUMA node 把 vmap 区切好，才能往对应 node 里插 */
 	vmap_init_nodes();
 
 	/* Import existing vmlist entries. */
+	/* 启动早期的映射只登记在 vmlist 里，这里补成 vmap_area 接管过来 */
 	for (tmp = vmlist; tmp; tmp = tmp->next) {
 		va = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
 		if (WARN_ON_ONCE(!va))
@@ -5304,9 +5314,12 @@ void __init vmalloc_init(void)
 	/*
 	 * Now we can initialize a free vmap space.
 	 */
+	/* 把还没被占用的地址段登记成可分配空间 */
 	vmap_init_free_space();
+	/* 置位之后 vmalloc()/vmap() 才允许被调用 */
 	vmap_initialized = true;
 
+	/* 注册 shrinker：内存紧张时回收各 node 的空闲 vmap 区 */
 	vmap_node_shrinker = shrinker_alloc(0, "vmap-node");
 	if (!vmap_node_shrinker) {
 		pr_err("Failed to allocate vmap-node shrinker!\n");

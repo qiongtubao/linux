@@ -937,6 +937,11 @@ buddy_merge_likely(unsigned long pfn, unsigned long buddy_pfn,
  * -- nyc
  */
 
+/*
+ * buddy 的合并核心：把一页（或 2^order 页）放进 zone 的空闲链表；若它的
+ * “伙伴页”也空闲，就合并成 order+1 的一整块，能合就一直合到 MAX_PAGE_ORDER。
+ * 最后把这块挂到 zone->free_area[order] 中对应迁移类型的链表上。
+ */
 static inline void __free_one_page(struct page *page,
 		unsigned long pfn,
 		struct zone *zone, unsigned int order,
@@ -965,10 +970,13 @@ static inline void __free_one_page(struct page *page,
 			return;
 		}
 
+		/* 按 PFN 异或 1<<order 找到伙伴页，顺带带回它的 PFN */
 		buddy = find_buddy_page_pfn(page, pfn, order, &buddy_pfn);
+		/* 伙伴页不空闲，合不了，直接去挂链表 */
 		if (!buddy)
 			goto done_merging;
 
+		/* 到了页块粒度：两边迁移类型不同且不可合并，就别合了 */
 		if (unlikely(order >= pageblock_order)) {
 			/*
 			 * We want to prevent merge between freepages on pageblock
@@ -1002,6 +1010,7 @@ static inline void __free_one_page(struct page *page,
 			set_pageblock_migratetype(buddy, migratetype);
 		}
 
+		/* 取两者共同的对齐起点，合成更大的块，order 升一档继续试 */
 		combined_pfn = buddy_pfn & pfn;
 		page = page + (combined_pfn - pfn);
 		pfn = combined_pfn;
@@ -1571,6 +1580,11 @@ static void __free_pages_ok(struct page *page, unsigned int order,
 		free_one_page(zone, page, pfn, order, fpi_flags);
 }
 
+/*
+ * 页真正“变成可分配”的最后一步：清掉 PageReserved、refcount 归零，
+ * 因为 __init_single_page() 初始化时把每页 refcount 都设成了 1（表示占用）。
+ * 之后交给 __free_pages_ok() 挂进 buddy，这些页才算能被别人拿到。
+ */
 void __meminit __free_pages_core(struct page *page, unsigned int order,
 		enum meminit_context context)
 {
@@ -1586,6 +1600,7 @@ void __meminit __free_pages_core(struct page *page, unsigned int order,
 	 * Note that hotplugged memory pages are initialized to PageOffline().
 	 * Pages freed from memblock might be marked as reserved.
 	 */
+	/* 热插拔进来的页，之前是 Offline 状态，不是 Reserved */
 	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG) &&
 	    unlikely(context == MEMINIT_HOTPLUG)) {
 		for (loop = 0; loop < nr_pages; loop++, p++) {
@@ -1596,6 +1611,7 @@ void __meminit __free_pages_core(struct page *page, unsigned int order,
 
 		adjust_managed_page_count(page, nr_pages);
 	} else {
+		/* 启动期这批页：清 Reserved、refcount 归零，才是空闲页 */
 		for (loop = 0; loop < nr_pages; loop++, p++) {
 			__ClearPageReserved(p);
 			set_page_count(p, 0);
@@ -1605,6 +1621,7 @@ void __meminit __free_pages_core(struct page *page, unsigned int order,
 		atomic_long_add(nr_pages, &page_zone(page)->managed_pages);
 	}
 
+	/* 加密虚拟机场景：页要先被 hypervisor 接受才能用 */
 	if (page_contains_unaccepted(page, order)) {
 		if (order == MAX_PAGE_ORDER && __free_unaccepted(page))
 			return;
@@ -1616,6 +1633,7 @@ void __meminit __free_pages_core(struct page *page, unsigned int order,
 	 * Bypass PCP and place fresh pages right to the tail, primarily
 	 * relevant for memory onlining.
 	 */
+	/* 绕过 PCP 直接进 buddy，且挂链表尾：新鲜页不急着被拿走 */
 	__free_pages_ok(page, order, FPI_TO_TAIL);
 }
 

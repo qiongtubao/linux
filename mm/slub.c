@@ -8430,12 +8430,18 @@ static int slab_memory_callback(struct notifier_block *self,
  * that may be pointing to the wrong kmem_cache structure.
  */
 
+/*
+ * 把静态的 boot 结构换成用 kmem_cache_zalloc() 分出来的真对象：内容照抄，
+ * 再把 partial/full 链表里指向静态结构体的 slab_cache 指针改成新对象，
+ * 最后挂进 slab_caches 链表，两个缓存从此都能正常分配。
+ */
 static struct kmem_cache * __init bootstrap(struct kmem_cache *static_cache)
 {
 	int node;
 	struct kmem_cache *s = kmem_cache_zalloc(kmem_cache, GFP_NOWAIT);
 	struct kmem_cache_node *n;
 
+	/* 静态结构里的字段原样搬过来，省得一个个赋值 */
 	memcpy(s, static_cache, kmem_cache->object_size);
 
 	/*
@@ -8443,10 +8449,12 @@ static struct kmem_cache * __init bootstrap(struct kmem_cache *static_cache)
 	 * up.  Even if it weren't true, IRQs are not up so we couldn't fire
 	 * IPIs around.
 	 */
+	/* 只清 boot CPU 的每 CPU 缓存：中断还没开，发不了 IPI */
 	__flush_cpu_slab(s, smp_processor_id());
 	for_each_kmem_cache_node(s, node, n) {
 		struct slab *p;
 
+		/* 链表里的 slab 仍指向老的静态缓存，逐个改指向新对象 */
 		list_for_each_entry(p, &n->partial, slab_list)
 			p->slab_cache = s;
 
@@ -8455,22 +8463,33 @@ static struct kmem_cache * __init bootstrap(struct kmem_cache *static_cache)
 			p->slab_cache = s;
 #endif
 	}
+	/* 登记到全局 slab_caches，之后 /proc/slabinfo 才看得到 */
 	list_add(&s->list, &slab_caches);
 	return s;
 }
 
+/*
+ * slab 自举的入口：slab 用来管“对象缓存”，可 struct kmem_cache 自己也得有
+ * 缓存，鸡生蛋了。于是先用两个 __initdata 静态变量假装成缓存，等能分配了
+ * 再 bootstrap() 搬到真实对象里。
+ * 顺序是硬约束：先 kmem_cache_node，再 kmem_cache，最后才是各 kmalloc 档位，
+ * 跑完 slab_state 推到 UP，kmalloc() 才真正可用。
+ */
 void __init kmem_cache_init(void)
 {
 	static __initdata struct kmem_cache boot_kmem_cache,
 		boot_kmem_cache_node;
 	int node;
 
+	/* guard page 调试要求单页分配，把 slub 的最大 order 压到 0 */
 	if (debug_guardpage_minorder())
 		slub_max_order = 0;
 
 	/* Inform pointer hashing choice about slub debugging state. */
+	/* 调试开关定了才敢定指针哈希方案，所以放最前面 */
 	hash_pointers_finalize(__slub_debug_enabled());
 
+	/* 先用静态结构顶替：此刻还没有任何缓存能分配内存 */
 	kmem_cache_node = &boot_kmem_cache_node;
 	kmem_cache = &boot_kmem_cache;
 
@@ -8478,9 +8497,11 @@ void __init kmem_cache_init(void)
 	 * Initialize the nodemask for which we will allocate per node
 	 * structures. Here we don't need taking slab_mutex yet.
 	 */
+	/* 记下哪些 node 要建 per-node 结构，跟 N_MEMORY 一致 */
 	for_each_node_state(node, N_MEMORY)
 		node_set(node, slab_nodes);
 
+	/* 先让 kmem_cache_node 能分配，才有地方存每个 node 的 slab 链 */
 	create_boot_cache(kmem_cache_node, "kmem_cache_node",
 			sizeof(struct kmem_cache_node),
 			SLAB_HWCACHE_ALIGN | SLAB_NO_OBJ_EXT, 0, 0);
@@ -8488,26 +8509,33 @@ void __init kmem_cache_init(void)
 	hotplug_node_notifier(slab_memory_callback, SLAB_CALLBACK_PRI);
 
 	/* Able to allocate the per node structures */
+	/* 到这一步只保证 kmem_cache_node 可用，别的还不行 */
 	slab_state = PARTIAL;
 
+	/* 现在轮到 kmem_cache 自己：大小要含每 node 的指针数组 */
 	create_boot_cache(kmem_cache, "kmem_cache",
 			offsetof(struct kmem_cache, node) +
 				nr_node_ids * sizeof(struct kmem_cache_node *),
 			SLAB_HWCACHE_ALIGN | SLAB_NO_OBJ_EXT, 0, 0);
 
+	/* 两个静态结构搬家，换成真有缓存支撑的对象 */
 	kmem_cache = bootstrap(&boot_kmem_cache);
 	kmem_cache_node = bootstrap(&boot_kmem_cache_node);
 
 	/* Now we can use the kmem_cache to allocate kmalloc slabs */
+	/* 先建好 size -> 档位索引的查表，再批量建 kmalloc-8 到 8k */
 	setup_kmalloc_cache_index_table();
 	create_kmalloc_caches();
 
 	/* Setup random freelists for each cache */
+	/* 每个缓存的空闲链表打散，降低被利用的确定性 */
 	init_freelist_randomization();
 
+	/* 注册 CPU 上线回调：cpu dead 时把该 CPU 的半空 slab 收回去 */
 	cpuhp_setup_state_nocalls(CPUHP_SLUB_DEAD, "slub:dead", NULL,
 				  slub_cpu_dead);
 
+	/* 这行日志出现在 kmem_cache_init 与 vmalloc_init 之间 */
 	pr_info("SLUB: HWalign=%d, Order=%u-%u, MinObjects=%u, CPUs=%u, Nodes=%u\n",
 		cache_line_size(),
 		slub_min_order, slub_max_order, slub_min_objects,

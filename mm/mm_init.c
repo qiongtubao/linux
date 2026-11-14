@@ -1808,6 +1808,14 @@ static void __init set_high_memory(void)
 	high_memory = phys_to_virt(highmem - 1) + 1;
 }
 
+/*
+ * 建 zone 与 struct page 的骨架：算出每个 zone 的 PFN 区间，为每个 node
+ * 建 pg_data_t / zone / usemap，并把全部 struct page 初始化出来。
+ * 由 setup_arch() -> paging_init() -> zone_sizes_init() 调用，早于
+ * mm_core_init()；此刻页全是 reserved、refcount 为 1，buddy 里一页空闲
+ * 都没有，空闲页要等后面的 memblock_free_all() 才放进来。
+ */
+
 /**
  * free_area_init - Initialise all pg_data_t and zone data
  * @max_zone_pfn: an array of max PFNs for each zone
@@ -1828,6 +1836,7 @@ void __init free_area_init(unsigned long *max_zone_pfn)
 	bool descending;
 
 	/* Record where the zone boundaries are */
+	/* 上界下界先全部清零，下面按 arch 给的 max_zone_pfn 重新填 */
 	memset(arch_zone_lowest_possible_pfn, 0,
 				sizeof(arch_zone_lowest_possible_pfn));
 	memset(arch_zone_highest_possible_pfn, 0,
@@ -1854,9 +1863,11 @@ void __init free_area_init(unsigned long *max_zone_pfn)
 
 	/* Find the PFNs that ZONE_MOVABLE begins at in each node */
 	memset(zone_movable_pfn, 0, sizeof(zone_movable_pfn));
+	/* 算出各 node 的 ZONE_MOVABLE 起点；没开 movablecore 就全为空 */
 	find_zone_movable_pfns_for_nodes();
 
 	/* Print out the zone ranges */
+	/* 启动日志里那段 "Zone ranges:" 就出自这里，肉眼可核对 */
 	pr_info("Zone ranges:\n");
 	for (i = 0; i < MAX_NR_ZONES; i++) {
 		if (i == ZONE_MOVABLE)
@@ -1887,6 +1898,7 @@ void __init free_area_init(unsigned long *max_zone_pfn)
 	 * enable future "sub-section" extensions of the memory map.
 	 */
 	pr_info("Early memory node ranges\n");
+	/* 逐条打印 memblock 的内存区间，并初始化对应 subsection 映射 */
 	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid) {
 		pr_info("  node %3d: [mem %#018Lx-%#018Lx]\n", nid,
 			(u64)start_pfn << PAGE_SHIFT,
@@ -1906,6 +1918,7 @@ void __init free_area_init(unsigned long *max_zone_pfn)
 			alloc_offline_node_data(nid);
 
 		pgdat = NODE_DATA(nid);
+		/* 为这个 node 建 pg_data_t、各 zone 和 usemap，并算出页数 */
 		free_area_init_node(nid);
 
 		/*
@@ -1926,11 +1939,13 @@ void __init free_area_init(unsigned long *max_zone_pfn)
 		sparse_vmemmap_init_nid_late(nid);
 
 	calc_nr_kernel_pages();
+	/* 初始化每个 struct page：全部标 reserved、refcount 置 1 */
 	memmap_init();
 
 	/* disable hash distribution for systems with a single node */
 	fixup_hashdist();
 
+	/* high_memory 指向直接映射区的末尾，HIGHMEM 时按可映射上界收窄 */
 	set_high_memory();
 }
 
@@ -2310,6 +2325,11 @@ bool pfn_range_intersects_zones(int nid, unsigned long start_pfn,
 	return false;
 }
 
+/*
+ * 在 kernel_init_freeable() 里、initcall 阶段之后调用，是内存管理彻底
+ * 稳定的收尾：deferred 页在这里补齐，日志里的 "Memory: ... available"
+ * 也由它打印，最后丢掉 memblock 自己的私有内存。
+ */
 static void __init mem_init_print_info(void);
 void __init page_alloc_init_late(void)
 {
@@ -2319,31 +2339,39 @@ void __init page_alloc_init_late(void)
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
 
 	/* There will be num_node_state(N_MEMORY) threads */
+	/* 每个有内存的 node 起一个 kthread，补完剩下的 struct page */
 	atomic_set(&pgdat_init_n_undone, num_node_state(N_MEMORY));
 	for_each_node_state(nid, N_MEMORY) {
 		kthread_run(deferred_init_memmap, NODE_DATA(nid), "pgdatinit%d", nid);
 	}
 
 	/* Block until all are initialised */
+	/* 等所有 node 补完，否则后面统计的页数不准 */
 	wait_for_completion(&pgdat_init_all_done_comp);
 
 	/*
 	 * We initialized the rest of the deferred pages.  Permanently disable
 	 * on-demand struct page initialization.
 	 */
+	/* 已经没有延迟页了，把这个静态分支永久关掉 */
 	static_branch_disable(&deferred_pages);
 
 	/* Reinit limits that are based on free pages after the kernel is up */
+	/* 按真实空闲页重算文件数上限（max_files） */
 	files_maxfiles_init();
 #endif
 
 	/* Accounting of total+free memory is stable at this point. */
+	/* 这里才打印 "Memory: ... available"：页数此时才稳定 */
 	mem_init_print_info();
+	/* 按内核页大小建 buffer_head 的哈希表，之后块设备才能读 */
 	buffer_init();
 
 	/* Discard memblock private memory */
+	/* memblock 记账本用完即弃，把它的内存还给 buddy */
 	memblock_discard();
 
+	/* 各 node 打乱空闲链表顺序，降低分配被预测的风险 */
 	for_each_node_state(nid, N_MEMORY)
 		shuffle_free_memory(NODE_DATA(nid));
 
@@ -2480,9 +2508,16 @@ void *__init alloc_large_system_hash(const char *tablename,
 	return table;
 }
 
+/*
+ * memblock 释放页的统一入口：把一段 struct page 从 reserved 变成 free，
+ * 最终由 __free_pages_core() 清掉 PageReserved、refcount 归零。
+ * 开了 DEFERRED_STRUCT_PAGE_INIT 时，尚未初始化好的页直接跳过，
+ * 留到 page_alloc_init_late() 里的 deferred 线程补。
+ */
 void __init memblock_free_pages(struct page *page, unsigned long pfn,
 							unsigned int order)
 {
+	/* 延迟初始化场景：页还没准备好就先不收，后面再补 */
 	if (IS_ENABLED(CONFIG_DEFERRED_STRUCT_PAGE_INIT)) {
 		int nid = early_pfn_to_nid(pfn);
 
@@ -2490,13 +2525,16 @@ void __init memblock_free_pages(struct page *page, unsigned long pfn,
 			return;
 	}
 
+	/* KMSAN 接管这批页的内存标注 */
 	if (!kmsan_memblock_free_pages(page, order)) {
 		/* KMSAN will take care of these pages. */
 		return;
 	}
 
 	/* pages were reserved and not allocated */
+	/* 这些页只是 reserved，没被真正分配过，先清掉分配打点的 tag */
 	clear_page_tag_ref(page);
+	/* 正式进 buddy：清 reserved、refcount 归零、并入 zone 计数 */
 	__free_pages_core(page, order, MEMINIT_EARLY);
 }
 
@@ -2669,61 +2707,107 @@ void __init __weak arch_mm_preinit(void)
 {
 }
 
+/* 默认是空实现，需要收尾的架构自己覆盖：x86 在 arch/x86/mm/init_64.c */
 void __init __weak mem_init(void)
 {
 }
+
+/*
+ * 内核内存管理的主初始化：在 start_kernel() 里紧跟 trap_init() 之后调用，
+ * 主链为 build_all_zonelists -> memblock_free_all -> mem_init ->
+ * kmem_cache_init -> vmalloc_init。
+ * 骨架在 setup_arch() 阶段已由 free_area_init() 建好，本函数负责把空闲页
+ * 交给 buddy、让 slab 自举、把 vmalloc 区变成可用，跑完这三样才算能用。
+ */
 
 /*
  * Set up kernel memory allocators
  */
 void __init mm_core_init(void)
 {
+	/* ① buddy 骨架：zone 优先级表 + per-CPU 页缓存回调，此时还没有空闲页 */
+	/* 架构钩子；x86_64 上就是 pci_iommu_alloc() */
 	arch_mm_preinit();
+	/* 为 gigantic 巨型页在启动期预留 bootmem */
 	hugetlb_bootmem_alloc();
 
 	/* Initializations relying on SMP setup */
+	/* 编译期断言：一次分配最多只试 2 个 zonelist */
 	BUILD_BUG_ON(MAX_ZONELISTS > 2);
+	/* 建 zone 优先级表（zonelist），决定分配时先试哪个 zone */
 	build_all_zonelists(NULL);
+	/* 注册 CPU 热插拔回调，CPU 上下线时建/拆 per-CPU 页缓存 */
 	page_alloc_init_cpuhp();
+	/* 内存分配打点（mem profiling）的 tag 段解析，未开直接返回 */
 	alloc_tag_sec_init();
 	/*
 	 * page_ext requires contiguous pages,
 	 * bigger than MAX_PAGE_ORDER unless SPARSEMEM.
 	 */
+	/* ② 早期调试设施：page_ext、加固开关、KFENCE、KMSAN、栈仓库、KHO 预留 */
+	/* 每页的扩展元数据；仅 FLATMEM 有活，SPARSEMEM 下是空实现 */
 	page_ext_init_flatmem();
+	/* 页毒化 / debug_pagealloc / init_on_alloc 等加固开关 */
 	mem_debugging_and_hardening_init();
+	/* KFENCE 采样检测器的对象池，未开启直接返回 */
 	kfence_alloc_pool_and_metadata();
+	/* 打印一行 "mem auto-init: ..." */
 	report_meminit();
+	/* KMSAN 影子内存，未开启是空实现 */
 	kmsan_init_shadow();
+	/* 栈追踪去重存储 */
 	stack_depot_early_init();
 
 	/*
 	 * KHO memory setup must happen while memblock is still active, but
 	 * as close as possible to buddy initialization
 	 */
+	/* kexec handover 需要预留的内存，必须赶在 memblock 退场前做 */
 	kho_memory_init();
 
+	/* ③ memblock 退场：把可分配内存全部交给 buddy（本阶段核心） */
+	printk(KERN_INFO "[latte] mm_core_init -> memblock_free_all\n");
+	/* 把 memblock 里所有可分配内存一次性还给 buddy */
 	memblock_free_all();
+	/* ④ 架构收尾：bootmem 阶段结束（x86_64 实现见 arch/x86/mm/init_64.c） */
+	printk(KERN_INFO "[latte] mm_core_init -> mem_init\n");
+	/* 架构钩子；x86_64 版本在里面置 after_bootmem = 1 */
 	mem_init();
+	/* ⑤ 对象缓存与虚拟地址区就绪：slab 自举 + vmalloc */
+	printk(KERN_INFO "[latte] mm_core_init -> kmem_cache_init\n");
+	/* slab 自举：先有 kmem_cache_node，再有 kmem_cache，再有 kmalloc 档位 */
 	kmem_cache_init();
 	/*
 	 * page_owner must be initialized after buddy is ready, and also after
 	 * slab is ready so that stack_depot_init() works properly
 	 */
+	/* 依赖 buddy 和 slab 都已就绪的 page_ext 补齐 */
 	page_ext_init_flatmem_late();
+	/* 内存泄漏检测 */
 	kmemleak_init();
+	/* 页表锁 ptlock 的 slab 缓存 */
 	ptlock_cache_init();
+	/* 页表 PMD/PUD/P4D 的 slab 缓存 */
 	pgtable_cache_init();
+	/* debugobjects 对象池 */
 	debug_objects_mem_init();
+	printk(KERN_INFO "[latte] mm_core_init -> vmalloc_init\n");
+	/* vmalloc 虚拟地址空间管理，本阶段最后一块拼图 */
 	vmalloc_init();
 	/* If no deferred init page_ext now, as vmap is fully initialized */
 	if (!deferred_struct_pages)
+		/* 非延迟页初始化时，在这里把 page_ext 补齐 */
 		page_ext_init();
 	/* Should be run before the first non-init thread is created */
+	/* x86_64 给 32 位兼容程序用的 espfix 栈，必须在建进程前备好 */
 	init_espfix_bsp();
 	/* Should be run after espfix64 is set up. */
+	/* 页表隔离（KPTI）的准备 */
 	pti_init();
+	/* KMSAN 运行时，未开启是空实现 */
 	kmsan_init_runtime();
+	/* 创建 struct mm_struct 的 slab 缓存 */
 	mm_cache_init();
+	/* 可执行内存（模块 / BPF JIT）分配器 */
 	execmem_init();
 }

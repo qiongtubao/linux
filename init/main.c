@@ -970,6 +970,7 @@ void start_kernel(void)
 	sort_main_extable();
 	printk(KERN_INFO "[latte] main -> trap_init\n");
 	trap_init(); //初始化中断事件
+	printk(KERN_INFO "[latte] main -> mm_core_init\n");
 	mm_core_init();
 	maple_tree_init();
 	poking_init();
@@ -1590,6 +1591,7 @@ static noinline void __init kernel_init_freeable(void)
 	workqueue_init_topology();
 	async_init();
 	padata_init();
+	printk(KERN_INFO "[latte] kernel_init_freeable -> page_alloc_init_late\n");
 	page_alloc_init_late();
 
 	do_basic_setup();

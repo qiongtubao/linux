@@ -2955,6 +2955,10 @@ static void sighand_ctor(void *data)
 	init_waitqueue_head(&sighand->signalfd_wqh);
 }
 
+/*
+ * 建 struct mm_struct 的专用缓存：大小要含动态的 mm_cpumask 和 mm_cid，
+ * SLAB_ACCOUNT 让每个进程的 mm 计入 memcg。
+ */
 void __init mm_cache_init(void)
 {
 	unsigned int mm_size;
@@ -2964,8 +2968,10 @@ void __init mm_cache_init(void)
 	 * dynamically sized based on the maximum CPU number this system
 	 * can have, taking hotplug into account (nr_cpu_ids).
 	 */
+	/* cpumask 和 mm_cid 都按最大可能 CPU 数算，热插拔也算进去 */
 	mm_size = sizeof(struct mm_struct) + cpumask_size() + mm_cid_size();
 
+	/* usercopy 范围限定在 saved_auxv，防止拷贝越界到别的字段 */
 	mm_cachep = kmem_cache_create_usercopy("mm_struct",
 			mm_size, ARCH_MIN_MMSTRUCT_ALIGN,
 			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT,
