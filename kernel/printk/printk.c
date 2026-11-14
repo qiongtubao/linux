@@ -2211,6 +2211,11 @@ static u16 printk_sprint(char *text, u16 size, int facility,
 }
 
 __printf(4, 0)
+/*
+ * 日志先进环形缓冲区（ring buffer），不等控制台：printk 可能在任何上下文
+ * 被调用（中断、NMI、panic），同步写设备太危险。真正吐到串口是后面
+ * console_flush_all() 的事。
+ */
 int vprintk_store(int facility, int level,
 		  const struct dev_printk_info *dev_info,
 		  const char *fmt, va_list args)
@@ -3157,6 +3162,10 @@ static inline void printk_kthreads_check_locked(void) { }
  *
  * Requires the console_lock.
  */
+/*
+ * 把环形缓冲区里还没输出的记录，逐条推给每个已注册的控制台。
+ * 返回 true 表示这一轮有进展；调用者会反复调用直到不进展为止。
+ */
 static bool console_flush_all(bool do_cond_resched, u64 *next_seq, bool *handover)
 {
 	struct console_flush_type ft;
@@ -3948,6 +3957,10 @@ static int unregister_console_locked(struct console *console);
  *  - Once a "real" console is registered, any attempt to register a
  *    bootconsoles will be rejected
  */
+/*
+ * 把一个控制台挂进全局链表。flags 带 CON_BOOT 的是 early console，
+ * 一旦有"真正的" console 注册，boot console 就会被撤掉（见下面的检查）。
+ */
 void register_console(struct console *newcon)
 {
 	bool use_device_lock = (newcon->flags & CON_NBCON) && newcon->write_atomic;
@@ -3957,6 +3970,9 @@ void register_console(struct console *newcon)
 	unsigned long flags;
 	u64 init_seq;
 	int err;
+
+	printk(KERN_INFO "[latte] register_console: %s%d flags=0x%x\n",
+	       newcon->name, newcon->index, newcon->flags);
 
 	console_list_lock();
 
@@ -4272,11 +4288,17 @@ EXPORT_SYMBOL(console_force_preferred_locked);
  * Just do some early initializations, and do the complex setup
  * later.
  */
+/*
+ * 控制台初始化的总开关：先装 tty 行规程，再跑 __con_initcall 段的
+ * 驱动初始化——串口、VGA 等 console 都在这一步 register_console()。
+ */
 void __init console_init(void)
 {
 	int ret;
 	initcall_t call;
 	initcall_entry_t *ce;
+
+	printk(KERN_INFO "[latte] console_init: run __con_initcall section\n");
 
 #ifdef CONFIG_NULL_TTY_DEFAULT_CONSOLE
 	if (!console_set_on_cmdline)

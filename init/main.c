@@ -1620,9 +1620,15 @@ static int __ref kernel_init(void *unused)
 }
 
 /* Open /dev/console, for stdin/stdout/stderr, this should never fail */
+/*
+ * 把 /dev/console 复制到 0/1/2：用户态 init 的标准输入输出错误都指向控制台，
+ * 否则 shell 一启动就是 “can't access tty”。
+ */
 void __init console_on_rootfs(void)
 {
 	struct file *file = filp_open("/dev/console", O_RDWR, 0);
+
+	printk(KERN_INFO "[latte] console_on_rootfs: /dev/console -> fd 0/1/2\n");
 
 	if (IS_ERR(file)) {
 		pr_err("Warning: unable to open an initial console.\n");

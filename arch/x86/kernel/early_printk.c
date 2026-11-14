@@ -111,6 +111,10 @@ ANNOTATE_NOENDBR_SYM(io_serial_out);
 DEFINE_STATIC_CALL(serial_in, io_serial_in);
 DEFINE_STATIC_CALL(serial_out, io_serial_out);
 
+/*
+ * 轮询“发送保持寄存器空”（LSR 的 THRE 位）再写 TXR：不依赖中断，
+ * 所以内核还没配好中断时也能把字符吐出去——这就是 early console。
+ */
 static int early_serial_putc(unsigned char ch)
 {
 	unsigned timeout = 0xffff;
@@ -124,6 +128,7 @@ static int early_serial_putc(unsigned char ch)
 static void early_serial_write(struct console *con, const char *s, unsigned n)
 {
 	while (*s && n-- > 0) {
+		/* 串口终端约定：换行要发 \r\n，只发 \n 光标不回行首 */
 		if (*s == '\n')
 			early_serial_putc('\r');
 		early_serial_putc(*s);
@@ -383,8 +388,15 @@ static void early_console_register(struct console *con, int keep_early)
 	else
 		early_console->flags |= CON_BOOT;
 	register_console(early_console);
+	/* 注册完才能用：这行是最早一批真的能落在串口上的日志 */
+	printk(KERN_INFO "[latte] early console registered: %s (keep=%d)\n",
+	       early_console->name, keep_early);
 }
 
+/*
+ * 解析 earlyprintk= 参数（本机是 earlyprintk=serial）。可选 "keep" 表示
+ * 不把它当临时 console：真正的 console 出现后也不撤。
+ */
 static int __init setup_early_printk(char *buf)
 {
 	int keep;

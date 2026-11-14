@@ -3192,6 +3192,7 @@ static void serial8250_console_putchar(struct uart_port *port, unsigned char ch)
 	serial_port_out(port, UART_TX, ch);
 }
 
+/* 等发送保持寄存器空再写：UART 忙时硬写会丢字符 */
 static void serial8250_console_wait_putchar(struct uart_port *port, unsigned char ch)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
@@ -3283,6 +3284,10 @@ static void serial8250_console_fifo_write(struct uart_8250_port *up,
  *
  *	Doing runtime PM is really a bad idea for the kernel console.
  *	Thus, we assume the function is called when device is powered up.
+ */
+/*
+ * 真正控制台的写入口：先关 UART 自己的中断（避免抢），逐字符轮询发出，
+ * 写完恢复 IER。console 输出宁可慢，也不能丢。
  */
 void serial8250_console_write(struct uart_8250_port *up, const char *s,
 			      unsigned int count)

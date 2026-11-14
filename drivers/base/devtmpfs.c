@@ -215,6 +215,10 @@ static int create_path(const char *nodepath)
 	return err;
 }
 
+/*
+ * 设备出现时自动 mknod 出节点：主次设备号取自 device->devt。
+ * 有它，用户态不跑 udev 也能在 /dev 下看到设备。
+ */
 static int handle_create(const char *nodename, umode_t mode, kuid_t uid,
 			 kgid_t gid, struct device *dev)
 {
@@ -358,9 +362,15 @@ static int handle_remove(const char *nodename, struct device *dev)
  * If configured, or requested by the commandline, devtmpfs will be
  * auto-mounted after the kernel mounted the root filesystem.
  */
+/*
+ * 把 devtmpfs 挂到相对路径 "dev" 上：调用时 cwd 决定挂载点，
+ * prepare_namespace() 里 cwd 是 /root，所以挂到新根的 /dev。
+ */
 int __init devtmpfs_mount(void)
 {
 	int err;
+
+	printk(KERN_INFO "[latte] devtmpfs_mount: mount_dev=%d\n", mount_dev);
 
 	if (!mount_dev)
 		return 0;
@@ -432,9 +442,15 @@ out:
  * calls.  That call is done while devtmpfs_init, which is marked __init,
  * synchronously waits for it to complete.
  */
+/*
+ * devtmpfs 的内核线程（kdevtmpfs）：各子系统注册/注销设备时往队列里丢请求，
+ * 它负责在 /dev 下建节点、删节点。
+ */
 static int __ref devtmpfsd(void *p)
 {
 	int err = devtmpfs_setup(p);
+
+	printk(KERN_INFO "[latte] devtmpfsd: kdevtmpfs thread running\n");
 
 	complete(&setup_done);
 	if (err)
