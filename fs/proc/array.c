@@ -123,6 +123,7 @@ void proc_task_name(struct seq_file *m, struct task_struct *p, bool escape)
  * you can test for combinations of others with
  * simple bit tests.
  */
+/* 进程状态字母：/proc/PID/stat 第三列就是它，含义见每项注释 */
 static const char * const task_state_array[] = {
 
 	/* states in TASK_REPORT: */

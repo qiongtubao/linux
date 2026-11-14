@@ -11,7 +11,7 @@
 | **启动** | 按下电源后，谁把内核叫醒；内核把自己和外设准备到什么程度；最后把控制权交给谁 | `init-process.md`、`initramfs-rootfs.md`、`root-mount/01`、`04`、`06`、`07`、`execve/01`、`05` |
 | **内存** | 三层记账（memblock/buddy/slab）、页分配与回收、内存里的“文件系统” | `mm-core-init.md`、`memory/01`~`05`、`swap/01`~`04`、`root-mount/03`、`execve/03` |
 | **磁盘与文件系统** | 块设备/分区/文件系统/挂载，路径怎么解析成 inode，dentry 缓存 | `root-mount/02`、`05`、`execve/04`、`vfs/01`~`04`、`inode/01`~`04`、`mount/01`~`04` |
-| **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve` 那一步跨过什么 | `init-process.md`、`root-mount/04`、`execve/02`、`06` |
+| **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve`、进程状态与作业控制 | `init-process.md`、`root-mount/04`、`execve/02`、`06`、`jobs/01`~`04` |
 | **设备与中断** | 设备号与 `/dev`、console 与 tty、printk 怎么落到串口、中断与 IDT | `devices/01`~`06`、`interrupts/01`~`05`、`tty/01`~`04` |
 
 ## 建议阅读顺序
@@ -30,6 +30,7 @@
 12. `vfs/` —— 路径怎么变成 inode：dentry 缓存与 drop_caches 实测（1 索引 + 4 篇）
 13. `inode/` —— 一个文件多个名字：硬链接让 dentry+1 而 inode 不变（1 索引 + 4 篇）
 14. `mount/` —— 目录树怎么拼起来：挂载点两侧 `st_dev` 为什么会变（1 索引 + 4 篇）
+15. `jobs/` —— 进程状态与作业控制：`kill -TSTP` 何时会被内核丢弃（1 索引 + 4 篇）
 
 ## 每篇主题文档的固定骨架
 

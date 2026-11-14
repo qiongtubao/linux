@@ -2526,6 +2526,7 @@ int ptrace_notify(int exit_code, unsigned long message)
 	return signr;
 }
 
+/* 组停止的实体：SIGSTOP/SIGTSTP/SIGTTIN 等落到这里，进程进入 T 状态 */
 /**
  * do_signal_stop - handle group stop for SIGSTOP and other stop signals
  * @signr: signr causing group stop if initiating
@@ -2552,6 +2553,9 @@ static bool do_signal_stop(int signr)
 	__releases(&current->sighand->siglock)
 {
 	struct signal_struct *sig = current->signal;
+
+	printk(KERN_INFO "[latte] do_signal_stop: signr=%d comm=%s\n",
+	       signr, current->comm);
 
 	if (!(current->jobctl & JOBCTL_STOP_PENDING)) {
 		unsigned long gstop = JOBCTL_STOP_PENDING | JOBCTL_STOP_CONSUME;
@@ -2797,6 +2801,10 @@ static void hide_si_addr_tag_bits(struct ksignal *ksig)
 	}
 }
 
+/*
+ * 信号处理的出口：从待处理队列取一个信号，决定“终止 / 停止 / 继续 /
+ * 调用户 handler”，然后回到用户态去执行。
+ */
 bool get_signal(struct ksignal *ksig)
 {
 	struct sighand_struct *sighand = current->sighand;
