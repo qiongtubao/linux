@@ -138,6 +138,7 @@ static inline void pmd_clear(pmd_t *p)
  * The following only work if pte_present() is true.
  * Undefined behaviour if not..
  */
+/*读User/Supervisor标志 */
 static inline int pte_read(pte_t pte)
 {
 	return pte.pte_low & _PAGE_READ;

@@ -187,6 +187,7 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 #define pte_special(pte)	(!!(pte_val(pte) & PTE_SPECIAL))
 #define pte_write(pte)		(!!(pte_val(pte) & PTE_WRITE))
 #define pte_rdonly(pte)		(!!(pte_val(pte) & PTE_RDONLY))
+//读User/Supervisor标志
 #define pte_user(pte)		(!!(pte_val(pte) & PTE_USER))
 #define pte_user_exec(pte)	(!(pte_val(pte) & PTE_UXN))
 #define pte_cont(pte)		(!!(pte_val(pte) & PTE_CONT))

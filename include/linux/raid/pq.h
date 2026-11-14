@@ -39,10 +39,10 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 #ifndef PAGE_SIZE
-# define PAGE_SIZE 4096
+# define PAGE_SIZE 4096 //页大小
 #endif
 #ifndef PAGE_SHIFT
-# define PAGE_SHIFT 12
+# define PAGE_SHIFT 12 //80x86 页大小2^12 = 4096
 #endif
 extern const char raid6_empty_zero_page[PAGE_SIZE];
 

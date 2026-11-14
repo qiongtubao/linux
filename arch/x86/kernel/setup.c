@@ -1033,6 +1033,7 @@ void __init setup_arch(char **cmdline_p)
 	 * 这个值确定了系统可用的物理内存上限，是所有内存管理操作的基础。
 	 * 通过 e820 内存映射表确定系统中实际可用的 RAM 大小。
 	 */
+	printk(KERN_INFO "[latte] setup_arch -> e820__end_of_ram_pfn\n");
 	max_pfn = e820__end_of_ram_pfn();
 
 	/* update e820 for memory not covered by WB MTRRs */
@@ -1088,6 +1089,7 @@ void __init setup_arch(char **cmdline_p)
 	 * 2. 保留内核代码、数据、BSS 等关键区域
 	 * 3. 为后续的内存初始化（如 page allocator）准备内存布局信息
 	 */
+	printk(KERN_INFO "[latte] setup_arch -> e820__memblock_setup\n");
 	e820__memblock_setup();
 
 	/*
@@ -1153,6 +1155,7 @@ void __init setup_arch(char **cmdline_p)
 	 * 注意：此函数依赖于早期的 IDT 页错误处理，因此在调用后需要安装
 	 * 真正的页错误处理程序。
 	 */
+	printk(KERN_INFO "[latte] setup_arch -> init_mem_mapping\n");
 	init_mem_mapping();
 
 	/*
@@ -1230,6 +1233,7 @@ void __init setup_arch(char **cmdline_p)
 	 * (Static Resource Affinity Table) 表，识别系统中的内存节点及其
 	 * 与 CPU 的亲和性关系。这对于多处理器系统和 NUMA 系统至关重要。
 	 */
+	printk(KERN_INFO "[latte] setup_arch -> initmem_init\n");
 	initmem_init();
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
 
@@ -1265,6 +1269,7 @@ void __init setup_arch(char **cmdline_p)
 	 *
 	 * 这些 zone 的初始化是后续页面分配器（page allocator）工作的基础。
 	 */
+	printk(KERN_INFO "[latte] setup_arch -> x86_init.paging.pagetable_init\n");
 	x86_init.paging.pagetable_init();
 
 	kasan_init();
