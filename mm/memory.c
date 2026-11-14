@@ -4579,6 +4579,10 @@ static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
  * We return with the mmap_lock locked or unlocked in the same cases
  * as does filemap_fault().
  */
+/*
+ * 换入：PTE 里是 swap entry，说明这张页在交换区。读回来（可能要等 I/O）、
+ * 放回 swap cache、重建 PTE；带写标志时还要走 COW。
+ */
 vm_fault_t do_swap_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;

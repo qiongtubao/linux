@@ -680,6 +680,10 @@ static pageout_t writeout(struct folio *folio, struct address_space *mapping,
 /*
  * pageout is called by shrink_folio_list() for each dirty folio.
  */
+/*
+ * 回收时处理“脏页”：文件页回写到磁盘，匿名页/tmpfs 页写进 swap。
+ * 写不出去就只能放弃回收这张页（否则会丢数据）。
+ */
 static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 			 struct swap_iocb **plug, struct list_head *folio_list)
 {

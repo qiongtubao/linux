@@ -1405,6 +1405,10 @@ start_over:
  * Context: Caller needs to hold the folio lock.
  * Return: Whether the folio was added to the swap cache.
  */
+/*
+ * 给一个页分配交换槽位：成功后页进 swap cache，页表里将被改成
+ * swap entry（类型 + 偏移），内容随后由 swap_writeout() 写出。
+ */
 int folio_alloc_swap(struct folio *folio, gfp_t gfp)
 {
 	unsigned int order = folio_order(folio);
@@ -3414,6 +3418,10 @@ err:
 	return ERR_PTR(err);
 }
 
+/*
+ * swapon(2)：把一块设备或文件变成交换区。要读 swap header、建 swap_map、
+ * 登记进 swap_info[]，之后回收才能从这里拿槽位。
+ */
 SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 {
 	struct swap_info_struct *si;
@@ -3433,6 +3441,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	struct folio *folio = NULL;
 	struct inode *inode = NULL;
 	bool inced_nr_rotate_swap = false;
+
+	printk(KERN_INFO "[latte] swapon: activating swap area\n");
 
 	if (swap_flags & ~SWAP_FLAGS_VALID)
 		return -EINVAL;

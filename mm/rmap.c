@@ -1862,6 +1862,7 @@ static inline unsigned int folio_unmap_pte_batch(struct folio *folio,
 /*
  * @arg: enum ttu_flags will be passed to this argument
  */
+/* 反向映射：按 rmap 找到映射这张页的所有 PTE，逐个摘掉才能换出/迁移 */
 static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 		     unsigned long address, void *arg)
 {
