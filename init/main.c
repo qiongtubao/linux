@@ -708,17 +708,26 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
+/*
+ * 内核初始化的分岔点：start_kernel() 的活儿干到这里，要分出 1 号进程
+ * （kernel_init）、2 号进程（kthreadd），自己则变成 0 号 idle。
+ * 必须是非 __init 函数：否则 start_kernel 的代码段可能被 1 号进程的
+ * free_initmem() 回收掉，而 0 号进程还没走到 idle。
+ */
 static noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
 	int pid;
 
+	/* RCU 进入“调度可用”状态，之后才好按优先级挑任务 */
 	rcu_scheduler_starting();
 	/*
 	 * We need to spawn init first so that it obtains pid 1, however
 	 * the init task will end up wanting to create kthreads, which, if
 	 * we schedule it before we create kthreadd, will OOPS.
 	 */
+	/* 先建 1 号进程抢下 pid 1：用户态 init 由它之后拉起 */
+	printk(KERN_INFO "[latte] rest_init -> kernel_init(pid 1)\n");
 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
 	/*
 	 * Pin init on the boot CPU. Task migration is not properly working
@@ -726,14 +735,18 @@ static noinline void __ref __noreturn rest_init(void)
 	 * CPUs for init to the non isolated CPUs.
 	 */
 	rcu_read_lock();
+	/* 多核调度还没好，先把 1 号进程钉在 boot CPU 上 */
 	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
 	tsk->flags |= PF_NO_SETAFFINITY;
 	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id()));
 	rcu_read_unlock();
 
 	numa_default_policy();
+	/* 再建 2 号进程 kthreadd：所有内核线程都由它派生 */
+	printk(KERN_INFO "[latte] rest_init -> kthreadd(pid 2)\n");
 	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES);
 	rcu_read_lock();
+	/* 记下 kthreadd 的 task_struct，后面建内核线程要用 */
 	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
 	rcu_read_unlock();
 
@@ -744,16 +757,20 @@ static noinline void __ref __noreturn rest_init(void)
 	 * CONFIG_PREEMPT_VOLUNTARY=y the init task might have scheduled
 	 * already, but it's stuck on the kthreadd_done completion.
 	 */
+	/* 标记内核已能调度，随后 may_sleep 一类检查开始生效 */
 	system_state = SYSTEM_SCHEDULING;
 
+	/* 放行 1 号进程：它正阻塞在 kthreadd_done 这个完成量上 */
 	complete(&kthreadd_done);
 
 	/*
 	 * The boot idle thread must execute schedule()
 	 * at least once to get things moving:
 	 */
+	/* 0 号进程先让出一次 CPU，别的任务才能跑起来 */
 	schedule_preempt_disabled();
 	/* Call into cpu_idle with preempt disabled */
+	printk(KERN_INFO "[latte] rest_init -> cpu_startup_entry(idle)\n");
 	cpu_startup_entry(CPUHP_ONLINE);
 }
 
@@ -1111,6 +1128,7 @@ void start_kernel(void)
 	kcsan_init();
 
 	/* Do the rest non-__init'ed, we're now alive */
+	printk(KERN_INFO "[latte] start_kernel -> rest_init\n");
 	rest_init();
 
 	/*
@@ -1333,37 +1351,51 @@ static int __init ignore_unknown_bootoption(char *param, char *val,
 	return 0;
 }
 
+/*
+ * 跑完单独一段 initcall：先过滤本段的内核参数，再逐个调用登记项。
+ */
 static void __init do_initcall_level(int level, char *command_line)
 {
 	initcall_entry_t *fn;
 
+	/* 只处理属于本段的参数，比如 core.= 只给 core 段看 */
 	parse_args(initcall_level_names[level],
 		   command_line, __start___param,
 		   __stop___param - __start___param,
 		   level, level,
 		   NULL, ignore_unknown_bootoption);
 
+	/* ftrace 打点，bootgraph 就是靠它画时间线 */
 	do_trace_initcall_level(initcall_level_names[level]);
+	/* 链接器已按段排好序，逐个调 initcall 并记录返回值 */
 	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
 		do_one_initcall(initcall_from_entry(fn));
 }
 
+/*
+ * 按段跑 initcall：pure→core→postcore→arch→subsys→fs→device→late。
+ * 先按段处理本段的内核参数，再顺序调用本段登记的每个函数。
+ */
 static void __init do_initcalls(void)
 {
 	int level;
 	size_t len = saved_command_line_len + 1;
 	char *command_line;
 
+	/* 每段解析都会改字符串，先抄一份可写的命令行 */
 	command_line = kzalloc(len, GFP_KERNEL);
 	if (!command_line)
 		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
 
 	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
 		/* Parser modifies command_line, restore it each time */
+		/* 上一段解析把命令行改坏了，每段之前恢复一次 */
 		strcpy(command_line, saved_command_line);
+		/* pure→core→postcore→arch→subsys→fs→device→late 依次跑 */
 		do_initcall_level(level, command_line);
 	}
 
+	/* 用完还给 slab */
 	kfree(command_line);
 }
 
@@ -1374,12 +1406,21 @@ static void __init do_initcalls(void)
  *
  * Now we can finally start doing some real work..
  */
+/*
+ * 内核初始化的收尾大集合：驱动模型、中断信息、构造函数，
+ * 最后按段跑完所有 initcall——绝大多数设备和子系统在此出现。
+ */
 static void __init do_basic_setup(void)
 {
+	/* cpuset 的多核部分，之后 /sys 里的 cpuset 才可用 */
 	cpuset_init_smp();
+	/* 建驱动模型：/sys/bus、/sys/devices、/sys/class 等 */
 	driver_init();
+	/* 建 /proc/interrupts 等中断信息节点 */
 	init_irq_proc();
+	/* 跑链接进来的构造函数（C++ 风格静态初始化） */
 	do_ctors();
+	printk(KERN_INFO "[latte] do_basic_setup -> do_initcalls\n");
 	do_initcalls();
 }
 
@@ -1392,6 +1433,10 @@ static void __init do_pre_smp_initcalls(void)
 		do_one_initcall(initcall_from_entry(fn));
 }
 
+/*
+ * 把当前进程 execve 成用户态 init：成功则永不返回，
+ * 失败返回负的错误码，由调用者决定再试下一个候选。
+ */
 static int run_init_process(const char *init_filename)
 {
 	const char *const *p;
@@ -1469,11 +1514,19 @@ static void mark_readonly(void)
 	}
 }
 
+/*
+ * 把整段 __init 代码与数据还给 buddy；x86 走这个默认实现。
+ */
 void __weak free_initmem(void)
 {
 	free_initmem_default(POISON_FREE_INITMEM);
 }
 
+/*
+ * 1 号进程本体：先把内核初始化收尾（SMP、initcall、deferred 页），
+ * 再把 __init 段还给 buddy，最后 execve 用户态 init。
+ * 这个函数从不返回——成功就变成用户进程，失败就 panic。
+ */
 static int __ref kernel_init(void *unused)
 {
 	int ret;
@@ -1481,32 +1534,45 @@ static int __ref kernel_init(void *unused)
 	/*
 	 * Wait until kthreadd is all set-up.
 	 */
+	/* 等 kthreadd 就绪，之后才敢建别的内核线程 */
 	wait_for_completion(&kthreadd_done);
 
+	/* 主体初始化：SMP、workqueue、page_alloc_init_late、initcall */
+	printk(KERN_INFO "[latte] kernel_init -> kernel_init_freeable\n");
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
+	/* 异步初始化必须全部落地，否则回收 __init 段会踩到它们 */
 	async_synchronize_full();
 
+	/* 宣告马上要回收 __init 段，此后不许再用那段代码 */
 	system_state = SYSTEM_FREEING_INITMEM;
 	kprobe_free_init_mem();
 	ftrace_free_init_mem();
 	kgdb_free_init_mem();
 	exit_boot_config();
+	/* 整段 __init 还给 buddy，日志里的 Freeing ...K 就是它 */
+	printk(KERN_INFO "[latte] kernel_init -> free_initmem\n");
 	free_initmem();
+	/* 把内核只读段真正设成只读，RO 保护在此收尾 */
 	mark_readonly();
 
 	/*
 	 * Kernel mappings are now finalized - update the userspace page-table
 	 * to finalize PTI.
 	 */
+	/* 内核页表定型后，用户页表才能确定 KPTI 的最终形态 */
 	pti_finalize();
 
+	/* 切到运行态，此后 system_state 检查走正常路径 */
 	system_state = SYSTEM_RUNNING;
 	numa_default_policy();
 
+	/* 启动期对 RCU 的特殊照顾到此结束 */
 	rcu_end_inkernel_boot();
 
 	do_sysctl_args();
+	/* 开始跑用户态进程：先 initramfs 的 init，再命令行 init= */
+	printk(KERN_INFO "[latte] kernel_init -> run_init_process\n");
 
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
@@ -1522,6 +1588,7 @@ static int __ref kernel_init(void *unused)
 	 * The Bourne shell can be used instead of init if we are
 	 * trying to recover a really broken machine.
 	 */
+	/* 其次是命令行 init= 指定的程序，失败就 panic */
 	if (execute_command) {
 		ret = run_init_process(execute_command);
 		if (!ret)
@@ -1539,12 +1606,14 @@ static int __ref kernel_init(void *unused)
 			return 0;
 	}
 
+	/* 最后按惯例逐个试 /sbin/init、/etc/init、/bin/init、/bin/sh */
 	if (!try_to_run_init_process("/sbin/init") ||
 	    !try_to_run_init_process("/etc/init") ||
 	    !try_to_run_init_process("/bin/init") ||
 	    !try_to_run_init_process("/bin/sh"))
 		return 0;
 
+	/* 一个都跑不起来就没救了，只能 panic */
 	panic("No working init found.  Try passing init= option to kernel. "
 	      "See Linux Documentation/admin-guide/init.rst for guidance.");
 }
@@ -1564,41 +1633,64 @@ void __init console_on_rootfs(void)
 	fput(file);
 }
 
+/*
+ * 1 号进程里“内核侧”的那一半：从建立 SMP 到跑完 initcall，
+ * 再准备好根文件系统与控制台，为最后 execve 用户程序铺路。
+ */
 static noinline void __init kernel_init_freeable(void)
 {
 	/* Now the scheduler is fully set up and can do blocking allocations */
+	/* 调度器已就绪，从此允许阻塞式分配（分配时可以睡眠） */
 	gfp_allowed_mask = __GFP_BITS_MASK;
 
 	/*
 	 * init can allocate pages on any node
 	 */
+	/* 1 号进程可以往任意有内存的 node 要页 */
 	set_mems_allowed(node_states[N_MEMORY]);
 
+	/* 记下 cad_pid：内核崩溃时用它去通知用户态 */
 	cad_pid = get_pid(task_pid(current));
 
+	/* 先把其它 CPU 准备好，这一步还没有真正上线 */
 	smp_prepare_cpus(setup_max_cpus);
 
+	/* 建系统工作队列，后面很多 initcall 依赖它 */
 	workqueue_init();
 
+	/* 初始化与进程、内存相关的内部结构 */
 	init_mm_internals();
 
+	/* 跑 early 段 initcall：它们必须在 SMP 起来之前完成 */
 	do_pre_smp_initcalls();
+	/* 死锁与软锁检测器 */
 	lockup_detector_init();
 
+	/* 真正拉起其它 CPU，之后 smp_processor_id 才可靠 */
 	smp_init();
+	/* 调度器的多核部分，1 号进程被钉在 boot CPU 就是等它 */
 	sched_init_smp();
 
+	/* 按 CPU 拓扑重建工作队列的 per-CPU 池 */
 	workqueue_init_topology();
+	/* 异步探测框架，设备探测可并行化 */
 	async_init();
+	/* 并行多线程框架，crypto 等模块会用到 */
 	padata_init();
+	/* 补 deferred 页、打印 Memory:、丢掉 memblock（见 mm 笔记） */
 	printk(KERN_INFO "[latte] kernel_init_freeable -> page_alloc_init_late\n");
 	page_alloc_init_late();
 
+	/* 驱动模型加八段 initcall，真正的设备初始化从这开始 */
+	printk(KERN_INFO "[latte] kernel_init_freeable -> do_basic_setup\n");
 	do_basic_setup();
 
+	/* KUnit 单元测试，一般没编进来 */
 	kunit_run_all_tests();
 
+	/* 等 initramfs 解压完，/init 这时才真的存在 */
 	wait_for_initramfs();
+	/* 把 /dev/console 接到 0/1/2，否则 shell 没输出 */
 	console_on_rootfs();
 
 	/*
@@ -1611,6 +1703,7 @@ static noinline void __init kernel_init_freeable(void)
 		pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
 			ramdisk_execute_command, ramdisk_command_access);
 		ramdisk_execute_command = NULL;
+		/* initramfs 里没有可用的 init，退回真正的根文件系统 */
 		prepare_namespace();
 	}
 
@@ -1623,5 +1716,6 @@ static noinline void __init kernel_init_freeable(void)
 	 * and default modules
 	 */
 
+	/* 加载内置公钥，供 IMA 校验用 */
 	integrity_load_keys();
 }

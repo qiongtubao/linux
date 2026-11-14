@@ -3290,6 +3290,10 @@ static inline void free_reserved_ptdesc(struct ptdesc *pt)
 }
 
 /*
+ * 默认实现：用链接脚本给出的 __init_begin / __init_end 两个符号划出整段
+ * __init 区域（代码 + 数据），整段丢还给 buddy。
+ */
+/*
  * Default method to free all the __init memory into the buddy system.
  * The freed pages will be poisoned with pattern "poison" if it's within
  * range [0, UCHAR_MAX].

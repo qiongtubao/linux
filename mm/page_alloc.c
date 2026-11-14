@@ -6236,11 +6236,17 @@ void adjust_managed_page_count(struct page *page, long count)
 }
 EXPORT_SYMBOL(adjust_managed_page_count);
 
+/*
+ * 把 [start, end) 这段“保留但已经不用”的内存按页还给 buddy；
+ * free_initmem() 回收 __init 段走的就是这里，启动期临时区也用它。
+ * 页数不为 0 时打印 "Freeing %s memory: %ldK"，日志里那行就是它。
+ */
 unsigned long free_reserved_area(void *start, void *end, int poison, const char *s)
 {
 	void *pos;
 	unsigned long pages = 0;
 
+	/* 向内收边：只还完整页，头尾不足一页的留给别人 */
 	start = (void *)PAGE_ALIGN((unsigned long)start);
 	end = (void *)((unsigned long)end & PAGE_MASK);
 	for (pos = start; pos < end; pos += PAGE_SIZE, pages++) {
@@ -6260,24 +6266,36 @@ unsigned long free_reserved_area(void *start, void *end, int poison, const char 
 		 * has not been initialized.
 		 */
 		direct_map_addr = kasan_reset_tag(direct_map_addr);
+		/* 调试时先整页刷毒化图案，被踩了才好查 */
 		if ((unsigned int)poison <= 0xFF)
 			memset(direct_map_addr, poison, PAGE_SIZE);
 
+		/* 一页页交出去：清 Reserved、refcount 归零、进 buddy */
 		free_reserved_page(page);
 	}
 
+	/* Freeing unused kernel image (initmem) memory: NNNK 就出自这里 */
 	if (pages && s)
 		pr_info("Freeing %s memory: %ldK\n", s, K(pages));
 
 	return pages;
 }
 
+/*
+ * 单页版的“保留页还给 buddy”：清 Reserved 标记、refcount 置 1（表示
+ * 还没人持有）、走正常释放路径，最后把计数补回 zone 和 totalram_pages。
+ * 和 __free_pages_core() 的区别：那个用于启动期整批页，这个用于零散回收。
+ */
 void free_reserved_page(struct page *page)
 {
+	/* 分配打点的 tag 先清掉，当它从没被分配过 */
 	clear_page_tag_ref(page);
+	/* 不再是保留页 */
 	ClearPageReserved(page);
+	/* refcount 置 1 再交给 __free_page，走正常释放路径 */
 	init_page_count(page);
 	__free_page(page);
+	/* 补回 zone 与系统的可用页计数 */
 	adjust_managed_page_count(page, 1);
 }
 EXPORT_SYMBOL(free_reserved_page);
