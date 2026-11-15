@@ -1309,6 +1309,9 @@ new_segment:
 			copy = err;
 		} else if (zc == MSG_SPLICE_PAGES) {
 			/* Splice in data if we can; copy if we can't. */
+			printk(KERN_INFO "[latte] tcp_splice_pages: len=%u\n",
+			       skb->len);
+
 			if (tcp_downgrade_zcopy_pure(sk, skb))
 				goto wait_for_space;
 			copy = tcp_wmem_schedule(sk, copy);

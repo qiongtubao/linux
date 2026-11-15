@@ -2993,6 +2993,7 @@ size_t splice_folio_into_pipe(struct pipe_inode_info *pipe,
  * if the pipe has insufficient space, we reach the end of the data or we hit a
  * hole.
  */
+/* 从 page cache 里把页挂进管道：sendfile 的第一段，不拷数据 */
 ssize_t filemap_splice_read(struct file *in, loff_t *ppos,
 			    struct pipe_inode_info *pipe,
 			    size_t len, unsigned int flags)
@@ -3003,6 +3004,8 @@ ssize_t filemap_splice_read(struct file *in, loff_t *ppos,
 	loff_t isize, end_offset;
 	bool writably_mapped;
 	int i, error = 0;
+
+	printk(KERN_INFO "[latte] filemap_splice_read: len=%zu\n", len);
 
 	if (unlikely(*ppos >= in->f_mapping->host->i_sb->s_maxbytes))
 		return 0;

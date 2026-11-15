@@ -1299,6 +1299,7 @@ COMPAT_SYSCALL_DEFINE6(pwritev2, compat_ulong_t, fd,
 }
 #endif /* CONFIG_COMPAT */
 
+/* sendfile 入口：文件 → 文件/套接字，全程不经过用户态缓冲 */
 static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 			   size_t count, loff_t max)
 {
@@ -1308,6 +1309,8 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 	loff_t out_pos;
 	ssize_t retval;
 	int fl;
+
+	printk(KERN_INFO "[latte] do_sendfile: count=%zu\n", count);
 
 	/*
 	 * Get input file, and verify that it is ok..

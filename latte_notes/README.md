@@ -10,7 +10,7 @@
 |---|---|---|
 | **启动** | 按下电源后，谁把内核叫醒；内核把自己和外设准备到什么程度；最后把控制权交给谁 | `init-process.md`、`initramfs-rootfs.md`、`root-mount/01`、`04`、`06`、`07`、`execve/01`、`05` |
 | **内存** | 三层记账（memblock/buddy/slab）、页分配与回收、缺页与写时复制、LRU 与第二次机会、换出换入、内存里的“文件系统” | `mm-core-init.md`、`memory/01`~`07`、`swap/01`~`05`、`root-mount/03`、`execve/03` |
-| **磁盘与文件系统** | 块设备/分区/文件系统/挂载，路径怎么解析成 inode，dentry 缓存，脏页回写，mmap | `root-mount/02`、`05`、`execve/04`、`vfs/01`~`06`、`inode/01`~`04`、`mount/01`~`04` |
+| **磁盘与文件系统** | 块设备/分区/文件系统/挂载，路径怎么解析成 inode，dentry 缓存，脏页回写，mmap，零拷贝 | `root-mount/02`、`05`、`execve/04`、`vfs/01`~`07`、`inode/01`~`04`、`mount/01`~`04` |
 | **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve`、进程状态与作业控制、信号投递、调度时机与权重、cgroup 份额、实时调度 | `init-process.md`、`root-mount/04`、`execve/02`、`06`、`jobs/01`~`05`、`exit/01`~`04`、`sched/01`~`04` |
 | **设备与中断** | 设备号与 `/dev`、console 与 tty、printk 怎么落到串口、中断与 IDT | `devices/01`~`06`、`interrupts/01`~`05`、`tty/01`~`04` |
 | **网络** | 网卡与 `net_device`、NAPI 批量收包、协议分发、`sk_buff`、ICMP 到 socket 队列、发送与 virtqueue、TCP 状态机、GRO 合并、GSO 分片 | `net/01`~`09` |
@@ -28,7 +28,7 @@
 9. `memory/` —— 页怎么分配、对象怎么缓存、紧张时谁回收、缺页才要页、回收先挑谁（1 索引 + 7 篇）
 10. `tty/` —— 终端行规程与信号：`Ctrl-C` 到底发给了谁（1 索引 + 4 篇）
 11. `swap/` —— 让匿名页可回收：加一块交换区后回收从空转变真干活，换出/换入逐页打点（1 索引 + 5 篇）
-12. `vfs/` —— 路径怎么变成 inode：dentry 缓存、`write()` 为什么没落盘、`mmap` 的页怎么进进程（1 索引 + 6 篇）
+12. `vfs/` —— 路径怎么变成 inode：dentry 缓存、`write()` 为什么没落盘、`mmap` 与 `sendfile`（1 索引 + 7 篇）
 13. `inode/` —— 一个文件多个名字：硬链接让 dentry+1 而 inode 不变（1 索引 + 4 篇）
 14. `mount/` —— 目录树怎么拼起来：挂载点两侧 `st_dev` 为什么会变（1 索引 + 4 篇）
 15. `jobs/` —— 进程状态、作业控制与信号投递：`kill -TSTP` 何时被丢弃、handler 怎么被摆到栈上（1 索引 + 5 篇）
