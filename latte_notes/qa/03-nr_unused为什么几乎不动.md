@@ -74,7 +74,7 @@ fast_dput() → 计数减到 0 → retain_dentry(dentry, false)   /* 无锁时 p
 **这是本次能给出的最强结论**：不是计数器的问题，而是“这些 dentry 在 `dput` 之后没有
 走到 `d_lru_add()`”。剩下的问题变成“谁还持有它们的引用”。
 
-## 下一步的具体方法（配置已具备，未执行）
+## 下一步的具体方法（已在 `04` 执行）
 
 本内核已开 `CONFIG_KPROBES=y`、`CONFIG_KPROBE_EVENTS=y`、`CONFIG_FTRACE=y`，
 可以完全从用户态用 tracefs 观察，不必改代码：
@@ -89,7 +89,8 @@ cat /sys/kernel/tracing/trace | tail -40
 ```
 
 注意 `d_lru_add()` 与 `retain_dentry()` 都是 `static`/`static inline`，可能被内联而
-探不到；`dput()` 是全局符号，一定可以。**这一步留给后续**。
+探不到；`dput()` 是全局符号，一定可以。**这一步已在 [04-用kprobe看dcache](04-用kprobe看dcache.md) 执行**：`d_lru_add` 在创建窗口
+确实不增（kprobe 计数），并发现创建时伴随一次 `__dentry_kill`。
 
 ## 可操作的结论（这条是确定的）
 
