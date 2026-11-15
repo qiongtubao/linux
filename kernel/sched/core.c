@@ -3287,6 +3287,11 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 {
 	unsigned int state = READ_ONCE(p->__state);
 
+	/* 只打真正的核间搬迁：旧 CPU 与新 CPU 不同 */
+	if (task_cpu(p) != new_cpu)
+		printk(KERN_INFO "[latte] migrate: comm=%s pid=%d %u->%u\n",
+		       p->comm, p->pid, task_cpu(p), new_cpu);
+
 	/*
 	 * We should never call set_task_cpu() on a blocked task,
 	 * ttwu() will sort out the placement.
