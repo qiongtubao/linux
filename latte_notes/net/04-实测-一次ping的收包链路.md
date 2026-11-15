@@ -61,11 +61,24 @@ ping -c 2 10.0.2.2                     # QEMU 用户态网络的网关
    （这与 `vfs/04` 那次“打点位置错了日志会安静得可怕”是同一类教训。）
 4. **ping 的 2 个回包对应 2 次 `ip_rcv_core`**：数值严格对齐，说明链路没有额外丢包或重复。
 
-## 一个没覆盖到的点（如实记录）
+## 最后一跳已补上（见 `net/05`）
 
-本次没有给 `icmp_rcv()` / socket 接收队列打点，所以“ICMP 回包最后交给 raw socket、
-`recvmsg()` 拷到用户态”这一段只有代码依据（`net/ipv4/icmp.c`、`net/socket.c`），
-**没有实测数据**。如果要补，可以给 `icmp_rcv()` 与 `sock_queue_rcv_skb()` 各加一个打点。
+当时这篇只追到 `ip_rcv_core()`，“ICMP 回包交给 raw socket、`recvmsg()` 拷到用户态”
+那一段只有代码依据、没有实测。`net/05-ICMP到socket最后一跳.md` 补了 5 个打点
+（`raw_local_deliver`、`raw_rcv_skb`、`icmp_rcv`、`ping_rcv`、`sock_queue_rcv_skb`），
+实测序列（`ping -c 2`，两个回包完全对称）：
+
+```
+ip_rcv_core: len=84
+raw_local_deliver: proto=1
+raw_rcv_skb: len=84
+sock_queue_rcv_skb: queued len=84
+icmp_rcv: type=0 code=0 len=56
+ping_rcv: len=56
+```
+
+结论：raw socket 先拿克隆（`ip_input.c:193` 先于 `:205`），`icmp_rcv` 后看，
+`__sock_queue_rcv_skb()` 里的 `__skb_queue_tail()` 才是 `recvmsg()` 真正要取的队列。
 
 ## 复现
 

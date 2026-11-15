@@ -197,8 +197,11 @@ static int raw_v4_input(struct net *net, struct sk_buff *skb,
 	return delivered;
 }
 
+/* 把 IPv4 包复制给监听了该协议的 raw socket（抓包/ping 走这条） */
 int raw_local_deliver(struct sk_buff *skb, int protocol)
 {
+	printk(KERN_INFO "[latte] raw_local_deliver: proto=%d\n", protocol);
+
 	struct net *net = dev_net(skb->dev);
 
 	return raw_v4_input(net, skb, ip_hdr(skb),
@@ -293,9 +296,12 @@ void raw_icmp_error(struct sk_buff *skb, int protocol, u32 info)
 	rcu_read_unlock();
 }
 
+/* 找到具体 raw socket 后把包交给它：入队或按 backlog 排队 */
 static int raw_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	enum skb_drop_reason reason;
+
+	printk(KERN_INFO "[latte] raw_rcv_skb: len=%u\n", skb->len);
 
 	/* Charge it to the socket. */
 

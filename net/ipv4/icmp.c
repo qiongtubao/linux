@@ -1204,6 +1204,10 @@ static enum skb_drop_reason icmp_discard(struct sk_buff *skb)
 /*
  *	Deal with incoming ICMP packets.
  */
+/*
+ * ICMP 的总入口：校验后按 type 分派。ICMP_ECHOREPLY 交给
+ * ping_rcv()，其它类型查 icmp_pointers[] 表；错误类会回注到原 socket
+ */
 int icmp_rcv(struct sk_buff *skb)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
@@ -1245,6 +1249,9 @@ int icmp_rcv(struct sk_buff *skb)
 		goto error;
 
 	icmph = icmp_hdr(skb);
+
+	printk(KERN_INFO "[latte] icmp_rcv: type=%u code=%u len=%u\n",
+	       icmph->type, icmph->code, skb->len);
 
 	ICMPMSGIN_INC_STATS(net, icmph->type);
 

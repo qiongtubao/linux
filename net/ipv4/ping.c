@@ -959,8 +959,11 @@ EXPORT_IPV6_MOD_GPL(ping_queue_rcv_skb);
  *	All we need to do is get the socket.
  */
 
+/* 只处理 ping socket（SOCK_DGRAM + IPPROTO_ICMP）的 echo 回包 */
 enum skb_drop_reason ping_rcv(struct sk_buff *skb)
 {
+	printk(KERN_INFO "[latte] ping_rcv: len=%u\n", skb->len);
+
 	struct net *net = dev_net(skb->dev);
 	struct icmphdr *icmph = icmp_hdr(skb);
 	struct sock *sk;

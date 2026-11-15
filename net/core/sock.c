@@ -485,6 +485,7 @@ static void sock_disable_timestamp(struct sock *sk, unsigned long flags)
 }
 
 
+/* 把 skb 挂进 socket 接收队列并唤醒等待者——用户态 recvmsg 从这里取 */
 int __sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	unsigned long flags;
@@ -513,6 +514,8 @@ int __sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	sock_skb_set_dropcount(sk, skb);
 	__skb_queue_tail(list, skb);
 	spin_unlock_irqrestore(&list->lock, flags);
+
+	printk(KERN_INFO "[latte] sock_queue_rcv_skb: queued len=%u\n", skb->len);
 
 	if (!sock_flag(sk, SOCK_DEAD))
 		sk->sk_data_ready(sk);
