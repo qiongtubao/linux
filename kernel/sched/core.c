@@ -4140,10 +4140,16 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
  * Return: %true if @p->state changes (an actual wakeup was done),
  *	   %false otherwise.
  */
+/* 唤醒落点：谁把谁从睡眠队列里拉回 runqueue */
 int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 {
 	guard(preempt)();
 	int cpu, success = 0;
+
+	/* 只打用户进程：内核线程（rcu_preempt 等）的唤醒频率会直接拖死串口 */
+	if (p->mm)
+		printk(KERN_INFO "[latte] wake: comm=%s pid=%d state=0x%x\n",
+		       p->comm, p->pid, p->__state);
 
 	wake_flags |= WF_TTWU;
 
@@ -5184,6 +5190,13 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	 * transition, resulting in a double drop.
 	 */
 	prev_state = READ_ONCE(prev->__state);
+
+	/* 只打“主动让出”且涉及用户进程的切换：抢占的量级是它的上千倍 */
+	if (prev_state != TASK_RUNNING && prev->mm)
+		printk(KERN_INFO "[latte] switch: %s/%d(state=0x%x) -> %s/%d\n",
+		       prev->comm, prev->pid, prev_state,
+		       current->comm, current->pid);
+
 	vtime_task_switch(prev);
 	perf_event_task_sched_in(prev, current);
 	finish_task(prev);

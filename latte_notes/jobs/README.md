@@ -72,4 +72,4 @@ exit_to_user_mode_loop  _TIF_SIGPENDING
 同类还剩：**`wait4` 与僵尸**（`WUNTRACED`/`WNOHANG`，把 `Z` 状态走完）、
 **`signalfd`/`pselect` 与信号阻塞**（把信号当文件描述符读，和 `05` 接得上）。
 **信号队列与阻塞**已经补上了，见 `05`；**网络收包路径**也已补完（`net/01`~`06`）。
-换域可以做 **zram/zswap**（需临时开 `CONFIG_ZRAM`）或 **调度器**（`sched_switch`，需 `-smp 2`）。
+换域可以做 **zram/zswap**（需临时开 `CONFIG_ZRAM`），**调度器**已经补上了（`sched/01`~`02`）。

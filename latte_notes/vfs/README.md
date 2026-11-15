@@ -86,4 +86,4 @@ msync → vfs_fsync_range(datasync=1) → do_writepages → submit_bio    ← �
 VFS 这一支收口了：路径（01~03）、缓存（02/04）、写回（05）、映射（06）都有实测。
 还能往下挖：**writeback 的限流细节**（`dirty_ratelimit`、cgroup writeback）、
 **`splice`/`sendfile` 的零拷贝**、**挂载传播**（`shared`/`slave` peer group）。
-也可以换域做 **调度器**（`sched_switch`，需 `-smp 2`）或 **zram/zswap**（需开 `CONFIG_ZRAM`）。
+也可以换域做 **调度器**（已补：`sched/01`~`02`）或 **zram/zswap**（需开 `CONFIG_ZRAM`）。
