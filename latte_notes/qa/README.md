@@ -10,7 +10,7 @@
 |---|---|---|---|
 | 1 | `pswpout` 只有 39 页，而实际换出 6597 页 | `swap/04` | ✅ **结案**：全零页走 zeromap，跳过 IO 不计数 |
 | 2 | `ps` 没显示僵尸 | `exit/04` | ✅ **是误判**：`ps` 列出了，是 `head -40` 截断造成的 |
-| 3 | `nr_unused` 为什么几乎不动 | `vfs/04`、`inode/04` | ⚠️ **部分结案**：证伪“统计有问题”；kprobe 复现“创建窗口 `d_lru_add` 不增” |
+| 3 | `nr_unused` 为什么几乎不动 | `vfs/04`、`inode/04` | ✅ **直接原因已找到**：tmpfs 的 dentry 带 `DCACHE_DONTCACHE`（`0x80`），`retain_dentry()` 直接不进 LRU；剩“为何 `nr_dentry` 不回落”未解 |
 
 ## 文档
 
@@ -20,6 +20,7 @@
 | 2 | [02-ps有没有显示僵尸](02-ps有没有显示僵尸.md) | 旧日志里确有 `59 0 [busybox]` |
 | 3 | [03-nr_unused为什么几乎不动](03-nr_unused为什么几乎不动.md) | `ls -R /` 让 `nr_unused` 涨到 18804（计数器正常）；新建的 100 个 dentry 始终不进 LRU |
 | 3b | [04-用kprobe看dcache](04-用kprobe看dcache.md) | 用 tracefs+kprobe 复现：创建窗口 `d_lru_add` 不增、伴随 `__dentry_kill` |
+| 3c | [05-从反汇编拿结构体偏移](05-从反汇编拿结构体偏移.md) | 反汇编得到 `d_lockref=0x80`，kprobe 读到 `d_flags=0x200080` ⇒ **DONTCACHE 解释了不进 LRU** |
 
 ## 问题 1 的关键对照（同一台 128M + 64M swap）
 
@@ -44,7 +45,7 @@
 
 ## 仍未结的口子
 
-- “新建文件的 dentry 为什么在 `dput` 后既不进 LRU、也不被销毁”（kprobe 已就位；
-  下一步需要 `struct dentry` 的 `d_lockref` 偏移，读引用计数）；
+- “`DONTCACHE` 的 dentry 为什么没在最后一次 `dput` 时销毁”（`nr_dentry` 不回落；
+  kprobe 看到 `dput` 入口 `cnt` 仍是 3~4，说明最后一次 dput 还没发生，但持有者未知）；
 - `pgsteal` 合计（6790）与 `SwapFree` 差值（7787 页）之间约 1000 页的差异，未深究；
 - `icmp_rcv()` / `socket` 接收队列没有实测（`net/04` 里已注明）。

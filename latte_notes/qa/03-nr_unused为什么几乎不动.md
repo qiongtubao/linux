@@ -91,6 +91,9 @@ cat /sys/kernel/tracing/trace | tail -40
 注意 `d_lru_add()` 与 `retain_dentry()` 都是 `static`/`static inline`，可能被内联而
 探不到；`dput()` 是全局符号，一定可以。**这一步已在 [04-用kprobe看dcache](04-用kprobe看dcache.md) 执行**：`d_lru_add` 在创建窗口
 确实不增（kprobe 计数），并发现创建时伴随一次 `__dentry_kill`。
+[05](05-从反汇编拿结构体偏移.md) 进一步读到了 `d_flags = 0x200080`——
+其中的 `0x80` 就是 `DCACHE_DONTCACHE`，`retain_dentry()` 因此直接返回 false，
+**这就是“永不进 LRU”的直接原因**。
 
 ## 可操作的结论（这条是确定的）
 

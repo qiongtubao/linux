@@ -64,8 +64,12 @@ grep -c 'ka:'  $T/trace     # __d_alloc
 | `R:kk __dentry_kill` | 计数恒 0（retprobe 前缀错） | 用 `r:kk __dentry_kill` |
 
 另外 `+8(%si):string` 虽然注册成功、也采到了 8 条记录，但读出来的字节不是合法 UTF-8
-（`sed` 直接报 “stream did not contain valid UTF-8”）——说明 **offset 猜错了**：
-`struct qstr` 里 `name` 指针的实际偏移需要从 BTF/`pahole` 取，不能靠手推。
+（`sed` 直接报 “stream did not contain valid UTF-8”）——说明 **offset 猜错了**。
+
+**这个问题在 [05](05-从反汇编拿结构体偏移.md) 里解决了**：内核没有 DWARF/BTF，但偏移
+印在 `dput` 的反汇编里（`lea 0x80(%rbp)` → `d_lockref=0x80`；`mov 0x84(%rbp),%eax`
+→ `count=0x84`），并据此读到了 `d_flags`，发现创建出来的普通文件 dentry 带
+`DCACHE_DONTCACHE`(0x80)。
 
 ## 仍未定性的部分
 
