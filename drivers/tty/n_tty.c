@@ -1795,9 +1795,14 @@ static size_t n_tty_receive_buf2(struct tty_struct *tty, const u8 *cp,
  *
  * Locking: Caller holds @tty->termios_rwsem
  */
+/* termios 生效点：每次 tcsetattr 都会走到这里，行规程按它决定怎么攒数据 */
 static void n_tty_set_termios(struct tty_struct *tty, const struct ktermios *old)
 {
 	struct n_tty_data *ldata = tty->disc_data;
+
+	printk(KERN_INFO "[latte] set_termios: icanon=%d vmin=%u vtime=%u onlcr=%d\n",
+	       L_ICANON(tty) ? 1 : 0, tty->termios.c_cc[VMIN],
+	       tty->termios.c_cc[VTIME], O_ONLCR(tty) ? 1 : 0);
 
 	if (!old || (old->c_lflag ^ tty->termios.c_lflag) & (ICANON | EXTPROC)) {
 		bitmap_zero(ldata->read_flags, N_TTY_BUF_SIZE);
@@ -2221,6 +2226,10 @@ static ssize_t n_tty_read(struct tty_struct *tty, struct file *file, u8 *kbuf,
 	/* Is this a continuation of a read started earlier? */
 	if (*cookie)
 		return n_tty_continue_cookie(tty, kbuf, nr, cookie);
+
+	printk(KERN_INFO "[latte] n_tty_read: icanon=%d vmin=%u vtime=%u nr=%zu\n",
+	       L_ICANON(tty) ? 1 : 0, tty->termios.c_cc[VMIN],
+	       tty->termios.c_cc[VTIME], nr);
 
 	retval = job_control(tty, file);
 	if (retval < 0)

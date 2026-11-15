@@ -2,7 +2,7 @@
 
 上一站（`devices/`）看到 initramfs 的 shell 打印 `can't access tty`，这一站把它做成实验：
 **同一句 `Ctrl-C`，为什么有时能杀进程、有时完全没反应？**
-4 篇主题文档，3 个有界打点，三次启动做对照。
+5 篇主题文档，5 个有界打点，三次启动做对照。
 
 ## 主题划分（按领域）
 
@@ -12,6 +12,7 @@
 | 设备 | 一个字符的旅程 | [02-一个字符的旅程](02-一个字符的旅程.md) | 中断读字节 → flip buffer → `n_tty` → `read()` |
 | CPU 与进程 | 控制终端 | [03-控制终端与会话](03-控制终端与会话.md) | 会话/pgrp/ctty 三层；`tty_get_pgrp()` 为空就没人收信号 |
 | 设备 | 实测 | [04-实测-Ctrl-C的两种命运](04-实测-Ctrl-C的两种命运.md) | `pgrp=none` vs `pgrp=set`，`rc=143` vs `rc=130` |
+| 设备 | 行规程开关 | [05-行规程的开关-ICANON与VMIN-VTIME](05-行规程的开关-ICANON与VMIN-VTIME.md) | 换行才交付；VMIN/VTIME 怎么等；`\r\n` 是补的 |
 
 ## 一条链
 
@@ -33,7 +34,7 @@ UART 收到 0x03
 | ctty 建在 `/dev/console` | `none` | 是 | 收不到信号 |
 | ctty 建在 `/dev/ttyS0` | `set` | 是 | `Ctrl-C` 生效 → `rc=130` |
 
-## 打点清单（3 个）
+## 打点清单（5 个）
 
 | 打点 | 位置 | 频率 |
 |---|---|---|
@@ -44,16 +45,21 @@ UART 收到 0x03
 **刻意不在 `serial8250_interrupt()` 里打点**：那是每次按键/每个字节都走的中断上下文，
 不适合 `printk`。
 
-## 自查 3 问
+## 自查 4 问
 
 1. `isig` 触发了但进程没死，问题在哪？（03/04：`tty_get_pgrp()` 为空 → 没有前台进程组）
 2. 为什么把 ctty 建在 `/dev/console` 不管用？（03：字符从 `/dev/ttyS0` 进，两个
    `tty_struct` 各记各的 pgrp）
 3. `rc=130` 与 `rc=143` 分别代表什么？（04：128+2 SIGINT；128+15 SIGTERM）
 
+4. `read()` 明明有数据却读不到，最可能是哪个开关？（05：`ICANON` 在等换行；
+   想“有多少给多少”要关 `ICANON` 并设 `VMIN/VTIME`，注意 `O_NONBLOCK` 会让 `VMIN` 失效）
+
 ## 下一阶段
 
-两条都补上了：**作业控制**（`Ctrl-Z`、`fg/bg`，需要完整 job control）见 `jobs/01`~`04`，
-**信号排队与投递**（`sigprocmask`、标准信号 vs 实时信号、sigframe）见 `jobs/05`。
-还没做的：**signalfd/pselect**（把信号当 fd 读）、**行规程的 `termios` 细节**
-（`ONLCR`/`ICANON`/`VMIN`）。
+tty 这条线走完了：终端是什么（01）、字符的旅程（02）、控制终端（03）、
+`Ctrl-C` 实测（04）、行规程开关（05）。**作业控制**见 `jobs/01`~`04`，
+**信号投递**见 `jobs/05`。
+
+还没做的只剩 **signalfd/pselect**（把信号当文件描述符读），
+以及 `ioctl(TIOCSTI)` 这类往输入队列塞字符的接口（本内核是否允许要实测）。
