@@ -3655,6 +3655,7 @@ vm_fault_t __vmf_anon_prepare(struct vm_fault *vmf)
  *   held to the old page, as well as updating the rmap.
  * - In any case, unlock the PTL and drop the reference we took to the old page.
  */
+/* 写时复制：给写者分配新页并把旧内容拷过去，从此父子各一份 */
 static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 {
 	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
@@ -3667,6 +3668,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	struct mmu_notifier_range range;
 	vm_fault_t ret;
 	bool pfn_is_zero;
+
+	printk(KERN_INFO "[latte] wp_page_copy: addr=%lx\n", vmf->address);
 
 	delayacct_wpcopy_start();
 
@@ -5135,6 +5138,7 @@ fallback:
  * but allow concurrent faults), and pte mapped but not yet locked.
  * We return with mmap_lock still held, but pte unmapped and unlocked.
  */
+/* 匿名页第一次被写：到这一刻才真的分配物理页（malloc 时并没有） */
 static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -5143,6 +5147,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	vm_fault_t ret = 0;
 	int nr_pages = 1;
 	pte_t entry;
+
+	printk(KERN_INFO "[latte] do_anonymous_page: addr=%lx\n", addr);
 
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
@@ -6471,6 +6477,7 @@ static vm_fault_t sanitize_fault_flags(struct vm_area_struct *vma,
  * The mmap_lock may have been released depending on flags and our
  * return value.  See filemap_fault() and __folio_lock_or_retry().
  */
+/* mm 层的缺页总入口：分派给匿名页 / 文件页 / COW 三条路 */
 vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 			   unsigned int flags, struct pt_regs *regs)
 {
@@ -6478,6 +6485,9 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	struct mm_struct *mm = vma->vm_mm;
 	vm_fault_t ret;
 	bool is_droppable;
+
+	printk(KERN_INFO "[latte] handle_mm_fault: addr=%lx flags=0x%x\n",
+	       address, flags);
 
 	__set_current_state(TASK_RUNNING);
 

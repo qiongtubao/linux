@@ -1716,6 +1716,7 @@ bool mmap_read_lock_maybe_expand(struct mm_struct *mm,
 	return true;
 }
 
+/* fork 复制地址空间：只复制页表并全部标只读，用户页一个字节都不拷 */
 __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 {
 	struct vm_area_struct *mpnt, *tmp;
@@ -1723,6 +1724,8 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 	unsigned long charge = 0;
 	LIST_HEAD(uf);
 	VMA_ITERATOR(vmi, mm, 0);
+
+	printk(KERN_INFO "[latte] dup_mmap: vmas=%d\n", oldmm->map_count);
 
 	if (mmap_write_lock_killable(oldmm))
 		return -EINTR;

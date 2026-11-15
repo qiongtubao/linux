@@ -1197,6 +1197,7 @@ do_kern_addr_fault(struct pt_regs *regs, unsigned long hw_error_code,
 }
 NOKPROBE_SYMBOL(do_kern_addr_fault);
 
+/* 用户态地址缺页的 C 入口：CPU 抛 #PF，异常处理最终走到这里 */
 /*
  * Handle faults in the user portion of the address space.  Nothing in here
  * should check X86_PF_USER without a specific justification: for almost
@@ -1215,6 +1216,9 @@ void do_user_addr_fault(struct pt_regs *regs,
 	struct mm_struct *mm;
 	vm_fault_t fault;
 	unsigned int flags = FAULT_FLAG_DEFAULT;
+
+	printk(KERN_INFO "[latte] do_user_addr_fault: addr=%lx err=%lx\n",
+	       address, error_code);
 
 	tsk = current;
 	mm = tsk->mm;

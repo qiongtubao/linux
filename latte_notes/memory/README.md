@@ -1,8 +1,8 @@
 # 内存：三层记账、buddy、slab、以及内存紧张时的三级响应
 
 前面几站一直在用内存（页表、rootfs、`__init` 段回收），这一站正面看它：
-**页怎么分配、小对象怎么缓存、紧张时谁去回收**。5 篇主题文档，4 个打点，
-外加一次真的把 128M 机器写爆的实验。
+**页怎么分配、小对象怎么缓存、紧张时谁去回收，以及缺页时才真要页**。
+6 篇主题文档，9 个打点，外加一次真的把 128M 机器写爆的实验。
 
 ## 主题划分（按领域）
 
@@ -13,6 +13,7 @@
 | 内存 | 对象缓存 | [03-slab-内核对象的缓存](03-slab-内核对象的缓存.md) | 页切槽位、per-CPU 缓存、自举问题 |
 | 内存 | 回收 | [04-内存紧张时发生什么](04-内存紧张时发生什么.md) | 水位 → kswapd → 直接回收 → compaction → OOM |
 | 内存 | 实测 | [05-实测-三种内存状态](05-实测-三种内存状态.md) | 2G / 128M / 写满 tmpfs 三组对照 |
+| 内存 | 缺页 | [06-缺页与写时复制-malloc不分配页fork不拷页](06-缺页与写时复制-malloc不分配页fork不拷页.md) | `#PF` 才要页、`fork` 只复制页表、写才拷 |
 
 ## 一条链
 
@@ -28,6 +29,16 @@ memblock（启动早期区间记账）
        └─ kmem_cache ──► slab：页切成对象槽位（kmalloc-* / task_struct / dentry）
 ```
 
+上面是“页从哪来”；下面是“**什么时候才来要**”（06）：
+
+```
+用户态写 → #PF(err=6 页不存在 / err=7 页只读) → do_user_addr_fault
+  └─ handle_mm_fault
+      ├─ 页不存在 → do_anonymous_page → alloc_pages
+      └─ 页只读   → do_wp_page → wp_page_copy（引用计数 >1 才真拷）
+fork → dup_mmap：只复制页表项并清可写位，一个字节都不拷
+```
+
 ## 打点清单
 
 | 打点 | 位置 | 本次观察到 |
@@ -36,6 +47,11 @@ memblock（启动早期区间记账）
 | `kswapd: node%d reclaim thread ready` | `mm/vmscan.c` | 2.20~2.45s |
 | `balance_pgdat: order=%d` | `mm/vmscan.c` | 只在写爆内存时出现，16 次 |
 | `direct reclaim: order=%u` | `mm/page_alloc.c` | 只在写爆内存时出现，3 次 |
+| `do_user_addr_fault: addr=… err=…` | `arch/x86/mm/fault.c` | 每次用户态缺页一次，`err` 说明原因 |
+| `handle_mm_fault: addr=… flags=…` | `mm/memory.c` | mm 层总入口，比 #PF 略多（GUP 也会调） |
+| `do_anonymous_page: addr=…` | `mm/memory.c` | 探针 3 页各 1 次 |
+| `wp_page_copy: addr=…` | `mm/memory.c` | 探针 2 次（第 3 页走了复用） |
+| `dup_mmap: vmas=…` | `mm/mmap.c` | fork 时 1 次（`vmas=12`） |
 
 **刻意不在 `__alloc_pages()` 快路径与 `shrink_node()` 里打点**：前者每次分配都会走，
 后者在回收循环里被反复调用，打了会把日志冲爆（而且在分配器里 `printk` 本身就要分配
@@ -49,14 +65,16 @@ memblock（启动早期区间记账）
    但 `pgscan_*`/`pgsteal_*` 一直是 0——没有 swap，tmpfs 页不可换出也不可丢弃，
    扫不到可回收页，最后只能 OOM。
 
-## 自查 3 问
+## 自查 4 问
 
 1. 为什么需要三层（区间/页/对象）？（01：粒度差三个数量级）
 2. order 10 那一列变 0 意味着什么？（02：连续 4M 块没了，高阶分配要 compaction 或失败）
 3. `pgscan` 为 0 但 OOM 了，怎么解释？（05：可回收页为 0，回收空转）
+4. `fork` 之后写同一页，为什么有时拷有时不拷？（06：看引用计数；只剩自己就就地复用）
 
 ## 下一阶段
 
-还剩两条可挖：**swap 与匿名页回收**（换出路径，本机没有交换设备，需要造一个 swap
-文件或 zram）、**页面错误与写时复制**（`#PF` → `do_anonymous_page` / `wp_page_copy`，
-与中断那站能接上）。
+内存这块基本收口。还能往下挖的两处：**LRU 双链表与第二次机会**
+（`/proc/zoneinfo` 的 `nr_active_*`/`nr_inactive_*` 与 `pgactivate`/`pgsteal_*`，本机零配置可做）、
+**page cache 与 writeback**（脏页什么时候回写，需要一块可写的盘——`CONFIG_VIRTIO_BLK=y`，
+host 上有 `mkfs.ext4`）。`swap/` 里点过的 zram/zswap 仍需临时开 `CONFIG_ZRAM`。
