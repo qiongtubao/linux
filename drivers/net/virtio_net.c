@@ -3255,6 +3255,7 @@ err_enable_qp:
 	return err;
 }
 
+/* TX 完成中断的 NAPI 轮询：回收已发完的 skb，腾出 virtqueue 槽位 */
 static int virtnet_poll_tx(struct napi_struct *napi, int budget)
 {
 	struct send_queue *sq = container_of(napi, struct send_queue, napi);
@@ -3263,6 +3264,8 @@ static int virtnet_poll_tx(struct napi_struct *napi, int budget)
 	struct netdev_queue *txq;
 	int opaque, xsk_done = 0;
 	bool done;
+
+	printk(KERN_INFO "[latte] virtnet_poll_tx: budget=%d\n", budget);
 
 	if (unlikely(is_xdp_raw_buffer_queue(vi, index))) {
 		/* We don't need to enable cb for XDP */
@@ -3369,6 +3372,7 @@ static int xmit_skb(struct send_queue *sq, struct sk_buff *skb, bool orphan)
 				  orphan ? VIRTNET_XMIT_TYPE_SKB_ORPHAN : VIRTNET_XMIT_TYPE_SKB);
 }
 
+/* virtio-net 的 ndo_start_xmit：把 skb 塞进 virtqueue 再 kick 通知 QEMU */
 static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct virtnet_info *vi = netdev_priv(dev);
@@ -3379,6 +3383,9 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 	bool xmit_more = netdev_xmit_more();
 	bool use_napi = sq->napi.weight;
 	bool kick;
+
+	printk(KERN_INFO "[latte] virtnet_xmit: len=%u qnum=%d\n",
+	       skb->len, qnum);
 
 	if (!use_napi)
 		free_old_xmit(sq, txq, false);

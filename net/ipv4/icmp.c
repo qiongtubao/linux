@@ -400,6 +400,10 @@ static void icmp_push_reply(struct sock *sk,
  *	Driving logic for building and sending ICMP messages.
  */
 
+/*
+ * 收到 ICMP_ECHO 后内核就地造回包：改 type 为 0、源目地址互换，
+ * 再交给 icmp_push_reply() 走 IP 层发回去，全程不经过用户态
+ */
 static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 {
 	struct rtable *rt = skb_rtable(skb);
@@ -412,6 +416,9 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 	u32 mark = IP4_REPLY_MARK(net, skb->mark);
 	int type = icmp_param->data.icmph.type;
 	int code = icmp_param->data.icmph.code;
+
+	printk(KERN_INFO "[latte] icmp_reply: type=%u code=%u len=%u\n",
+	       type, code, skb->len);
 
 	if (ip_options_echo(net, &icmp_param->replyopts.opt.opt, skb))
 		return;

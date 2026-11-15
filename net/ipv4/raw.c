@@ -485,6 +485,7 @@ static int raw_getfrag(void *from, char *to, int offset, int len, int odd,
 	return ip_generic_getfrag(rfv->msg, to, offset, len, odd, skb);
 }
 
+/* 用户态 raw socket 的发包入口：ping 的 echo 请求从 sendmsg 进来 */
 static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	struct inet_sock *inet = inet_sk(sk);
@@ -500,6 +501,8 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	struct ip_options_data opt_copy;
 	struct raw_frag_vec rfv;
 	int hdrincl;
+
+	printk(KERN_INFO "[latte] raw_sendmsg: len=%zu\n", len);
 
 	err = -EMSGSIZE;
 	if (len > 0xFFFF)

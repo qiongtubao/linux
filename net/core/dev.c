@@ -3848,11 +3848,15 @@ static int xmit_one(struct sk_buff *skb, struct net_device *dev,
 	return rc;
 }
 
+/* qdisc 把 skb 交出来的地方：调用驱动 ndo_start_xmit（txq 自旋锁内） */
 struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *dev,
 				    struct netdev_queue *txq, int *ret)
 {
 	struct sk_buff *skb = first;
 	int rc = NETDEV_TX_OK;
+
+	printk(KERN_INFO "[latte] dev_hard_start_xmit: len=%u dev=%s\n",
+	       first->len, dev->name);
 
 	while (skb) {
 		struct sk_buff *next = skb->next;
@@ -4646,6 +4650,7 @@ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
 	return netdev_get_tx_queue(dev, queue_index);
 }
 
+/* 所有发包的汇聚点：选发送队列 → 过 qdisc → 交给驱动（或直发） */
 /**
  * __dev_queue_xmit() - transmit a buffer
  * @skb:	buffer to transmit
@@ -4674,6 +4679,9 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	struct Qdisc *q;
 	int rc = -ENOMEM;
 	bool again = false;
+
+	printk(KERN_INFO "[latte] dev_queue_xmit: len=%u proto=0x%04x dev=%s\n",
+	       skb->len, ntohs(skb->protocol), dev->name);
 
 	skb_reset_mac_header(skb);
 	skb_assert_len(skb);

@@ -170,3 +170,8 @@ tr -d '\r' < /tmp/latte-net5.log | grep -E "InMsgs=|packets transmitted"
 `net/04` 说“包进了 IPv4”，这篇说“包已经在 socket 队列里等着 `recvmsg()`”，
 中间只有三件事：raw 克隆先走、ICMP 协议栈后看、最后都汇到
 `__sock_queue_rcv_skb()` 的 `__skb_queue_tail()`。
+
+## 下一站
+
+反方向由 `06-发送路径-从dev_queue_xmit到virtqueue.md` 接着讲：用户态 `sendmsg` 的包
+怎么汇到 `__dev_queue_xmit()`、第一次发包为什么要先发 ARP、TX 完成为什么是 NAPI 轮询。
