@@ -6075,11 +6075,15 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 }
 
 /* 真正干活的地方：按优先级扫 LRU、回收页，并收缩 slab（shrink_slab） */
+/* 一轮回收：先扫 inactive，访问过的被 promote 到 active 才保住 */
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long nr_reclaimed, nr_scanned, nr_node_reclaimed;
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
+
+	printk(KERN_INFO "[latte] shrink_node: order=%d target=%lu\n",
+	       sc->order, sc->nr_to_reclaim);
 
 	if (lru_gen_enabled() && root_reclaim(sc)) {
 		memset(&sc->nr, 0, sizeof(sc->nr));

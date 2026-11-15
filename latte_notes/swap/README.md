@@ -46,7 +46,7 @@
 
 ## 下一阶段
 
-swap 之外还有两条可挖：**zram/zswap**（把交换区放在内存里压缩，需要 `CONFIG_ZRAM`，
-本内核未开）、**页面回收的 LRU 细节**（active/inactive 双链表、第二次机会）。
-也可以换域：**VFS 路径查找**（`dentry` 缓存、`lookup_fast`）或**作业控制**
-（`Ctrl-Z`、`fg/bg`，与 `tty/` 那站接得上）。
+swap 之外还剩：**zram/zswap**（把交换区放在内存里压缩，需要 `CONFIG_ZRAM`，本内核未开）、
+**换出路径的细节**（`swap_writepage` → `swap_read_folio`，需要交换设备才能实测）。
+两处已经补上了：**页面回收的 LRU 细节**（active/inactive 双链表、第二次机会）见 `memory/07`，
+**VFS 路径查找**（dentry 缓存、`lookup_fast`）见 `vfs/01`~`04`。

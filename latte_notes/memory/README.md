@@ -1,8 +1,8 @@
 # 内存：三层记账、buddy、slab、以及内存紧张时的三级响应
 
 前面几站一直在用内存（页表、rootfs、`__init` 段回收），这一站正面看它：
-**页怎么分配、小对象怎么缓存、紧张时谁去回收，以及缺页时才真要页**。
-6 篇主题文档，9 个打点，外加一次真的把 128M 机器写爆的实验。
+**页怎么分配、小对象怎么缓存、紧张时谁去回收、缺页时才真要页、回收先挑谁**。
+7 篇主题文档，12 个打点，外加一次真的把 128M 机器写爆的实验。
 
 ## 主题划分（按领域）
 
@@ -14,6 +14,7 @@
 | 内存 | 回收 | [04-内存紧张时发生什么](04-内存紧张时发生什么.md) | 水位 → kswapd → 直接回收 → compaction → OOM |
 | 内存 | 实测 | [05-实测-三种内存状态](05-实测-三种内存状态.md) | 2G / 128M / 写满 tmpfs 三组对照 |
 | 内存 | 缺页 | [06-缺页与写时复制-malloc不分配页fork不拷页](06-缺页与写时复制-malloc不分配页fork不拷页.md) | `#PF` 才要页、`fork` 只复制页表、写才拷 |
+| 内存 | 回收选择 | [07-LRU与第二次机会-访问过才活得更久](07-LRU与第二次机会-访问过才活得更久.md) | 一次访问做记号、二次访问升 active、压力下降级再丢 |
 
 ## 一条链
 
@@ -39,6 +40,15 @@ memblock（启动早期区间记账）
 fork → dup_mmap：只复制页表项并清可写位，一个字节都不拷
 ```
 
+回收先挑谁（07）：页在 active / inactive 两条链上流转，
+
+```
+第一次访问 → 只置 PG_referenced（不动链表，页还在 inactive）
+第二次访问 → lru_activate() 搬到 active（PGACTIVATE +1，发一张复活券）
+内存紧张   → shrink_inactive_list 先扫 inactive；不够就把 active 降级
+             （shrink_active_list）→ 下一轮没再被访问就回收
+```
+
 ## 打点清单
 
 | 打点 | 位置 | 本次观察到 |
@@ -52,10 +62,14 @@ fork → dup_mmap：只复制页表项并清可写位，一个字节都不拷
 | `do_anonymous_page: addr=…` | `mm/memory.c` | 探针 3 页各 1 次 |
 | `wp_page_copy: addr=…` | `mm/memory.c` | 探针 2 次（第 3 页走了复用） |
 | `dup_mmap: vmas=…` | `mm/mmap.c` | fork 时 1 次（`vmas=12`） |
+| `mark_accessed: pfn=… ref=… act=…` | `mm/swap.c` | 读两遍 1MB 文件：第一遍全是 `ref=0 act=0` |
+| `lru_activate: pfn=… nr=…` | `mm/swap.c` | 第一遍 31 次（噪声）→ 第二遍 248 次 |
+| `shrink_node: order=… target=…` | `mm/vmscan.c` | 压 200MB 时 347 次 |
 
-**刻意不在 `__alloc_pages()` 快路径与 `shrink_node()` 里打点**：前者每次分配都会走，
-后者在回收循环里被反复调用，打了会把日志冲爆（而且在分配器里 `printk` 本身就要分配
-内存，容易把问题放大）。
+**刻意不在 `__alloc_pages()` 快路径与 `shrink_folio_list()` 里打点**：前者每次分配都会走，
+后者每 32 页一批，压力下上千行（本次 4MB 文件那版就打出了 17MB 日志）。
+`shrink_node()` 每轮回收才一次，实测 347 次，可以打。
+（在分配器里 `printk` 本身还要分配内存，容易把问题放大。）
 
 ## 两个反直觉结论（详见主题五）
 
@@ -65,16 +79,18 @@ fork → dup_mmap：只复制页表项并清可写位，一个字节都不拷
    但 `pgscan_*`/`pgsteal_*` 一直是 0——没有 swap，tmpfs 页不可换出也不可丢弃，
    扫不到可回收页，最后只能 OOM。
 
-## 自查 4 问
+## 自查 5 问
 
 1. 为什么需要三层（区间/页/对象）？（01：粒度差三个数量级）
 2. order 10 那一列变 0 意味着什么？（02：连续 4M 块没了，高阶分配要 compaction 或失败）
 3. `pgscan` 为 0 但 OOM 了，怎么解释？（05：可回收页为 0，回收空转）
 4. `fork` 之后写同一页，为什么有时拷有时不拷？（06：看引用计数；只剩自己就就地复用）
+5. 同一个文件读一遍和读两遍，页在 LRU 上的位置差在哪？（07：第一遍只置引用位，
+   第二遍才 `lru_activate` 进 active；但 active 也会被降级回收）
 
 ## 下一阶段
 
-内存这块基本收口。还能往下挖的两处：**LRU 双链表与第二次机会**
-（`/proc/zoneinfo` 的 `nr_active_*`/`nr_inactive_*` 与 `pgactivate`/`pgsteal_*`，本机零配置可做）、
-**page cache 与 writeback**（脏页什么时候回写，需要一块可写的盘——`CONFIG_VIRTIO_BLK=y`，
-host 上有 `mkfs.ext4`）。`swap/` 里点过的 zram/zswap 仍需临时开 `CONFIG_ZRAM`。
+内存这条线基本走完（分配 → 缺页 → 回收 → 回收先挑谁）。
+还能往下挖：**page cache 与 mmap**（`filemap_fault`、`msync`）、**swap 换出路径**
+（需要交换设备或 `CONFIG_ZRAM`）、**cgroup 内存控制**（`memory.max`、memcg LRU）。
+`writeback` 已经补上了，见 `vfs/05`。

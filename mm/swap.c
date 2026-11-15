@@ -300,9 +300,13 @@ void lru_note_cost_refault(struct folio *folio)
 				folio_nr_pages(folio), 0);
 }
 
+/* inactive → active 的唯一搬运点：PGACTIVATE 也在这里 +1 */
 static void lru_activate(struct lruvec *lruvec, struct folio *folio)
 {
 	long nr_pages = folio_nr_pages(folio);
+
+	printk(KERN_INFO "[latte] lru_activate: pfn=%lu nr=%ld\n",
+	       folio_pfn(folio), nr_pages);
 
 	if (folio_test_active(folio) || folio_test_unevictable(folio))
 		return;
@@ -452,8 +456,13 @@ static bool lru_gen_clear_refs(struct folio *folio)
  * When a newly allocated folio is not yet visible, so safe for non-atomic ops,
  * __folio_set_referenced() may be substituted for folio_mark_accessed().
  */
+/* 访问的落点：未引用→置引用位；已引用→搬 active，这就是“第二次机会” */
 void folio_mark_accessed(struct folio *folio)
 {
+	printk(KERN_INFO "[latte] mark_accessed: pfn=%lu ref=%d act=%d\n",
+	       folio_pfn(folio), folio_test_referenced(folio) ? 1 : 0,
+	       folio_test_active(folio) ? 1 : 0);
+
 	if (folio_test_dropbehind(folio))
 		return;
 	if (lru_gen_enabled()) {
