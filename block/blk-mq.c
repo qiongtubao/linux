@@ -1155,8 +1155,12 @@ inline void __blk_mq_end_request(struct request *rq, blk_status_t error)
 }
 EXPORT_SYMBOL(__blk_mq_end_request);
 
+/* 请求完成：从驱动回到块层（硬件中断或轮询里调用） */
 void blk_mq_end_request(struct request *rq, blk_status_t error)
 {
+	printk(KERN_INFO "[latte] blk_end_rq: bytes=%u err=%d\n",
+	       blk_rq_bytes(rq), error);
+
 	if (blk_update_request(rq, error, blk_rq_bytes(rq)))
 		BUG();
 	__blk_mq_end_request(rq, error);
@@ -1347,9 +1351,14 @@ EXPORT_SYMBOL(blk_mq_complete_request);
  * is going to be processed now, so blk layer can do proper initializations
  * such as starting the timeout timer.
  */
+/* 请求真正下发到驱动的时刻（调度器挑中它、分配 tag 之后） */
 void blk_mq_start_request(struct request *rq)
 {
 	struct request_queue *q = rq->q;
+
+	printk(KERN_INFO "[latte] blk_start_rq: opf=0x%x sector=%llu bytes=%u\n",
+	       rq->cmd_flags, (unsigned long long)blk_rq_pos(rq),
+	       blk_rq_bytes(rq));
 
 	trace_block_rq_issue(rq);
 
@@ -3126,6 +3135,9 @@ void blk_mq_submit_bio(struct bio *bio)
 	unsigned int nr_segs;
 	struct request *rq;
 	blk_status_t ret;
+
+	printk(KERN_INFO "[latte] blk_mq_submit_bio: opf=0x%x size=%u\n",
+	       bio->bi_opf, bio->bi_iter.bi_size);
 
 	/*
 	 * If the plug has a cached request for this queue, try to use it.
