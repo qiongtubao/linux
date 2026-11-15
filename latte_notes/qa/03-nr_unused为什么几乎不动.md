@@ -1,78 +1,109 @@
-# 主题三 · `nr_unused` 为什么几乎不动：有结论，也有没查清的
+# 主题三 · `nr_unused` 为什么几乎不动：证伪了一个假设，锁定了一个新疑点
 
 ## 问题回顾
 
-`vfs/04` 与 `inode/04` 两次实测都是同一个现象：建 100 个文件后 `nr_dentry` +100，
-但 `nr_unused` 只从 1 涨到 3；`echo 2 > drop_caches` 也清不掉它们。
+`vfs/04` 与 `inode/04` 两次实测：建 100 个文件后 `nr_dentry` +100，但 `nr_unused`
+只从 1 涨到 3；`echo 2 > drop_caches` 也清不掉。
 
-## 代码说“本应发生什么”
+当时列了三种可能，其中第一种是“**统计口径有问题**（读到的数是过期快照）”。
+这一站用两个实验把它**证伪**，并把问题缩小到“新建的 dentry 为什么一直有引用”。
 
-```c
-/* fs/dcache.c:899 */
-void dput(struct dentry *dentry)
-{
-	if (likely(fast_dput(dentry)))   /* 计数减一；到 0 时判断要不要保留 */
-		return;
-	...
-}
+## 实验 A：先证明计数器本身是好的
 
-/* fs/dcache.c:744 retain_dentry() 的结尾 */
-if (unlikely(!(d_flags & DCACHE_LRU_LIST))) {
-	if (!locked)
-		return false;            /* 无锁时不敢动，交给带锁的再判一次 */
-	d_lru_add(dentry);           /* ← 这里 this_cpu_inc(nr_dentry_unused) */
-}
+```sh
+cat /proc/sys/fs/dentry-state      # 基线
+ls -R / > /dev/null                # 制造大量 dentry
+cat /proc/sys/fs/dentry-state
+echo 2 > /proc/sys/vm/drop_caches  # 手工回收
+cat /proc/sys/fs/dentry-state
 ```
 
-也就是说：**只要 dentry 的引用计数真的归零、且它还在哈希表里，就应该被挂进 LRU 并
-让 `nr_unused` 加一**。而 `nr_unused` 是 per-CPU 累加、读 `/proc/sys/fs/dentry-state`
-时先汇总（`proc_nr_dentry()`，`fs/dcache.c:192`）再输出，**不是过期快照**。
+| 阶段 | `nr_dentry` | `nr_unused` |
+|---|---|---|
+| 基线 | 621 | 1 |
+| `ls -R /` 之后 | **19423** | **18804** |
+| `drop_caches=2` 之后 | **2715** | **1712** |
 
-## 新实验（本次补做）
+两件事同时被证明：
 
-| 动作 | `nr_dentry` | `nr_unused` | `nr_negative` |
-|---|---|---|---|
-| 基线 | 621 | 1 | 0 |
-| `stat /nope1`（确实报了 ENOENT） | 621 | 2 | 0 |
-| 100 次 `stat /nopeN` | 621 | 2 | 0 |
-| 100 次 `[ -e /missingN ]` | 621 | 2 | 0 |
-| 100 次 `touch /fN` | **721** | 3 | 0 |
-| `drop_caches=2` 之后 | 723 | 3 | 0 |
+1. **`nr_unused` 会正常增长**（1 → 18804），读数不是过期快照；
+   `proc_nr_dentry()`（`fs/dcache.c:191`）在每次读之前都会汇总 per-CPU 计数。
+2. **`drop_caches=2` 会正常回收**（19423 → 2715，收回一万七千多个 dentry）。
 
-两条新事实：
+**结论：统计口径没有问题。**
 
-1. **负 dentry 不驻留**：100 次不存在的路径查找（确认真的发生了：`stat` 打印了
-   `No such file or directory`）之后 `nr_dentry` 一点没涨、`nr_negative` 保持 0。
-   所以“用不存在的路径来制造可回收 dentry”这个思路在本 rootfs（tmpfs）上行不通。
-2. **正向 dentry 驻留但不计入 `nr_unused`**：建 100 个文件后 +100，之后 `drop_caches`
-   也清不掉。
+## 实验 B：异常只出现在“新建文件”这个场景
 
-## 现状：仍未定性
+```sh
+touch /f1 … /f100      # 一次调用建 100 个文件
+cat /proc/sys/fs/dentry-state   # 立刻读
+sleep 2
+cat /proc/sys/fs/dentry-state   # 等 2 秒再读
+ls -l / > /dev/null             # 让它们被"再查一次"
+cat /proc/sys/fs/dentry-state
+cat /f1 > /dev/null             # 重新打开再关闭一个
+cat /proc/sys/fs/dentry-state
+```
 
-按上面的代码，第 2 条不该发生——`dput` 到 0 就该 `d_lru_add()`。可能的解释有三类：
+| 阶段 | `nr_dentry` | `nr_unused` |
+|---|---|---|
+| 基线 | 621 | 1 |
+| `touch` 100 个文件后 | 721（+100） | 2 |
+| 等 2 秒 | 721 | 2 |
+| `ls -l /` 之后 | 721 | 2 |
+| 重新打开 `/f1` 再关闭 | 721 | 2 |
 
-| 猜测 | 需要怎么验证 |
+**这 100 个 dentry 既不进 LRU（`nr_unused` 不涨），也没被销毁（`nr_dentry` 不掉）。**
+
+## 现在的结论
+
+| 假设 | 状态 |
 |---|---|
-| 这些 dentry 的引用计数没归零（有别处持有引用） | 给 `retain_dentry()` 的两个分支打点，看进入哪个 |
-| 走了另一条入 LRU 的路径（本版本已无 `__dput_to_list`） | 读本版本 `lock_for_kill()` / `__dentry_kill()` 全路径 |
-| tmpfs 的 dentry 操作让它们被直接销毁/不缓存 | 查 `simple_lookup()` 与 `shmem` 的 `dentry_operations` |
+| ① 统计口径/读数是过期快照 | ❌ **已证伪**（实验 A） |
+| ② 它们走了另一条入 LRU 的路径 | 未验证 |
+| ③ 有其他代码持有这些 dentry 的引用 | **最可能**（既不进 LRU 也不销毁 = 引用计数未归零） |
 
-本次**没有**继续加打点：boot 期间进出 LRU 的 dentry 数以百计，逐条 `printk` 会把日志冲爆。
-更合适的工具是 kprobe/`drgn` 之类的动态观测（不在本系列“打点 + 实测”的框架内）。
+代码上本应发生的（`fs/dcache.c`）：
+
+```c
+fast_dput() → 计数减到 0 → retain_dentry(dentry, false)   /* 无锁时 punt */
+            → 拿锁 → retain_dentry(dentry, true)
+                → 若不在 LRU 上：d_lru_add()  → nr_dentry_unused++   ← 应发生却没发生
+```
+
+**这是本次能给出的最强结论**：不是计数器的问题，而是“这些 dentry 在 `dput` 之后没有
+走到 `d_lru_add()`”。剩下的问题变成“谁还持有它们的引用”。
+
+## 下一步的具体方法（配置已具备，未执行）
+
+本内核已开 `CONFIG_KPROBES=y`、`CONFIG_KPROBE_EVENTS=y`、`CONFIG_FTRACE=y`，
+可以完全从用户态用 tracefs 观察，不必改代码：
+
+```sh
+mount -t tracefs none /sys/kernel/tracing
+echo 'p:dp dput' >> /sys/kernel/tracing/kprobe_events        # 探 dput
+echo 'p:rd retain_dentry' >> /sys/kernel/tracing/kprobe_events
+echo 1 > /sys/kernel/tracing/events/kprobes/enable
+# 然后跑 touch /x1 …，再读 trace 与 trace_pipe
+cat /sys/kernel/tracing/trace | tail -40
+```
+
+注意 `d_lru_add()` 与 `retain_dentry()` 都是 `static`/`static inline`，可能被内联而
+探不到；`dput()` 是全局符号，一定可以。**这一步留给后续**。
 
 ## 可操作的结论（这条是确定的）
 
-- **看 dcache 真实占用用 `/proc/slabinfo` 的 `dentry` 行**（`active_objs`/`num_objs`），
+- 看 dcache 真实占用用 `/proc/slabinfo` 的 `dentry` 行（`active_objs`/`num_objs`），
   不要用 `nr_unused`；
-- `drop_caches` 不是“清空缓存”，只回收“无人引用、且在 LRU 上”的那部分。
+- `drop_caches` 不是“清空缓存”，只回收“无人引用、在 LRU 上”的那部分（实验 A 证实
+  它能收回 16700 个，也证实它清不掉“仍被引用”的 100 个）。
 
 ## 代码位置
 
 | 位置 | 内容 |
 |---|---|
-| `fs/dcache.c:899` `dput()` | 引用计数减一 |
+| `fs/dcache.c:899` `dput()` | 引用计数减一（kprobe 的合适探点） |
 | `fs/dcache.c:812` `fast_dput()` | 无锁快路径 |
-| `fs/dcache.c:744` `retain_dentry()` | 决定保留 / 放 LRU / 销毁 |
+| `fs/dcache.c:744` `retain_dentry()` | 决定保留/入 LRU/销毁 |
 | `fs/dcache.c:489` `d_lru_add()` | `nr_dentry_unused` 加一 |
-| `fs/dcache.c:191` `proc_nr_dentry()` | `/proc/sys/fs/dentry-state` 的读数刷新 |
-| `fs/inode.c` / `fs/libfs.c` | inode 与 dentry 的绑定、`simple_lookup()` |
+| `fs/dcache.c:191` `proc_nr_dentry()` | `/proc/sys/fs/dentry-state` 读数刷新 |

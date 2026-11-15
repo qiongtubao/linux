@@ -45,8 +45,11 @@
 
 上一站留下的问题是“建 100 个文件，为什么 `nr_unused` 几乎不动”。本站给出更可靠的
 观察方式：看 `slabinfo` 的 `active_objs` 与 `inode-state` 的 `nr_inodes`，
-而不是 `nr_unused`。至于 `nr_unused` 的统计口径，仍需要读
-`get_nr_dentry_unused()` 与 `d_lru_add()` 的完整路径才能定性——**没有查清就不下结论。**
+而不是 `nr_unused`。
+
+`qa/03` 后来补做了决定性实验：`ls -R /` 能让 `nr_unused` 涨到 18804、`drop_caches`
+能收回 16700 个——**计数器本身正常**，异常只出现在“新建文件”这一场景（这批 dentry
+既不进 LRU 也不被销毁）。统计口径的假设被证伪，剩下的问题是“谁还持有它们的引用”。
 
 ## 复现
 

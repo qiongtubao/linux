@@ -82,9 +82,10 @@ timeout 45 qemu-system-x86_64 -kernel arch/x86/boot/bzImage \
 grep -E "dentry-state|^[0-9]+" /tmp/latte-dent3.log
 ```
 
-## 待解的两个问题
+## 待解的两个问题（已在 `qa/` 站跟进）
 
-- 为什么建了 100 个文件后 `nr_unused` 仍然只有 2？按代码 `dput()` 到 0 就该进 LRU 才对。
-  可能是 rootfs（tmpfs）的 inode 缓存一直持有 alias，或 `nr_unused` 的统计口径与预期
-  不同——需要再读 `get_nr_dentry_unused()` 与 `dput()` 的完整路径才能定性。
-- 负 dentry 为什么没被统计到（见结论 3）。
+- 为什么建了 100 个文件后 `nr_unused` 仍然只有 2？**后续实验证明计数器本身正常**
+  （`ls -R /` 能让它涨到 18804），问题在于这批新建的 dentry 一直有引用、没走
+  `d_lru_add()`。详见 `qa/03`。
+- 负 dentry 为什么没被统计到：`qa/03` 里用 `stat` 逐条复查，确认 100 次不存在的路径
+  查找之后 `nr_dentry` 与 `nr_negative` 都没变——**tmpfs 上负 dentry 不驻留**。
