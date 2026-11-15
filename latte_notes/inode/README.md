@@ -50,7 +50,7 @@ rm /b           → vfs_unlink()   : i_nlink--，d_delete() 让 dentry 变 negat
 
 ## 下一阶段
 
-同一领域还能挖：**mount 与 vfsmount 树**（`follow_managed` 怎么跨文件系统）、
-**writeback**（脏页回写与 `sync`）。换域可以做**作业控制**（`Ctrl-Z`/`fg`）或
+同一领域还能挖：**mount 与 vfsmount 树**（`follow_managed` 怎么跨文件系统），
+**writeback**（脏页回写与 `sync`）已经补上了，见 `vfs/05`。换域可以做**作业控制**（`Ctrl-Z`/`fg`）或
 **zram/zswap**。上一站遗留的 `nr_unused` 统计口径问题仍未解，需要读
 `get_nr_dentry_unused()` 与 `d_lru_add()`。

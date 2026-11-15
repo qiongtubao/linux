@@ -2,8 +2,9 @@
 
 `open("/etc/passwd")` 里那串字符要经过逐段解析才能变成可读的 inode。
 这一站看三件套（dentry / inode / file）、dentry 缓存为什么让第二次打开变快，
-并用 `dentry-state` 与 `drop_caches` 做了一次实测。
-1 份索引 + 4 篇主题文档，2 个打点。
+并用 `dentry-state` 与 `drop_caches` 做了一次实测；最后补上写路径：
+`write()` 为什么返回了却没落盘、脏页什么时候才回写。
+1 份索引 + 5 篇主题文档，7 个打点。
 
 ## 主题划分（按领域）
 
@@ -13,6 +14,7 @@
 | 文件系统 | 缓存 | [02-dentry缓存-为什么第二次打开快](02-dentry缓存-为什么第二次打开快.md) | 哈希表 + LRU + 引用计数；`nr_unused` 才是可回收量 |
 | 文件系统 | 代码路径 | [03-代码路径-从open到inode](03-代码路径-从open到inode.md) | walk → 最后一段 → `vfs_open`；创建走 `lookup_open` |
 | 文件系统 | 实测 | [04-实测-dentry缓存的增长与回收](04-实测-dentry缓存的增长与回收.md) | +100 个名字 = +100 个 dentry；`drop_caches` 清不动 |
+| 文件系统 | 写回 | [05-writeback-write不落盘-脏页什么时候才回写](05-writeback-write不落盘-脏页什么时候才回写.md) | `write()` 只标脏；阈值限流、`sync` 才落盘 |
 
 ## 一条链
 
@@ -26,6 +28,17 @@ open("/f1")
          └─ vfs_open（inode + dentry → file）
 ```
 
+写路径（05），注意它和上面那条链**不在一个调用栈里**：
+
+```
+write(fd, buf, 1MB)
+ └─ generic_perform_write → 拷进 page cache + 标脏 + balance_dirty_pages  ← 打点
+      （到此 write() 就返回了，盘上还没动）
+
+回写（阈值 / 定时 / sync 三条触发线）
+ └─ do_writepages → ext4_writepages → submit_bio_noacct → /dev/vda   ← 打点
+```
+
 ## 打点与实测
 
 | 打点 / 读数 | 位置 | 本次值 |
@@ -34,19 +47,27 @@ open("/f1")
 | `drop_caches: value=%d` | `fs/drop_caches.c:63` | 2 次 |
 | `nr_dentry` | `/proc/sys/fs/dentry-state` | 621 → 721（+100） |
 | `nr_unused` | 同上 | 1 → 2（几乎不动） |
+| `generic_perform_write: bytes=…` | `mm/filemap.c:4228` | 每次 1MB 写各 1 次（A/B 各 8 次） |
+| `balance_dirty_pages: dirtied=…` | `mm/page-writeback.c:1811` | A 8 次；阈值调低后 78 次 |
+| `do_writepages: nr_to_write=…` | `mm/page-writeback.c:2598` | B 阶段 4 次、`sync` 2 次 |
+| `ext4_writepages: nr_to_write=…` | `fs/ext4/inode.c:3009` | B 阶段 4 次、`sync` 1 次 |
+| `submit_bio: opf=… size=…` | `block/blk-core.c:790` | A 阶段 0 个数据 bio；B 阶段 1MB/4MB |
 
 **没在 `lookup_fast()` / `lookup_slow()` 打点**：一次 `ls` 就有几百次调用，是最热路径。
 
-## 自查 3 问
+## 自查 4 问
 
 1. 为什么建 100 个文件，`nr_dentry` 正好 +100？（01/02：每个名字一个 dentry 对象）
 2. `drop_caches=2` 之后 `nr_dentry` 几乎不变，怎么解释？（04：只回收无人引用的
    dentry，本次 `nr_unused` 只有 2~3）
 3. `open(O_CREAT)` 与 `mknod()` 的创建路径有什么不同？（03：前者走 `lookup_open`，
    后者走 `do_mknodat` → `vfs_create`/`vfs_mknod`）
+4. `dd` 写完 8MB 就返回了，为什么 `Dirty` 还有 8192 kB？（05：`write()` 只到 page cache；
+   阈值没到就没人回写，`sync` 才强制落盘）
 
 ## 下一阶段
 
-VFS 还能往下挖：**inode 缓存与硬链接**（一个 inode 多个 dentry）、**文件系统挂载**
-（`vfsmount` 树、`follow_managed`）、**writeback**（脏页怎么回写）。也可以换域做
-**作业控制**（`Ctrl-Z`/`fg`/`bg`）或 **zram/zswap**。
+VFS 这一支基本收口（路径、缓存、挂载、写回都有实测）。还能往下挖：
+**page cache 与 mmap**（`filemap_fault`、`msync`，和 `memory/06` 的缺页接得上）、
+**writeback 的限流细节**（`dirty_ratelimit`、cgroup writeback）。
+也可以换域做 **作业控制**（`Ctrl-Z`/`fg`/`bg`）或 **zram/zswap**。

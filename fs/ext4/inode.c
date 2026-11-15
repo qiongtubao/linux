@@ -3005,6 +3005,7 @@ out_writepages:
 	return ret;
 }
 
+/* ext4 的 writepages：攒脏页 → 配 bio → 交给块层 */
 static int ext4_writepages(struct address_space *mapping,
 			   struct writeback_control *wbc)
 {
@@ -3016,6 +3017,9 @@ static int ext4_writepages(struct address_space *mapping,
 	};
 	int ret;
 	int alloc_ctx;
+
+	printk(KERN_INFO "[latte] ext4_writepages: nr_to_write=%ld\n",
+	       wbc->nr_to_write);
 
 	ret = ext4_emergency_state(sb);
 	if (unlikely(ret))

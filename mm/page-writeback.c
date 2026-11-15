@@ -1807,6 +1807,7 @@ static void balance_wb_limits(struct dirty_throttle_control *dtc,
  * If we're over `background_thresh' then the writeback threads are woken to
  * perform some writeout.
  */
+/* 脏页限流：超过阈值就让写入者在这里睡一会儿，等回写追上来 */
 static int balance_dirty_pages(struct bdi_writeback *wb,
 			       unsigned long pages_dirtied, unsigned int flags)
 {
@@ -1828,6 +1829,9 @@ static int balance_dirty_pages(struct bdi_writeback *wb,
 	bool strictlimit = bdi->capabilities & BDI_CAP_STRICTLIMIT;
 	unsigned long start_time = jiffies;
 	int ret = 0;
+
+	printk(KERN_INFO "[latte] balance_dirty_pages: dirtied=%lu\n",
+	       pages_dirtied);
 
 	for (;;) {
 		unsigned long now = jiffies;
@@ -2590,10 +2594,14 @@ done:
 }
 EXPORT_SYMBOL_GPL(writeback_iter);
 
+/* 回写总闸：把「这个 mapping 的脏页」派给文件系统的 writepages */
 int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
 	int ret;
 	struct bdi_writeback *wb;
+
+	printk(KERN_INFO "[latte] do_writepages: nr_to_write=%ld\n",
+	       wbc->nr_to_write);
 
 	if (wbc->nr_to_write <= 0)
 		return 0;

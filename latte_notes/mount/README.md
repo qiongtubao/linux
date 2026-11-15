@@ -52,6 +52,6 @@ mount -t tmpfs none /mnt
 
 ## 下一阶段
 
-同一领域还剩 **writeback**（脏页回写与 `sync`，需要一块能被写脏的磁盘）、
-**挂载传播**（`shared`/`slave` peer group，容器里很关键）。也可以换域做
+同一领域还剩 **writeback**（脏页回写与 `sync`）——已经补上了，见 `vfs/05`；
+**挂载传播**（`shared`/`slave` peer group，容器里很关键）还没做。也可以换域做
 **作业控制**（`Ctrl-Z`/`fg`/`bg`）或 **zram/zswap**（需临时开 `CONFIG_ZRAM`）。

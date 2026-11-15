@@ -770,6 +770,7 @@ static blk_status_t blk_validate_atomic_write_op_size(struct request_queue *q,
 	return BLK_STS_OK;
 }
 
+/* 块层入口：bio 从这儿进请求队列（合并、排程、下发给驱动） */
 /**
  * submit_bio_noacct - re-submit a bio to the block device layer for I/O
  * @bio:  The bio describing the location in memory and on the device.
@@ -784,6 +785,9 @@ void submit_bio_noacct(struct bio *bio)
 	struct block_device *bdev = bio->bi_bdev;
 	struct request_queue *q = bdev_get_queue(bdev);
 	blk_status_t status = BLK_STS_IOERR;
+
+	printk(KERN_INFO "[latte] submit_bio: opf=0x%x size=%u\n",
+	       bio->bi_opf, bio->bi_iter.bi_size);
 
 	might_sleep();
 

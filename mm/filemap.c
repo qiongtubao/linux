@@ -4224,6 +4224,7 @@ generic_file_direct_write(struct kiocb *iocb, struct iov_iter *from)
 }
 EXPORT_SYMBOL(generic_file_direct_write);
 
+/* write() 的主干：数据只拷进 page cache 并把页标脏，不碰磁盘 */
 ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 {
 	struct file *file = iocb->ki_filp;
@@ -4233,6 +4234,9 @@ ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 	size_t chunk = mapping_max_folio_size(mapping);
 	long status = 0;
 	ssize_t written = 0;
+
+	printk(KERN_INFO "[latte] generic_perform_write: bytes=%zu\n",
+	       iov_iter_count(i));
 
 	do {
 		struct folio *folio;
