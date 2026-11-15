@@ -1,9 +1,10 @@
 # 调度器：谁决定下一个跑谁
 
 前面几站讲“进程怎么开始（`execve`）、怎么停（`jobs`）、怎么结束（`exit`）”，
-这一站讲**它们怎么轮流用 CPU**。三篇：什么时候换人（阻塞 vs 抢占）、
-“公平”按什么分（EEVDF 的权重与切片）、以及组和组之间怎么分（cgroup `cpu.weight`）。
-1 份索引 + 3 篇主题文档，2 个打点。
+这一站讲**它们怎么轮流用 CPU**。四篇：什么时候换人（阻塞 vs 抢占）、
+“公平”按什么分（EEVDF 权重）、组和组之间怎么分（cgroup `cpu.weight`）、
+以及不参与公平的实时任务（`SCHED_FIFO` 与 5% 的限流缝）。
+1 份索引 + 4 篇主题文档，3 个打点。
 
 ## 主题划分（按领域）
 
@@ -12,6 +13,7 @@
 | CPU 与进程 | 调度时机 | [01-什么时候换人-两种让出与抢占](01-什么时候换人-两种让出与抢占.md) | `voluntary` 自己睡，`nonvoluntary` 被人抢 |
 | CPU 与进程 | 公平性 | [02-公平性-EEVDF与nice权重](02-公平性-EEVDF与nice权重.md) | nice 是权重；`slice=0.7ms`；差距 68 倍 |
 | CPU 与进程 | 分组 | [03-cgroup的CPU权重-组间按份额分](03-cgroup的CPU权重-组间按份额分.md) | `cpu.weight` 100:300 → 份额 1:3；`cpu.max` 本内核没有 |
+| CPU 与进程 | 实时 | [04-实时调度-SCHED_FIFO与那5%的缝](04-实时调度-SCHED_FIFO与那5%的缝.md) | RT 独占 95%，普通任务被饿 0.95s |
 
 ## 一条链
 
@@ -27,15 +29,17 @@ try_to_wake_up          __schedule()                  finish_task_switch()
                                  switch_to（换栈/寄存器）
 ```
 
-## 打点清单（2 个）
+## 打点清单（3 个）
 
 | 打点 | 位置 | 本次触发 |
 |---|---|---|
 | `wake: comm=… pid=… state=…` | `kernel/sched/core.c` `try_to_wake_up()` | 只打用户进程（`p->mm`），探针相关 16 次 |
 | `switch: prev(state=…) -> next` | `kernel/sched/core.c` `finish_task_switch()` | 只打“主动让出 + 用户进程”，探针相关 4 次 |
+| `setscheduler: comm=… policy=… prio=…` | `kernel/sched/syscalls.c` `__sched_setscheduler()` | 1 次（改成 `SCHED_FIFO(1)`） |
 
-两个都加了过滤器，而且**必须加**：不过滤时 `try_to_wake_up` 被 `rcu_preempt`
+前两个都加了过滤器，而且**必须加**：不过滤时 `try_to_wake_up` 被 `rcu_preempt`
 这类内核线程反复命中，2 核启动 90 秒都跑不完（详见 01 的“日志量”一节）。
+`setscheduler` 只在改策略时触发，天然低频，不用过滤。
 
 ## 实测数字
 
@@ -47,8 +51,11 @@ try_to_wake_up          __schedule()                  finish_task_switch()
 | 同上两进程的 `sum_exec_runtime` | **1.977 s : 0.034 s** |
 | 两个 cgroup（`cpu.weight` 100 vs 300）各跑 2s 的 `utime` | **50 : 149** ticks（1:3） |
 | 同上两组的 `cpu.stat` `usage_usec` | **0.511 s : 1.517 s** |
+| `SCHED_FIFO(1)` vs `SCHED_OTHER` 抢同核：RT 的 `utime` | **95 ticks**（正好 95%，来自限流） |
+| 同上：普通任务从被唤醒到首次运行的延迟 | **0.952 s**（被饿住） |
+| 对照（两个 `SCHED_OTHER`）：`utime` | **50 : 50**，时间窗重叠 |
 
-## 自查 4 问
+## 自查 5 问
 
 1. `voluntary` 和 `nonvoluntary` 的上下文切换差在哪？（01：自己调 `schedule()`
    让出 vs 被 tick/唤醒打断后强制让出）
@@ -58,10 +65,12 @@ try_to_wake_up          __schedule()                  finish_task_switch()
    实测 1.977s : 0.034s；jiffy 粒度下是 196:3 ticks）
 4. `cpu.weight=300` 会让一个组“独占三颗核”吗？（03：不会，只是竞争时占三份；
    要封顶得用 `cpu.max`，本内核没开 `CONFIG_CFS_BANDWIDTH`）
+5. RT 任务的 `utime` 为什么正好是 95 ticks？（04：`sched_rt_runtime_us/periode`
+   = 950000/1000000；剩下 5% 才轮到普通任务，本次普通任务被饿到 0.952 s 之后）
 
 ## 下一阶段
 
-调度这块还能挖：**实时调度**（`SCHED_FIFO`/`SCHED_RR` 抢占普通任务，需要 root
-与 `sched_setscheduler`）、**多核负载均衡**（`-smp 4` 下 `sched_migrate_task` 打点）、
-**唤醒抢占**（`sched_wakeup` 的 `success` 字段）、**`cpu.max` 硬配额**
-（需重开 `CONFIG_CFS_BANDWIDTH`，本内核 `# ... is not set`，见 `03`）。
+调度这块还能挖：**多核负载均衡**（`-smp 4` 下 `sched_migrate_task` 打点、
+`newidle_balance` 何时偷任务）、**唤醒抢占**（`sched_wakeup` 的 `success` 字段、
+`WAKEUP_PREEMPTION`）、**`cpu.max` 硬配额**（需重开 `CONFIG_CFS_BANDWIDTH`，见 `03`）、
+**RT 限流关掉会怎样**（`echo -1 > /proc/sys/kernel/sched_rt_runtime_us`，危险，会把 shell 一起饿死）。

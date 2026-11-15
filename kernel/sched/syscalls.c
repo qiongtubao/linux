@@ -510,6 +510,7 @@ req_priv:
 	return 0;
 }
 
+/* 改调度策略的唯一入口：nice / SCHED_FIFO / SCHED_RR 都从这里生效 */
 int __sched_setscheduler(struct task_struct *p,
 			 const struct sched_attr *attr,
 			 bool user, bool pi)
@@ -523,6 +524,9 @@ int __sched_setscheduler(struct task_struct *p,
 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
 	struct rq *rq;
 	bool cpuset_locked = false;
+
+	printk(KERN_INFO "[latte] setscheduler: comm=%s pid=%d policy=%d prio=%d\n",
+	       p->comm, p->pid, attr->sched_policy, attr->sched_priority);
 
 	/* The pi code expects interrupts enabled */
 	BUG_ON(pi && in_interrupt());
