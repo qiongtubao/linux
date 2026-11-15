@@ -2199,6 +2199,7 @@ static void tcp_v4_fill_cb(struct sk_buff *skb, const struct iphdr *iph,
  *	From tcp_input.c
  */
 
+/* TCP 段的总入口：查 socket、分派到 established / listen 等路径 */
 int tcp_v4_rcv(struct sk_buff *skb)
 {
 	struct net *net = dev_net_rcu(skb->dev);
@@ -2212,6 +2213,8 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	bool refcounted;
 	int ret;
 	u32 isn;
+
+	printk(KERN_INFO "[latte] tcp_v4_rcv: len=%u\n", skb->len);
 
 	drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	if (skb->pkt_type != PACKET_HOST)

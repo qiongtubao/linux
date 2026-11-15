@@ -1,10 +1,11 @@
-# 网络收发：一次 ping 从网卡到 socket，再发出去
+# 网络收发：一次 ping 从网卡到 socket，再发出去，最后看 TCP 状态机
 
 这是全库最后一个没碰过的领域：**网络**。给 QEMU 加一块 virtio 网卡，配 IP、ping 网关，
 用 4 个打点把“中断 → NAPI 轮询 → 协议分发 → IPv4”整条链走了一遍，
 再用 5 个打点把“IPv4 → ICMP → socket 接收队列”这一跳补完，
-最后用 6 个打点把反方向“sendmsg → virtqueue”走通。
-1 份索引 + 6 篇主题文档。
+用 6 个打点把反方向“sendmsg → virtqueue”走通，
+最后用 3 个打点把 TCP 状态机跑了一遍（一次 HTTP 请求的握手与挥手）。
+1 份索引 + 7 篇主题文档，18 个打点。
 
 ## 主题划分（按领域）
 
@@ -16,6 +17,7 @@
 | 网络 | 实测 | [04-实测-一次ping的收包链路](04-实测-一次ping的收包链路.md) | 5 次轮询收 4 个包、2 个进 IPv4 |
 | 网络 | 最后一跳 | [05-ICMP到socket最后一跳](05-ICMP到socket最后一跳.md) | raw 先拿克隆、`icmp_rcv` 后看，都汇到 socket 队列 |
 | 网络 | 发送 | [06-发送路径-从dev_queue_xmit到virtqueue](06-发送路径-从dev_queue_xmit到virtqueue.md) | 先 ARP 再发帧，TX 完成靠 NAPI 轮询 |
+| 网络 | TCP | [07-TCP状态机-一次HTTP请求的握手与挥手](07-TCP状态机-一次HTTP请求的握手与挥手.md) | 4 次状态迁移看清“谁先关的”；TIME_WAIT 在主动方 |
 
 ## 一条链
 
@@ -47,6 +49,15 @@ MSI-X 中断（virtio0-input.0）
                  └─ TX 中断 → virtnet_poll_tx       ← 打点
 ```
 
+TCP 那条（07）：状态机只有一个迁移点
+
+```
+tcp_v4_rcv                                    ← 打点（每段）
+ ├─ 已建立 → tcp_rcv_established              ← 打点（头部预测快路径）
+ └─ LISTEN → 新建子 socket（一出生就是 SYN_RECV）
+tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
+```
+
 ## 实测三组数字
 
 | 观察点 | 数值 |
@@ -55,7 +66,7 @@ MSI-X 中断（virtio0-input.0）
 | `/proc/interrupts` `virtio0-input.0` | **3 次** |
 | 打点：`virtnet_poll` / `netif_receive_skb` / `ip_rcv_core` | **5 / 4 / 2** |
 
-## 打点清单（15 个）
+## 打点清单（18 个）
 
 | 打点 | 位置 | 本次触发 |
 |---|---|---|
@@ -74,11 +85,14 @@ MSI-X 中断（virtio0-input.0）
 | `dev_hard_start_xmit: len=… dev=…` | 同上 | 10 次（与上一条同数） |
 | `virtnet_xmit: len=… qnum=…` | `drivers/net/virtio_net.c` | 10 次（`dev=lo` 时 0 次） |
 | `virtnet_poll_tx: budget=%d` | 同上 | 12 次（比发包多，NAPI 会空轮询） |
+| `tcp_v4_rcv: len=%u` | `net/ipv4/tcp_ipv4.c` | 一次 HTTP 请求 7 段 |
+| `tcp_rcv_established: len=%u` | `net/ipv4/tcp_input.c` | 3 次（数据 + 纯 ACK） |
+| `tcp_state: 旧 -> 新 dport=…` | `net/ipv4/tcp.c` | 4 次：`3→1`、`1→8`、`8→9`、`9→7` |
 
 **`ip_rcv()` 里刻意没有打点**：实测证明它一次都不触发（GRO 走了批量路径 `ip_list_rcv`），
 打点放在两条路径的汇合点 `ip_rcv_core()` 才抓得到。
 
-## 自查 5 问
+## 自查 6 问
 
 1. 为什么中断 3 次却收了 6 个包？（02/04：NAPI 一次轮询批量收，`budget=64`）
 2. `skb->protocol` 有什么用？（02/03：决定交给哪个协议处理函数）
@@ -87,9 +101,13 @@ MSI-X 中断（virtio0-input.0）
    打点有没有出现；`ping_table` 与 raw 哈希表是两张表，`ping_rcv` 再查一次才命中）
 5. 同一个 ping，回包是谁造的？（06：`OutEchoReps` 只有内核 `icmp_reply()` 才 +1；
    ping `10.0.2.2` 时是宿主机上的 slirp 答的，guest 内核没参与）
+6. 短连接为什么在 `/proc/net/tcp` 里看不见，谁进 TIME_WAIT？
+   （07：`/proc/net/tcp` 是快照，50ms 的连接抓不住；被动关闭方走 `CLOSE_WAIT→LAST_ACK`，
+   TIME_WAIT 只在主动关闭方）
 
 ## 下一阶段
 
-网络还能挖：**TCP 状态机**（`tcp_v4_rcv` → `tcp_rcv_established`，需要 slirp `hostfwd`
-加一个 guest 内 `httpd`）、**GRO/GSO 细节**（为什么 4 个包能成 1 个 list）。
+网络还能挖：**GRO/GSO 细节**（为什么 4 个包能成 1 个 list、`napi_gro_receive` 的合并规则）、
+**TCP 拥塞控制**（`tcp_cong_control`、cwnd/ssthresh 在丢包时的变化，需要能造丢包的链路）、
+**netfilter**（`CONFIG_NETFILTER=y`，iptables 规则命中时的 hook 顺序）。
 也可以回到之前留的口子：`nr_unused` 统计口径、`pswpout` 计数偏小、zram/zswap。

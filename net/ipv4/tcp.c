@@ -2942,9 +2942,13 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 }
 EXPORT_IPV6_MOD(tcp_recvmsg);
 
+/* TCP 状态的唯一迁移点：三次握手、四次挥手、TIME_WAIT 都在这里改 */
 void tcp_set_state(struct sock *sk, int state)
 {
 	int oldstate = sk->sk_state;
+
+	printk(KERN_INFO "[latte] tcp_state: %d -> %d dport=%u\n",
+	       oldstate, state, ntohs(inet_sk(sk)->inet_dport));
 
 	/* We defined a new enum for TCP states that are exported in BPF
 	 * so as not force the internal TCP states to be frozen. The

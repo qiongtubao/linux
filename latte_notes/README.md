@@ -13,7 +13,7 @@
 | **磁盘与文件系统** | 块设备/分区/文件系统/挂载，路径怎么解析成 inode，dentry 缓存，脏页回写，mmap | `root-mount/02`、`05`、`execve/04`、`vfs/01`~`06`、`inode/01`~`04`、`mount/01`~`04` |
 | **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve`、进程状态与作业控制、信号投递、调度时机与权重、cgroup 份额、实时调度 | `init-process.md`、`root-mount/04`、`execve/02`、`06`、`jobs/01`~`05`、`exit/01`~`04`、`sched/01`~`04` |
 | **设备与中断** | 设备号与 `/dev`、console 与 tty、printk 怎么落到串口、中断与 IDT | `devices/01`~`06`、`interrupts/01`~`05`、`tty/01`~`04` |
-| **网络** | 网卡与 `net_device`、NAPI 批量收包、协议分发、`sk_buff`、ICMP 到 socket 队列、发送与 virtqueue | `net/01`~`06` |
+| **网络** | 网卡与 `net_device`、NAPI 批量收包、协议分发、`sk_buff`、ICMP 到 socket 队列、发送与 virtqueue、TCP 状态机 | `net/01`~`07` |
 
 ## 建议阅读顺序
 
@@ -33,7 +33,7 @@
 14. `mount/` —— 目录树怎么拼起来：挂载点两侧 `st_dev` 为什么会变（1 索引 + 4 篇）
 15. `jobs/` —— 进程状态、作业控制与信号投递：`kill -TSTP` 何时被丢弃、handler 怎么被摆到栈上（1 索引 + 5 篇）
 16. `exit/` —— 进程的结束与回收：僵尸是怎么来的、`wait` 到底做了什么（1 索引 + 4 篇）
-17. `net/` —— 网络收发包：一次 ping 从网卡中断到 socket 队列，再反方向发出去（1 索引 + 6 篇）
+17. `net/` —— 网络收发：一次 ping 从网卡中断到 socket 队列，再反方向发出去，以及 TCP 状态机（1 索引 + 7 篇）
 18. `sched/` —— 调度器：什么时候换人、nice 与 cgroup 权重怎么分、RT 怎么抢（1 索引 + 4 篇）
 19. `qa/` —— 结案：三个悬而未决的问题（`pswpout` 偏小、`ps` 漏看僵尸、`nr_unused`）（1 索引 + 3 篇）
 

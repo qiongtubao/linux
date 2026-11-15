@@ -6256,12 +6256,15 @@ reset:
  *	the rest is checked inline. Fast processing is turned on in
  *	tcp_data_queue when everything is OK.
  */
+/* 已建立连接上的常规段（数据/ACK）：先走“头部预测”快路径 */
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	const struct tcphdr *th = (const struct tcphdr *)skb->data;
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int len = skb->len;
+
+	printk(KERN_INFO "[latte] tcp_rcv_established: len=%u\n", len);
 
 	/* TCP congestion window tracking */
 	trace_tcp_probe(sk, skb);
