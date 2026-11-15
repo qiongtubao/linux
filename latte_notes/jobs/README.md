@@ -2,8 +2,9 @@
 
 上一站（`tty/`）讲清楚 `Ctrl-C` 走的是行规程。这一站看它的兄弟：**停止与继续**。
 同一句 `kill -TSTP`，在没有控制终端时被内核**丢弃**，有控制终端时进程立刻变成 `T`。
-最后补上**信号投递**：发信号与投递是两条链，handler 的现场是内核在你栈上摆的。
-1 份索引 + 5 篇主题文档，5 个打点。
+再补上**信号投递**：发信号与投递是两条链，handler 的现场是内核在你栈上摆的；
+最后是 `signalfd`——把信号变成可 `poll()` 的 fd，和 handler 二选一。
+1 份索引 + 6 篇主题文档，7 个打点。
 
 ## 主题划分（按领域）
 
@@ -14,6 +15,7 @@
 | CPU 与进程 | 代码路径 | [03-代码路径-停止与继续](03-代码路径-停止与继续.md) | `get_signal` → 孤儿检查 → `do_signal_stop` → 让出 CPU |
 | CPU 与进程 | 实测 | [04-实测-SIGTSTP的两种命运](04-实测-SIGTSTP的两种命运.md) | 两种环境下的状态与打点对照 |
 | CPU 与进程 | 投递 | [05-信号投递-内核怎么把信号摆到用户栈上](05-信号投递-内核怎么把信号摆到用户栈上.md) | 标准信号发 2 投 1、实时信号发 2 投 2；frame 在用户栈 |
+| CPU 与进程 | signalfd | [06-signalfd-把信号变成可poll的fd](06-signalfd-把信号变成可poll的fd.md) | 阻塞才进 fd；与 handler 抢 `dequeue_signal()` |
 
 ## 一条链
 
@@ -49,7 +51,7 @@ exit_to_user_mode_loop  _TIF_SIGPENDING
 | `kill -TSTP` | **被丢弃**，`state` 仍 `S` | `state=T`，打点 `signr=20` |
 | `kill -CONT` | 回到 `S` | 回到 `S` |
 
-## 打点清单（5 个）
+## 打点清单（7 个）
 
 | 打点 | 位置 | 本次触发 |
 |---|---|---|
@@ -58,6 +60,8 @@ exit_to_user_mode_loop  _TIF_SIGPENDING
 | `handle_signal: sig=…` | `arch/x86/kernel/signal.c` | 标准 **1** 次、实时 **2** 次 |
 | `setup_rt_frame: sig=…` | `arch/x86/kernel/signal.c` | 同上 |
 | `setup_sigcontext: sig=… sp=…` | `arch/x86/kernel/signal_64.c` | 同上，`sp` 两次相同 |
+| `signalfd: ufd=… flags=… mask0=0x…` | `fs/signalfd.c` | 4 次；`flags=0x800`=`SFD_NONBLOCK`；mask 是**取反**的 |
+| `signalfd_read: count=…` | `fs/signalfd.c` | 9 次，`count=1`（每次读一个 siginfo） |
 
 ## 自查 4 问
 
@@ -66,10 +70,15 @@ exit_to_user_mode_loop  _TIF_SIGPENDING
 3. `fg` 到底做了哪两件事？（02：`tcsetpgrp` 设前台组 + `SIGCONT`）
 4. 连续 `kill` 两次 `SIGUSR1`，handler 为什么只跑一次？（05：标准信号只有一位 pending，
    第二次在 `legacy_queue()` 被短路；实时信号才排队）
+5. 装了 handler 又开了 `signalfd()`，信号会去哪个？（06：二选一——没有 `SIG_BLOCK`
+   就先去 handler（A 组 fd 读不到）；阻塞后 handler 不再被调用，信号从 `read(fd)` 出来）
 
 ## 下一阶段
 
-同类还剩：**`wait4` 与僵尸**（`WUNTRACED`/`WNOHANG`，把 `Z` 状态走完）、
-**`signalfd`/`pselect` 与信号阻塞**（把信号当文件描述符读，和 `05` 接得上）。
-**信号队列与阻塞**已经补上了，见 `05`；**网络收包路径**也已补完（`net/01`~`06`）。
-换域可以做 **zram/zswap**（需临时开 `CONFIG_ZRAM`），**调度器**已经补上了（`sched/01`~`02`）。
+jobs 这条线走完了：状态（01）、作业控制（02）、代码路径（03）、`SIGTSTP` 实测（04）、
+信号投递（05）、`signalfd`（06）。
+
+还能挖：**`wait4` 的 `WUNTRACED`/`WNOHANG`**（把 `T`→`Z` 的回收走完整）、
+**`pselect`/`epoll` 与信号屏蔽的原子性**、**实时信号的排队上限**
+（`RLIMIT_SIGPENDING`，需要 `setrlimit` 配合灌信号）。
+换域可以做 **zram/zswap**（需临时开 `CONFIG_ZRAM`）。

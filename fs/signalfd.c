@@ -211,6 +211,8 @@ static ssize_t signalfd_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (!count)
 		return -EINVAL;
 
+	printk(KERN_INFO "[latte] signalfd_read: count=%zu\n", count);
+
 	nonblock = file->f_flags & O_NONBLOCK || iocb->ki_flags & IOCB_NOWAIT;
 	do {
 		ret = signalfd_dequeue(ctx, &info, nonblock);
@@ -261,6 +263,9 @@ static int do_signalfd4(int ufd, sigset_t *mask, int flags)
 
 	sigdelsetmask(mask, sigmask(SIGKILL) | sigmask(SIGSTOP));
 	signotset(mask);
+
+	printk(KERN_INFO "[latte] signalfd: ufd=%d flags=0x%x mask0=0x%lx\n",
+	       ufd, flags, mask->sig[0]);
 
 	if (ufd == -1) {
 		struct file *file;
