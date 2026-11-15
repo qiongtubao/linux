@@ -11,7 +11,7 @@
 | **启动** | 按下电源后，谁把内核叫醒；内核把自己和外设准备到什么程度；最后把控制权交给谁 | `init-process.md`、`initramfs-rootfs.md`、`root-mount/01`、`04`、`06`、`07`、`execve/01`、`05` |
 | **内存** | 三层记账（memblock/buddy/slab）、页分配与回收、缺页与写时复制、LRU 与第二次机会、内存里的“文件系统” | `mm-core-init.md`、`memory/01`~`07`、`swap/01`~`04`、`root-mount/03`、`execve/03` |
 | **磁盘与文件系统** | 块设备/分区/文件系统/挂载，路径怎么解析成 inode，dentry 缓存，脏页回写 | `root-mount/02`、`05`、`execve/04`、`vfs/01`~`05`、`inode/01`~`04`、`mount/01`~`04` |
-| **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve`、进程状态与作业控制 | `init-process.md`、`root-mount/04`、`execve/02`、`06`、`jobs/01`~`04`、`exit/01`~`04` |
+| **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve`、进程状态与作业控制、信号投递 | `init-process.md`、`root-mount/04`、`execve/02`、`06`、`jobs/01`~`05`、`exit/01`~`04` |
 | **设备与中断** | 设备号与 `/dev`、console 与 tty、printk 怎么落到串口、中断与 IDT | `devices/01`~`06`、`interrupts/01`~`05`、`tty/01`~`04` |
 | **网络** | 网卡与 `net_device`、NAPI 批量收包、协议分发、`sk_buff`、ICMP 到 socket 队列、发送与 virtqueue | `net/01`~`06` |
 
@@ -31,7 +31,7 @@
 12. `vfs/` —— 路径怎么变成 inode：dentry 缓存、drop_caches，以及 `write()` 为什么没落盘（1 索引 + 5 篇）
 13. `inode/` —— 一个文件多个名字：硬链接让 dentry+1 而 inode 不变（1 索引 + 4 篇）
 14. `mount/` —— 目录树怎么拼起来：挂载点两侧 `st_dev` 为什么会变（1 索引 + 4 篇）
-15. `jobs/` —— 进程状态与作业控制：`kill -TSTP` 何时会被内核丢弃（1 索引 + 4 篇）
+15. `jobs/` —— 进程状态、作业控制与信号投递：`kill -TSTP` 何时被丢弃、handler 怎么被摆到栈上（1 索引 + 5 篇）
 16. `exit/` —— 进程的结束与回收：僵尸是怎么来的、`wait` 到底做了什么（1 索引 + 4 篇）
 17. `net/` —— 网络收发包：一次 ping 从网卡中断到 socket 队列，再反方向发出去（1 索引 + 6 篇）
 18. `qa/` —— 结案：三个悬而未决的问题（`pswpout` 偏小、`ps` 漏看僵尸、`nr_unused`）（1 索引 + 3 篇）

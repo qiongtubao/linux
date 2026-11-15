@@ -1039,6 +1039,7 @@ static inline bool legacy_queue(struct sigpending *signals, int sig)
 	return (sig < SIGRTMIN) && sigismember(&signals->signal, sig);
 }
 
+/* 发信号的落点：标准信号只留一位，实时信号排队（sigqueue） */
 static int __send_signal_locked(int sig, struct kernel_siginfo *info,
 				struct task_struct *t, enum pid_type type, bool force)
 {
@@ -1046,6 +1047,9 @@ static int __send_signal_locked(int sig, struct kernel_siginfo *info,
 	struct sigqueue *q;
 	int override_rlimit;
 	int ret = 0, result;
+
+	printk(KERN_INFO "[latte] send_signal: sig=%d shared=%d\n",
+	       sig, type != PIDTYPE_PID);
 
 	lockdep_assert_held(&t->sighand->siglock);
 

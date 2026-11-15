@@ -232,9 +232,12 @@ unsigned long get_sigframe_size(void)
 	return max_frame_size;
 }
 
+/* 在用户栈上摆 sigframe：返回地址指向 handler，restorer 负责收尾 */
 static int
 setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 {
+	printk(KERN_INFO "[latte] setup_rt_frame: sig=%d\n", ksig->sig);
+
 	/* Perform fixup for the pre-signal frame. */
 	rseq_signal_deliver(ksig, regs);
 
@@ -251,11 +254,14 @@ setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 	}
 }
 
+/* 决定怎么投递：先按 syscall 重启规则调整返回值（EINTR 或重试） */
 static void
 handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 {
 	bool stepping, failed;
 	struct fpu *fpu = x86_task_fpu(current);
+
+	printk(KERN_INFO "[latte] handle_signal: sig=%d\n", ksig->sig);
 
 	if (v8086_mode(regs))
 		save_v86_state((struct kernel_vm86_regs *) regs, VM86_SIGNAL);

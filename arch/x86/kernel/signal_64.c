@@ -161,12 +161,16 @@ static unsigned long frame_uc_flags(struct pt_regs *regs)
 	return flags;
 }
 
+/* 真正往用户栈写 ucontext + sigcontext + 掩码（64 位 ABI） */
 int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 {
 	sigset_t *set = sigmask_to_save();
 	struct rt_sigframe __user *frame;
 	void __user *fp = NULL;
 	unsigned long uc_flags;
+
+	printk(KERN_INFO "[latte] setup_sigcontext: sig=%d sp=%lx\n",
+	       ksig->sig, regs->sp);
 
 	/* x86-64 should always use SA_RESTORER. */
 	if (!(ksig->ka.sa.sa_flags & SA_RESTORER))

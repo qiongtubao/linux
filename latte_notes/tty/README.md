@@ -53,6 +53,7 @@ UART 收到 0x03
 
 ## 下一阶段
 
-还剩两条可挖：**作业控制**（`Ctrl-Z`、`fg/bg`，需要完整 job control）、
-**signalfd/信号排队**（信号的排队与阻塞）；或者换域去挖 **VFS 路径查找**（`dentry`
-缓存与 `lookup_fast`）。
+两条都补上了：**作业控制**（`Ctrl-Z`、`fg/bg`，需要完整 job control）见 `jobs/01`~`04`，
+**信号排队与投递**（`sigprocmask`、标准信号 vs 实时信号、sigframe）见 `jobs/05`。
+还没做的：**signalfd/pselect**（把信号当 fd 读）、**行规程的 `termios` 细节**
+（`ONLCR`/`ICANON`/`VMIN`）。
