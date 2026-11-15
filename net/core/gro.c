@@ -459,6 +459,7 @@ static void gro_flush_oldest(struct gro_node *gro, struct list_head *head)
 	gro_complete(gro, oldest);
 }
 
+/* 每个收到的段都先过这里：能找到同一条流的就合并，否则直接上送 */
 static enum gro_result dev_gro_receive(struct gro_node *gro,
 				       struct sk_buff *skb)
 {
@@ -470,6 +471,8 @@ static enum gro_result dev_gro_receive(struct gro_node *gro,
 	struct sk_buff *pp = NULL;
 	enum gro_result ret;
 	int same_flow;
+
+	printk(KERN_INFO "[latte] dev_gro_receive: len=%u\n", skb->len);
 
 	if (netif_elide_gro(skb->dev))
 		goto normal;

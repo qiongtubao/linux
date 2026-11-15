@@ -652,6 +652,7 @@ static void ip_sublist_rcv(struct list_head *head, struct net_device *dev,
 }
 
 /* Receive a list of IP packets */
+/* 批量入口：GRO 合出来的一串 skb 一次上送，这里数一下串了多长 */
 void ip_list_rcv(struct list_head *head, struct packet_type *pt,
 		 struct net_device *orig_dev)
 {
@@ -659,6 +660,14 @@ void ip_list_rcv(struct list_head *head, struct packet_type *pt,
 	struct net *curr_net = NULL;
 	struct sk_buff *skb, *next;
 	LIST_HEAD(sublist);
+
+	{
+		int n = 0;
+
+		list_for_each_entry(skb, head, list)
+			n++;
+		printk(KERN_INFO "[latte] ip_list_rcv: n=%d\n", n);
+	}
 
 	list_for_each_entry_safe(skb, next, head, list) {
 		struct net_device *dev = skb->dev;

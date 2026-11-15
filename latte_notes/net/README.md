@@ -4,8 +4,9 @@
 用 4 个打点把“中断 → NAPI 轮询 → 协议分发 → IPv4”整条链走了一遍，
 再用 5 个打点把“IPv4 → ICMP → socket 接收队列”这一跳补完，
 用 6 个打点把反方向“sendmsg → virtqueue”走通，
-最后用 3 个打点把 TCP 状态机跑了一遍（一次 HTTP 请求的握手与挥手）。
-1 份索引 + 7 篇主题文档，18 个打点。
+最后用 3 个打点把 TCP 状态机跑了一遍（一次 HTTP 请求的握手与挥手），
+再用 2 个打点把 GRO 的合并效果量了一次（186 个包 → 24 个 skb）。
+1 份索引 + 8 篇主题文档，20 个打点。
 
 ## 主题划分（按领域）
 
@@ -18,6 +19,7 @@
 | 网络 | 最后一跳 | [05-ICMP到socket最后一跳](05-ICMP到socket最后一跳.md) | raw 先拿克隆、`icmp_rcv` 后看，都汇到 socket 队列 |
 | 网络 | 发送 | [06-发送路径-从dev_queue_xmit到virtqueue](06-发送路径-从dev_queue_xmit到virtqueue.md) | 先 ARP 再发帧，TX 完成靠 NAPI 轮询 |
 | 网络 | TCP | [07-TCP状态机-一次HTTP请求的握手与挥手](07-TCP状态机-一次HTTP请求的握手与挥手.md) | 4 次状态迁移看清“谁先关的”；TIME_WAIT 在主动方 |
+| 网络 | 合并 | [08-GRO-186个包怎么变成24个skb](08-GRO-186个包怎么变成24个skb.md) | 合并发生在 skb 内部：186 段 → 24 个 skb |
 
 ## 一条链
 
@@ -66,7 +68,7 @@ tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
 | `/proc/interrupts` `virtio0-input.0` | **3 次** |
 | 打点：`virtnet_poll` / `netif_receive_skb` / `ip_rcv_core` | **5 / 4 / 2** |
 
-## 打点清单（18 个）
+## 打点清单（20 个）
 
 | 打点 | 位置 | 本次触发 |
 |---|---|---|
@@ -88,11 +90,14 @@ tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
 | `tcp_v4_rcv: len=%u` | `net/ipv4/tcp_ipv4.c` | 一次 HTTP 请求 7 段 |
 | `tcp_rcv_established: len=%u` | `net/ipv4/tcp_input.c` | 3 次（数据 + 纯 ACK） |
 | `tcp_state: 旧 -> 新 dport=…` | `net/ipv4/tcp.c` | 4 次：`3→1`、`1→8`、`8→9`、`9→7` |
+| `dev_gro_receive: len=%u` | `net/core/gro.c` | 186 次（256KB 传输的每一段） |
+| `ip_list_rcv: n=%d` | `net/ipv4/ip_input.c` | 23 批，每批 `n=1`（skb 已内部合成长包） |
 
-**`ip_rcv()` 里刻意没有打点**：实测证明它一次都不触发（GRO 走了批量路径 `ip_list_rcv`），
+**`ip_rcv()` 里刻意没有打点**：实测证明它一次都不触发——**所有**收到的包都从批量路径
+`ip_list_rcv` 进来，哪怕每批只有 1 个 skb（`net/08` 量到 23 批、每批 `n=1`）。
 打点放在两条路径的汇合点 `ip_rcv_core()` 才抓得到。
 
-## 自查 6 问
+## 自查 7 问
 
 1. 为什么中断 3 次却收了 6 个包？（02/04：NAPI 一次轮询批量收，`budget=64`）
 2. `skb->protocol` 有什么用？（02/03：决定交给哪个协议处理函数）
@@ -104,10 +109,14 @@ tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
 6. 短连接为什么在 `/proc/net/tcp` 里看不见，谁进 TIME_WAIT？
    （07：`/proc/net/tcp` 是快照，50ms 的连接抓不住；被动关闭方走 `CLOSE_WAIT→LAST_ACK`，
    TIME_WAIT 只在主动关闭方）
+7. `ip_list_rcv: n=1` 但 `netif_receive_skb: len=21640`，矛盾吗？
+   （08：不矛盾——GRO 把 15 个段合进**同一个 skb**，list 里就只有 1 个）
 
 ## 下一阶段
 
-网络还能挖：**GRO/GSO 细节**（为什么 4 个包能成 1 个 list、`napi_gro_receive` 的合并规则）、
-**TCP 拥塞控制**（`tcp_cong_control`、cwnd/ssthresh 在丢包时的变化，需要能造丢包的链路）、
-**netfilter**（`CONFIG_NETFILTER=y`，iptables 规则命中时的 hook 顺序）。
+网络还能挖：**GSO/TSO**（发送侧反过来：一个大 skb 交给驱动、分片在网卡/软件里做，
+`dev_queue_xmit` 的 `len` 会大于 MTU）、**TCP 拥塞控制**（`tcp_cong_control`、
+cwnd/ssthresh 在丢包时的变化，需要能造丢包的链路）、**netfilter**
+（`CONFIG_NETFILTER=y`，iptables 规则命中时的 hook 顺序）、
+**GRO 的边界**（`GRO_MAX_SIZE`、`napi_gro_flush` 何时触发）。
 也可以回到之前留的口子：`nr_unused` 统计口径、`pswpout` 计数偏小、zram/zswap。
