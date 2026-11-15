@@ -308,11 +308,22 @@ static struct mount *find_master(struct mount *m,
  * into a propagation graph.  Set mountpoints for all secondaries,
  * link their roots into @tree_list via ->mnt_hash.
  */
+/* 传播核心：把这次挂载复制到同一个 peer group 里的每一份 */
 int propagate_mnt(struct mount *dest_mnt, struct mountpoint *dest_mp,
 		  struct mount *source_mnt, struct hlist_head *tree_list)
 {
 	struct mount *m, *n, *copy, *this;
 	int err = 0, type;
+
+	{
+		struct mount *lp;
+		int peers = 0;
+
+		list_for_each_entry(lp, &dest_mnt->mnt_share, mnt_share)
+			peers++;
+		printk(KERN_INFO "[latte] propagate_mnt: dest_group=%d peers=%d\n",
+		       dest_mnt->mnt_group_id, peers);
+	}
 
 	if (dest_mnt->mnt_master)
 		SET_MNT_MARK(dest_mnt->mnt_master);

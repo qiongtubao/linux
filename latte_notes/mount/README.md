@@ -3,7 +3,8 @@
 上一站（`inode/`）说硬链接不能跨文件系统，因为 inode 号只在同一 superblock 内唯一。
 这一站补上另一半：**不同文件系统怎么被接成一棵树**。
 一次 `mount` 让 `/mnt` 的 `st_dev` 从 `0x2` 变成 `0x15`（21），`umount` 又变回来。
-1 份索引 + 4 篇主题文档，2 个打点。
+最后看挂载传播：shared 组里挂一次 `/a/sub`，`/b/sub` 会自己出现。
+1 份索引 + 5 篇主题文档，4 个打点。
 
 ## 主题划分（按领域）
 
@@ -13,6 +14,7 @@
 | 文件系统 | 结构 | [02-vfsmount树与命名空间](02-vfsmount树与命名空间.md) | `struct mount` 的两个链表、命名空间隔离、mountinfo 怎么读 |
 | 文件系统 | 代码路径 | [03-代码路径-mount与跨挂载点解析](03-代码路径-mount与跨挂载点解析.md) | 先建 sb 再接树；解析时 `handle_mounts()` 换根 |
 | 文件系统 | 实测 | [04-实测-挂载点两侧的st_dev](04-实测-挂载点两侧的st_dev.md) | 挂载/卸载前后 state 与 mountinfo 对照 |
+| 文件系统 | 传播 | [05-挂载传播-一次挂载怎么变成两份](05-挂载传播-一次挂载怎么变成两份.md) | shared 组挂一次变两份；private 一次都不传 |
 
 ## 一条链
 
@@ -41,17 +43,25 @@ mount -t tmpfs none /mnt
 |---|---|---|
 | `do_new_mount: %s -> %s` | `fs/namespace.c` | 5 次（内核 devtmpfs + proc/sysfs/devtmpfs/tmpfs） |
 | `do_umount: flags=0x%x` | `fs/namespace.c` | 1 次（`flags=0x0`） |
+| `attach_mnt: src_group=… moving=…` | `fs/namespace.c` | 挂在 shared 组里的 bind 显示 `src_group=1` |
+| `propagate_mnt: dest_group=… peers=…` | `fs/pnode.c` | 只有 A 组出现 1 次（private 组 0 次） |
 
-## 自查 3 问
+## 自查 4 问
 
 1. 为什么 `mount` 之后 `/mnt` 的 `st_dev` 会变？（01/04：换到了另一个 superblock）
 2. 为什么要先 `vfs_kern_mount()` 再 `attach_recursive_mnt()`？（03：建 sb 可能失败，
    失败要能干净回滚，不能先动树）
 3. `stat -c %D` 和 mountinfo 的设备号为什么看起来对不上？（04：`%D` 是十六进制，
    0x15 = 21 = `0:21`）
+4. 为什么在 `/a/sub` 上挂载，`/b/sub` 也会出现？（05：`/a` 与 `/b` 同属一个 peer group
+   （mountinfo 都标 `shared:1`），`propagate_mnt()` 给组里每份都复制一个挂载；
+   设成 private 后 `propagate_mnt` 一次都不调用）
 
 ## 下一阶段
 
-同一领域还剩 **writeback**（脏页回写与 `sync`）——已经补上了，见 `vfs/05`；
-**挂载传播**（`shared`/`slave` peer group，容器里很关键）还没做。也可以换域做
-**作业控制**（`Ctrl-Z`/`fg`/`bg`）或 **zram/zswap**（需临时开 `CONFIG_ZRAM`）。
+mount 这条线走完了：概念（01）、结构（02）、代码路径（03）、`st_dev` 实测（04）、
+传播（05）。**writeback** 见 `vfs/05`，**作业控制** 见 `jobs/01`~`04`。
+
+还没做的是 **slave 分支的实测**：要有两个 mount namespace（上游一份 shared、
+下游 slave）才能看到“只收不发”，而 busybox 没有 `unshare`，需要自己写个
+`unshare(CLONE_NEWNS)` 的小程序。剩下的就是 **zram/zswap**（需改 `.config`）。

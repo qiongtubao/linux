@@ -2554,6 +2554,7 @@ enum mnt_tree_flags_t {
  *         Otherwise a negative error code is returned.
  */
 /* 把新 mount 接到父目录的 mount 树上：从这一刻起路径解析才会走到它 */
+/* 每次挂载/绑定的落点：源 mount 属于哪个 peer group，决定要不要传播 */
 static int attach_recursive_mnt(struct mount *source_mnt,
 				const struct pinned_mountpoint *dest)
 {
@@ -2569,6 +2570,9 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	struct hlist_node *n;
 	int err = 0;
 	bool moving = mnt_has_parent(source_mnt);
+
+	printk(KERN_INFO "[latte] attach_mnt: src_group=%d moving=%d\n",
+	       source_mnt->mnt_group_id, moving ? 1 : 0);
 
 	/*
 	 * Preallocate a mountpoint in case the new mounts need to be
