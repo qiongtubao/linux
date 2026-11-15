@@ -91,6 +91,6 @@ fork → dup_mmap：只复制页表项并清可写位，一个字节都不拷
 ## 下一阶段
 
 内存这条线基本走完（分配 → 缺页 → 回收 → 回收先挑谁）。
-还能往下挖：**page cache 与 mmap**（`filemap_fault`、`msync`）、**swap 换出路径**
-（需要交换设备或 `CONFIG_ZRAM`）、**cgroup 内存控制**（`memory.max`、memcg LRU）。
-`writeback` 已经补上了，见 `vfs/05`。
+还能往下挖：**swap 换出路径**（需要交换设备或 `CONFIG_ZRAM`）、
+**cgroup 内存控制**（`memory.max`、memcg LRU）。
+两处已经补上了：`writeback` 见 `vfs/05`，**page cache 与 mmap** 见 `vfs/06`。

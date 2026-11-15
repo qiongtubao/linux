@@ -5827,11 +5827,15 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
  * If mmap_lock is released, vma may become invalid (for example
  * by other thread calling munmap()).
  */
+/* 文件页缺页的分派点：交给 vma 对应的 a_ops->fault（普通文件就是 filemap_fault） */
 static vm_fault_t do_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *vm_mm = vma->vm_mm;
 	vm_fault_t ret;
+
+	printk(KERN_INFO "[latte] do_fault: addr=%lx write=%d\n",
+	       vmf->address, !!(vmf->flags & FAULT_FLAG_WRITE));
 
 	/*
 	 * The VMA was not fully populated on mmap() or missing VM_DONTEXPAND

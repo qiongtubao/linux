@@ -3444,6 +3444,7 @@ static vm_fault_t filemap_fault_recheck_pte_none(struct vm_fault *vmf)
  *
  * Return: bitwise-OR of %VM_FAULT_ codes.
  */
+/* 普通文件的缺页：先查 page cache，没有才发起读盘（major fault） */
 vm_fault_t filemap_fault(struct vm_fault *vmf)
 {
 	int error;
@@ -3455,6 +3456,9 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	struct folio *folio;
 	vm_fault_t ret = 0;
 	bool mapping_locked = false;
+
+	printk(KERN_INFO "[latte] filemap_fault: addr=%lx idx=%lu\n",
+	       vmf->address, vmf->pgoff);
 
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	if (unlikely(index >= max_idx))

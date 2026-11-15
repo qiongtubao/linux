@@ -165,6 +165,7 @@ SYSCALL_DEFINE1(syncfs, int, fd)
 	return ret ? ret : ret2;
 }
 
+/* msync/fsync 的统一出口：转给文件系统的 ->fsync，真正落盘在它里面 */
 /**
  * vfs_fsync_range - helper to sync a range of data & metadata to disk
  * @file:		file to sync
@@ -179,6 +180,8 @@ SYSCALL_DEFINE1(syncfs, int, fd)
 int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file->f_mapping->host;
+
+	printk(KERN_INFO "[latte] vfs_fsync_range: datasync=%d\n", datasync);
 
 	if (!file->f_op->fsync)
 		return -EINVAL;
