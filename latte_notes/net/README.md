@@ -1,12 +1,13 @@
-# 网络收发：一次 ping 从网卡到 socket，再发出去，最后看 TCP 状态机
+# 网络收发：一次 ping 从网卡到 socket，再发出去，外加 TCP 与 GRO/GSO
 
 这是全库最后一个没碰过的领域：**网络**。给 QEMU 加一块 virtio 网卡，配 IP、ping 网关，
 用 4 个打点把“中断 → NAPI 轮询 → 协议分发 → IPv4”整条链走了一遍，
 再用 5 个打点把“IPv4 → ICMP → socket 接收队列”这一跳补完，
 用 6 个打点把反方向“sendmsg → virtqueue”走通，
 最后用 3 个打点把 TCP 状态机跑了一遍（一次 HTTP 请求的握手与挥手），
-再用 2 个打点把 GRO 的合并效果量了一次（186 个包 → 24 个 skb）。
-1 份索引 + 8 篇主题文档，20 个打点。
+再用 2 个打点把 GRO 的合并效果量了一次（186 个包 → 24 个 skb），
+最后用 3 个打点看发侧的 GSO（22 个 GSO skb 拆成 188 帧）。
+1 份索引 + 9 篇主题文档，23 个打点。
 
 ## 主题划分（按领域）
 
@@ -20,6 +21,7 @@
 | 网络 | 发送 | [06-发送路径-从dev_queue_xmit到virtqueue](06-发送路径-从dev_queue_xmit到virtqueue.md) | 先 ARP 再发帧，TX 完成靠 NAPI 轮询 |
 | 网络 | TCP | [07-TCP状态机-一次HTTP请求的握手与挥手](07-TCP状态机-一次HTTP请求的握手与挥手.md) | 4 次状态迁移看清“谁先关的”；TIME_WAIT 在主动方 |
 | 网络 | 合并 | [08-GRO-186个包怎么变成24个skb](08-GRO-186个包怎么变成24个skb.md) | 合并发生在 skb 内部：186 段 → 24 个 skb |
+| 网络 | 分片 | [09-GSO-188次协议栈处理怎么变成22次](09-GSO-188次协议栈处理怎么变成22次.md) | 一 skb 当多段；设备没 TSO 就软件拆回 188 帧 |
 
 ## 一条链
 
@@ -68,7 +70,7 @@ tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
 | `/proc/interrupts` `virtio0-input.0` | **3 次** |
 | 打点：`virtnet_poll` / `netif_receive_skb` / `ip_rcv_core` | **5 / 4 / 2** |
 
-## 打点清单（20 个）
+## 打点清单（23 个）
 
 | 打点 | 位置 | 本次触发 |
 |---|---|---|
@@ -92,12 +94,15 @@ tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
 | `tcp_state: 旧 -> 新 dport=…` | `net/ipv4/tcp.c` | 4 次：`3→1`、`1→8`、`8→9`、`9→7` |
 | `dev_gro_receive: len=%u` | `net/core/gro.c` | 186 次（256KB 传输的每一段） |
 | `ip_list_rcv: n=%d` | `net/ipv4/ip_input.c` | 23 批，每批 `n=1`（skb 已内部合成长包） |
+| `tcp_transmit: len=… gso=…` | `net/ipv4/tcp_output.c` | 一次 256KB 写只 22 次（最大 len=43800） |
+| `validate_xmit: len=… gso=… mtu=…` | `net/core/dev.c` | 26 次，`gso=1460` 时 `len=43854` |
+| `gso_software: len=… gso=…` | `net/core/dev.c` | 17 次（virtio 没有 TSO，必须软件拆） |
 
 **`ip_rcv()` 里刻意没有打点**：实测证明它一次都不触发——**所有**收到的包都从批量路径
 `ip_list_rcv` 进来，哪怕每批只有 1 个 skb（`net/08` 量到 23 批、每批 `n=1`）。
 打点放在两条路径的汇合点 `ip_rcv_core()` 才抓得到。
 
-## 自查 7 问
+## 自查 8 问
 
 1. 为什么中断 3 次却收了 6 个包？（02/04：NAPI 一次轮询批量收，`budget=64`）
 2. `skb->protocol` 有什么用？（02/03：决定交给哪个协议处理函数）
@@ -111,12 +116,13 @@ tcp_set_state(旧 -> 新)   三次握手/挥手都从这一处改    ← 打点
    TIME_WAIT 只在主动关闭方）
 7. `ip_list_rcv: n=1` 但 `netif_receive_skb: len=21640`，矛盾吗？
    （08：不矛盾——GRO 把 15 个段合进**同一个 skb**，list 里就只有 1 个）
+8. GSO 生效了，网线上的帧数会变少吗？（09：不一定。设备没 TSO 时
+   `validate_xmit_skb` 会软件拆回 188 帧；GSO 省的是协议栈处理次数）
 
 ## 下一阶段
 
-网络还能挖：**GSO/TSO**（发送侧反过来：一个大 skb 交给驱动、分片在网卡/软件里做，
-`dev_queue_xmit` 的 `len` 会大于 MTU）、**TCP 拥塞控制**（`tcp_cong_control`、
-cwnd/ssthresh 在丢包时的变化，需要能造丢包的链路）、**netfilter**
-（`CONFIG_NETFILTER=y`，iptables 规则命中时的 hook 顺序）、
+网络还能挖：**TCP 拥塞控制**（`tcp_cong_control`、cwnd/ssthresh 在丢包时的变化，
+需要能造丢包的链路）、**netfilter**（`CONFIG_NETFILTER=y`，iptables 规则命中时的 hook 顺序）、
+**TSO 真开起来**（给 virtio-net 加 `tx=on|off` 对比 `gso_software` 有无）、
 **GRO 的边界**（`GRO_MAX_SIZE`、`napi_gro_flush` 何时触发）。
 也可以回到之前留的口子：`nr_unused` 统计口径、`pswpout` 计数偏小、zram/zswap。

@@ -3978,6 +3978,7 @@ out_free:
 	return NULL;
 }
 
+/* 交给驱动前的最后一道：设备吃不下这么大的包就在这里软件分片 */
 static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
 {
 	netdev_features_t features;
@@ -3987,6 +3988,10 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device 
 		goto out_null;
 
 	features = netif_skb_features(skb);
+
+	printk(KERN_INFO "[latte] validate_xmit: len=%u gso=%u mtu=%u\n",
+	       skb->len, skb_shinfo(skb)->gso_size, dev->mtu);
+
 	skb = validate_xmit_vlan(skb, features);
 	if (unlikely(!skb))
 		goto out_null;
@@ -3997,6 +4002,9 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device 
 
 	if (netif_needs_gso(skb, features)) {
 		struct sk_buff *segs;
+
+		printk(KERN_INFO "[latte] gso_software: len=%u gso=%u\n",
+		       skb->len, skb_shinfo(skb)->gso_size);
 
 		segs = skb_gso_segment(skb, features);
 		if (IS_ERR(segs)) {
