@@ -9,7 +9,7 @@
 | 领域 | 一句话解释 | 已有的文档 |
 |---|---|---|
 | **启动** | 按下电源后，谁把内核叫醒；内核把自己和外设准备到什么程度；最后把控制权交给谁 | `init-process.md`、`initramfs-rootfs.md`、`root-mount/01`、`04`、`06`、`07`、`execve/01`、`05` |
-| **内存** | 三层记账（memblock/buddy/slab）、页分配与回收、缺页与写时复制、LRU 与第二次机会、换出换入、内存里的“文件系统” | `mm-core-init.md`、`memory/01`~`07`、`swap/01`~`05`、`root-mount/03`、`execve/03` |
+| **内存** | 三层记账（memblock/buddy/slab）、页分配与回收、缺页与写时复制、LRU 与第二次机会、换出换入、内存里的“文件系统” | `mm-core-init.md`、`memory/01`~`07`、`swap/01`~`06`、`root-mount/03`、`execve/03` |
 | **磁盘与文件系统** | 块设备/分区/文件系统/挂载，路径怎么解析成 inode，dentry 缓存，脏页回写，mmap，零拷贝 | `root-mount/02`、`05`、`execve/04`、`vfs/01`~`07`、`inode/01`~`04`、`mount/01`~`06` |
 | **CPU 与进程** | 0/1/2 号进程、内核态与用户态、`execve`、进程状态与作业控制、信号投递、调度时机与权重、cgroup 份额、实时调度、多核均衡 | `init-process.md`、`root-mount/04`、`execve/02`、`06`、`jobs/01`~`06`、`exit/01`~`04`、`sched/01`~`05` |
 | **设备与中断** | 设备号与 `/dev`、console 与 tty、printk 怎么落到串口、中断与 IDT | `devices/01`~`06`、`interrupts/01`~`05`、`tty/01`~`05` |
@@ -27,7 +27,7 @@
 8. `interrupts/` —— 硬件怎么打断内核：IDT 装表 → 进门 → 驱动 handler（1 索引 + 5 篇）
 9. `memory/` —— 页怎么分配、对象怎么缓存、紧张时谁回收、缺页才要页、回收先挑谁（1 索引 + 7 篇）
 10. `tty/` —— 终端行规程与信号：`Ctrl-C` 发给了谁、`ICANON`/`VMIN` 怎么决定读到什么（1 索引 + 5 篇）
-11. `swap/` —— 让匿名页可回收：加一块交换区后回收从空转变真干活，换出/换入逐页打点（1 索引 + 5 篇）
+11. `swap/` —— 让匿名页可回收：加交换区、逐页打点、zram 压缩比（1 索引 + 6 篇）
 12. `vfs/` —— 路径怎么变成 inode：dentry 缓存、`write()` 为什么没落盘、`mmap` 与 `sendfile`（1 索引 + 7 篇）
 13. `inode/` —— 一个文件多个名字：硬链接让 dentry+1 而 inode 不变（1 索引 + 4 篇）
 14. `mount/` —— 目录树怎么拼起来：`st_dev` 为什么变、传播的 shared/slave 两个方向（1 索引 + 6 篇）
