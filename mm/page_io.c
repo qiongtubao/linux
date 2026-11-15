@@ -445,9 +445,18 @@ static void swap_writepage_bdev_async(struct folio *folio,
 	submit_bio(bio);
 }
 
+/* 换出落点：一个页从这里写去 swap（文件或分区） */
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
+
+	/* 每 512 页采样一行：一次换出可能上万页，全打会把 ring buffer 冲掉 */
+	{
+		static unsigned int latte_cnt;
+
+		if (!(latte_cnt++ & 511))
+			printk(KERN_INFO "[latte] swap_out: page#%u\n", latte_cnt);
+	}
 
 	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
 	/*
@@ -607,6 +616,7 @@ static void swap_read_folio_bdev_async(struct folio *folio,
 	submit_bio(bio);
 }
 
+/* 换入落点：一个页从 swap 读回来（缺页时 SynchronousIO 走这里） */
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
@@ -614,6 +624,14 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	bool workingset = folio_test_workingset(folio);
 	unsigned long pflags;
 	bool in_thrashing;
+
+	/* 同样采样：每 512 页打一行 */
+	{
+		static unsigned int latte_cnt;
+
+		if (!(latte_cnt++ & 511))
+			printk(KERN_INFO "[latte] swap_in: page#%u\n", latte_cnt);
+	}
 
 	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio) && !synchronous, folio);
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
