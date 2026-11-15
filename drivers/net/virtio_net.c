@@ -3111,6 +3111,7 @@ static void virtnet_rx_dim_update(struct virtnet_info *vi, struct receive_queue 
 	rq->packets_in_napi = 0;
 }
 
+/* NAPI 轮询：在一次 budget 内尽量多收包，收不完就继续轮询而不是反复进中断 */
 static int virtnet_poll(struct napi_struct *napi, int budget)
 {
 	struct receive_queue *rq =
@@ -3120,6 +3121,8 @@ static int virtnet_poll(struct napi_struct *napi, int budget)
 	unsigned int received;
 	unsigned int xdp_xmit = 0;
 	bool napi_complete;
+
+	printk(KERN_INFO "[latte] virtnet_poll: budget=%d\n", budget);
 
 	virtnet_poll_cleantx(rq, budget);
 
@@ -6775,6 +6778,10 @@ static const struct xdp_metadata_ops virtnet_xdp_metadata_ops = {
 	.xmo_rx_hash			= virtnet_xdp_rx_hash,
 };
 
+/*
+ * virtio 网卡的探测：读特性、分配收发队列、注册 net_device（于是有了 eth0）。
+ * 之后每个队列各自开一个 NAPI 实例，靠 MSI-X 中断驱动。
+ */
 static int virtnet_probe(struct virtio_device *vdev)
 {
 	int i, err = -ENOMEM;
@@ -6782,6 +6789,8 @@ static int virtnet_probe(struct virtio_device *vdev)
 	struct virtnet_info *vi;
 	u16 max_queue_pairs;
 	int mtu = 0;
+
+	printk(KERN_INFO "[latte] virtnet_probe: virtio-net device probing\n");
 
 	/* Find if host supports multiqueue/rss virtio_net device */
 	max_queue_pairs = 1;

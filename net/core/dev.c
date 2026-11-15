@@ -5846,6 +5846,10 @@ static inline int nf_ingress(struct sk_buff *skb, struct packet_type **pt_prev,
 	return 0;
 }
 
+/*
+ * 收包的分发点：按以太网类型（skb->protocol）把包交给注册在该类型的
+ * packet_type 链——IPv4 就是在这里交给 ip_rcv() 的。
+ */
 static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 				    struct packet_type **ppt_prev)
 {
@@ -5863,6 +5867,9 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 	trace_netif_receive_skb(skb);
 
 	orig_dev = skb->dev;
+
+	printk(KERN_INFO "[latte] netif_receive_skb: len=%u proto=0x%04x dev=%s\n",
+	       skb->len, ntohs(skb->protocol), skb->dev->name);
 
 	skb_reset_network_header(skb);
 #if !defined(CONFIG_DEBUG_NET)
@@ -7644,6 +7651,7 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 	return work;
 }
 
+/* 单个 NAPI 实例的轮询：跑到 budget 用完或网卡没包了，再决定要不要重新调度 */
 static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 {
 	bool do_repoll = false;

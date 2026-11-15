@@ -457,11 +457,14 @@ static int ip_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 /*
  * 	Main IP Receive routine.
  */
+/* 单包路径（ip_rcv）与批量路径（ip_list_rcv）都汇到这里：校验并剥 IP 头 */
 static struct sk_buff *ip_rcv_core(struct sk_buff *skb, struct net *net)
 {
 	const struct iphdr *iph;
 	int drop_reason;
 	u32 len;
+
+	printk(KERN_INFO "[latte] ip_rcv_core: len=%u\n", skb->len);
 
 	/* When the interface is in promisc. mode, drop all the crap
 	 * that it receives, do not try to analyse it.
@@ -560,6 +563,10 @@ out:
 
 /*
  * IP receive entry point
+ */
+/*
+ * IPv4 的入口：先做基本校验（ip_rcv_core），再过 netfilter 的 PRE_ROUTING，
+ * 最后交给 ip_rcv_finish 查路由——本机就是本机的包，或需要转发。
  */
 int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
 	   struct net_device *orig_dev)

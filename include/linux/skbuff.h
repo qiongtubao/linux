@@ -882,6 +882,10 @@ enum skb_tstamp_type {
  *	@extensions: allocated extensions, valid if active_extensions is nonzero
  */
 
+/*
+ * 数据包的内核表示：head/data/tail/end 四个指针圈出一块缓冲，
+ * 各层协议头依次往里填；收包时指针从外往内“剥”。
+ */
 struct sk_buff {
 	union {
 		struct {
