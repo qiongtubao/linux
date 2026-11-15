@@ -1,9 +1,9 @@
 # 调度器：谁决定下一个跑谁
 
 前面几站讲“进程怎么开始（`execve`）、怎么停（`jobs`）、怎么结束（`exit`）”，
-这一站讲**它们怎么轮流用 CPU**。两篇：什么时候换人（阻塞 vs 抢占），
-以及“公平”到底按什么分（EEVDF 的权重与切片）。
-1 份索引 + 2 篇主题文档，2 个打点。
+这一站讲**它们怎么轮流用 CPU**。三篇：什么时候换人（阻塞 vs 抢占）、
+“公平”按什么分（EEVDF 的权重与切片）、以及组和组之间怎么分（cgroup `cpu.weight`）。
+1 份索引 + 3 篇主题文档，2 个打点。
 
 ## 主题划分（按领域）
 
@@ -11,6 +11,7 @@
 |---|---|---|---|
 | CPU 与进程 | 调度时机 | [01-什么时候换人-两种让出与抢占](01-什么时候换人-两种让出与抢占.md) | `voluntary` 自己睡，`nonvoluntary` 被人抢 |
 | CPU 与进程 | 公平性 | [02-公平性-EEVDF与nice权重](02-公平性-EEVDF与nice权重.md) | nice 是权重；`slice=0.7ms`；差距 68 倍 |
+| CPU 与进程 | 分组 | [03-cgroup的CPU权重-组间按份额分](03-cgroup的CPU权重-组间按份额分.md) | `cpu.weight` 100:300 → 份额 1:3；`cpu.max` 本内核没有 |
 
 ## 一条链
 
@@ -36,7 +37,7 @@ try_to_wake_up          __schedule()                  finish_task_switch()
 两个都加了过滤器，而且**必须加**：不过滤时 `try_to_wake_up` 被 `rcu_preempt`
 这类内核线程反复命中，2 核启动 90 秒都跑不完（详见 01 的“日志量”一节）。
 
-## 实测两组数字
+## 实测数字
 
 | 观察点 | 数值 |
 |---|---|
@@ -44,8 +45,10 @@ try_to_wake_up          __schedule()                  finish_task_switch()
 | 同 CPU 加一个竞争者，忙等 500ms 后 `nonvoluntary_ctxt_switches` | 1 → **128** |
 | nice 0 vs nice 19（绑同一 CPU，各跑 2s）的 `utime` | **196 : 3** ticks |
 | 同上两进程的 `sum_exec_runtime` | **1.977 s : 0.034 s** |
+| 两个 cgroup（`cpu.weight` 100 vs 300）各跑 2s 的 `utime` | **50 : 149** ticks（1:3） |
+| 同上两组的 `cpu.stat` `usage_usec` | **0.511 s : 1.517 s** |
 
-## 自查 3 问
+## 自查 4 问
 
 1. `voluntary` 和 `nonvoluntary` 的上下文切换差在哪？（01：自己调 `schedule()`
    让出 vs 被 tick/唤醒打断后强制让出）
@@ -53,10 +56,12 @@ try_to_wake_up          __schedule()                  finish_task_switch()
    根本不在 runqueue 里，调度器选不到它）
 3. nice 0 与 nice 19 平分 2 秒会各拿多少？（02：权重 1024:15 ≈ 68:1，
    实测 1.977s : 0.034s；jiffy 粒度下是 196:3 ticks）
+4. `cpu.weight=300` 会让一个组“独占三颗核”吗？（03：不会，只是竞争时占三份；
+   要封顶得用 `cpu.max`，本内核没开 `CONFIG_CFS_BANDWIDTH`）
 
 ## 下一阶段
 
 调度这块还能挖：**实时调度**（`SCHED_FIFO`/`SCHED_RR` 抢占普通任务，需要 root
 与 `sched_setscheduler`）、**多核负载均衡**（`-smp 4` 下 `sched_migrate_task` 打点）、
-**cgroup CPU 控制**（`cpu.max`，`CONFIG_CGROUP_SCHED=y` 已开）、
-**唤醒抢占**（`WAKEUP_PREEMPTION` 与 `sched_wakeup` tracepoint 的 `success` 字段）。
+**唤醒抢占**（`sched_wakeup` 的 `success` 字段）、**`cpu.max` 硬配额**
+（需重开 `CONFIG_CFS_BANDWIDTH`，本内核 `# ... is not set`，见 `03`）。
