@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>25-NVMe：PCIe 上的块设备驱动</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75; max-width: 900px; margin: 0 auto;
+    padding: 32px 24px 80px; font-size: 16px; }
+  nav.top { display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border); }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="26-socket.html">下一篇：Socket →</a>
+</nav>
+
+<h1>⚡ NVMe：PCIe 上的块设备驱动</h1>
+<p class="subtitle">绕过 SATA 控制器，让 SSD 直接对着一圈环形队列发命令 · 预计阅读 10 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>老式 SATA 硬盘的协议是给“磁头 + 盘片”设计的：一次只能挂一个命令、一次搬一小段数据，还得由主板上的 AHCI 控制器转手。SSD 没有磁头，随机读只要几微秒，却被这条“单车道、带红绿灯”的路卡死。于是业界把 SSD 直接挂上 PCIe 总线，并新写了一套协议——<span class="term">NVMe</span>（Non-Volatile Memory Express）。</p>
+<p>它的思路像快餐店的<strong>点餐台</strong>：柜台前有多个窗口（队列），每个窗口各排一条队；你把订单小票放进窗口的传送带（提交队列 SQ），按一下铃（doorbell），后厨做完把成品放到取餐口（完成队列 CQ），再按一下铃通知你取走。窗口有几十个、每条队能排几百单，所以成千上万个 IO 能真的并行。</p>
+<p>对内核来说，NVMe 盘就是一个标准的块设备：上面有 <code>request_queue</code>、hctx、IO 调度器，和 SATA 盘一样被 <code>mkfs</code>、被挂载。驱动的任务只是<strong>把 <code>request</code> 翻译成 NVMe 命令、拷进环形队列、敲 doorbell、等中断</strong>。这一篇看的就是这台翻译机。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">NVMe</td><td>Non-Volatile Memory Express</td><td>为闪存设计的 PCIe 上的命令协议，多队列、低延迟。</td></tr>
+  <tr><td class="term">提交队列</td><td>SQ (Submission Queue)</td><td>主机内存中的环形数组，放 64 字节命令；控制器从这里取任务。</td></tr>
+  <tr><td class="term">完成队列</td><td>CQ (Completion Queue)</td><td>环形的 16 字节完成条目，控制器写、主机读。</td></tr>
+  <tr><td class="term">门铃</td><td>doorbell</td><td>设备 BAR 里的寄存器，主机写“尾指针”告诉控制器有新命令。</td></tr>
+  <tr><td class="term">命令 capsule</td><td>command</td><td>64 字节固定格式：opcode、命令号、命名空间、数据指针、起始 LBA、长度。</td></tr>
+  <tr><td class="term">PRP</td><td>Physical Region Page</td><td>命令里的数据指针，指向内存页；跨页时用 PRP list 串成链。</td></tr>
+  <tr><td class="term">命名空间</td><td>namespace / nsid</td><td>控制器里的一块逻辑存储，对应一个 <code>/dev/nvme0n1</code>。</td></tr>
+  <tr><td class="term">管理队列</td><td>admin queue</td><td>队列 0，专门跑 identify、创建/删除 IO 队列等控制命令。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<p>先看一条命令如何从主机内存走到控制器，再回来看完成：</p>
+<pre><code>主机内存（驱动分配的一圈页）                 控制器（BAR 寄存器）
+ SQ ring:  [ ... | cmd5 | cmd6 | 空 | 空 ]     SQ0 Tail  ← writel(sq_tail)
+                ▲                                    │
+                │ 驱动 memcpy 命令                   ▼
+                └────────────── doorbell ──►  取走命令、DMA 读数据
+ CQ ring:  [ ... | cqe3 | 空 | 空 ]
+                ▲                                    │
+                │ 驱动读 cqe、处理完                │ 写完 cqe
+                └──────── 写 CQ0 Head ──► doorbell  ◄┘
+                       (告诉控制器“这条我取走了”)
+PCIe BAR0 布局: [ SQ0 Tail ][ CQ0 Head ][ SQ1 Tail ][ CQ1 Head ] ...</code></pre>
+<p><strong>command capsule（64 字节）关键字段</strong>：</p>
+<pre><code>0  opcode      如 0x02 = Read, 0x01 = Write
+1  flags
+2  command_id  等于块层的 request tag，用来对上完成项
+4  nsid        命名空间号（哪块盘）
+8  metadata 指针 / 16  dptr: PRP1, PRP2（数据放在哪）
+24 slba        起始逻辑块地址（LBA）
+32 length      传输扇区数减一
+34 control     含 FUA 等标志</code></pre>
+<p>队列深度由控制器支持的上限和驱动配置共同决定（常见 1024）。每个 IO 队列有独立的中断（MSI-X），所以 CPU 0 提交的 IO 完成时大概率回到 CPU 0，缓存亲和性好。</p>
+<p>整个驱动的生命周期：<strong>probe</strong>（PCI 匹配、映射 BAR、建 admin 队列、identify 控制器）→ <strong>setup IO queues</strong>（按 CPU 数创建 IO 队列）→ <strong>alloc namespace</strong>（每块逻辑盘建 gendisk 与 request_queue）→ 运行时 <code>nvme_queue_rq</code> 循环 → 移除/reset 时销毁。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 探测：nvme_probe</h3>
+<p class="srcline">drivers/nvme/host/pci.c:2946-2985  nvme_probe（节选）</p>
+<pre><code>static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	int node, result = -ENOMEM;
+	struct nvme_dev *dev;
+	unsigned long quirks = id-&gt;driver_data;
+	// ...
+	node = dev_to_node(&amp;pdev-&gt;dev);
+	if (node == NUMA_NO_NODE)
+		set_dev_node(&amp;pdev-&gt;dev, first_memory_node);
+
+	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
+	if (!dev)
+		return -ENOMEM;
+
+	dev-&gt;nr_write_queues = write_queues;
+	dev-&gt;nr_poll_queues = poll_queues;
+	dev-&gt;nr_allocated_queues = nvme_max_io_queues(dev) + 1;
+	dev-&gt;queues = kcalloc_node(dev-&gt;nr_allocated_queues,
+			sizeof(struct nvme_queue), GFP_KERNEL, node);
+	// ...
+	pci_set_drvdata(pdev, dev);
+	result = nvme_dev_map(dev);          /* 映射 BAR0，拿到 doorbell */
+	// ...
+	result = nvme_setup_prp_pools(dev);  /* 预分配 PRP list 池 */
+	// ... 省略 quirk 检测与中断向量申请
+	nvme_reset_ctrl(&amp;dev-&gt;ctrl);         /* 异步 reset：建队列、identify */
+	async_schedule(nvme_async_probe, dev);
+	return 0;</code></pre>
+<p><code>nr_allocated_queues</code> 比 IO 队列多 1，那 1 个就是 admin 队列。<code>nvme_dev_map</code> 用 <code>pci_iomap</code> 把 BAR0 映射进内核虚拟地址，之后写 doorbell 就是 <code>writel</code> 到这段地址。真正的硬件初始化（复位、建队列、identify 控制器与命名空间）在 <code>nvme_reset_ctrl</code> 的工作线程里做，probe 本身快速返回。</p>
+
+<h3>4.2 多队列：nvme_setup_io_queues</h3>
+<p class="srcline">drivers/nvme/host/pci.c:2208-2237  nvme_setup_io_queues（节选）</p>
+<pre><code>static int nvme_setup_io_queues(struct nvme_dev *dev)
+{
+	struct nvme_queue *adminq = &amp;dev-&gt;queues[0];
+	struct pci_dev *pdev = to_pci_dev(dev-&gt;dev);
+	unsigned int nr_io_queues;
+	// ...
+	dev-&gt;nr_write_queues = write_queues;
+	dev-&gt;nr_poll_queues = poll_queues;
+
+	if (dev-&gt;ctrl.quirks &amp; NVME_QUIRK_SHARED_TAGS)
+		nr_io_queues = 1;
+	else
+		nr_io_queues = min(nvme_max_io_queues(dev),
+				   dev-&gt;nr_allocated_queues - 1);
+
+	result = nvme_set_queue_count(&amp;dev-&gt;ctrl, &amp;nr_io_queues);
+	if (result &lt; 0)
+		return result;
+	if (nr_io_queues == 0)
+		return 0;
+
+	clear_bit(NVMEQ_ENABLED, &amp;adminq-&gt;flags);
+	// ... 省略 CMB（控制器内存）优化与 BAR 重映射
+	// 之后为每个队列分配 SQ/CQ 内存并向控制器发 Create CQ/SQ 命令</code></pre>
+<p>先算“想要几个队列”（<code>nvme_max_io_queues</code> 取 CPU 数与配置上限的较小值），再让控制器确认实际能给几个（<code>nvme_set_queue_count</code>，走 admin 命令 <code>Set Features</code>）。<code>NVME_QUIRK_SHARED_TAGS</code> 是 Apple 硬件的一个怪癖：admin 与 IO 共用 tag，只能用一个 IO 队列。<code>clear_bit(NVMEQ_ENABLED)</code> 是先把 admin 队列标为不可用，避免重建期间有新请求塞进来。</p>
+<p>队列创建完后，块层的 tagset 由 <code>nvme_pci_map_queues</code>（<code>:443</code>）按 PCIe 的 NUMA 亲和关系映射：<code>blk_mq_pci_map_queues(map, pdev, offset)</code>，让提交 IO 的 CPU 和它的 PCIe 根节点在同一个 NUMA 域。轮询模式（<code>poll_queues</code>）没有中断亲和，退回通用 <code>blk_mq_map_queues</code>。</p>
+
+<h3>4.3 命名空间变成块设备：nvme_alloc_ns</h3>
+<p class="srcline">drivers/nvme/host/core.c:3800-3845  nvme_alloc_ns（节选）</p>
+<pre><code>static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid,
+		struct nvme_ns_ids *ids)
+{
+	struct nvme_ns *ns;
+	struct gendisk *disk;
+	struct nvme_id_ns *id;
+	// ...
+	if (nvme_identify_ns(ctrl, nsid, ids, &amp;id))
+		return;
+
+	ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
+	ns-&gt;queue = blk_mq_init_queue(ctrl-&gt;tagset);   /* 共享控制器 tagset */
+	if (IS_ERR(ns-&gt;queue))
+		goto out_free_ns;
+
+	blk_queue_flag_set(QUEUE_FLAG_NONROT, ns-&gt;queue);  /* 非旋转设备 */
+	ns-&gt;queue-&gt;queuedata = ns;        /* 驱动从 hctx-&gt;queue 反查 ns */
+	ns-&gt;ctrl = ctrl;
+	// ...
+	nvme_set_disk_name(disk_name, ns, ctrl, &amp;flags);
+	disk = alloc_disk_node(0, node);
+	// ...
+	disk-&gt;fops = &amp;nvme_fops;
+	disk-&gt;private_data = ns;
+	disk-&gt;queue = ns-&gt;queue;
+	memcpy(disk-&gt;disk_name, disk_name, DISK_NAME_LEN);
+	ns-&gt;disk = disk;
+	// ... 省略 update_ns_info 与 LightNVM 分支
+	device_add_disk(ctrl-&gt;device, ns-&gt;disk, nvme_ns_id_attr_groups);</code></pre>
+<p><code>nvme_identify_ns</code> 发管理命令拿命名空间参数（容量、扇区大小、LBA 格式）。每个命名空间建一个 <code>request_queue</code>，但<strong>共享控制器级的 tagset</strong>（<code>ctrl-&gt;tagset</code>）——tag 是硬件队列里的槽位，同一控制器的所有盘共用同一批队列。<code>QUEUE_FLAG_NONROT</code> 让块层知道这是非旋转介质，影响合并与调度器选择。<code>device_add_disk</code> 之后 <code>/dev/nvme0n1</code> 出现，udev 建 /dev 节点，文件系统就能挂载了。</p>
+
+<h3>4.4 提交一条请求：nvme_queue_rq</h3>
+<p class="srcline">drivers/nvme/host/pci.c:903-950  nvme_queue_rq（节选）</p>
+<pre><code>static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+			 const struct blk_mq_queue_data *bd)
+{
+	struct nvme_ns *ns = hctx-&gt;queue-&gt;queuedata;  /* 名字空间 */
+	struct nvme_queue *nvmeq = hctx-&gt;driver_data;  /* 硬件队列 */
+	struct nvme_dev *dev = nvmeq-&gt;dev;
+	struct request *req = bd-&gt;rq;
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);  /* 请求私有区 */
+	struct nvme_command cmnd;
+	blk_status_t ret;
+
+	iod-&gt;aborted = 0;  iod-&gt;npages = -1;  iod-&gt;nents = 0;
+
+	if (unlikely(!test_bit(NVMEQ_ENABLED, &amp;nvmeq-&gt;flags)))
+		return BLK_STS_IOERR;             /* 队列已停用 */
+
+	ret = nvme_setup_cmd(ns, req, &amp;cmnd);  /* request → NVMe 命令 */
+	if (ret)
+		return ret;
+
+	if (blk_rq_nr_phys_segments(req)) {
+		ret = nvme_map_data(dev, req, &amp;cmnd);   /* DMA 映射 + 填 PRP */
+		if (ret)
+			goto out_free_cmd;
+	}
+
+	blk_mq_start_request(req);          /* 启动超时计时 */
+	nvme_submit_cmd(nvmeq, &amp;cmnd, bd-&gt;last);   /* 拷进 SQ + doorbell */
+	return BLK_STS_OK;
+out_free_cmd:
+	nvme_cleanup_cmd(req);
+	return ret;</code></pre>
+<p>这是驱动的核心回调，由块层在 hctx 派发时调用。顺序：<strong>构造命令</strong>（<code>nvme_setup_cmd</code> 按 <code>req_op</code> 分发到读/写/flush/discard 等）、<strong>映射数据</strong>（<code>nvme_map_data</code> 把 <code>request</code> 的页做 DMA 映射，填进命令的 PRP1/PRP2 或 PRP list）、<strong>启动请求</strong>（开始超时计时）、<strong>提交</strong>（拷命令、敲铃）。<code>bd-&gt;last</code> 是“这批的最后一个”，用于决定是否立刻敲铃。</p>
+<p class="srcline">drivers/nvme/host/core.c:808-860  nvme_setup_cmd（节选）</p>
+<pre><code>	memset(cmd, 0, sizeof(*cmd));
+	switch (req_op(req)) {
+	case REQ_OP_FLUSH:
+		nvme_setup_flush(ns, cmd);
+		break;
+	case REQ_OP_WRITE_ZEROES:
+		ret = nvme_setup_write_zeroes(ns, req, cmd);
+		break;
+	case REQ_OP_DISCARD:
+		ret = nvme_setup_discard(ns, req, cmd);
+		break;
+	case REQ_OP_READ:
+		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_read);
+		break;
+	case REQ_OP_WRITE:
+		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_write);
+		break;
+	// ... 省略 zone append / 直通等
+	default:
+		WARN_ON_ONCE(1);
+		return BLK_STS_IOERR;
+	}
+	cmd-&gt;common.command_id = req-&gt;tag;    /* tag 就是回调匹配键 */
+	trace_nvme_setup_cmd(req, cmd);</code></pre>
+<p><code>command_id = req-&gt;tag</code> 极重要：完成队列条目只回传这个 16 位 id，驱动靠它找回是哪个 <code>request</code> 完成了。命令结构在 <code>include/linux/nvme.h:797</code>（<code>struct nvme_rw_command</code>）：<code>slba</code> 起始 LBA、<code>length</code> 扇区数减一、<code>dptr</code> 数据指针。</p>
+
+<h3>4.5 拷命令与敲铃：nvme_submit_cmd</h3>
+<p class="srcline">drivers/nvme/host/pci.c:505-518  nvme_submit_cmd</p>
+<pre><code>static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+			    bool write_sq)
+{
+	spin_lock(&amp;nvmeq-&gt;sq_lock);   /* 保护 SQ 尾指针 */
+	memcpy(nvmeq-&gt;sq_cmds + (nvmeq-&gt;sq_tail &lt;&lt; nvmeq-&gt;sqes),
+	       cmd, sizeof(*cmd));
+	if (++nvmeq-&gt;sq_tail == nvmeq-&gt;q_depth)
+		nvmeq-&gt;sq_tail = 0;       /* 环形回绕 */
+	nvme_write_sq_db(nvmeq, write_sq);   /* 写 SQ Tail 门铃 */
+	spin_unlock(&amp;nvmeq-&gt;sq_lock);
+}</code></pre>
+<p><code>sq_cmds</code> 是驱动分配的一段连续内存，控制器通过 <code>SQ0 Base Address</code> 寄存器也能看到它（同一块物理内存，DMA 一致性）。<code>sq_tail &lt;&lt; sqes</code> 计算槽位字节偏移（<code>sqes</code> 是命令大小的 log2，通常 6 → 64 字节）。写完修改 tail 并回绕；<code>nvme_write_sq_db</code> 决定是否立即敲铃：若不是本批最后一个，且下一个位置不会回绕，就跳过门铃——批量提交时只敲一次，减少 MMIO 开销。</p>
+
+<h3>4.6 完成：nvme_process_cq</h3>
+<p class="srcline">drivers/nvme/host/pci.c:1073-1094  nvme_process_cq（节选）</p>
+<pre><code>static inline int nvme_process_cq(struct nvme_queue *nvmeq)
+{
+	int found = 0;
+
+	while (nvme_cqe_pending(nvmeq)) {   /* 用 phase bit 判断新条目 */
+		found++;
+		dma_rmb();                     /* 保证读到完整 CQE */
+		nvme_handle_cqe(nvmeq, nvmeq-&gt;cq_head);
+		nvme_update_cq_head(nvmeq);    /* head++，回绕时翻转 phase */
+	}
+
+	if (found)
+		nvme_ring_cq_doorbell(nvmeq);  /* 告诉控制器已消费 */
+	return found;
+}</code></pre>
+<p>中断处理里循环取完成项，直到 <code>nvme_cqe_pending</code> 为假。判断“有没有新条目”靠 <strong>phase bit</strong>：CQ 内存初始清零，控制器写条目时把 status 的最低位设为当前 phase；主机回绕一圈后翻转自己的 phase 期望值，于是“清零的旧条目”不会被误认成新的——不需要额外计数器。<code>dma_rmb()</code> 防止读到半个 CQE。<code>nvme_handle_cqe</code> 里 <code>blk_mq_complete_request(req)</code> 完成请求，最终唤醒等 IO 的线程。</p>
+
+<h2>5. 动手验证</h2>
+<p><strong>看设备与驱动。</strong></p>
+<pre><code>lspci | grep -i nvme                 # 形如 Non-Volatile memory controller
+lspci -vv -s &lt;bus:dev.fn&gt; | grep -E 'LnkCap|LnkSta|MSI-X'
+nvme list                            # 需 nvme-cli：列出 /dev/nvme0n1 容量/型号
+nvme id-ctrl /dev/nvme0 | head -20   # 控制器 identify：型号、固件、队列上限
+nvme id-ns /dev/nvme0n1 | head -20   # 命名空间：容量、LBA 格式</code></pre>
+<p><code>LnkSta</code> 显示当前 PCIe 速率（如 8GT/s x4）；<code>MSI-X: Enable+ Count=N</code> 的 N 就对应队列数（每队列一个中断向量）。<code>nvme id-ctrl</code> 里的 <code>sqes/cqes</code> 是命令/完成项大小，<code>maxcmd</code> 是队列深度上限。</p>
+<p><strong>看内核侧的队列。</strong></p>
+<pre><code>ls /sys/block/nvme0n1/mq/              # hctx 目录
+cat /sys/block/nvme0n1/mq/0/cpu_list    # 该队列服务的 CPU
+cat /sys/block/nvme0n1/queue/scheduler  # 通常 [none]
+cat /sys/block/nvme0n1/queue/nr_requests
+grep nvme /proc/interrupts | head -4</code></pre>
+<p><code>mq/</code> 下的每个目录就是一个硬件队列，<code>cpu_list</code> 是 <code>blk_mq_pci_map_queues</code> 的结果；<code>/proc/interrupts</code> 里每个 <code>nvme0qN</code> 一行，计数随 IO 增长，说明该队列在干活。</p>
+<p><strong>没有 NVMe 硬件？用 qemu 造一块。</strong></p>
+<pre><code>qemu-system-x86_64 -m 2G -smp 4 \
+  -kernel arch/x86/boot/bzImage -append "console=ttyS0" \
+  -drive file=rootfs.img,format=raw,if=virtio \
+  -device nvme,serial=deadbeef,drive=drv0 \
+  -drive file=nvme.img,format=raw,if=none,id=drv0 \
+  -nographic</code></pre>
+<p>启动后 <code>lspci</code> 能看到 NVMe 控制器，<code>ls /sys/block/</code> 出现 <code>nvme0n1</code>；<code>nvme id-ctrl /dev/nvme0</code> 可读取 qemu 模拟的 identify 数据。对 <code>/dev/nvme0n1</code> 做 <code>mkfs.ext4</code>、挂载、读写，即可复现本篇所有路径。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. NVMe 为什么比 SATA 快得多？</b>它直接走 PCIe，且协议原生支持多队列（每 CPU 一条或多条 SQ/CQ），命令只有 64 字节、路径短；SATA/AHCI 只有一条队列且经控制器转手。</div>
+<div class="qa"><b>Q2. SQ 和 CQ 分别由谁写？</b>SQ 由主机驱动写命令、写 SQ Tail 门铃通知控制器；CQ 由控制器写完成条目，主机读完后写 CQ Head 门铃告知已消费。</div>
+<div class="qa"><b>Q3. 完成项怎么和 request 对上？</b>NVMe 命令的 <code>command_id</code> 被设成 <code>req-&gt;tag</code>，CQE 回传该 id，驱动据此找回请求并完成它。</div>
+<div class="qa"><b>Q4. CQ 的 phase bit 有什么用？</b>区分“控制器刚写入的新条目”和“回绕后残留的旧内容”，避免额外维护计数器，只需读到 status 最低位等于当前期望 phase。</div>
+<div class="qa"><b>Q5. <code>nvme_alloc_ns</code> 建的 request_queue 和控制器 tagset 什么关系？</b>每命名空间一个 queue，但共享控制器级 <code>tagset</code>：队列与 hctx 都落到同一组硬件队列，tag 池也是同一批。</div>
+
+<footer>
+  <p>上一篇：<a href="24-block.html">24-block 块层</a> · 下一篇：<a href="26-socket.html">26-socket 套接字</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

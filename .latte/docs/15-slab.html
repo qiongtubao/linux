@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 · slab/slub：内核对象的对象池</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="16-page-table.html">下一篇：页表与缺页异常 →</a>
+</nav>
+
+<h1>🧩 slab / slub：内核对象的“预切割零件盒”</h1>
+<p class="subtitle">把整页内存预先切成同尺寸的小格子，让高频小对象分配变成链表弹出 · 预计阅读 38 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>想象一个组装车间：每个工位每天都在拿螺丝、垫片、小卡扣，规格只有十几种。如果每次都向仓库申请“一个 4 平米的标准托盘区”再自己在里面画格子，那光画线和管理就累死了。正常做法是：仓库直接按“螺丝盒、垫片盒、卡扣盒”这几种规格把托盘预先切成格子，工人来了就从对应的盒子里取一个，还回去就塞回原位。盒子空了再向仓库要一整托盘。</p>
+<p>Linux 内核的 <span class="term">slab 分配器</span>就是这套“预切格子”的服务：它向伙伴系统（第 14 篇）申请整页或几页连续内存，把这些页切成尺寸相同的对象槽位，每个槽位对应一个 <code>struct task_struct</code>、一个文件对象、一个 dentry、一个 socket……之后再分配这类对象，就只是从空闲链表里弹一个指针出来，比走一趟伙伴系统快一到两个数量级。</p>
+<p>操作系统的现实约束把问题推得更深：内核里会有成百上千种“同类对象”，每种数量都很大；盲目地每种都向伙伴系统要 4 KB，会让伙伴系统 constantly 分裂合并，且每个对象都要额外的描述开销。slab 把“一大块页”和“一堆同尺寸对象”解耦：页只从伙伴系统拿一次，对象分配全程在链表上完成；同时通过<span class="term">每 CPU 缓存</span>把这条路变成几乎无锁。</p>
+<p>Linux 5.10 默认使用 <span class="term">SLUB</span> 作为 slab 的实现（旧版还有 SLAB、SLOB 可选，但绝大多数发行版都开 SLUB）。SLUB 的设计精髓是“元数据塞进 <code>struct page</code>，不给每个对象加头部”，因此对象槽可以紧密排列、缓存友好。本篇文章只讲这一套。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">对象缓存</td><td>kmem_cache</td><td>描述“某一种固定大小对象”的池；名字、对象尺寸、对齐、每 slab 页数都在里面。</td></tr>
+  <tr><td class="term">slab</td><td>slab</td><td>一次从伙伴系统要来的连续页面，被切成 N 个等长槽位；是对象的“容器”。</td></tr>
+  <tr><td class="term">对象</td><td>object</td><td>slab 里一个槽位，可被分配出去使用；未分配时是空闲链表上的一个节点。</td></tr>
+  <tr><td class="term">空闲链表</td><td>freelist</td><td>把空闲对象串起来的单链表，指针就存放在空闲对象本身内部（不额外占内存）。</td></tr>
+  <tr><td class="term">每 CPU 缓存</td><td>kmem_cache_cpu</td><td>每个 CPU 一份的“当前 slab + 本地空闲链表”，分配/释放优先走它。</td></tr>
+  <tr><td class="term">部分空闲 slab</td><td>partial slab</td><td>既不是全空也不是全满的 slab，挂在节点级 partial 链表上待用。</td></tr>
+  <tr><td class="term">kmalloc</td><td>kmalloc</td><td>内核最常用的“任意大小”分配接口，内部落到按 2 的幂分级的 kmalloc-N 缓存。</td></tr>
+  <tr><td class="term">kzalloc</td><td>kzalloc</td><td>kmalloc + 清零（<code>__GFP_ZERO</code>）。</td></tr>
+  <tr><td class="term">kcalloc</td><td>kcalloc</td><td>分配 n 个元素并溢出检查，等价于带 saturating 乘法的 kzalloc。</td></tr>
+  <tr><td class="term">krealloc</td><td>krealloc</td><td>调整已有 kmalloc 块的大小，必要时搬移内容。</td></tr>
+  <tr><td class="term">slub_debug</td><td>slub_debug</td><td>SLUB 的调试模式：红区、毒化、追踪分配/释放调用点。</td></tr>
+  <tr><td class="term">slabinfo</td><td>/proc/slabinfo</td><td>每个缓存的活跃对象数、总对象数、对象大小、每 slab 对象数等。</td></tr>
+  <tr><td class="term">缓存别名宽容</td><td>cache aliasing / merge</td><td>相同尺寸与对齐的缓存可以合并成一个（<code>slab_nomerge</code> 可关）。</td></tr>
+  <tr><td class="term">kmemleak</td><td>kmemleak</td><td>内核自带的“失物招领”：周期性扫描，报告疑似泄漏的分配点。</td></tr>
+  <tr><td class="term">对象构造器</td><td>ctor</td><td>缓存可选的回调，每个新对象初始化时调用一次。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 三层结构：缓存 → slab → 对象</h3>
+<pre><code>kmem_cache（一种对象的池）
+├─ per-CPU: kmem_cache_cpu[0]   freelist → [obj][obj][obj]，page 指向当前 slab
+├─ per-CPU: kmem_cache_cpu[1]   ...
+├─ node 0:  kmem_cache_node
+│            ├─ partial 链表：还有空槽的 slab（既非全空也非全满）
+│            ├─ 完全空的 slab 会被归还伙伴系统（保留 min_partial 个）
+│            └─ 全满的 slab 不挂在链表上（只由使用者的指针维系）
+└─ object_size / size / offset / oo：几何参数
+
+  一个 slab（2^order 页）
+  ┌────┬────┬────┬────┬────┬────┐
+  │obj0│obj1│obj2│obj3│obj4│obj5│   ← 相邻两槽间偏移 = s-&gt;size（含对齐与调试区）
+  └────┴────┴────┴────┴────┴────┘
+       元数据全部存在 struct page 里：freelist、inuse、objects、frozen
+</code></pre>
+<p>为什么分三层？<code>kmem_cache</code> 是“目录条目”（这是什么对象、多大），<code>kmem_cache_cpu</code> 和 <code>kmem_cache_node</code> 是“服务窗口”：前者服务本 CPU 的快速请求，后者服务所有 CPU 的补货请求。<span class="term">slab</span> 是真正的内存容器，<span class="term">object</span> 是容器里的格子。SLUB 最重要的简化是：不为每个对象单独保留元数据（不像老 SLAB 每个 object 前面挂一个 <code>kmem_bufctl</code>），而是把 <code>freelist/inuse/frozen</code> 全塞进 <code>struct page</code> 的 union 字段——因为一个 slab 恰好对应一个 <code>struct page</code> 头（复合页首页），天然就能挂这些状态。</p>
+
+<h3>3.2 分配路径</h3>
+<pre><code>kmem_cache_alloc(s, gfp)
+ └─ slab_alloc(s, gfp, _RET_IP_)
+     └─ slab_alloc_node(s, gfp, NUMA_NO_NODE, addr)
+         ├─ 快路径: 读本 CPU 的 c-&gt;freelist / c-&gt;page
+         │    若都有 → 取头对象，cmpxchg_double 换出下一个 → 完成（无锁）
+         └─ 慢路径: __slab_alloc → local_irq_save
+                ├─ 本 CPU 的 partial 有没有可用 slab？有就直接切
+                ├─ 否则向节点 partial 链表要一个 slab（或新向伙伴系统要）
+                └─ 都失败 → 返回 NULL（upside: 可能触发 GC/回收）
+</code></pre>
+<p>注意“无锁”的准确含义：快路径不需要 <code>spin_lock</code>，但它依赖 <code>local_irq</code> 之间不会被其它 CPU 干扰——因为 <code>freelist</code> 和 <code>tid</code> 是本 CPU 独占的。唯一需要处理的是“本 CPU 上的中断/抢占可能在本指令序列之间插入，导致 freelist 变了”，于是用 <code>cmpxchg_double</code> 做“检查 tid 未被改过且 freelist 未被改过，再一起更新”。</p>
+
+<h3>3.3 释放路径</h3>
+<pre><code>kfree(ptr) / kmem_cache_free(s, ptr)
+ └─ 用 virt_to_head_page(ptr) 找到对象所属的 slab
+     ├─ !PageSlab(page) → 这是 kmalloc_large 的大块，走 __free_pages
+     └─ slab_free(s, page, ptr)
+         ├─ 若 page == 本 CPU 的 c-&gt;page → 直接用 cmpxchg_double 压回本地 freelist
+         └─ 否则 __slab_free：
+              加 node list_lock；处理 inuse 计数
+              若这个 slab 变空且超出 min_partial → 还给伙伴系统
+              若它在 node partial 上就从那里摘下来
+</code></pre>
+<p>这里也藏着“frozen”的概念：当一个 slab 正在被某个 CPU 当作 <code>c-&gt;page</code> 使用时，它的元数据不允许其它 CPU 改动，就用 <code>frozen</code> 位标记住；释放发生在“非本地 slab”时，需要走节点锁。<code>inuse</code> 计数因此在不同路径下含义略不同，这是 SLUB 里最容易读混的地方。</p>
+
+<h3>3.4 kmalloc 的大小分级</h3>
+<table>
+  <tr><th>缓存名</th><th>对象大小</th><th>典型用途</th></tr>
+  <tr><td>kmalloc-8</td><td>8 B</td><td>极小结构/指针数组</td></tr>
+  <tr><td>kmalloc-16 / 32 / 64</td><td>16 / 32 / 64 B</td><td>小描述符、小缓冲</td></tr>
+  <tr><td>kmalloc-96 / 128 / 192 / 256</td><td>96 / 128 / 192 / 256 B</td><td>常见的“几百字节”结构</td></tr>
+  <tr><td>kmalloc-512 / 1024 / 2048</td><td>512 B / 1 KB / 2 KB</td><td>中等缓冲、bio、request</td></tr>
+  <tr><td>kmalloc-4096 / 8192</td><td>4 KB / 8 KB</td><td>整页级缓冲</td></tr>
+  <tr><td>kmalloc-16k / 32k（视配置）</td><td>16 KB / 32 KB</td><td>大缓冲；超过阈值改走 kmalloc_large（伙伴系统直供）</td></tr>
+</table>
+<p>分级不是随便给定的：早期 64→96→128 的“三档”是因为很多结构在 65~96 字节之间，用一个 96 字节的槽比浪费到 128 划算得多。<code>include/linux/slab.h:346</code> 的 <code>kmalloc_index()</code> 就是这张表的代码化：</p>
+<p class="srcline">include/linux/slab.h:339-386  kmalloc_index（节选，省略了 KMALLOC_MIN_SIZE 的特殊分支中的解释）</p>
+<pre><code>/*
+ * Figure out which kmalloc slab an allocation of a certain size
+ * belongs to.
+ * 0 = zero alloc
+ * 1 =  65 .. 96 bytes
+ * 2 = 129 .. 192 bytes
+ * n = 2^(n-1)+1 .. 2^n
+ */
+static __always_inline unsigned int kmalloc_index(size_t size)
+{
+	if (!size)
+		return 0;
+
+	if (size &lt;= KMALLOC_MIN_SIZE)
+		return KMALLOC_SHIFT_LOW;
+
+	if (KMALLOC_MIN_SIZE &lt;= 32 &amp;&amp; size &gt; 64 &amp;&amp; size &lt;= 96)
+		return 1;
+	if (KMALLOC_MIN_SIZE &lt;= 64 &amp;&amp; size &gt; 128 &amp;&amp; size &lt;= 192)
+		return 2;
+	if (size &lt;=          8) return 3;
+	if (size &lt;=         16) return 4;
+	if (size &lt;=         32) return 5;
+	if (size &lt;=         64) return 6;
+	if (size &lt;=        128) return 7;
+	if (size &lt;=        256) return 8;
+	if (size &lt;=        512) return 9;
+	if (size &lt;=       1024) return 10;
+	if (size &lt;=   2 * 1024) return 11;
+	if (size &lt;=   4 * 1024) return 12;
+	if (size &lt;=   8 * 1024) return 13;
+	if (size &lt;=  16 * 1024) return 14;
+	if (size &lt;=  32 * 1024) return 15;
+	if (size &lt;=  64 * 1024) return 16;
+	if (size &lt;= 128 * 1024) return 17;
+	if (size &lt;= 256 * 1024) return 18;
+	if (size &lt;= 512 * 1024) return 19;
+	if (size &lt;= 1024 * 1024) return 20;
+	if (size &lt;=  2 * 1024 * 1024) return 21;
+	if (size &lt;=  4 * 1024 * 1024) return 22;
+	if (size &lt;=  8 * 1024 * 1024) return 23;
+	if (size &lt;= 16 * 1024 * 1024) return 24;
+	if (size &lt;= 32 * 1024 * 1024) return 25;
+	if (size &lt;= 64 * 1024 * 1024) return 26;
+	BUG();</code></pre>
+<p>返回值的含义是“第几个 kmalloc 缓存”（index 3 对应 8 字节，index 6 对应 64 字节，以此类推）。<code>kmalloc_caches[type][index]</code> 就是具体缓存指针。<code>index 1 和 2</code> 是“非 2 的幂”的补位缓存（96、192），它们的存在让“几十字节的结构”不至于浪费到下一个 2 的幂。超过 <code>KMALLOC_MAX_CACHE_SIZE</code> 后直接转向 <code>kmalloc_large</code>（伙伴系统直供）。</p>
+
+<h3>3.5 合并与调试</h3>
+<p>相同 <code>size</code>、<code>align</code>、<code>flags</code> 的缓存会被合并（merge）成一个物理缓存，节省内存。代价是不同子系统同名对象混在一起后，<code>/proc/slabinfo</code> 里分不清谁是谁（会出现 <code>:t-0000128</code> 这类合成名）。<code>slab_nomerge</code> 启动参数可以禁用合并以便排障。</p>
+<p>调试模式由 <code>slub_debug</code> 控制：</p>
+<table>
+  <tr><th>标志</th><th>作用</th></tr>
+  <tr><td>F</td><td>对每个缓存启用跟踪（存分配的调用地址）</td></tr>
+  <tr><td>Z</td><td>红区（redzone）：在对象前后留哨兵字节，越界写会被 <code>check_object</code> 抓到</td></tr>
+  <tr><td>P</td><td>毒化（poison）：分配时填 0x6b，释放时填 0x6a，读未初始化内存会看到明显图案</td></tr>
+  <tr><td>U</td><td>用户跟踪：记录哪些用户分配过该对象（需要 <code>track_user</code>）</td></tr>
+  <tr><td>A</td><td>在 slab 创建时就失败（用于错误注入）</td></tr>
+</table>
+<p>也可以按缓存单独开：<code>slub_debug=FZ,dentry</code>。开启后对象尺寸变大，性能下降，但能定位大部分野指针/越界问题。</p>
+
+<h3>3.6 从驱动视角的常见误用</h3>
+<ul>
+  <li><code>kmalloc(GFP_KERNEL)</code> 在自旋锁里或中断上下文里被调用：可能睡眠，会触发 “BUG: sleeping function called from invalid context”。正确做法是用 <code>GFP_ATOMIC</code>，并考虑失败回退。</li>
+  <li>用 <code>kmalloc</code> 申请大块（超过 <code>KMALLOC_MAX_CACHE_SIZE</code>）却假设它来自 slab：它会走伙伴系统直供，<code>virt_to_head_page()</code> 后不是 <code>PageSlab</code>；<code>kfree</code> 内部能识别并走 <code>__free_pages</code>，但调用者不要做“反推 slab”的假设。</li>
+  <li>把 <code>kfree</code> 当 <code>kfree_sensitive</code> 用：普通 <code>kfree</code> 不清内容，密钥/密码类对象应使用 <code>kfree_sensitive</code>（5.10 引入）。</li>
+  <li>申请后不初始化就释放/使用：<code>kmalloc</code> 不保证内容；<code>kzalloc</code> 才清零。</li>
+</ul>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 缓存的数据结构</h3>
+<p class="srcline">include/linux/slub_def.h:83-99  struct kmem_cache（节选，省略了 sysfs/kasan/usercopy 等条件字段）</p>
+<pre><code>struct kmem_cache {
+	struct kmem_cache_cpu __percpu *cpu_slab;
+	/* Used for retrieving partial slabs, etc. */
+	slab_flags_t flags;
+	unsigned long min_partial;
+	unsigned int size;	/* The size of an object including metadata */
+	unsigned int object_size;/* The size of an object without metadata */
+	struct reciprocal_value reciprocal_size;
+	unsigned int offset;	/* Free pointer offset */
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+	/* Number of per cpu partial objects to keep around */
+	unsigned int cpu_partial;
+#endif
+	struct kmem_cache_order_objects oo;
+
+	/* Allocation and freeing of slabs */
+	struct kmem_cache_order_objects max;
+	struct kmem_cache_order_objects min;
+	gfp_t allocflags;	/* gfp flags to use on each alloc */</code></pre>
+<ul>
+<li><code>cpu_slab</code> 是每 CPU 的指针；<code>this_cpu_ptr(s-&gt;cpu_slab)</code> 得到本 CPU 的 <code>kmem_cache_cpu</code>。这种 per-CPU 变量的访问在 x86 上就是一次 <code>%gs</code> 段前缀读，极快。</li>
+<li><code>object_size</code> 是调用者以为的大小，<code>size</code> 是实际槽位间距（含对齐、调试红区、kasan 影子等）。<code>size &gt; object_size</code> 的差额在 <code>/proc/slabinfo</code> 的 objsize 列里能看出来。</li>
+<li><code>offset</code> 是“freelist 指针藏在对象内部哪个偏移处”。正常情况下它就在对象开头或第一个空闲字节；kasan 等开启时会被挪到安全位置。</li>
+<li><code>oo</code>（order_objects）把“每个 slab 用多少页、装多少对象”压缩进一个 <code>unsigned int</code> 位域：高位放 order，低位放 objects，这样判断“补货要几页”不用两次除法。</li>
+</ul>
+
+<p class="srcline">include/linux/slub_def.h:42-50  struct kmem_cache_cpu</p>
+<pre><code>struct kmem_cache_cpu {
+	void **freelist;	/* Pointer to next available object */
+	unsigned long tid;	/* Globally unique transaction id */
+	struct page *page;	/* The slab from which we are allocating */
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+	struct page *partial;	/* Partially allocated frozen slabs */
+#endif
+#ifdef CONFIG_SLUB_STATS
+	unsigned stat[NR_SLUB_STAT_ITEMS];
+#endif
+};</code></pre>
+<p><code>tid</code> 就是“事务号”：每次修改 <code>freelist</code> 都换一个新号，<code>cmpxchg_double</code> 只有在 <code>freelist</code> 和 <code>tid</code> 都匹配时才成功，从而避免被本 CPU 上的中断插入破坏。这是一个非常巧妙的无锁技巧：不需要关抢占（只关 <code>local_irq</code>），也不产生跨 CPU 的锁。</p>
+
+<h3>4.2 快路径：slab_alloc_node</h3>
+<p class="srcline">mm/slub.c:3594-3635  slab_alloc_node（节选，省略了前面的 tid 读取与 hook 调用）</p>
+<pre><code>	object = c-&gt;freelist;
+	page = c-&gt;page;
+	if (unlikely(!object || !page || !node_match(page, node))) {
+		object = __slab_alloc(s, gfpflags, node, addr, c);
+	} else {
+		void *next_object = get_freepointer_safe(s, object);
+
+		/*
+		 * The cmpxchg will only match if there was no additional
+		 * operation and if we are on the right processor.
+		 * ...（省略：cmpxchg_double 的语义说明）...
+		 */
+		if (unlikely(!this_cpu_cmpxchg_double(
+				s-&gt;cpu_slab-&gt;freelist, s-&gt;cpu_slab-&gt;tid,
+				object, tid,
+				next_object, next_tid(tid)))) {
+
+			note_cmpxchg_failure("slab_alloc", s, tid);
+			goto redo;
+		}
+		prefetch_freepointer(s, next_object);
+		stat(s, ALLOC_FASTPATH);
+	}
+
+	maybe_wipe_obj_freeptr(s, object);
+
+	if (unlikely(slab_want_init_on_alloc(gfpflags, s)) &amp;&amp; object)
+		memset(object, 0, s-&gt;object_size);
+
+	slab_post_alloc_hook(s, objcg, gfpflags, 1, &amp;object);
+
+	return object;
+}</code></pre>
+<ul>
+<li><code>object = c-&gt;freelist</code> 就是本 CPU 当前可用对象的头；<code>page</code> 是这些对象所在的 slab。两者都在 → 走快路径。</li>
+<li><code>get_freepointer_safe(s, object)</code> 读出“下一个空闲对象”的指针（它藏在 object+offset 处）。</li>
+<li><code>cmpxchg_double(freelist, tid, object, tid, next, next_tid)</code>：只有当“仍是 object / 仍是 tid”时才把 freelist 换成 next 并把 tid 递增。这是一条指令 <code>cmpxchg16b</code>，不需要任何锁，在单核上是完全原子的，多核之间因为各自有 <code>cpu_slab</code> 所以不冲突。</li>
+<li><code>prefetch_freepointer</code>：提前把下一个对象拉进 cache，减少下一次分配的延迟。</li>
+<li><code>slab_want_init_on_alloc()</code>：开 <code>init_on_alloc=1</code> 时（安全加固，防信息泄漏）会对每次分配清零，此时 <code>malloc</code> 语义变成 <code>zalloc</code>。</li>
+<li>失败（<code>!object</code> 或 node 不匹配）就走 <code>__slab_alloc</code> 慢路径——通常是本 CPU 的 freelist 空了，需要从 partial 或新 slab 补货。</li>
+</ul>
+
+<p class="srcline">mm/slub.c:3486-3504  __slab_alloc（节选，省略了 ___slab_alloc 内部实现与 cmpxchg 失败处理）</p>
+<pre><code>static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+			  unsigned long addr, struct kmem_cache_cpu *c)
+{
+	void *p;
+	unsigned long flags;
+
+	local_irq_save(flags);
+#ifdef CONFIG_PREEMPTION
+	/*
+	 * We may have been preempted and rescheduled on a different
+	 * cpu before disabling interrupts. Need to reload cpu area
+	 * pointer.
+	 */
+	c = this_cpu_ptr(s-&gt;cpu_slab);
+#endif
+
+	p = ___slab_alloc(s, gfpflags, node, addr, c);
+	local_irq_restore(flags);</code></pre>
+<p>慢路径并不是“一定很慢”：多数情况下只是本 CPU 的 freelist 空了，<code>___slab_alloc</code> 会先看 <code>c-&gt;partial</code>（每 CPU 的备用 slab 链），如果还有，就把它变成新的 <code>c-&gt;page</code> 并继续从它的 freelist 取对象；只有当 CPU partial 与节点 partial 都空时，才会向伙伴系统申请一个全新的 slab——这是真正的“昂贵”路径。开启 <code>CONFIG_SLUB_STATS</code> 后可以通过 <code>/sys/kernel/slab/&lt;cache&gt;/alloc_fastpath</code>、<code>alloc_slowpath</code> 观察比例。</p>
+
+<h3>4.3 对外接口：kmem_cache_alloc / __kmalloc</h3>
+<p class="srcline">mm/slub.c:3664-3674  kmem_cache_alloc</p>
+<pre><code>void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
+{
+	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
+
+	trace_kmem_cache_alloc(_RET_IP_, ret, s-&gt;object_size,
+				s-&gt;size, gfpflags);
+
+	return ret;
+}</code></pre>
+<p><code>_RET_IP_</code>（返回地址）是调试神器：当 <code>slub_debug=U</code> 时它会被存进对象的跟踪区，<code>slabinfo</code> 可以据此反查谁分配了这块。</p>
+
+<p class="srcline">mm/slub.c:4852-4872  __kmalloc</p>
+<pre><code>void *__kmalloc(size_t size, gfp_t flags)
+{
+	struct kmem_cache *s;
+	void *ret;
+
+	if (unlikely(size &gt; KMALLOC_MAX_CACHE_SIZE))
+		return kmalloc_large(size, flags);
+
+	s = kmalloc_slab(size, flags);
+
+	if (unlikely(ZERO_OR_NULL_PTR(s)))
+		return s;
+
+	ret = slab_alloc(s, flags, _RET_IP_);
+
+	trace_kmalloc(_RET_IP_, ret, s-&gt;size, s-&gt;size, flags);
+
+	ret = kasan_kmalloc(s, ret, size, flags);
+
+	return ret;
+}</code></pre>
+<ul>
+<li>“任意大小”内部先换算成 <code>s = kmalloc_slab(size, flags)</code>，也就是用第 3.4 节的 <code>kmalloc_index</code> 查表。<code>ZERO_OR_NULL_PTR(s)</code> 处理 size=0（返回 <code>ZERO_SIZE_PTR</code>，一个非 NULL 但不指向任何内容的哨兵）。</li>
+<li>超过缓存最大尺寸（在没有 CONFIG_SLUB_TINY 等精简选项时约 8~32 KB，取决于 KMALLOC_MAX_CACHE_SIZE）就落到 <code>kmalloc_large()</code>——那是伙伴系统直供的路径，等价于 <code>__get_free_pages()</code>。</li>
+<li><code>kasan_kmalloc()</code> 是 KASAN 影子内存标记；普通内核这里是空函数。</li>
+</ul>
+
+<p>头文件里还有一个“编译期分流”的版本，当大小是编译期常量时直接内联到具体缓存，省掉一次查表：</p>
+<p class="srcline">include/linux/slab.h:538-553  kmalloc</p>
+<pre><code>static __always_inline void *kmalloc(size_t size, gfp_t flags)
+{
+	if (__builtin_constant_p(size)) {
+#ifndef CONFIG_SLOB
+		unsigned int index;
+#endif
+		if (size &gt; KMALLOC_MAX_CACHE_SIZE)
+			return kmalloc_large(size, flags);
+#ifndef CONFIG_SLOB
+		index = kmalloc_index(size);
+
+		if (!index)
+			return ZERO_SIZE_PTR;
+
+		return kmem_cache_alloc_trace(
+				kmalloc_caches[kmalloc_type(flags)][index],
+				flags, size);
+#endif
+	}
+	return __kmalloc(size, flags);
+}</code></pre>
+<p>这里的 <code>kmalloc_caches[kmalloc_type(flags)][index]</code> 是二维数组：第一维按“可回收性/可移动性”分（普通/可回收/DMA），第二维是尺寸等级。<code>kmalloc_type()</code> 根据 <code>__GFP_RECLAIMABLE</code> 选择对应缓存——这就是为什么用 <code>kzalloc</code> 申请的结构和“可回收”缓存分属不同池，在压力下可被 shrinker 回收。</p>
+
+<h3>4.4 释放：kfree</h3>
+<p class="srcline">mm/slub.c:5002-5024  kfree（节选，省略了 trace/hook 与统计细节）</p>
+<pre><code>void kfree(const void *x)
+{
+	struct page *page;
+	void *object = (void *)x;
+
+	trace_kfree(_RET_IP_, x);
+
+	if (unlikely(ZERO_OR_NULL_PTR(x)))
+		return;
+
+	page = virt_to_head_page(x);
+	if (unlikely(!PageSlab(page))) {
+		unsigned int order = compound_order(page);
+
+		BUG_ON(!PageCompound(page));
+		kfree_hook(object);
+		mod_node_page_state(page_pgdat(page), NR_SLAB_UNRECLAIMABLE_B,
+				    -(PAGE_SIZE &lt;&lt; order));
+		__free_pages(page, order);
+		return;
+	}
+	slab_free(page-&gt;slab_cache, page, object, NULL, 1, _RET_IP_);
+}</code></pre>
+<ul>
+<li><code>virt_to_head_page(x)</code>：把对象地址换算成它所在的“首页” <code>struct page</code>（复合页的 head）。这正是 SLUB 元数据放在 <code>struct page</code> 里的好处：一个地址就能找到 slab 状态和所属缓存（<code>page-&gt;slab_cache</code>）。</li>
+<li><code>!PageSlab(page)</code> 分支处理 <code>kmalloc_large</code> 分配：它不是 slab 页，直接 <code>__free_pages()</code> 还给伙伴系统。<code>BUG_ON(!PageCompound)</code> 是防止对普通单页误走这条路径。</li>
+<li>末尾 <code>slab_free(page-&gt;slab_cache, page, object, NULL, 1, ...)</code>：<code>NULL, 1</code> 表示只有一个对象、没有链式批量释放（批量释放接口 <code>kmem_cache_free_bulk</code> 会传链表头和计数）。</li>
+</ul>
+
+<h3>4.5 创建自定义缓存</h3>
+<p class="srcline">mm/slab_common.c:406-412  kmem_cache_create</p>
+<pre><code>kmem_cache_create(const char *name, unsigned int size, unsigned int align,
+		slab_flags_t flags, void (*ctor)(void *))
+{
+	return kmem_cache_create_usercopy(name, size, align, flags, 0, 0,
+					  ctor);
+}</code></pre>
+<p><code>kmem_cache_create</code> 只是转发给 <code>kmem_cache_create_usercopy</code>（后者多支持“哪一段可以被 copy_to_user”）。其下方几百行是真正的校验与创建：计算对齐、合并策略、调用 <code>__kmem_cache_create(s, flags)</code>（<code>mm/slab_common.c:256</code>）建立 SLUB 侧结构，再把它挂进 <code>slab_caches</code> 全局链表。</p>
+<p>对应的销毁 <code>kmem_cache_destroy()</code> 在 <code>mm/slab_common.c:481</code>，有一个非常值得注意的保护：</p>
+<pre><code>	err = shutdown_cache(s);
+	if (err) {
+		pr_err("kmem_cache_destroy %s: Slab cache still has objects\n",
+		       s-&gt;name);
+		dump_stack();
+	}</code></pre>
+<p>也就是说：<strong>如果缓存里还有对象没被释放，销毁会失败并在 dmesg 打印栈</strong>。这是排查驱动泄漏的第一道自动检查——看到这条就说明你的 <code>kmem_cache_free</code> 漏了。</p>
+
+<h3>4.6 /proc/slabinfo 的列</h3>
+<p class="srcline">mm/slab_common.c:913-926  print_slabinfo_header</p>
+<pre><code>static void print_slabinfo_header(struct seq_file *m)
+{
+	/*
+	 * Output format version, so at least we can change it
+	 * without _too_ many complaints.
+	 */
+#ifdef CONFIG_DEBUG_SLAB
+	seq_puts(m, "slabinfo - version: 2.1 (statistics)\n");
+#else
+	seq_puts(m, "slabinfo - version: 2.1\n");
+#endif
+	seq_puts(m, "# name            &lt;active_objs&gt; &lt;num_objs&gt; &lt;objsize&gt; &lt;objperslab&gt; &lt;pagesperslab&gt;");
+	seq_puts(m, " : tunables &lt;limit&gt; &lt;batchcount&gt; &lt;sharedfactor&gt;");
+	seq_puts(m, " : slabdata &lt;active_slabs&gt; &lt;num_slabs&gt; &lt;sharedavail&gt;");</code></pre>
+<p>列为：缓存名、活跃对象数、总对象数、对象间距、每 slab 对象数、每 slab 页数；冒号后是调优参数与 slab 统计。真正计算这些数的是 <code>mm/slub.c:6647</code> 的 <code>get_slabinfo</code>：</p>
+<p class="srcline">mm/slub.c:6647-6667  get_slabinfo</p>
+<pre><code>void get_slabinfo(struct kmem_cache *s, struct slabinfo *sinfo)
+{
+	unsigned long nr_slabs = 0;
+	unsigned long nr_objs = 0;
+	unsigned long nr_free = 0;
+	int node;
+	struct kmem_cache_node *n;
+
+	for_each_kmem_cache_node(s, node, n) {
+		nr_slabs += node_nr_slabs(n);
+		nr_objs += node_nr_objs(n);
+		nr_free += count_partial(n, count_free);
+	}
+
+	sinfo-&gt;active_objs = nr_objs - nr_free;
+	sinfo-&gt;num_objs = nr_objs;
+	sinfo-&gt;active_slabs = nr_slabs;
+	sinfo-&gt;num_slabs = nr_slabs;
+	sinfo-&gt;objects_per_slab = oo_objects(s-&gt;oo);
+	sinfo-&gt;cache_order = oo_order(s-&gt;oo);
+}</code></pre>
+<p>注意：它只看节点级 partial 链表上的空闲对象，<strong>不统计每 CPU freelist 上的空闲对象</strong>——所以 <code>active_objs</code> 会略高于真实值（每个 CPU 的本地空闲不参与计数），这是 SLUB 的已知近似。对比 <code>slabinfo</code> 前后两次差值的技巧就是：只在 CPU 不动时可信，或者用 <code>/sys/kernel/slab/&lt;name&gt;/objects</code>（更精确）。</p>
+
+<h3>4.7 排查泄漏</h3>
+<p><code>/proc/slabinfo</code> 持续增长的 <code>active_objs</code> 是泄漏的一个信号，但不能确定是谁。<code>slub_debug=U</code> 后再 <code>cat /sys/kernel/slab/&lt;cache&gt;/alloc_calls</code> 可以看到每个分配点的数量。更系统的方法是 <span class="term">kmemleak</span>：它周期扫描内存、标记被引用可达的对象，未被引用的 slab 分配会被记录并打印栈：</p>
+<pre><code># 内核 cmdline 加 kmemleak=on（或 /sys/kernel/debug/kmemleak 可写）
+$ echo scan &gt; /sys/kernel/debug/kmemleak
+$ cat /sys/kernel/debug/kmemleak
+unreferenced object 0xffff88810a… (size 512):
+  comm "insmod", pid 1234
+  backtrace:
+    [&lt;ffffffff81a1b2c3&gt;] kzalloc
+    [&lt;ffffffffc0a01020&gt;] mydrv_probe
+</code></pre>
+<p>kmemleak 的开销不小（约 10-20% 性能损失），只适合开发与排障阶段。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看 slubinux 的全景</h3>
+<pre><code>$ sudo cat /proc/slabinfo | head -20
+slabinfo - version: 2.1
+# name            &lt;active_objs&gt; &lt;num_objs&gt; &lt;objsize&gt; &lt;objperslab&gt; &lt;pagesperslab&gt; : tunables ...
+dentry                 ／ ... 12345  13000  192  21  1 : tunables ...
+inode_cache            ...
+kmalloc-8              ...
+kmalloc-96             ...
+kmalloc-1k             ...
+filp                   ...
+task_struct            ...
+</code></pre>
+<p>读法：<code>objsize=192</code>、<code>objperslab=21</code> 意味着每个 slab（通常 1 页 4 KB）切出 21 个 192 字节对象；21×192 ≈ 4032，剩下的是对齐/元数据。<code>active_objs / num_objs</code> 就是“占用率”，把两次采样相减能看出哪类缓存持续涨。</p>
+
+<h3>5.2 观察某个缓存的实时状态</h3>
+<pre><code>$ ls /sys/kernel/slab/ | head -20
+$ cat /sys/kernel/slab/kmalloc-128/objects
+$ cat /sys/kernel/slab/kmalloc-128/object_size
+$ cat /sys/kernel/slab/kmalloc-128/slabs
+$ cat /sys/kernel/slab/kmalloc-128/aliases        # 被合并的缓存名
+</code></pre>
+<p><code>/sys/kernel/slab/&lt;name&gt;/</code> 暴露每个缓存的内部参数（只读），包括 <code>cpu_slabs</code>、<code>objects_partial</code>、<code>slabs_cpu_partial</code> 等。<code>alloc_fastpath</code>、<code>alloc_slowpath</code>（若开启 SLUB_STATS）直接告诉你快/慢路径比例。</p>
+
+<h3>5.3 触发缓存增长与回收</h3>
+<pre><code>$ free -m | grep Mem
+$ sudo dd if=/dev/zero of=/tmp/bigfile bs=1M count=500
+$ cat /proc/slabinfo | grep -E "dentry|inode|kmalloc-|ext4|buffer"
+$ sync &amp;&amp; echo 2 &gt; /proc/sys/vm/drop_caches     # 只回收 slab
+$ cat /proc/slabinfo | grep -E "dentry|inode|kmalloc-|ext4|buffer"
+</code></pre>
+<p>创建 500 MB 文件后，ext4 会为大量对 extent/buffer_head 分配对象，<code>dentry</code>/<code>inode_cache</code> 也会有波动。<code>echo 2</code> 触发 slab shrinker 回收可回收缓存（例如 dentry），<code>active_objs</code> 会明显下降；而 <code>kmalloc-*</code> 里由驱动占着的不会被回收。</p>
+
+<h3>5.4 用 bpftrace 观察 kmalloc 大小分布（可选）</h3>
+<pre><code>$ sudo bpftrace -e 'tracepoint:kmalloc:kmalloc { @bytes[args-&gt;bytes_req]++;
+                                 }'
+</code></pre>
+<p>运行几秒后 <code>Ctrl-C</code>，会看到一张“请求大小直方图”；对比 <code>args-&gt;bytes_req</code> 与 <code>args-&gt;bytes_alloc</code> 就能看到每次浪费了多少。如果只装了 trace-cmd，对应的是 <code>trace-cmd record -e kmalloc</code>。</p>
+
+<h3>5.5 验证 slub_debug 的效果</h3>
+<pre><code># 在 qemu 里加启动参数：slub_debug=FZPU
+$ grep -i "slub" /proc/cmdline
+$ cat /proc/slabinfo | head -5          # 会看到 version 2.1 (statistics)
+$ cat /sys/kernel/slab/dentry/red_zone
+$ cat /sys/kernel/slab/dentry/poison
+</code></pre>
+<p>开启后 <code>objsize</code> 会变大（红区和跟踪信息占了空间），<code>/sys/kernel/slab/&lt;name&gt;/red_zone</code> 会显示 1。故意写一个用例：<code>kmalloc(200)</code> 后写到 ptr[201] —— 因为那块是 192 字节的槽位，tail padding 被红区覆盖，随后 <code>check_object()</code> 会在 dmesg 里报 “Object padding overwritten”。</p>
+
+<h3>5.6 用 kmemleak 找自己的驱动泄漏（qemu 可选）</h3>
+<pre><code>$ sudo echo "kernel.kptr_restrict=0" &gt;/dev/null 2&gt;&amp;1
+$ mount -t debugfs none /sys/kernel/debug
+$ echo scan=on &gt; /sys/kernel/debug/kmemleak
+# 加载你的模块，制造“申请后忘释放”的路径
+$ echo scan &gt; /sys/kernel/debug/kmemleak
+$ cat /sys/kernel/debug/kmemleak
+</code></pre>
+<p>如果看不到你的栈，先确认内核编了 <code>CONFIG_DEBUG_KMEMLEAK=y</code>，并且在 cmdline 里加了 <code>kmemleak=on</code>。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 既然伙伴系统已经能分配页，为什么还要 slab？</b>直接向伙伴系统要页的问题是：①每次申请都要动 zone 锁、可能触发合并/分裂，对小对象来说太慢；②每个对象的头部/尾部会浪费大量空间；③不同类型对象混在同一页里会互相干扰（释放一个对象不代表能还页）。slab 一次要一大块页，切成固定槽位，之后分配只是链表操作；也能保证同一 slab 里的对象类型一致，便于回收和调试。</div>
+<div class="qa"><b>Q2. SLUB 的 freelist 指针存在哪里？为什么不需要额外内存？</b>存在空闲对象<strong>自身内部</strong>——也就是对象被释放后，那个槽位的第一段（偏移 <code>s-&gt;offset</code>，通常是 0）被用来存“下一个空闲对象的地址”。既然对象此刻没人用，这块空间正好是空闲的，所以零额外开销。当你分配得到它时，这个指针已被读走并用于更新 freelist，对象内部就干净可用了。</div>
+<div class="qa"><b>Q3. <code>kmalloc(100)</code> 实际从哪个缓存拿内存？会不会浪费？</b>会走 <code>kmalloc-128</code>（因为在 65~96 之外，最近的上界 128）。<code>kmalloc_index(100)</code> 返回 7，对应 <code>kmalloc_caches[...][7]</code>。浪费的 28 字节是分级缓存的必然代价，换来的是“不用为每个大小都建一个缓存”，也保证了同尺寸对象能在同一个 slab 里紧密排列。</div>
+<div class="qa"><b>Q4. <code>/proc/slabinfo</code> 显示 active_objs 持续增长，就一定是泄漏吗？</b>不一定。缓存可能只是被长期占用（例如 dnentries 作为负缓存保留、网络 socket 处于 TIME_WAIT 仍未释放），也可能是 per-CPU freelist 未被统计导致的偏移。要确认泄漏，应观察多轮、多时间点是否单调增长，并结合 <code>/sys/kernel/slab/&lt;cache&gt;/objects</code>、<code>slub_debug=U</code> 的 <code>alloc_calls</code> 或 kmemleak 的调用栈来判断“代码路径是否真的丢掉了指针”。</div>
+<div class="qa"><b>Q5. 为什么说 <code>kmem_cache_destroy()</code> 里的 “Slab cache still has objects” 是很重要的诊断？</b>它意味着缓存里还有对象没有被归还（引用计数不为 0），销毁会失败并 dump_stack。这通常意味着你的驱动/子系统在某条路径上漏了 <code>kmem_cache_free</code>，或者对象仍被别处引用。相比“悄悄销毁然后内存泄漏”，这个错误至少能让你在卸载模块时立刻知道。</div>
+
+<footer>
+  <p>上一篇：<a href="14-buddy.html">14-buddy 伙伴系统</a> · 下一篇：<a href="16-page-table.html">16-page-table 页表与缺页异常</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

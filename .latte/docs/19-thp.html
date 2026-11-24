@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 · 透明大页 THP：把 512 个页表项压成一个</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="20-vfs.html">下一篇：VFS：一切皆文件 →</a>
+</nav>
+
+<h1>📦 透明大页 THP：把 512 个页表项压成一个</h1>
+<p class="subtitle">用 2 MB 的"整块"映射换掉 512 次翻译，既省页表内存又省 TLB 压力，代价是内存放大和难预测的延迟抖动 · 预计阅读 42 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>先说清楚大页要解决的两个瓶颈。第 16 篇讲过，x86-64 的页表是四级的：一个进程的地址空间如果铺满 128 TB，光 PTE 那一级就要 128 TB / 4 KB = 340 亿个表项，按每项 8 字节算是 2.7 TB——当然实际用不到那么多，但只要程序碰过的地址是分散的，页表项的数量就会接近"碰过的页数"。每个页表项 8 字节，而它映射的页只有 4 KB 有效数据，<b>页表本身比数据还稠密</b>。</p>
+<p>第二个瓶颈在 CPU 内部。CPU 里有个叫 <span class="term">TLB</span>（Translation Lookaside Buffer）的缓存，专门存"最近用过的地址翻译结果"。它很快，但<b>很小</b>——典型只有 1536~2048 项。如果一个程序的工作集是 4 MB（1024 个 4 KB 页），TLB 装得下；但如果是 64 MB（16384 个页），就装不下了。装不下意味着<b>TLB miss</b>，CPU 必须去内存里查页表（四次访存），这比去数据缓存里拿数据慢得多。数据库、内存索引这类要扫大量内存的程序，TLB miss 就是致命的。</p>
+<p>大页的思路非常直接：<b>既然 4 KB 太小，那就用 2 MB 的页</b>。2 MB = 512 个 4 KB 页。一个 PMD 表项就能覆盖整整 2 MB，于是：页表项数量<b>除以 512</b>，TLB 里能缓存的映射范围<b>扩大 512 倍</b>。这就是"大页"这个名字的全部含义。</p>
+<p>那怎么用大页？Linux 有两条路子，区别很大：</p>
+<ul>
+  <li><b>hugetlbfs（显式大页）</b>：你必须<b>事先申请</b>一大块（通常是 2 MB 或 1 GB）常驻物理内存，挂到一个特殊文件系统上，然后 <code>mmap()</code> 它。申请的页在启动时就被预留，不能被回收。你能精确控制"哪段地址用大页"，代价是要自己规划。</li>
+  <li><b>THP（透明大页）</b>：<b>不需要你申请</b>。内核在普通的匿名内存缺页时，如果发现这个区域"适合大页"，就直接分配一个 2 MB 的大页来满足它；已经存在的小页，也可以被后台线程 khugepaged 合并成大页。所谓"透明"，就是<b>应用程序完全无感</b>——同一份代码，不需要改一行就能受益。</li>
+</ul>
+<p>THP 的代价也很实在：<b>①内存放大</b>——你要 4 KB，内核可能给你 2 MB，剩下的 2 MB - 4 KB 被浪费（浪费的部分还是零页，但地址空间和 memcg 记账会按 2 MB 算）；<b>②延迟抖动</b>——分配 2 MB 需要一次 order-9 的连续内存分配，可能触发直接内存回收和内存整理，产生几百毫秒的停顿；<b>③拆分</b>——如果程序只碰了其中一个 4 KB 页，内核还得把这个大页拆回小页（<code>__split_huge_pmd()</code>），拆分的瞬间也会有延迟尖峰。本文会把这些代价的成因逐一对应到源码。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">大页</td><td>huge page / large page</td><td>比基础页（4 KB）大得多的内存映射单位；x86-64 上 THP 是 2 MB，hugetlbfs 可到 1 GB。</td></tr>
+  <tr><td class="term">基础页</td><td>base page</td><td>普通页，本篇指 4 KB（<code>PAGE_SIZE</code>）。</td></tr>
+  <tr><td class="term">THP</td><td>Transparent HugePages</td><td>透明大页：内核自动把匿名内存用 2 MB 粒度映射，应用程序无需配合。</td></tr>
+  <tr><td class="term">hugetlbfs</td><td>—</td><td>显式大页文件系统；大页需要事先申请（<code>hugetlbfs</code> 挂载 / <code>NR_HugePages</code> 预留）。</td></tr>
+  <tr><td class="term">PMD</td><td>Page Middle Directory</td><td>页表第 3 级；大页就装在 PMD 这一级（5.10 的 THP 是 PMD 级，即 2 MB）。</td></tr>
+  <tr><td class="term">复合页</td><td>compound page</td><td>物理上连续、逻辑上被当作一个单位管理的 <code>struct page</code>；大页是一个 head page 加 511 个 tail page。</td></tr>
+  <tr><td class="term">khugepaged</td><td>—</td><td>后台内核线程，负责把已经存在的小页合并成大页（collapse）。</td></tr>
+  <tr><td class="term">collapse</td><td>—</td><td>把小页合并成大页：申请一块 2 MB 连续内存、拷内容、改页表项。</td></tr>
+  <tr><td class="term">split</td><td>—</td><td>把大页拆成小页（<code>__split_huge_pmd()</code>）；内容不丢，只是页表项变细。</td></tr>
+  <tr><td class="term">VM_HUGEPAGE</td><td>—</td><td>VMA 标志，表示"这块内存希望用大页"；由 <code>madvise(MADV_HUGEPAGE)</code> 设置。</td></tr>
+  <tr><td class="term">MADV_HUGEPAGE</td><td>—</td><td><code>madvise()</code> 的建议值，标记 VMA 允许（并期望）使用 THP。</td></tr>
+  <tr><td class="term">enabled 开关</td><td>transparent_hugepage/enabled</td><td>系统级 THP 策略：<code>always</code> / <code>madvise</code> / <code>never</code>。</td></tr>
+  <tr><td class="term">defrag 开关</td><td>transparent_hugepage/defrag</td><td>遇到内存碎片时是否同步做内存整理来凑出 2 MB 连续空间。</td></tr>
+  <tr><td class="term">内存放大</td><td>memory bloat</td><td>THP 用 2 MB 满足 4 KB 的需求，多出来的空间被"占着"却没用。</td></tr>
+  <tr><td class="term">AnonHugePages</td><td>—</td><td><code>/proc/meminfo</code> 与 <code>/proc/[pid]/smaps</code> 中报告匿名 THP 用量的字段。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 4 KB 映射 vs 2 MB 映射</h3>
+<pre><code>  4 KB 页（普通映射）                        2 MB 大页（THP）
+
+  PUD -&gt; PMD -&gt; PTE -&gt; 页                     PUD -&gt; PMD(=大页) -&gt; 页
+                    +------+                                  +--------+
+   PTE[0]  --------&gt;| 页 0 |                 PMD(PSE)  --------&gt;| 页 0  |
+   PTE[1]  --------&gt;| 页 1 |                                  | 页 1  |
+   PTE[2]  --------&gt;| 页 2 |                                  | 页 2  |
+     ...            |  ... |                                  |  ...  |
+   PTE[511]--------&gt;|页511 |                                  | 页 511|
+                    +------+                                  +--------+
+
+  映射 2 MB 需要：512 个 PTE (+ 1 个 PMD)      映射 2 MB 需要：1 个 PMD
+  TLB 占 512 项                                TLB 占 1 项
+  页表内存：512*8 = 4 KB                       页表内存：8 字节（+PMD 4KB 页）
+</code></pre>
+<p>收益一目了然：<b>页表项少 512 倍，TLB 压力小 512 倍</b>。代价是<b>粒度变粗</b>——只要用到大页里的任何一个字节，整个 2 MB 都被占着。</p>
+
+<h3>3.2 THP 的三条落地路径</h3>
+<pre><code>  【路径 A：缺页时直接分配大页】
+     程序第一次碰匿名内存 -&gt; 缺页异常
+        -&gt; __handle_mm_fault() 发现 PMD 是空的
+        -&gt; create_huge_pmd()  (mm/memory.c)
+        -&gt; do_huge_pmd_anonymous_page()  (mm/huge_memory.c)
+        -&gt; 分配一个 order-9 复合页，清零，装进 PMD
+
+  【路径 B：后台合并（khugepaged）】
+     程序已经用小页跑了一阵 -&gt; khugepaged 定期扫描
+        -&gt; 发现某个 VMA 里有一片连续的、够 2 MB 的小页
+        -&gt; collapse_huge_page()
+        -&gt; 申请 2 MB 连续内存 -&gt; 拷贝内容 -&gt; 换成 PMD 映射
+
+  【路径 C：按需建议（MADV_HUGEPAGE）】
+     程序调用 madvise(addr, len, MADV_HUGEPAGE)
+        -&gt; VMA 打上 VM_HUGEPAGE 标记
+        -&gt; khugepaged 把这个 mm 登记进扫描名单
+        -&gt; 之后走路径 A 或路径 B
+</code></pre>
+<p>路径 A 是"生下来就是大页"，路径 B 是"长大变成大页"，路径 C 是"给路径 A/B 开个许可证"。</p>
+
+<h3>3.3 三种系统级策略</h3>
+<pre><code>  /sys/kernel/mm/transparent_hugepage/enabled
+
+  always    : 所有合适的匿名 VMA 都用大页
+  madvise  : 只有打了 VM_HUGEPAGE 标记的 VMA 才用大页  &lt;-- 很多发行版的默认值
+  never     : 完全禁用 THP（退回到全部 4 KB）
+</code></pre>
+<p><code>madvise</code> 是最常用的折中：默认不打扰所有程序，需要大页的应用自己用 <code>madvise()</code> 申请。Debian/Ubuntu 历史上因为 THP 的延迟抖动问题，一度默认设成 <code>madvise</code>；而 RHEL/CentOS 系的 <code>transparent_hugepage=never</code> 曾经是默认，理由同样是数据库场景下的尾延迟问题。</p>
+
+<h3>3.4 大页 vs hugetlbfs</h3>
+<table>
+  <tr><th>对比项</th><th>THP（透明大页）</th><th>hugetlbfs（显式大页）</th></tr>
+  <tr><td>谁决定用哪块</td><td>内核自动挑（可以 madvise 建议）</td><td>用户明确申请哪一块</td></tr>
+  <tr><td>物理内存来源</td><td>普通 buddy 页临时拼成 order-9</td><td>启动时预留的 hugepage 池</td></tr>
+  <tr><td>内存是否常驻</td><td>否——用完可被回收</td><td>是——预留后不能被回收</td></tr>
+  <tr><td>延迟抖动</td><td>有（分配 2 MB 连续块、拆分大页）</td><td>几乎没有（内存早就预留好了）</td></tr>
+  <tr><td>内存放大</td><td>有</td><td>无（要用多少申请多少）</td></tr>
+  <tr><td>典型用途</td><td>通用、零改造</td><td>数据库（Oracle/PostgreSQL）追求稳定尾延迟</td></tr>
+  <tr><td>配置方式</td><td><code>/sys/kernel/mm/transparent_hugepage/*</code></td><td><code>/proc/sys/vm/nr_hugepages</code> + 挂载 hugetlbfs</td></tr>
+</table>
+
+<h3>3.5 THP 的三种开销，对应到源码</h3>
+<pre><code>  ① 内存放大
+     用户要 4 KB，内核给 2 MB
+     -&gt; add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR)  按 2 MB 记账
+     -&gt; RSS 里显示 2 MB，实际用 4 KB
+     -&gt; memcg 限额也按 2 MB 扣
+
+  ② 分配延迟（"延迟抖动"的根源）
+     alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER)
+     -&gt; order-9 = 2 MB 连续
+     -&gt; buddy 系统里没有 2 MB 连续块？
+        -&gt; 触发 direct reclaim + compaction（内存整理）
+        -&gt; 可能几百毫秒的停顿
+     -&gt; /sys/kernel/mm/transparent_hugepage/defrag 控制要不要同步整理
+
+  ③ 拆分延迟
+     程序只碰了 2 MB 里的一个 4 KB 页
+     -&gt; __split_huge_pmd() 把大页拆成 512 个 PTE
+     -&gt; 内容不丢（复用同一批复合页），但页表操作变多
+     -&gt; 拆分点附近会出现延迟尖峰
+</code></pre>
+<p>这就是为什么很多数据库会明确把 THP 关掉或设成 <code>madvise</code>：<b>它们宁可自己用 hugetlbfs 精确管理大页，也不要被内核"惊喜"地塞一个 order-9 分配</b>。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 大页的尺寸常量</h3>
+<p class="srcline">include/linux/huge_mm.h:112-118  HPAGE_PMD_ORDER / HPAGE_PMD_NR</p>
+<pre><code>#define HPAGE_PMD_ORDER (HPAGE_PMD_SHIFT-PAGE_SHIFT)
+#define HPAGE_PMD_NR (1&lt;&lt;HPAGE_PMD_ORDER)
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define HPAGE_PMD_SHIFT PMD_SHIFT
+#define HPAGE_PMD_SIZE	((1UL) &lt;&lt; HPAGE_PMD_SHIFT)
+#define HPAGE_PMD_MASK	(~(HPAGE_PMD_SIZE - 1))
+</code></pre>
+<p><code>HPAGE_PMD_SHIFT</code> 就是 <code>PMD_SHIFT</code>（第 16 篇讲过是 21），所以 <code>HPAGE_PMD_SIZE = 2 MB</code>。<code>HPAGE_PMD_ORDER = 21 - 12 = 9</code>，是伙伴系统的阶数——<b>order-9 意味着 2 MB 连续物理内存</b>，这正是"大页分配可能触发内存整理"的根源。<code>HPAGE_PMD_NR = 512</code>，是一个大页包含的基础页数量。</p>
+
+<h3>4.2 缺页路径的入口：<code>create_huge_pmd()</code></h3>
+<p>第 16 篇讲过，<code>__handle_mm_fault()</code> 在 PMD 为空时会尝试走大页路径：</p>
+<p class="srcline">mm/memory.c:4404-4412  create_huge_pmd</p>
+<pre><code>static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf)
+{
+	if (vma_is_anonymous(vmf-&gt;vma) /* 检查是否为匿名VMA */)
+		return do_huge_pmd_anonymous_page(vmf);
+	if (vmf-&gt;vma-&gt;vm_ops-&gt;huge_fault)
+		return vmf-&gt;vma-&gt;vm_ops-&gt;huge_fault(vmf, PE_SIZE_PMD);
+	return VM_FAULT_FALLBACK;
+}
+</code></pre>
+<p>三个出口：<b>①</b> 匿名 VMA → <code>do_huge_pmd_anonymous_page()</code>（THP 的主路径）；<b>②</b> 有 <code>vm_ops-&gt;huge_fault</code> 的 VMA（典型是 shmem/文件映射）→ 交给文件系统处理；<b>③</b> 都不行 → <code>VM_FAULT_FALLBACK</code>，<b>退回普通 4 KB 路径</b>。<b>"能退回去"是 THP 的基本礼貌</b>——大页是优化，不是承诺。</p>
+
+<h3>4.3 <code>do_huge_pmd_anonymous_page()</code>：检查与分配</h3>
+<p class="srcline">mm/huge_memory.c:695-716  do_huge_pmd_anonymous_page</p>
+<pre><code>vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf-&gt;vma;
+	gfp_t gfp;
+	struct page *page;
+	unsigned long haddr = vmf-&gt;address &amp; HPAGE_PMD_MASK;
+
+	if (!transhuge_vma_suitable(vma, haddr))
+		return VM_FAULT_FALLBACK;
+	if (unlikely(anon_vma_prepare(vma)))
+		return VM_FAULT_OOM;
+	if (unlikely(khugepaged_enter(vma, vma-&gt;vm_flags)))
+		return VM_FAULT_OOM;
+	if (!(vmf-&gt;flags &amp; FAULT_FLAG_WRITE) &amp;&amp;
+			!mm_forbids_zeropage(vma-&gt;vm_mm) &amp;&amp;
+			transparent_hugepage_use_zero_page()) {
+		pgtable_t pgtable;
+		struct page *zero_page;
+		vm_fault_t ret;
+		pgtable = pte_alloc_one(vma-&gt;vm_mm);
+		if (unlikely(!pgtable))
+			return VM_FAULT_OOM;
+</code></pre>
+<p>三个前置检查：<code>transhuge_vma_suitable()</code>（VMA 够不够大、地址对齐不对不对）、<code>anon_vma_prepare()</code>（准备反向映射）、<code>khugepaged_enter()</code>（把这个 mm 登记给 khugepaged）。然后是一个<b>优化分支</b>：如果只是<b>读</b>一个大页，而且内核允许用"全零大页"，那就不分配 2 MB 物理内存，直接把 PMD 指向一个共享的零页——<b>零页的内容本来就是 0，而新分配的匿名内存也要求是 0</b>，语义完全等价，却省掉了 2 MB 的分配。</p>
+
+<p class="srcline">mm/huge_memory.c:746-754  do_huge_pmd_anonymous_page（真正分配）</p>
+<pre><code>	gfp = alloc_hugepage_direct_gfpmask(vma);
+	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+	if (unlikely(!page)) {
+		count_vm_event(THP_FAULT_FALLBACK);
+		return VM_FAULT_FALLBACK;
+	}
+	prep_transhuge_page(page);
+	return __do_huge_pmd_anonymous_page(vmf, page, gfp);
+}
+</code></pre>
+<p><code>alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER)</code> 就是那次 order-9 分配——<b>THP 延迟抖动的主要来源就在这一行</b>。<code>alloc_hugepage_direct_gfpmask()</code> 会根据 <code>defrag</code> 开关和 VMA 是否有 <code>VM_HUGEPAGE</code> 标记，决定 GFP 标志里带不带 <code>__GFP_DIRECT_RECLAIM</code>（允许直接回收）和 <code>__GFP_COMP</code>（允许同步内存整理）。分配失败就 <code>VM_FAULT_FALLBACK</code> 退回 4 KB 路径——<b>所以 THP 永远不该把系统卡死</b>。</p>
+
+<h3>4.4 <code>__do_huge_pmd_anonymous_page()</code>：把大页装进 PMD</h3>
+<p class="srcline">mm/huge_memory.c:619-632  __do_huge_pmd_anonymous_page</p>
+<pre><code>		entry = mk_huge_pmd(page, vma-&gt;vm_page_prot);
+		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+		page_add_new_anon_rmap(page, vma, haddr, true);
+		lru_cache_add_inactive_or_unevictable(page, vma);
+		pgtable_trans_huge_deposit(vma-&gt;vm_mm, vmf-&gt;pmd, pgtable);
+		set_pmd_at(vma-&gt;vm_mm, haddr, vmf-&gt;pmd, entry);
+		add_mm_counter(vma-&gt;vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
+		mm_inc_nr_ptes(vma-&gt;vm_mm);
+		spin_unlock(vmf-&gt;ptl);
+		count_vm_event(THP_FAULT_ALLOC);
+		count_memcg_event_mm(vma-&gt;vm_mm, THP_FAULT_ALLOC);
+	}
+</code></pre>
+<p>逐行看：<code>mk_huge_pmd()</code> 造出 PMD 表项（带 PSE 位，指向复合页的 head page）；<code>page_add_new_anon_rmap()</code> 建立反向映射（第 16 篇讲的 <code>anon_vma</code> 机制）；<code>lru_cache_add_inactive_or_unevictable()</code> 把大页挂进 LRU 链表（第 18 篇）；<code>set_pmd_at()</code> 真正写进页表；最后 <code>add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR)</code> <b>按 512 个基础页记账</b>——<b>这就是内存放大的账本</b>：你只要了 4 KB，RSS 和 memcg 配额都按 2 MB 算。</p>
+
+<h3>4.5 <code>__split_huge_pmd()</code>：把大页拆回小页</h3>
+<p>当程序只碰了 2 MB 里的一个 4 KB 页，或者 VMA 的边界不在 2 MB 对齐位置，内核就必须拆页。</p>
+<p class="srcline">mm/huge_memory.c:2211-2237  __split_huge_pmd</p>
+<pre><code>repeat:
+	if (pmd_trans_huge(*pmd)) {
+		if (!page) {
+			page = pmd_page(*pmd);
+			if (unlikely(!trylock_page(page))) {
+				get_page(page);
+				_pmd = *pmd;
+				spin_unlock(ptl);
+				lock_page(page);
+				spin_lock(ptl);
+				if (unlikely(!pmd_same(*pmd, _pmd))) {
+					unlock_page(page);
+					put_page(page);
+					page = NULL;
+					goto repeat;
+				}
+				put_page(page);
+			}
+		}
+		if (PageMlocked(page))
+			clear_page_mlock(page);
+	} else if (!(pmd_devmap(*pmd) || is_pmd_migration_entry(*pmd)))
+		goto out;
+	__split_huge_pmd_locked(vma, pmd, range.start, freeze);
+out:
+	spin_unlock(ptl);
+</code></pre>
+<p><code>trylock_page()</code> 是<b>并发保护</b>：如果别的 CPU 正拿着这个大页（比如正在拆分或正在回收），就退出去拿阻塞锁，拿到后必须用 <code>pmd_same()</code> 复查页表项有没有被别人改过——这是典型的"读-改-写"竞态处理。</p>
+
+<p>真正拆页的代码在 <code>__split_huge_pmd_locked()</code> 里：</p>
+<p class="srcline">mm/huge_memory.c:2113-2149  __split_huge_pmd_locked</p>
+<pre><code>	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+	pmd_populate(mm, &amp;_pmd, pgtable);
+
+	for (i = 0, addr = haddr; i &lt; HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
+		pte_t entry, *pte;
+		/*
+		 * Note that NUMA hinting access restrictions are not
+		 * transferred to avoid any possibility of altering
+		 * permissions across VMAs.
+		 */
+		if (freeze || pmd_migration) {
+			swp_entry_t swp_entry;
+			swp_entry = make_migration_entry(page + i, write);
+			entry = swp_entry_to_pte(swp_entry);
+			if (soft_dirty)
+				entry = pte_swp_mksoft_dirty(entry);
+			if (uffd_wp)
+				entry = pte_swp_mkuffd_wp(entry);
+		} else {
+			entry = mk_pte(page + i, READ_ONCE(vma-&gt;vm_page_prot));
+			entry = maybe_mkwrite(entry, vma);
+			if (!write)
+				entry = pte_wrprotect(entry);
+			if (!young)
+				entry = pte_mkold(entry);
+			if (soft_dirty)
+				entry = pte_swp_mksoft_dirty(entry);
+			if (uffd_wp)
+				entry = pte_swp_mkuffd_wp(entry);
+		}
+		pte = pte_offset_map(&amp;_pmd, addr);
+		BUG_ON(!pte_none(*pte));
+		set_pte_at(mm, addr, pte, entry);
+		if (!pmd_migration)
+			atomic_inc(&amp;page[i]._mapcount);
+		pte_unmap(pte);
+	}
+</code></pre>
+<p><b>关键证据在 <code>mk_pte(page + i, ...)</code> 这个 <code>page + i</code></b>：拆出来的 512 个 PTE <b>指向的还是原来那个复合页里的第 i 个子页</b>，<b>一个字节都没有复制，物理内存也没变</b>。5.10 的拆分只做两件事：把 PMD 表项撤下来（<code>pgtable_trans_huge_withdraw</code>），换成一张普通的 PTE 表（<code>pmd_populate</code>），然后逐个填 PTE。<b>所以"拆分"本身并不慢</b>——慢的是拆分前后的其他动作（比如为了对齐而把整个 VMA 重新布局）。</p>
+
+<h3>4.6 <code>hugepage_vma_check()</code>：谁有资格用大页</h3>
+<p class="srcline">mm/khugepaged.c:440-461  hugepage_vma_check</p>
+<pre><code>static bool hugepage_vma_check(struct vm_area_struct *vma,
+			       unsigned long vm_flags)
+{
+	if ((!(vm_flags &amp; VM_HUGEPAGE) &amp;&amp; !khugepaged_always()) ||
+	    (vm_flags &amp; VM_NOHUGEPAGE) ||
+	    test_bit(MMF_DISABLE_THP, &amp;vma-&gt;vm_mm-&gt;flags))
+		return false;
+
+	if (shmem_file(vma-&gt;vm_file) ||
+	    (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) &amp;&amp;
+	     vma-&gt;vm_file &amp;&amp;
+	     (vm_flags &amp; VM_DENYWRITE))) {
+		return IS_ALIGNED((vma-&gt;vm_start &gt;&gt; PAGE_SHIFT) - vma-&gt;vm_pgoff,
+				HPAGE_PMD_NR);
+	}
+	if (!vma-&gt;anon_vma || vma-&gt;vm_ops)
+		return false;
+	if (vma_is_temporary_stack(vma))
+		return false;
+	return !(vm_flags &amp; VM_NO_KHUGEPAGED);
+}
+</code></pre>
+<p>逐条读这四个"否决项"：<b>①</b> 既没有 <code>VM_HUGEPAGE</code> 标记、系统又不是 <code>always</code> 模式 → 不行（这就是 <code>madvise</code> 模式的实现）；<b>②</b> 有 <code>VM_NOHUGEPAGE</code> 标记 → 不行（<code>MADV_NOHUGEPAGE</code> 可以给某块内存单独禁用）；<b>③</b> <code>!vma-&gt;anon_vma || vma-&gt;vm_ops</code> → 不行（有 <code>vm_ops</code> 说明是有文件系统后备的映射，5.10 的 THP 只支持匿名内存和共享内存）；<b>④</b> 临时栈 → 不行。</p>
+<p>而 <code>VM_HUGEPAGE</code> 标记本身是这样设置和判断的：</p>
+<p class="srcline">include/linux/huge_mm.h:130-157  __transparent_hugepage_enabled</p>
+<pre><code>static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma)
+{
+	if (vma-&gt;vm_flags &amp; VM_NOHUGEPAGE)
+		return false;
+
+	if (vma_is_temporary_stack(vma))
+		return false;
+
+	if (test_bit(MMF_DISABLE_THP, &vma-&gt;vm_mm-&gt;flags))
+		return false;
+
+	if (transparent_hugepage_flags &amp; (1 &lt;&lt; TRANSPARENT_HUGEPAGE_FLAG))
+		return true;
+	/*
+	 * For dax vmas, try to always use hugepage mappings. If the kernel does
+	 * not support hugepages, fsdax mappings will fallback to PAGE_SIZE
+	 * mappings, and device-dax namespaces, that try to guarantee a given
+	 * mapping size, will fail to enable
+	 */
+	if (vma_is_dax(vma))
+		return true;
+
+	if (transparent_hugepage_flags &amp;
+				(1 &lt;&lt; TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG))
+		return !!(vma-&gt;vm_flags &amp; VM_HUGEPAGE);
+
+	return false;
+}
+</code></pre>
+<p>三个 <code>if</code> 依次对应系统级开关：<code>always</code>（<code>TRANSPARENT_HUGEPAGE_FLAG</code>）→ 直接返回 true；<code>madvise</code>（<code>TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG</code>）→ 看 VMA 有没有 <code>VM_HUGEPAGE</code> 标记；都不满足（<code>never</code>）→ 返回 false。</p>
+
+<h3>4.7 <code>madvise(MADV_HUGEPAGE)</code>：给某块内存开许可证</h3>
+<p class="srcline">mm/khugepaged.c:345-382  hugepage_madvise</p>
+<pre><code>int hugepage_madvise(struct vm_area_struct *vma,
+		     unsigned long *vm_flags, int advice)
+{
+	switch (advice) {
+	case MADV_HUGEPAGE:
+#ifdef CONFIG_S390
+		/*
+		 * qemu blindly sets MADV_HUGEPAGE on all allocations, but s390
+		 * can't handle this properly after s390_enable_sie, so we simply
+		 * ignore the madvise to prevent qemu from causing a SIGSEGV.
+		 */
+		if (mm_has_pgste(vma-&gt;vm_mm))
+			return 0;
+#endif
+		*vm_flags &amp;= ~VM_NOHUGEPAGE;
+		*vm_flags |= VM_HUGEPAGE;
+		/*
+		 * If the vma become good for khugepaged to scan,
+		 * register it here without waiting a page fault that
+		 * may not happen any time soon.
+		 */
+		if (!(*vm_flags &amp; VM_NO_KHUGEPAGED) &amp;&amp;
+				khugepaged_enter_vma_merge(vma, *vm_flags))
+			return -ENOMEM;
+		break;
+	case MADV_NOHUGEPAGE:
+		*vm_flags &amp;= ~VM_HUGEPAGE;
+		*vm_flags |= VM_NOHUGEPAGE;
+		break;
+	}
+
+	return 0;
+}
+</code></pre>
+<p>注意那句注释：<b>"register it here without waiting a page fault that may not happen any time soon"</b>——打上 <code>VM_HUGEPAGE</code> 标记后立刻把这个 mm 登记给 khugepaged，这样<b>即使程序之后再也不碰这段内存，khugepaged 也会主动去合并它</b>。</p>
+
+<h3>4.8 <code>enabled</code> 开关的实现</h3>
+<p class="srcline">mm/huge_memory.c:162-199  enabled_show / enabled_store</p>
+<pre><code>static ssize_t enabled_show(struct kobject *kobj,
+			    struct kobj_attribute *attr, char *buf)
+{
+	if (test_bit(TRANSPARENT_HUGEPAGE_FLAG, &amp;transparent_hugepage_flags))
+		return sprintf(buf, "[always] madvise never\n");
+	else if (test_bit(TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG, &amp;transparent_hugepage_flags))
+		return sprintf(buf, "always [madvise] never\n");
+	else
+		return sprintf(buf, "always madvise [never]\n");
+}
+
+static ssize_t enabled_store(struct kobject *kobj,
+			     struct kobj_attribute *attr,
+			     const char *buf, size_t count)
+{
+	ssize_t ret = count;
+
+	if (sysfs_streq(buf, "always")) {
+		clear_bit(TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG, &amp;transparent_hugepage_flags);
+		set_bit(TRANSPARENT_HUGEPAGE_FLAG, &amp;transparent_hugepage_flags);
+	} else if (sysfs_streq(buf, "madvise")) {
+		clear_bit(TRANSPARENT_HUGEPAGE_FLAG, &amp;transparent_hugepage_flags);
+		set_bit(TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG, &amp;transparent_hugepage_flags);
+	} else if (sysfs_streq(buf, "never")) {
+		clear_bit(TRANSPARENT_HUGEPAGE_FLAG, &amp;transparent_hugepage_flags);
+		clear_bit(TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG, &amp;transparent_hugepage_flags);
+	} else
+		ret = -EINVAL;
+
+	if (ret &gt; 0) {
+		int err = start_stop_khugepaged();
+		if (err)
+			ret = err;
+	}
+	return ret;
+}
+</code></pre>
+<p>实现就是两个 bit 的组合：<code>TRANSPARENT_HUGEPAGE_FLAG</code>（always）和 <code>TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG</code>（madvise）。<code>enabled_show()</code> 用方括号标出当前值，所以 <code>cat</code> 出来的 <code>[madvise]</code> 表示"当前是 madvise 模式"。最后 <code>start_stop_khugepaged()</code> 会根据新策略启停 khugepaged 线程——切到 <code>never</code> 时 khugepaged 就被停掉了。</p>
+
+<h3>4.9 khugepaged：后台合并线程</h3>
+<p class="srcline">mm/khugepaged.c:2243-2262  khugepaged</p>
+<pre><code>static int khugepaged(void *none)
+{
+	struct mm_slot *mm_slot;
+
+	set_freezable();
+	set_user_nice(current, MAX_NICE);
+
+	while (!kthread_should_stop()) {
+		khugepaged_do_scan();
+		khugepaged_wait_work();
+	}
+
+	spin_lock(&amp;khugepaged_mm_lock);
+	mm_slot = khugepaged_scan.mm_slot;
+	khugepaged_scan.mm_slot = NULL;
+	if (mm_slot)
+		collect_mm_slot(mm_slot);
+	spin_unlock(&amp;khugepaged_mm_lock);
+	return 0;
+}
+</code></pre>
+<p>一个非常朴素的循环：<b>扫一遍 → 睡一会儿 → 再扫一遍</b>。<code>set_user_nice(current, MAX_NICE)</code> 把线程的 nice 值降到最低优先级——<b>khugepaged 是"后台做好事"，绝不能跟业务抢 CPU</b>。扫描间隔由 <code>khugepaged_scan_sleep_millisecs</code> 控制（默认 10000 ms，即 10 秒一轮）。</p>
+<p>扫描的核心是 <code>khugepaged_do_scan()</code> → <code>khugepaged_scan_mm_slot()</code> → <code>khugepaged_scan_pmd()</code>，最后落到 <code>collapse_huge_page()</code>：申请一块新的 2 MB 连续内存，把原来 512 个小页的内容拷进去，然后把 PMD 表项换成指向新的大页。合并的判定条件是：<b>该 PMD 覆盖的 2 MB 范围内，所有 4 KB 页都已经驻留且没有在写</b>——否则合并会丢数据。</p>
+
+<h3>4.10 hugetlbfs：显式大页文件系统</h3>
+<p class="srcline">fs/hugetlbfs/inode.c:1-9  文件头注释</p>
+<pre><code>/*
+ * hugetlbpage-backed filesystem.  Based on ramfs.
+ *
+ * Nadia Yvette Chambers, 2002
+ *
+ * Copyright (C) 2002 Linus Torvalds.
+ * License: GPL
+ */
+</code></pre>
+<p class="srcline">fs/hugetlbfs/inode.c:1424-1429  hugetlbfs_fs_type</p>
+<pre><code>static struct file_system_type hugetlbfs_fs_type = {
+	.name			= "hugetlbfs",
+	.init_fs_context	= hugetlbfs_init_fs_context,
+	.parameters		= hugetlb_fs_parameters,
+	.kill_sb		= kill_litter_super,
+};
+</code></pre>
+<p>hugetlbfs 是一个"用 RAM 当后备存储"的伪文件系统。挂载它、创建一个文件，<code>mmap()</code> 那个文件，得到的映射就是 hugetlb 映射——VMA 上会打上 <code>VM_HUGETLB</code> 标志（见 <code>fs/hugetlbfs/inode.c:146</code>），用 <code>hugetlb_vm_ops</code>。<b>这些页是启动时就从伙伴系统预留出来的（<code>/proc/sys/vm/nr_hugepages</code>），不参与普通回收</b>——这正是它尾延迟稳定的原因：分配时不需要现凑 2 MB 连续块。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看系统级 THP 开关</h3>
+<pre><code>$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never
+$ cat /sys/kernel/mm/transparent_hugepage/defrag
+[always] defer defer+madvise madvise never
+$ cat /sys/kernel/mm/transparent_hugepage/shmem_enabled
+always [never] advise
+$ cat /sys/kernel/mm/transparent_hugepage/hpage_pmd_size
+2097152
+</code></pre>
+<p>方括号里是当前值。<code>hpage_pmd_size</code> 是 2097152 字节 = 2 MB，和第 4.1 节的 <code>HPAGE_PMD_SIZE</code> 对上。</p>
+
+<h3>5.2 看 <code>/proc/meminfo</code> 里的 THP 用量</h3>
+<pre><code>$ grep -i huge /proc/meminfo
+AnonHugePages:     61440 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:         0 kB
+FilePmdMapped:         0 kB
+Hugetlb:            0 kB
+</code></pre>
+<p><code>AnonHugePages</code> 是<b>匿名 THP 的总用量</b>（第 18 篇说的"内存放大"的直接体现）。内核里这个值来自 <code>global_node_page_state(NR_ANON_THPS) * HPAGE_PMD_NR</code>（<code>fs/proc/meminfo.c:131-132</code>），也就是"大页个数 × 512 × 4 KB"。</p>
+<p>做个对比实验，能直观看到内存放大：</p>
+<pre><code>$ cat &gt; thp_bloat.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void)
+{
+	size_t len = 2UL * 1024 * 1024;   /* 2 MB */
+	char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (p == MAP_FAILED) { perror("mmap"); return 1; }
+	memset(p, 1, 1);        /* 只碰第一个字节 */
+	puts("mapped 2 MB, touched 1 byte");
+	puts("now check: grep AnonHugePages /proc/meminfo");
+	sleep(10);
+	return 0;
+}
+EOF
+$ gcc -O0 -o thp_bloat thp_bloat.c &amp;&amp; ./thp_bloat
+mapped 2 MB, touched 1 byte
+$ grep AnonHugePages /proc/meminfo
+AnonHugePages:     61440 kB
+</code></pre>
+<p><code>AnonHugePages</code> 会增加 2048 kB（2 MB），而程序实际只用了 1 个字节——<b>这就是内存放大</b>。用 <code>/proc/[pid]/smaps</code> 可以定位到具体是哪个 VMA。</p>
+
+<h3>5.3 用 <code>smaps</code> 定位大页</h3>
+<pre><code>$ cat &gt; thp_smaps.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void)
+{
+	size_t len = 4UL * 1024 * 1024;   /* 4 MB */
+	char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	int i;
+
+	if (p == MAP_FAILED) { perror("mmap"); return 1; }
+	for (i = 0; i &lt; 4; i++) p[i * 1024 * 1024] = 1;   /* 每 MB 碰一下 */
+	printf("pid = %d\n", getpid());
+	fflush(stdout);
+	sleep(20);
+	return 0;
+}
+EOF
+$ gcc -O0 -o thp_smaps thp_smaps.c &amp;&amp; ./thp_smaps &amp;
+$ PID=$(pgrep thp_smaps)
+$ grep -A 25 "$(readlink /proc/$PID/exe)" /proc/$PID/smaps | grep -E "^[0-9a-f]+-|Size:|AnonHugePages|^Rss:"
+</code></pre>
+<p>典型输出：</p>
+<pre><code>7f8e3a800000-7f8e3a840000 rw-p 00000000 00:00 0 
+Size:                4096 kB
+Rss:                 4096 kB
+AnonHugePages:       4096 kB
+</code></pre>
+<p><b><code>AnonHugePages: 4096 kB</code> 表示这个 4 MB 的 VMA 全部由 THP 覆盖</b>（4 MB = 2 个 2 MB 大页）。对照第 16 篇讲的 <code>/proc/[pid]/smaps</code>，<code>AnonHugePages</code> 是判断"这块内存是不是大页"的权威字段（内核源码 <code>fs/proc/task_mmu.c:799</code>）。</p>
+<p>如果换成 <code>madvise(MADV_NOHUGEPAGE)</code>，同样的程序 <code>AnonHugePages</code> 会变成 0。</p>
+
+<h3>5.4 用 <code>MADV_HUGEPAGE</code> 精确控制</h3>
+<pre><code>$ cat &gt; thp_madvise.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void)
+{
+	size_t len = 4UL * 1024 * 1024;
+	char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	int i;
+
+	if (p == MAP_FAILED) { perror("mmap"); return 1; }
+#ifdef MADV_HUGEPAGE
+	/* 请求这一段用大页 */
+	if (madvise(p, len, MADV_HUGEPAGE) != 0) perror("madvise");
+#else
+	printf("MADV_HUGEPAGE not available on this system\n");
+#endif
+	for (i = 0; i &lt; 4; i++) p[i * 1024 * 1024] = 1;
+	printf("pid = %d\n", getpid());
+	sleep(20);
+	return 0;
+}
+EOF
+$ gcc -O0 -o thp_madvise thp_madvise.c &amp;&amp; ./thp_madvise &amp;
+</code></pre>
+<p>在 <code>enabled = madvise</code> 模式下，只有打了 <code>MADV_HUGEPAGE</code> 的 VMA 才会用大页。<b>这是给应用控制 THP 的标准做法</b>：Java 的 <code>-XX:+UseTransparentHugePages</code>、MySQL 的 <code>large_pages</code> 配置本质上都是在做这件事。</p>
+
+<h3>5.5 观察 khugepaged 在干活</h3>
+<pre><code>$ ps -eLo pid,tid,comm | grep khugepaged
+  1234  1234 kswapd0
+  1234  1235 khugepaged
+$ cat /proc/$(pgrep -x khugepaged)/status | grep -E "State|voluntary"
+$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/pages_collapsed
+$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/sleep_millisecs
+10000
+$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/pages_to_scan
+4096
+</code></pre>
+<p><code>pages_collapsed</code> 是 khugepaged 累计合并成功的大页数——<b>如果这个数字一直是 0，说明你的负载没有触发合并</b>（或者 THP 被关了）。<code>sleep_millisecs</code> 默认 10000 ms，<code>pages_to_scan</code> 默认 4096（每轮最多扫多少个 2 MB 区域）。</p>
+
+<h3>5.6 观察拆分行为</h3>
+<pre><code>$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/defrag
+$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none
+0
+</code></pre>
+<p><code>defrag</code> 的取值含义：</p>
+<table>
+  <tr><th>值</th><th>含义</th></tr>
+  <tr><td>always</td><td>任何 THP 分配都允许同步做内存整理（延迟最可控，但可能有停顿）</td></tr>
+  <tr><td>defer</td><td>只在没有空闲大页时才做整理（常见默认）</td></tr>
+  <tr><td>defer+madvise</td><td>只有 <code>MADV_HUGEPAGE</code> 的 VMA 允许 defer 之外的整理</td></tr>
+  <tr><td>madvise</td><td>只有 <code>MADV_HUGEPAGE</code> 的 VMA 允许同步整理</td></tr>
+  <tr><td>never</td><td>永远不同步整理；分配失败就退回 4 KB</td></tr>
+</table>
+<p><b>想要"绝不为大页付延迟代价"，就设 <code>never</code></b>；想要"大页必须拿到，宁可停顿"，就设 <code>always</code>。</p>
+
+<h3>5.7 实验：hugetlbfs 显式大页</h3>
+<pre><code>$ cat /proc/meminfo | grep -i hugetlb
+Hugetlb:            0 kB
+$ echo 512 | sudo tee /proc/sys/vm/nr_hugepages
+$ cat /proc/meminfo | grep -i hugetlb
+Hugetlb:         1048576 kB
+$ sudo mount -t hugetlbfs -o pagesize=2M hugetlbfs /mnt/huge
+$ df -h /mnt/huge
+$ dd if=/dev/zero of=/mnt/huge/test bs=1M count=100
+$ ls -l /mnt/huge/
+</code></pre>
+<p><code>nr_hugepages = 512</code> 表示预留 512 个 2 MB 大页 = 1 GB 内存，<b>这部分内存从启动起就被钉住，不会被回收，也不会计入普通 free</b>。在 <code>/mnt/huge</code> 下写的文件直接占用大页，<code>mmap</code> 它就得到 hugetlb 映射。对比 THP 就能体会两种思路的差别：<b>THP 是"内核顺手帮你"，hugetlbfs 是"你自己规划并预留"</b>。</p>
+
+<h3>5.8 在 qemu 里观察 THP（可选）</h3>
+<pre><code>$ qemu-system-x86_64 -kernel bzImage -m 1024 -append "console=ttyS0 transparent_hugepage=always" -nographic
+# 启动后
+$ cat /sys/kernel/mm/transparent_hugepage/enabled
+$ echo madvise &gt; /sys/kernel/mm/transparent_hugepage/enabled
+$ grep AnonHugePages /proc/meminfo
+</code></pre>
+<p>内核命令行参数 <code>transparent_hugepage=always|madvise|never</code> 等价于开机时设置那个 sysfs 开关。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. THP 和 hugetlbfs 有什么区别？什么时候该用哪个？</b>THP 是<b>透明</b>的：内核自动把合适的匿名内存用 2 MB 映射，程序无感，页是临时分配的（可被回收），存在内存放大和延迟抖动。hugetlbfs 是<b>显式</b>的：你在启动时通过 <code>nr_hugepages</code> 预留大页池，挂载后自己 mmap，<b>页常驻不可回收，没有放大也没有抖动</b>。追求尾延迟稳定的关键业务（Oracle、PostgreSQL 的大内存配置）通常用 hugetlbfs；希望零改造获得 TLB 收益的普通应用用 THP。</div>
+<div class="qa"><b>Q2. 为什么 THP 会造成"内存放大"？放大多少？</b>因为一个大页是 2 MB，只要程序碰了其中一个 4 KB 页，整块 2 MB 就算被占用。内核按 <code>add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR)</code> 记账（HPAGE_PMD_NR = 512），所以 RSS、memcg 配额都按 2 MB 计算，而实际有用的可能只有几 KB。<b>最坏情况下放大 512 倍</b>；如果程序均匀地碰过整个 2 MB，则没有浪费。</div>
+<div class="qa"><b>Q3. THP 的"延迟抖动"是怎么产生的？</b>主要来自<b>分配时刻</b>：<code>alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER)</code> 要一次拿 order-9（2 MB 连续）的物理内存。如果 buddy 系统里没有现成的 2 MB 连续块，就要触发<b>直接内存回收 + 内存整理（compaction）</b>把碎片拼起来，这个过程可能耗时几十到几百毫秒，用户态表现为一次莫名的卡顿。缓解手段是设置 <code>/sys/kernel/mm/transparent_hugepage/defrag = never</code>（分配失败就退回 4 KB）或 <code>madvise</code>（只让明确申请大页的 VMA 承担这个代价）。</div>
+<div class="qa"><b>Q4. 把大页拆成小页会把数据复制一遍吗？</b><b>不会。</b>5.10 的 <code>__split_huge_pmd_locked()</code> 里，每个 PTE 指向的是 <code>mk_pte(page + i, ...)</code>——<b>原复合页里的第 i 个子页</b>。物理内存完全不动，拆分的动作只是把 PMD 表项换成一张普通的 PTE 表，再逐个填好 512 个 PTE。内容零拷贝。真正可能产生延迟的是拆分前后的其他工作（比如为了让 VMA 边界对齐而调整映射布局）。</div>
+<div class="qa"><b>Q5. <code>enabled = madvise</code> 模式下，怎么才能让我的程序用上大页？</b>在 <code>mmap()</code> 之后调用 <code>madvise(addr, len, MADV_HUGEPAGE)</code>。内核会在 VMA 上打 <code>VM_HUGEPAGE</code> 标记（<code>hugepage_madvise()</code>，见 4.7 节），此后这个 VMA 走大页路径。反过来用 <code>MADV_NOHUGEPAGE</code> 可以给某段内存单独禁用大页。注意 <code>madvise</code> 只是<b>建议</b>——如果当前分配不到 2 MB 连续块，内核仍然会退回 4 KB，这是正常行为。</div>
+
+<footer>
+  <p>上一篇：<a href="18-reclaim.html">18-reclaim 内存回收：direct reclaim 与 kswapd</a> · 下一篇：<a href="20-vfs.html">20-vfs VFS：一切皆文件</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

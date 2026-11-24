@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>32 eBPF：内核里的安全虚拟机</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="33-driver-model.html">下一篇：33-driver-model 设备模型 →</a>
+</nav>
+
+<h1>🧪 eBPF：内核里的安全虚拟机</h1>
+<p class="subtitle">不写内核模块、不重启、不冒崩溃风险，把自定义程序插进内核热点路径执行 · 预计阅读 13 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>假设你在一栋大楼里做安全检查：想查清所有包裹的流向、想拦住可疑物品、想统计每个电梯的使用频率。传统做法是「改造大楼」——加装固定管道、改结构（这相当于编译并加载内核模块），一旦设计错了，整栋楼可能塌。</p>
+<p>另一个做法是在楼里放一台「可编程的安检机器人」：管理员随时可以给它换一套规则，但机器人被严格限制——只能看不能砸墙、只能在指定房间活动、不能打电话出去、运行时间超了就自动停。eBPF（extended Berkeley Packet Filter）就是这台机器人：一段由你写、由内核<strong>先审查再执行</strong>的小程序。</p>
+<p>从操作系统角度看，内核一直缺一块「安全的可编程性」：性能观测、包过滤、安全策略、流量整形都需要在内核里看数据、改行为，但每个需求都编一个模块代价太高，而且任意模块都能让内核 panic。eBPF 用三件事解决：<strong>受限指令集</strong>（只能执行经过验证的指令）、<strong>静态验证器</strong>（加载前证明程序不会越界/死循环/泄露指针）、<strong>JIT 编译</strong>（验证通过后翻译成机器码，性能接近原生）。</p>
+<p>它最初只是 tcpdump 用的包过滤器，2014 年重写后扩展成通用执行引擎，如今 <code>bpftrace</code>、Cilium、XDP 抗 DDoS、容器安全策略都建在它上面。理解 eBPF，等于理解现代 Linux 可观测与网络加速的公共底座。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">eBPF</td><td>extended BPF</td><td>内核内的受限字节码虚拟机，可挂到多种钩子上执行</td></tr>
+  <tr><td class="term">字节码</td><td>BPF instruction</td><td>定长 8 字节的指令，含 opcode、目标寄存器、偏移、立即数</td></tr>
+  <tr><td class="term">寄存器</td><td>R0–R10</td><td>11 个 64 位寄存器；R0 返回值，R1–R5 传参，R6–R9 被调用者保存，R10 只读栈帧指针</td></tr>
+  <tr><td class="term">验证器</td><td>verifier</td><td>加载时逐条模拟执行、跟踪寄存器/栈类型与值域，证明程序安全</td></tr>
+  <tr><td class="term">JIT</td><td>just-in-time compiler</td><td>把验证过的字节码翻译成本机机器码，避免解释执行开销</td></tr>
+  <tr><td class="term">程序类型</td><td>prog type</td><td>决定能挂哪里、上下文是什么、能用哪些 helper（如 XDP、KPROBE）</td></tr>
+  <tr><td class="term">挂载点</td><td>attach point</td><td>程序被触发的具体位置：socket、tracepoint、kprobe、XDP、cgroup 钩子</td></tr>
+  <tr><td class="term">上下文</td><td>ctx</td><td>触发时传给程序的只读结构指针（如 <code>struct __sk_buff *</code>、<code>struct pt_regs *</code>）</td></tr>
+  <tr><td class="term">map</td><td>BPF map</td><td>内核与用户态共享的键值存储，程序可读写、用户态通过 fd 访问</td></tr>
+  <tr><td class="term">helper</td><td>helper function</td><td>内核提供给程序的受控函数，如 <code>bpf_map_lookup_elem</code>、<code>bpf_probe_read</code></td></tr>
+  <tr><td class="term">bpf() 系统调用</td><td>sys_bpf</td><td>唯一入口，用 <code>cmd</code> 区分创建 map / 加载程序 / 查询等操作</td></tr>
+  <tr><td class="term">BTF</td><td>BPF Type Format</td><td>描述内核类型信息的元数据，让程序能安全地按名字访问结构体字段</td></tr>
+  <tr><td class="term">kprobe</td><td>kernel probe</td><td>在任意内核函数入口/返回处插桩（动态、性能开销较大）</td></tr>
+  <tr><td class="term">tracepoint</td><td>tracepoint</td><td>内核预置的静态插桩点，稳定、开销低，推荐优先使用</td></tr>
+  <tr><td class="term">XDP</td><td>eXpress Data Path</td><td>网卡驱动收包最早期的钩子，可在分配 skb 之前直接丢包/改包</td></tr>
+  <tr><td class="term">尾调用</td><td>tail call</td><td>程序链式跳转到另一个程序，用于拆分复杂逻辑（数量受限）</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<p>先用一张图看清「用户态 → 内核」的完整往返：</p>
+<pre><code>
+ 用户态                                  内核态
+ ┌──────────────────────┐              ┌─────────────────────────────┐
+ │ 编译器(clang -target  │              │ kernel/bpf/syscall.c        │
+ │  bpf) 生成 .o         │  bpf(BPF_    │   └─ bpf_prog_load()        │
+ │      │                │  PROG_LOAD)  │        ├─ 拷贝指令           │
+ │      ▼                │ ───────────► │        ├─ bpf_check()       │
+ │ 加载器(bpftool/libbpf)│              │        │    └─ verifier.c    │
+ │      │                │ ◄─────────── │        └─ bpf_prog_select_  │
+ │      │  返回 prog fd   │   fd         │             runtime() → JIT│
+ │      ▼                │              │                             │
+ │  attach(挂到钩子)      │              │ 挂载后由内核在事件点调用     │
+ │  read(map) 取结果      │ ◄──map fd──► │  bpf_prog_run() 执行        │
+ └──────────────────────┘              └─────────────────────────────┘
+</code></pre>
+<p><code>kernel/bpf/</code> 的目录职责很清晰：</p>
+<table>
+  <tr><th>文件/目录</th><th>职责</th></tr>
+  <tr><td><code>syscall.c</code></td><td><code>bpf()</code> 系统调用总入口；map 与程序对象生命周期（fd、引用计数）</td></tr>
+  <tr><td><code>verifier.c</code></td><td>最核心、最大：控制流检查 + 逐指令模拟 + 类型/边界推断</td></tr>
+  <tr><td><code>core.c</code></td><td>解释器（<code>___bpf_prog_run</code>）、JIT 调度、<code>bpf_prog_select_runtime</code></td></tr>
+  <tr><td><code>arraymap.c / hashtab.c / ...</code></td><td>各种 map 类型的实现：数组、哈希、LRU、环形缓冲、per-CPU</td></tr>
+  <tr><td><code>helpers.c</code></td><td>通用 helper 的注册与原型表（<code>bpf_base_func_proto</code>）</td></tr>
+  <tr><td><code>btf.c</code></td><td>BTF 解析与校验，支撑 CO-RE（编译一次到处运行）</td></tr>
+  <tr><td><code>disasm.c</code></td><td>把字节码反汇编成人类可读文本（失败日志里那串指令）</td></tr>
+</table>
+
+<h3>3.1 程序类型与挂载点</h3>
+<table>
+  <tr><th>类型</th><th>典型挂载点</th><th>典型用途</th></tr>
+  <tr><td><code>SOCKET_FILTER</code></td><td>socket（<code>SO_ATTACH_BPF</code>）</td><td>tcpdump/libpcap 的过滤表达式</td></tr>
+  <tr><td><code>KPROBE / KRETEProbe</code></td><td><code>perf_event_open</code> 上的 kprobe</td><td>跟踪任意内核函数、读参数与返回值</td></tr>
+  <tr><td><code>TRACEPOINT</code></td><td>静态 tracepoint</td><td>低开销观测调度、系统调用、网络事件</td></tr>
+  <tr><td><code>XDP</code></td><td>网卡驱动收包路径</td><td>DDoS 过滤、负载均衡、AF_XDP 前置处理</td></tr>
+  <tr><td><code>SCHED_CLS / SCHED_ACT</code></td><td>tc 的 clsact qdisc</td><td>容器网络策略、流量整形</td></tr>
+  <tr><td><code>CGROUP_SKB / CGROUP_SOCK</code></td><td>cgroup v2 钩子</td><td>按 cgroup 做连接管控、包过滤</td></tr>
+  <tr><td><code>LSM</code></td><td>LSM 钩子</td><td>自定义安全策略（与本篇 29-lsm 呼应）</td></tr>
+</table>
+<p>「类型」不是装饰：验证器根据类型决定 <strong>R1 的上下文类型</strong>和 <strong>可调用的 helper 白名单</strong>。XDP 程序拿到的 ctx 是 <code>struct xdp_md</code>，能改包；socket filter 拿到的 ctx 就是 skb，能力又不同。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 系统调用入口：用 cmd 分派</h3>
+<p><code>bpf()</code> 只有一个 <code>union bpf_attr</code> 参数，靠第一个参数 <code>cmd</code> 分派到不同操作。注意开头的 <code>sysctl_unprivileged_bpf_disabled</code>：默认非特权用户不能随便加载程序。</p>
+<p class="srcline">kernel/bpf/syscall.c:4357-4386  SYSCALL_DEFINE3(bpf)</p>
+<pre><code>SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
+{
+	union bpf_attr attr;
+	int err;
+
+	if (sysctl_unprivileged_bpf_disabled &amp;&amp; !bpf_capable())
+		return -EPERM;
+
+	err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);
+	if (err)
+		return err;
+	size = min_t(u32, size, sizeof(attr));
+
+	/* copy attributes from user space, may be less than sizeof(bpf_attr) */
+	memset(&amp;attr, 0, sizeof(attr));
+	if (copy_from_user(&amp;attr, uattr, size) != 0)
+		return -EFAULT;
+
+	err = security_bpf(cmd, &amp;attr, size);
+	if (err &lt; 0)
+		return err;
+
+	switch (cmd) {
+	case BPF_MAP_CREATE:
+		err = map_create(&amp;attr);
+		break;
+	case BPF_MAP_LOOKUP_ELEM:
+		err = map_lookup_elem(&amp;attr);
+		break;
+    // ...（省略：UPDATE/DELETE/GET_NEXT_KEY、BPF_PROG_LOAD 等数十个分支）
+</code></pre>
+<ul>
+  <li><code>bpf_check_uarg_tail_zero</code> 防「用户态传了比内核期望更长的结构、尾部长不为零」的兼容性陷阱——允许旧结构，但多出的字节必须清零。</li>
+  <li><code>security_bpf</code> 是 LSM 钩子（例如 lockdown 模式会在此拒绝）。</li>
+  <li>每个 case 最终返回一个 <strong>fd</strong>（-1 到 n），用户态拿到 fd 就能 attach 或操作对象。</li>
+</ul>
+
+<h3>4.2 一次程序加载的完整流程</h3>
+<p><code>BPF_PROG_LOAD</code> 落到 <code>bpf_prog_load</code>。它先做权限与配额检查，再拷贝指令，最后交给验证器。验证器是整个 eBPF 安全模型的守门人。</p>
+<p class="srcline">kernel/bpf/syscall.c:2119-2160, 2208-2212  bpf_prog_load（节选）</p>
+<pre><code>	if (attr-&gt;insn_cnt == 0 ||
+	    attr-&gt;insn_cnt &gt; (bpf_capable() ? BPF_COMPLEXITY_LIMIT_INSNS : BPF_MAXINSNS))
+		return -E2BIG;
+	if (type != BPF_PROG_TYPE_SOCKET_FILTER &amp;&amp;
+	    type != BPF_PROG_TYPE_CGROUP_SKB &amp;&amp;
+	    !bpf_capable())
+		return -EPERM;
+
+	if (is_net_admin_prog_type(type) &amp;&amp; !capable(CAP_NET_ADMIN) &amp;&amp; !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (is_perfmon_prog_type(type) &amp;&amp; !perfmon_capable())
+		return -EPERM;
+    // ...（省略：license 检查、attach 类型校验、bpf_prog_alloc）
+
+	err = -EFAULT;
+	if (copy_from_user(prog-&gt;insns, u64_to_user_ptr(attr-&gt;insns),
+			   bpf_prog_insn_size(prog)) != 0)
+		goto free_prog;
+
+    // ...（省略：find_prog_type、prog_name 拷贝、btf 处理）
+	/* run eBPF verifier */
+	err = bpf_check(&amp;prog, attr, uattr);
+	if (err &lt; 0)
+		goto free_used_maps;
+
+	prog = bpf_prog_select_runtime(prog, &amp;err);</code></pre>
+<p>要点：<strong>非特权用户只允许 socket filter / cgroup skb 这两类</strong>（历史上最安全的两类），且指令数上限只有 <code>BPF_MAXINSNS</code>（4096）；带 <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code> 才有更高上限。网络型程序还要 <code>CAP_NET_ADMIN</code>，跟踪型程序要 <code>CAP_PERFMON</code>。权限分权设计得很细，正是为了不把「能跑内核代码」这个能力随手送人。</p>
+
+<h3>4.3 验证器主循环 do_check</h3>
+<p>验证器分两遍：第一遍 <code>check_cfg</code> 用 DFS 检查程序是合法的有向无环图（无越界跳转、无不可达指令、无回边循环），第二遍 <code>do_check</code> 沿所有路径模拟执行。看 <code>do_check</code> 的骨架：</p>
+<p class="srcline">kernel/bpf/verifier.c:9280-9312  do_check（节选，主循环开头）</p>
+<pre><code>		insn = &amp;insns[env-&gt;insn_idx];
+		class = BPF_CLASS(insn-&gt;code);
+
+		if (++env-&gt;insn_processed &gt; BPF_COMPLEXITY_LIMIT_INSNS) {
+			verbose(env,
+				"BPF program is too large. Processed %d insn\n",
+				env-&gt;insn_processed);
+			return -E2BIG;
+		}
+
+		err = is_state_visited(env, env-&gt;insn_idx);
+		if (err &lt; 0)
+			return err;
+		if (err == 1) {
+			/* found equivalent state, can prune the search */
+			if (env-&gt;log.level &amp; BPF_LOG_LEVEL) {
+				verbose(env, "\nfrom %d to %d%s: safe\n",
+					env-&gt;prev_insn_idx, env-&gt;insn_idx,
+					env-&gt;cur_state-&gt;speculative ?
+					" (speculative execution)" : "");
+				// ...（省略：日志格式细节）
+			}
+			goto process_bpf_exit;
+		}
+
+		if (signal_pending(current))
+			return -EAGAIN;
+
+		if (need_resched())
+			cond_resched();</code></pre>
+<p>四个关键点：<code>BPF_COMPLEXITY_LIMIT_INSNS</code> 限制「验证工作量」而不是指令条数——聪明的程序能用少量指令展开大量分支，这个计数器保证验证不会把 CPU 耗死。<code>is_state_visited</code> 是<strong>状态剪枝</strong>：如果到达某条指令时寄存器/栈状态与之前某次相同，这条路就不用再分析（返回 1 表示已证明安全）。<code>signal_pending</code>/<code>cond_resched</code> 则让长时间验证可被中断、可让出 CPU，避免用户态被挂住。</p>
+
+<h3>4.4 每类指令的类型检查</h3>
+<p>接着是真正的分派：按指令大类（ALU、LDX、STX、ST、JMP）分别检查。以 <code>BPF_LDX</code>（读内存）为例，它要求源寄存器是一个<strong>已初始化且类型可读</strong>的指针，再检查 <code>reg + off</code> 这段内存是否在所属对象（map 值、栈、ctx）的合法范围内。</p>
+<p class="srcline">kernel/bpf/verifier.c:9348-9390  do_check（LDX 分支，节选）</p>
+<pre><code>		if (class == BPF_ALU || class == BPF_ALU64) {
+			err = check_alu_op(env, insn);
+			if (err)
+				return err;
+
+		} else if (class == BPF_LDX) {
+			enum bpf_reg_type *prev_src_type, src_reg_type;
+
+			/* check for reserved fields is already done */
+
+			/* check src operand */
+			err = check_reg_arg(env, insn-&gt;src_reg, SRC_OP);
+			if (err)
+				return err;
+
+			err = check_reg_arg(env, insn-&gt;dst_reg, DST_OP_NO_MARK);
+			if (err)
+				return err;
+
+			src_reg_type = regs[insn-&gt;src_reg].type;
+
+			/* check that memory (src_reg + off) is readable,
+			 * the state of dst_reg will be updated by this func
+			 */
+			err = check_mem_access(env, env-&gt;insn_idx, insn-&gt;src_reg,
+					       insn-&gt;off, BPF_SIZE(insn-&gt;code),
+					       BPF_READ, insn-&gt;dst_reg, false);
+			if (err)
+				return err;</code></pre>
+<p>而 <code>check_reg_arg</code> 对「类型」的把关是这样：</p>
+<p class="srcline">kernel/bpf/verifier.c:1717-1748  check_reg_arg（节选）</p>
+<pre><code>static int check_reg_arg(struct bpf_verifier_env *env, u32 regno,
+			 enum reg_arg_type t)
+{
+	struct bpf_verifier_state *vstate = env-&gt;cur_state;
+	struct bpf_func_state *state = vstate-&gt;frame[vstate-&gt;curframe];
+	struct bpf_insn *insn = env-&gt;prog-&gt;insnsi + env-&gt;insn_idx;
+	struct bpf_reg_state *reg, *regs = state-&gt;regs;
+	bool rw64;
+
+	if (regno &gt;= MAX_BPF_REG) {
+		verbose(env, "R%d is invalid\n", regno);
+		return -EINVAL;
+	}
+
+	reg = &amp;regs[regno];
+	rw64 = is_reg64(env, insn, regno, reg, t);
+	if (t == SRC_OP) {
+		/* check whether register used as source operand can be read */
+		if (reg-&gt;type == NOT_INIT) {
+			verbose(env, "R%d !read_ok\n", regno);
+			return -EACCES;
+		}
+		/* We don't need to worry about FP liveness because it's read-only */
+		if (regno == BPF_REG_FP)
+			return 0;
+</code></pre>
+<p><code>reg-&gt;type == NOT_INIT</code> 这条检查极其重要：它把「读未初始化的栈内存」变成一条硬错误（<code>R3 !read_ok</code>）。因为 eBPF 程序能直接读内核栈，如果不限制，就能把内核栈里的残留数据通过 map 泄露给用户态——这正是历史上真实出现过的漏洞类型。<code>mark_reg_read</code> 则记录「这个寄存器/栈槽在后续某条路径会被读」，用于分析未初始化。</p>
+
+<h3>4.5 指针算术的边界追踪</h3>
+<p>eBPF 里指针可以加常量或变量，但不能被随意「造出来」。验证器给每个指针寄存器维护固定的 <code>off</code> 和可变范围 <code>{smin,smax,umin,umax}</code>。加常量时直接把偏移累加，但要求不溢出 s32 的 <code>off</code> 字段：</p>
+<p class="srcline">kernel/bpf/verifier.c:5536-5557  adjust_ptr_min_max_vals（BPF_ADD 分支）</p>
+<pre><code>	case BPF_ADD:
+		ret = sanitize_ptr_alu(env, insn, ptr_reg, dst_reg, smin_val &lt; 0);
+		if (ret &lt; 0) {
+			verbose(env, "R%d tried to add from different maps or paths\n", dst);
+			return ret;
+		}
+		/* We can take a fixed offset as long as it doesn't overflow
+		 * the s32 'off' field
+		 */
+		if (known &amp;&amp; (ptr_reg-&gt;off + smin_val ==
+			      (s64)(s32)(ptr_reg-&gt;off + smin_val))) {
+			/* pointer += K.  Accumulate it into fixed offset */
+			dst_reg-&gt;smin_value = smin_ptr;
+			dst_reg-&gt;smax_value = smax_ptr;
+			dst_reg-&gt;umin_value = umin_ptr;
+			dst_reg-&gt;umax_value = umax_ptr;
+			dst_reg-&gt;var_off = ptr_reg-&gt;var_off;
+			dst_reg-&gt;off = ptr_reg-&gt;off + smin_val;
+			dst_reg-&gt;raw = ptr_reg-&gt;raw;
+			break;
+		}</code></pre>
+<p><code>sanitize_ptr_alu</code> 防的是 Spectre-v1 型侧信道：指针加变量时插入掩码让非法分支的偏移被夹住。<code>smin/smax/umin/umax</code> 的四元组让验证器能做「区间推理」：比如已知 <code>i &lt; 8</code>（分支条件收窄），那么 <code>buf[i]</code> 访问就被证明不越界。这就是「eBPF 不需要运行时检查也能保证安全」的来源。</p>
+
+<h3>4.6 验证通过之后：JIT 还是解释器</h3>
+<p>验证成功后 <code>bpf_prog_select_runtime</code> 决定执行方式：先装好解释器入口，再尝试 JIT 编译；若 JIT 失败（或架构不支持）就回退到解释器。</p>
+<p class="srcline">kernel/bpf/core.c:1796-1813  bpf_prog_select_runtime（节选）</p>
+<pre><code>struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
+{
+	/* In case of BPF to BPF calls, verifier did all the prep
+	 * work with regards to JITing, etc.
+	 */
+	if (fp-&gt;bpf_func)
+		goto finalize;
+
+	bpf_prog_select_func(fp);
+
+	/* eBPF JITs can rewrite the program in case constant
+	 * blinding is active. However, in case of error during
+	 * blinding, bpf_int_jit_compile() must always return a
+	 * valid program, which in this case would simply not
+	 * be JITed, but falls back to the interpreter.
+	 */
+	if (!bpf_prog_is_dev_bound(fp-&gt;aux)) {
+		*err = bpf_prog_alloc_jited_linfo(fp);
+		if (*err)
+			return fp;
+
+		fp = bpf_int_jit_compile(fp);
+        // ...（省略：JIT 失败且 CONFIG_BPF_JIT_ALWAYS_ON 时的处理）</code></pre>
+<p>解释器本体在 <code>core.c</code> 的 <code>___bpf_prog_run</code>，它用 GCC 的「计算 goto」把 256 种 opcode 映射成标签，每个标签就是一段 C 代码——比朴素 switch 快，但仍远不如 JIT。<code>CONFIG_BPF_JIT_ALWAYS_ON</code> 打开时（多数发行版默认）只允许 JIT，避免解释器被用于绕过 Spectre 缓解措施。</p>
+
+<h2>5. 动手验证</h2>
+<p><b>(1)</b> 看当前内核有没有 eBPF、有哪些已加载的程序：</p>
+<pre><code>$ uname -r
+5.10.0-30-amd64
+$ sudo bpftool prog show
+12: kprobe  name do_sys_open  tag ...  gpl
+     loaded_at 2024-08-20T09:20:12+0800  uid 0
+     xlated 1160B  jited 664B  memlock 4096B  map_ids 3,4
+
+$ sudo bpftool prog show --json | jq '. | length'   # 统计总数
+$ sudo bpftool map show
+3: array  name counters  flags 0x0  key 4B  value 8B  max_entries 32</code></pre>
+<p><code>xlated</code> 是验证/修补后的字节码大小，<code>jited</code> 是机器码大小，两者都有说明 JIT 生效。</p>
+<p><b>(2)</b> 用 bpftrace 跟踪 <code>do_sys_open</code>（最简单的 kprobe 体验）：</p>
+<pre><code># 安装：apt install bpftrace  /  dnf install bpftrace
+$ sudo bpftrace -e 'kprobe:do_sys_open { printf("%s opens %s\n",
+      comm, str(arg1)); }'
+Attaching 1 probe...
+cat opens /etc/ld.so.cache
+cat opens /lib/x86_64-linux-gnu/libc.so.6
+...
+^C
+</code></pre>
+<p>注意 x86-64 上 <code>arg1</code> 是第二个参数（第一个是 <code>dfd</code>），对应文件名指针——bpftrace 已按架构自动处理了参数映射。<code>str()</code> 是 helper <code>bpf_probe_read_user_str</code> 的语法糖，验证器会确认这次读取发生在用户地址空间范围内。</p>
+<p><b>(3)</b> 自己写一个最小程序并观察验证器报错（最能体会「安全」二字）：</p>
+<pre><code>$ cat &gt; bad.c &lt;&lt;'EOF'
+int prog(void *ctx) {
+    return *(int *)(0xffff888000000000ULL);   /* 解引用任意内核地址 */
+}
+EOF
+$ clang -target bpf -O2 -c bad.c -o bad.o
+$ sudo bpftool prog load bad.o /sys/fs/bpf/bad
+libbpf: load bpf program failed: Permission denied
+libbpf: -- BEGIN DUMP LOG ---
+R1 invalid mem access 'inv'
+processed 2 insns ...
+libbpf: -- END LOG ---</code></pre>
+<p>验证器连「这个立即数当指针用」都不会放过，因为 <code>inv</code>（scalar）类型不能用于内存访问。把常量换成 <code>ctx</code> 字段、把类型写对，才会通过。</p>
+<p><b>(4)</b> 看 JIT 与解释器的差别：</p>
+<pre><code>$ sudo bpftool prog show id 12 --pretty | grep -E 'jited|xlated'
+$ cat /proc/sys/net/core/bpf_jit_enable      # 1 = JIT 开
+$ dmesg | grep -i bpf</code></pre>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 为什么 eBPF 程序不需要每次访问内存都做越界检查？</b>因为验证器在加载时已沿所有路径证明「此访问必然落在合法对象范围内」，并把结论固化到程序里。运行时的代价只是一条普通指令。</div>
+<div class="qa"><b>Q2. BPF 程序能否调用任意内核函数？</b>不能。只能调用该程序类型白名单里的 helper（由 <code>env-&gt;ops-&gt;get_func_proto</code> 决定），且 helper 参数会按 <code>bpf_func_proto</code> 声明的类型再检查一遍。普通内核函数地址对程序不可见。</div>
+<div class="qa"><b>Q3. map 为什么必须由内核和用户态共享？</b>程序在内核跑、结果要交给用户态读。map 是双方都可访问的受控容器，用户态用 <code>BPF_MAP_LOOKUP_ELEM</code> 读、程序用 <code>bpf_map_lookup_elem</code> 读，避免程序直接往用户内存写。</div>
+<div class="qa"><b>Q4. 状态剪枝（is_state_visited）解决什么问题？</b>分支多的程序路径数指数爆炸。若两条路径到达同一指令时寄存器/栈状态等价，后续行为必然相同，已验证过一次就够了，可剪掉整棵子树。</div>
+<div class="qa"><b>Q5. XDP 为什么比 iptables 快？</b>XDP 在驱动收包的最早期执行，此时还没分配 <code>sk_buff</code>、没走协议栈，可以直接 <code>XDP_DROP</code>。普通 netfilter 钩子已经在 skb 分配和部分解析之后，成本高得多。</div>
+
+<footer>
+  <p>上一篇：<a href="31-kvm.html">31-kvm 虚拟化</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="33-driver-model.html">33-driver-model 设备模型</a></p>
+</footer>
+
+</body>
+</html>

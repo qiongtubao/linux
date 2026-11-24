@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · RCU</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="13-atomic.html">下一篇：13 原子与内存屏障 →</a>
+</nav>
+
+<h1>🔄 RCU：读多写少的无锁革命</h1>
+<p class="subtitle">用“复制 + 延迟回收”换掉读侧加锁：宽限期、静止态与 RCU 链表 · 预计阅读 24 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>图书馆要换一本旧杂志的封面。管理员不能一把抽走：也许正有读者捧着这一本，看到第 30 页。抽走的话，读者手里的纸页可能已经被扔进碎纸机——他再翻一页就等于读到了被回收的内存。管理员的做法是：<strong>把新杂志放上架，旧杂志照样留在架上，只是登记“旧的那本待回收”</strong>；等确认没有读者还在看旧的那本了，再把它扔掉。</p>
+
+<p>内核里到处是这种“读多写少”的结构：路由表、进程表、目录项缓存、模块列表、网络设备的哈希桶……它们的共同特点是<strong>读操作远远多于写操作</strong>。传统做法是用读写锁（rwsem）：读者也要拿锁（一次原子操作 + 一次计数），写者要等所有读者退出才能改。读者那么多、写得那么少，这笔开销实在不划算。</p>
+
+<p>RCU（Read-Copy-Update，读-拷贝-更新）的思路是<strong>把成本从读侧搬到写侧和回收侧</strong>，分成三步：</p>
+
+<ol>
+  <li><strong>读侧完全不加锁</strong>。读者只做一件极轻的事：记一下“我正在读”（<code>rcu_read_lock()</code>）。它不是一把会互斥的锁，只是一个计数器加一条屏障。</li>
+  <li><strong>写者复制一份再改</strong>。写者不原地修改共享结构，而是构造一份新的副本，在副本上改好，然后用一条带内存屏障的写（<code>rcu_assign_pointer()</code>）把“大家该看哪一份”的指针切换过去。</li>
+  <li><strong>旧数据延迟回收</strong>。旧的那份不能立刻 <code>kfree()</code>——可能还有读者正捧着它。写者把它交给 RCU（<code>call_rcu()</code> 或 <code>kfree_rcu()</code>），RCU 等到“所有可能捧着旧数据的读者都放下”了，再执行真正的释放。</li>
+</ol>
+
+<p>“所有可能捧着旧数据的读者都放下了”这个时刻，就是 RCU 的核心概念——<span class="term">宽限期（grace period）</span>。宽限期怎么定义？答案是：等到<strong>每一颗 CPU 都至少报告过一次“静止态”（quiescent state）</strong>。静止态的含义是“此刻这颗 CPU 上没有正在进行的 RCU 读侧临界区”。一旦所有 CPU 都报告过静止态，说明没有任何读者可能还持有旧指针了，旧数据才可以安全释放。</p>
+
+<p>RCU 不是免费的：写者变贵（要复制）、内存占用变大（老数据要等宽限期）、释放变成异步的（回调在软中断或内核线程上下文跑）、而且<strong>不能随手 <code>free()</code></strong>（必须走 <code>kfree_rcu()</code>）。所以内核的规矩是：只有当更新率<strong>大约 10% 以下</strong>时才考虑用 RCU，否则老老实实用读写锁或普通锁。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">RCU</td><td>Read-Copy-Update</td><td>一种读侧不加锁、靠延迟回收来保证一致性的同步机制</td></tr>
+  <tr><td class="term">读侧临界区</td><td>read-side critical section</td><td>被 <code>rcu_read_lock()</code>/<code>unlock</code> 包住的那段代码</td></tr>
+  <tr><td class="term">宽限期</td><td>grace period (GP)</td><td>从写者发起同步开始，到所有 CPU 都报告过静止态为止的一段时间</td></tr>
+  <tr><td class="term">静止态</td><td>quiescent state (QS)</td><td>“该 CPU 上此刻没有 RCU 读者”的一个瞬间</td></tr>
+  <tr><td class="term">读侧无锁</td><td>lockless reader</td><td>读者不获取任何互斥锁，只做标记 + 屏障</td></tr>
+  <tr><td class="term">发布</td><td>publish</td><td>写者用 <code>rcu_assign_pointer()</code> 把新指针“放上线”</td></tr>
+  <tr><td class="term">延迟回收</td><td>deferred reclaim</td><td>旧数据挂进回调队列，等宽限期过后才真正释放</td></tr>
+  <tr><td class="term">rcu_read_lock</td><td>rcu_read_lock()</td><td>进入读侧临界区；不可睡眠</td></tr>
+  <tr><td class="term">rcu_dereference</td><td>rcu_dereference()</td><td>读出 RCU 保护的指针（带正确的内存序）</td></tr>
+  <tr><td class="term">rcu_assign_pointer</td><td>rcu_assign_pointer()</td><td>发布新指针，带 release 语义</td></tr>
+  <tr><td class="term">synchronize_rcu</td><td>synchronize_rcu()</td><td>等待一个完整宽限期结束</td></tr>
+  <tr><td class="term">call_rcu</td><td>call_rcu()</td><td>登记一个回调，等宽限期过后执行</td></tr>
+  <tr><td class="term">kfree_rcu</td><td>kfree_rcu()</td><td>等宽限期过后释放对象的语法糖</td></tr>
+  <tr><td class="term">rcu_barrier</td><td>rcu_barrier()</td><td>等待所有已登记的 RCU 回调执行完毕（模块卸载时用）</td></tr>
+  <tr><td class="term">RCU 链表</td><td>list_add_rcu / list_for_each_entry_rcu</td><td>支持无锁遍历的链表；删除的元素要延迟释放</td></tr>
+  <tr><td class="term">抢占式 RCU</td><td>PREEMPT_RCU</td><td>读者可以被抢占，靠嵌套计数在退出时报告静止态</td></tr>
+  <tr><td class="term">非抢占式 RCU</td><td>TREE_RCU / TINY_RCU</td><td>读者不能被抢占，退出临界区时直接报告静止态</td></tr>
+  <tr><td class="term">RCU stall</td><td>RCU CPU stall</td><td>某个 CPU 长时间不报告静止态，宽限期无法结束，内核报警</td></tr>
+  <tr><td class="term">SRCU</td><td>Sleepable RCU</td><td>读侧允许睡眠的 RCU 变体（用 srcu_read_lock）</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 三个阶段</h3>
+
+<pre><code>  读侧（几乎零成本）                写侧                        回收侧
+  ────────────────              ─────────                    ─────────
+  rcu_read_lock()                复制一份新对象              call_rcu()/
+    ↓ 标记“我在读”                在副本上修改                  kfree_rcu()
+  ptr = rcu_dereference(p)         ↓                           挂进回调队列
+    ↓ 读出当前指针               rcu_assign_pointer(p, new)    ↓
+  ... 用 ptr ...                   ↓ 发布新指针              等一个宽限期
+    ↓                           synchronize_rcu()  ← 可选       ↓
+  rcu_read_unlock()                ↓ 等宽限期              宽限期结束
+    ↓ 报告静止态                （此刻才能安全 free 旧对象）   ↓
+                                                          真正 free(old)</code></pre>
+
+<h3>3.2 宽限期与静止态（时序图）</h3>
+
+<pre><code>时间 ───────────────────────────────────────────────────────────►
+
+ CPU0            CPU1            CPU2         写者
+  │               │               │            │
+  │ rcu_read_lock │               │            │
+  │ ptr = OLD     │               │            │  此刻 CPU0 手上有旧指针
+  │ ... 用 OLD .. │               │            │
+  │ rcu_read_unlock               │            │  ← CPU0 报告静止态(QS)
+  │  → QS#1       │               │            │
+  │               │               │            │  synchronize_rcu()
+  │               │               │            │  ← 宽限期开始(GP start)
+  │               │ rcu_read_lock │            │
+  │               │ ptr = NEW     │            │  ← 发布之后进入的读者
+  │               │ ... 用 NEW .. │            │     只会看到新指针
+  │               │ rcu_read_unlock│            │
+  │               │  → QS#2       │            │
+  │               │               │ ← 一直空闲  │
+  │               │               │  → QS#3     │  (空闲 CPU 立刻报告)
+  │               │               │            │
+  │        ┌──────────────────────────────────────────────┐
+  │        │ 全部 CPU 都报告过 QS → 宽限期结束              │
+  │        │ 现在 free(OLD) 是安全的：没有任何读者还握着它 │
+  │        └──────────────────────────────────────────────┘</code></pre>
+
+<div class="note">
+<b>关键推论：</b>CPU0 在写者发布新指针<strong>之前</strong>就进入了读侧临界区，它读到的是旧指针 OLD。只要宽限期覆盖了“CPU0 进入临界区”到“CPU0 报告静止态”这段路，写者就<strong>不能</strong>在宽限期内 free(OLD)。反过来，任何在发布之后才进入的读者都只会看到 NEW。这就是 RCU 正确性的全部。
+</div>
+
+<h3>3.3 读侧怎么报告静止态</h3>
+
+<p>“静止态”这个词听起来很玄，其实只取决于内核配置：</p>
+
+<table>
+  <tr><th>实现</th><th>读者行为</th><th>何时报告 QS</th></tr>
+  <tr><td><code>PREEMPT_RCU</code>（抢占式）</td><td>只做 <code>++current-&gt;rcu_read_lock_nesting</code></td><td>最外层 <code>rcu_read_unlock()</code> 时报告；若中途被抢占，由上下文切换路径补报</td></tr>
+  <tr><td><code>TREE_RCU</code> / <code>TINY_RCU</code>（非抢占式）</td><td><code>preempt_disable()</code>，读者期间不能被抢占</td><td>退出临界区、重新允许抢占的那一刻</td></tr>
+</table>
+
+<p>差别很大：抢占式 RCU 里读者可以被踢下 CPU，但代价是“报告静止态”的时机变复杂（被抢占的任务什么时候算 QS？答案是它<strong>重新被调度回来</strong>的时候）。非抢占式 RCU 里读者一退出临界区就立刻报告，简单得多，但读者期间不能被抢占（对延迟不利）。</p>
+
+<h3>3.4 RCU 链表：删除之后为什么不能马上 free</h3>
+
+<pre><code>写者删除元素 B：
+   list_del_rcu(&amp;B-&gt;list);        ← B 从链表里摘掉了
+   ...                                ← 但 B 本身还占着内存！
+   kfree_rcu(B, rcu);                 ← 真正的释放推迟到宽限期之后
+
+读者遍历链表：
+   rcu_read_lock();
+   list_for_each_entry_rcu(pos, &amp;head, list) {
+           use(pos);        ← 这个 pos 可能正指向 B！
+   }
+   rcu_read_unlock();
+
+如果写者摘掉 B 之后立刻 kfree(B)：
+   读者可能刚拿到 pos=&amp;B，还没来得及 use(pos) → 访问已释放内存 → use-after-free。
+如果用 kfree_rcu(B)：
+   宽限期保证“所有可能在遍历 B 的读者都已退出”→ 此时 free(B) 才安全。</code></pre>
+
+<h3>3.5 什么时候<strong>不</strong>该用 RCU</h3>
+
+<p>内核官方检查清单（<code>Documentation/RCU/checklist.rst</code>）第一条就写着：如果数据结构被更新的频率超过<strong>大约 10%</strong>，应该认真考虑别的方案，因为 RCU 是<strong>用写侧和内存的开销换读侧的开销</strong>。另外，RCU 读侧临界区里<strong>不能睡眠</strong>（非抢占式内核里绝对不行，抢占式也只允许阻塞那些支持优先级继承的锁），也不能做可能长时间等待的操作。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 <code>rcu_read_lock</code>：读者的全部动作</h3>
+
+<p class="srcline">include/linux/rcupdate.h:637-644  rcu_read_lock</p>
+<pre><code>static __always_inline void rcu_read_lock(void)
+{
+	__rcu_read_lock();
+	__acquire(RCU);
+	rcu_lock_acquire(&amp;rcu_lock_map);
+	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+			 "rcu_read_lock() used illegally while idle");
+}</code></pre>
+
+<p>读者侧的“加锁”就这么点东西：<code>__rcu_read_lock()</code>（不同 RCU 实现不同）、给 sparse 用的注解、给 lockdep 用的记账。没有任何原子读-改-写，没有获取/释放语义，<strong>不会阻塞任何其他 CPU</strong>。这就是 RCU 读侧快的全部秘密。</p>
+
+<p>抢占式实现里，<code>__rcu_read_lock()</code> 仅仅是个计数：</p>
+
+<p class="srcline">kernel/rcu/tree_plugin.h:374-383  __rcu_read_lock</p>
+<pre><code>void __rcu_read_lock(void)
+{
+	rcu_preempt_read_enter();
+	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
+		WARN_ON_ONCE(rcu_preempt_depth() &gt; RCU_NEST_PMAX);
+	if (IS_ENABLED(CONFIG_RCU_STRICT_GRACE_PERIOD) &amp;&amp; rcu_state.gp_kthread)
+		WRITE_ONCE(current-&gt;rcu_read_unlock_special.b.need_qs, true);
+	barrier();  /* critical section after entry code. */
+}
+EXPORT_SYMBOL_GPL(__rcu_read_lock);</code></pre>
+
+<p><code>rcu_preempt_read_enter()</code> 就是 <code>++current-&gt;rcu_read_lock_nesting</code>（见 <code>kernel/rcu/tree_plugin.h:353-356</code>）。最后那行 <code>barrier()</code> 是<strong>编译器屏障</strong>：保证“进入临界区”这条语句不会被编译器重排到临界区内部代码之后。这是第 13 篇要展开的话题。</p>
+
+<h3>4.2 <code>rcu_read_unlock</code>：报告静止态</h3>
+
+<p class="srcline">include/linux/rcupdate.h:689-696  rcu_read_unlock</p>
+<pre><code>static inline void rcu_read_unlock(void)
+{
+	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+			 "rcu_read_unlock() used illegally while idle");
+	__release(RCU);
+	__rcu_read_unlock();
+	rcu_lock_release(&amp;rcu_lock_map); /* Keep acq info for rls diags. */
+}</code></pre>
+
+<p>抢占式实现里，<code>__rcu_read_unlock()</code> 递减嵌套计数，<strong>只有最外层那次</strong>（计数减到 0）才算真正退出临界区：</p>
+
+<p class="srcline">kernel/rcu/tree_plugin.h:392-407  __rcu_read_unlock</p>
+<pre><code>void __rcu_read_unlock(void)
+{
+	struct task_struct *t = current;
+
+	if (rcu_preempt_read_exit() == 0) {
+		barrier();  /* critical section before exit code. */
+		if (unlikely(READ_ONCE(t-&gt;rcu_read_unlock_special.s)))
+			rcu_read_unlock_special(t);
+	}
+	if (IS_ENABLED(CONFIG_PROVE_LOCKING)) {
+		int rrln = rcu_preempt_depth();
+
+		WARN_ON_ONCE(rrln &lt; 0 || rrln &gt; RCU_NEST_PMAX);
+	}
+}
+EXPORT_SYMBOL_GPL(__rcu_read_unlock);</code></pre>
+
+<p><code>rcu_read_unlock_special()</code> 存在的理由是“任务在 RCU 读侧临界区里被抢占、切换走了”这种特殊情况——此时静止态要等到它被调度回来才报告。日常路径上它就是个空操作。</p>
+
+<h3>4.3 <code>rcu_assign_pointer</code>：发布</h3>
+
+<p class="srcline">include/linux/rcupdate.h:414-423  rcu_assign_pointer</p>
+<pre><code>#define rcu_assign_pointer(p, v)					      \
+do {									      \
+	uintptr_t _r_a_p__v = (uintptr_t)(v);				      \
+	rcu_check_sparse(p, __rcu);					      \
+									      \
+	if (__builtin_constant_p(v) &amp;&amp; (_r_a_p__v) == (uintptr_t)NULL)	      \
+		WRITE_ONCE((p), (typeof(p))(_r_a_p__v));		      \
+	else								      \
+		smp_store_release(&amp;p, RCU_INITIALIZER((typeof(p))_r_a_p__v)); \
+} while (0)</code></pre>
+
+<p>三个要点：</p>
+
+<ul>
+  <li><code>smp_store_release()</code> 提供了 <strong>release 语义</strong>：保证“在调用 <code>rcu_assign_pointer()</code> 之前对副本做的所有修改，对之后读到该指针的读者都是可见的”。没有这条保证，读者可能拿到新指针却看到未初始化的新数据。</li>
+  <li><code>WRITE_ONCE()</code> 只在赋值为 NULL 且是编译期常量时使用——那种情况下没有“发布顺序”需要保证。</li>
+  <li><code>rcu_check_sparse(p, __rcu)</code> 让 sparse 静态检查器能验证“你确实用了 RCU 保护的指针”。</li>
+</ul>
+
+<p>注意：<code>rcu_assign_pointer()</code> 只是<strong>发布</strong>，它<strong>不</strong>保证旧数据安全释放。旧数据的回收是另一件事。</p>
+
+<h3>4.4 <code>rcu_dereference</code>：读</h3>
+
+<p class="srcline">include/linux/rcupdate.h:496-498  rcu_dereference_check</p>
+<pre><code>#define rcu_dereference_check(p, c) \
+	__rcu_dereference_check((p), (c) || rcu_read_lock_held(), __rcu)</code></pre>
+
+<p class="srcline">include/linux/rcupdate.h:550-556  rcu_dereference</p>
+<pre><code>/**
+ * rcu_dereference() - fetch RCU-protected pointer for dereferencing
+ * @p: The pointer to read, prior to dereferencing
+ *
+ * This is a simple wrapper around rcu_dereference_check().
+ */
+#define rcu_dereference(p) rcu_dereference_check(p, 0)</code></pre>
+
+<p><code>rcu_dereference()</code> 做两件事：<b>①</b> 用正确的内存序读出指针（在 x86 上就是一条普通的 load，因为 x86 是强序模型；别的架构需要额外屏障）；<b>②</b> 顺便做一次<strong>合法性检查</strong>——<code>c || rcu_read_lock_held()</code> 表示“你要么持有某把更新侧的锁，要么正在 RCU 读侧临界区里”。如果两个条件都不满足（也就是在读侧临界区外裸读一个 RCU 指针），lockdep 会报 “rcu_dereference() used illegally”。</p>
+
+<p>与之对称，写侧有一对 <code>rcu_dereference_protected()</code>（<code>include/linux/rcupdate.h:546-547</code>），用于“更新侧已经持有锁，值不会变”的场景，它连 <code>READ_ONCE()</code> 都省了。</p>
+
+<h3>4.5 <code>synchronize_rcu</code>：等一个宽限期</h3>
+
+<p class="srcline">kernel/rcu/tree.c:3624-3637  synchronize_rcu</p>
+<pre><code>void synchronize_rcu(void)
+{
+	RCU_LOCKDEP_WARN(lock_is_held(&amp;rcu_bh_lock_map) ||
+			 lock_is_held(&amp;rcu_lock_map) ||
+			 lock_is_held(&amp;rcu_sched_lock_map),
+			 "Illegal synchronize_rcu() in RCU read-side critical section");
+	if (rcu_blocking_is_gp())
+		return;
+	if (rcu_gp_is_expedited())
+		synchronize_rcu_expedited();
+	else
+		wait_rcu_gp(call_rcu);
+}
+EXPORT_SYMBOL_GPL(synchronize_rcu);</code></pre>
+
+<p>逐行看：</p>
+
+<ul>
+  <li><b>第一段是自我保护</b>：如果你在 RCU 读侧临界区里调用 <code>synchronize_rcu()</code>，那是必死的（你在等所有读者退出，其中一个就是你自己）。lockdep 会提前抓住它并报 “Illegal synchronize_rcu() in RCU read-side critical section”。</li>
+  <li><b><code>rcu_blocking_is_gp()</code></b>：如果当前这个 CPU 正在“阻塞式地参与宽限期”，直接返回即可。</li>
+  <li><b><code>rcu_gp_is_expedited()</code></b>：<span class="term">加速宽限期（expedited grace period）</span>是给“写者已经在等锁、必须尽快拿到结果”这种场景用的特殊路径（比如 <code>rmmod</code> 卸载模块时）。它不等待所有 CPU 报告静止态，而是直接让每个 CPU 执行一次上下文切换来强制报告。</li>
+  <li><b><code>wait_rcu_gp(call_rcu)</code></b>：普通路径。发起宽限期，等待它结束，然后执行挂起的回调。</li>
+</ul>
+
+<h3>4.6 <code>call_rcu</code>：延迟回收</h3>
+
+<p class="srcline">kernel/rcu/tree.c:3025-3029  call_rcu</p>
+<pre><code>void call_rcu(struct rcu_head *head, rcu_callback_t func)
+{
+	__call_rcu(head, func);
+}
+EXPORT_SYMBOL_GPL(call_rcu);</code></pre>
+
+<p><code>call_rcu()</code> 把一个回调挂进当前 CPU 的回调链表，它会在<strong>下一个宽限期结束之后</strong>被执行（由 softirq 或 <code>rcu_*_kthread</code> 内核线程驱动）。执行时机是“回调所在的 CPU 恰好经历了一次宽限期结束”，所以它可能发生在你不期待的地方（比如中断上下文）——因此回调里不能睡眠。</p>
+
+<h3>4.7 RCU 链表：写侧</h3>
+
+<p class="srcline">include/linux/rculist.h:85-95  __list_add_rcu</p>
+<pre><code>static inline void __list_add_rcu(struct list_head *new,
+		struct list_head *prev, struct list_head *next)
+{
+	if (!__list_add_valid(new, prev, next))
+		return;
+
+	new-&gt;next = next;
+	new-&gt;prev = prev;
+	rcu_assign_pointer(list_next_rcu(prev), new);
+	next-&gt;prev = new;
+}</code></pre>
+
+<p class="srcline">include/linux/rculist.h:113-116  list_add_rcu</p>
+<pre><code>static inline void list_add_rcu(struct list_head *new, struct list_head *head)
+{
+	__list_add_rcu(new, head, head-&gt;next);
+}</code></pre>
+
+<p>关键在 <code>rcu_assign_pointer(list_next_rcu(prev), new)</code>：插入点的“next”指针是用<strong>发布</strong>语义写的。普通链表的 <code>list_add()</code> 直接写 <code>prev-&gt;next = new</code>，而 RCU 版本必须用 <code>rcu_assign_pointer()</code>，否则读者可能看到一个“半初始化”的新节点。</p>
+
+<h3>4.8 RCU 链表：读侧</h3>
+
+<p class="srcline">include/linux/rculist.h:390-394  list_for_each_entry_rcu</p>
+<pre><code>#define list_for_each_entry_rcu(pos, head, member, cond...)		\
+	for (__list_check_rcu(dummy, ## cond, 0),			\
+	     pos = list_entry_rcu((head)-&gt;next, typeof(*pos), member);	\
+		&amp;pos-&gt;member != (head);					\
+		pos = list_entry_rcu(pos-&gt;member.next, typeof(*pos), member))</code></pre>
+
+<p>读侧每走一步都用 <code>list_entry_rcu()</code>（内部是 <code>READ_ONCE(ptr)</code>）来取指针。配合 <code>__list_check_rcu()</code>，开了 <code>CONFIG_PROVE_RCU_LIST</code> 之后，如果你<strong>没有</strong>在 <code>rcu_read_lock()</code> 里就遍历 RCU 链表，内核会直接报 “RCU-list traversed in non-reader section!”。</p>
+
+<h3>4.9 <code>kfree_rcu</code>：为什么它比 <code>call_rcu</code> 更好用</h3>
+
+<p class="srcline">include/linux/rcupdate.h:877-883  kfree_rcu</p>
+<pre><code>#define kfree_rcu(ptr, rhf)						\
+do {									\
+	typeof (ptr) ___p = (ptr);					\
+									\
+	if (___p)							\
+		__kvfree_rcu(&amp;((___p)-&gt;rhf), offsetof(typeof(*(ptr)), rhf)); \
+} while (0)</code></pre>
+
+<p>很多 RCU 回调函数的内容就是一句 <code>kfree()</code>，但每个都要写一个独立的函数，还给模块卸载带来麻烦（模块卸载时必须调用高延迟的 <code>rcu_barrier()</code>）。<code>kfree_rcu()</code> 的聪明之处：<strong>它不存函数地址，而是存 <code>rcu_head</code> 在结构体里的偏移量</strong>。内核地址空间的低 4096 字节永远不会被分配，所以偏移量一定小于 4096，可以用一个整数塞进回调指针里——运行时再由 <code>kvfree_call_rcu()</code> 把它还原成偏移量并 free 掉。注释里写得很清楚：</p>
+
+<pre><code> * The kfree_rcu() function handles this issue.  Rather than encoding a
+ * function address in the embedded rcu_head structure, kfree_rcu() instead
+ * encodes the offset of the rcu_head structure within the base structure.
+ * Because the functions are not allowed in the low-order 4096 bytes of
+ * kernel virtual memory, offsets up to 4095 bytes can be accommodated.</code></pre>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 先看看你的内核提供了哪些 RCU 旋钮</h3>
+
+<pre><code>$ ls /sys/module/rcu/parameters/
+blimit            gp_cleanup_delay    jiffies_till_next_fqs  kthread_prio
+qhimark           gp_init_delay       jiffies_till_sched_qs  qlowmark
+qovld             gp_preinit_delay    jiffies_to_sched_qs    qlowmark
+rcu_divisor       gp_cleanup_delay    kthread_prio           rcu_fanout_exact
+rcu_fanout_leaf   jiffies_till_first_fqs  rcu_min_cached_objs  rcu_resched_ns
+dump_tree         rcu_kick_kthreads   use_softirq
+
+$ cat /proc/sys/kernel/panic_on_rcu_stall
+0</code></pre>
+
+<p>几个有用的：<code>rcu_kick_kthreads</code>（是否让宽限期内核线程忙轮询）、<code>rcu_divisor</code>（宽限期轮询频率）、<code>use_softirq</code>（回调在软中断还是内核线程里跑）。</p>
+
+<div class="warn">
+<b>关于 <code>/sys/kernel/debug/rcu/</code>：</b>这个目录（含 <code>stall_warnings</code>）是 Linux <b>5.11 及以后</b>才加进来的，<b>5.10 没有</b>。在 5.10 上想看 stall 警告，直接看 <code>dmesg</code>。
+</div>
+
+<h3>5.2 观察一个真实的宽限期</h3>
+
+<p>内核给 RCU 准备了一整套 tracepoint，开着 <code>CONFIG_TRACEPOINTS</code>（大多数发行版内核都开）就能看到宽限期的开始和结束：</p>
+
+<pre><code># 列出可用的 RCU 事件
+$ ls /sys/kernel/debug/tracing/events/rcu/
+rcu_callback              rcu_invoke_callback
+rcu_exp_grace_period      rcu_kvfree_callback
+rcu_future_grace_period   rcu_nocb_wake
+rcu_grace_period          rcu_preempt_task
+rcu_grace_period_init     rcu_quiescent_state_report
+rcu_invoke_kfree_bulk_callback  rcu_unlock_preempted_task
+rcu_invoke_kvfree_callback
+
+# 跟踪宽限期
+$ cd /sys/kernel/debug/tracing
+$ echo 1 &gt; events/rcu/rcu_grace_period/enable
+$ echo 1 &gt; events/rcu/rcu_quiescent_state_report/enable
+$ cat trace | head -40
+</code></pre>
+
+<p>典型输出会长这样：</p>
+
+<pre><code>              &lt;...&gt;-1409  [000] ...1 99999.999999: rcu_grace_period: ctxt=1
+              &lt;...&gt;-1409  [000] ...1 99999.999999: rcu_quiescent_state_report: ctxt=1
+              &lt;...&gt;-1409  [000] ...1 99999.999999: rcu_quiescent_state_report: ctxt=1
+                 &lt;idle&gt;-0     [000] ...1 99999.999999: rcu_quiescent_state_report: ctxt=1
+                 &lt;idle&gt;-0     [000] ...1 99999.999999: rcu_quiescent_state_report: ctxt=1
+              &lt;...&gt;-1234   [002] ...1 99999.999999: rcu_quiescent_state_report: ctxt=1
+</code></pre>
+
+<p>读法：<code>rcu_grace_period</code> 是宽限期开始，<code>rcu_quiescent_state_report</code> 是每个 CPU 报告静止态。看到 N 颗 CPU 都报告了，宽限期就结束，之前挂起的 <code>call_rcu</code> 回调就会跑起来。</p>
+
+<h3>5.3 制造一次 RCU stall（可选，慎用）</h3>
+
+<pre><code># 一个 CPU 长时间不报告静止态 → 宽限期卡住
+# 21 秒后内核会打印 stall 警告（默认值来自 CONFIG_RCU_CPU_STALL_TIMEOUT）
+$ cat /proc/sys/kernel/panic_on_rcu_stall
+0
+
+# 把它设成 1，让 stall 直接 panic（调试用，会导致系统崩溃）
+$ sudo sysctl -w kernel.panic_on_rcu_stall=1</code></pre>
+
+<p>典型的 stall 警告形如：</p>
+
+<pre><code>WARNING: RCU Stall Detected
+detected stalls on CPUs/tasks:
+	[0] rcu_preempt: 1-...: (rcu_read_lock_nesting) 49999 jiffies
+	[1] kworker/1:1: (tasks) R
+Sending NMI from CPU 0 to CPUs 1:
+NMI backtrace for cpu 1
+CPU: 1 PID: 0 Comm: swapper/1
+Call Trace:
+ &lt;TASK&gt;
+ rcu_read_unlock_special+0x.../0x...
+ rcu_read_unlock+0x.../0x...
+</code></pre>
+
+<p>它会告诉你<strong>哪个 CPU、哪个任务</strong>卡在读侧临界区里出不来，以及它卡在哪一行调用栈上——这是排查“某个 CPU 长时间占着中断不放”类问题的利器。</p>
+
+<h3>5.4 用 <code>rcutorture</code> 给 RCU 做压力测试</h3>
+
+<p>RCU 自带一个“折磨测试”模块（<code>kernel/rcu/rcutorture.c</code>），它会开一堆读者线程和几个假的写者线程，不断地插入/删除/遍历，专门用来把 RCU 实现里的 bug 逼出来。Kconfig 名字是 <code>CONFIG_RCU_TORTURE_TEST</code>（<code>kernel/rcu/Kconfig.debug:45</code>）。</p>
+
+<p><b>如果你的发行版内核带了这个模块</b>，直接用：</p>
+
+<pre><code>$ sudo modprobe rcutorture
+$ ls /sys/module/rcutorture/parameters/
+extendables  fqs_duration  fqs_holdoff  fqs_stutter  fwd_progress  gp_cond
+gp_exp  gp_normal  gp_sync  irqreader  leakpointer  n_barrier_cbs
+nfakewriters  nreaders  object_debug  onoff_holdoff  onoff_interval
+read_exit_delay  read_exit_burst  shuffle_interval  stall_cpu  stat_interval
+stutter  test_boost  torture_type  verbose
+
+$ cat /sys/module/rcutorture/parameters/nfakewriters
+4
+$ cat /sys/module/rcutorture/parameters/torture_type
+rcu
+
+$ dmesg | grep -i torture | tail -20
+rcu: torture testing: fqs_duration=0 fqs_holdoff=0 fqs_stutter=3
+rcu: Starting Rcupdate test with nreaders=4 nfakewriters=4
+...
+</code></pre>
+
+<p>几个常用参数：<code>nreaders</code>（读者线程数，-1 表示每 CPU 一个）、<code>nfakewriters</code>（假写者数量）、<code>torture_type</code>（测 <code>rcu</code> 还是 <code>srcu</code>）、<code>stutter</code>（跑几秒停几秒）、<code>stall_cpu</code>（故意让某颗 CPU 卡住多少秒，用来验证 stall 检测器有效）。</p>
+
+<p><b>如果没有这个模块</b>，用 qemu + busybox 最小环境跑一个（这是编译内核的最小步骤）：</p>
+
+<pre><code># 1) 在源码树里打开相关配置
+$ scripts/config --enable DEBUG_KERNEL \
+                  --enable RCU_TORTURE_TEST=m \
+                  --enable RCU_CPU_STALL_TIMEOUT \
+                  --disable MODULE_SIG \
+                  --enable MODULE_SIG_FORCE
+$ make olddefconfig
+$ make -j$(nproc) bzImage modules
+
+# 2) 准备一个 busybox 根文件系统
+$ wget https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox
+$ chmod +x busybox
+$ mkdir -p rootfs/{bin,dev,proc,sys,lib/modules}
+$ cp busybox rootfs/bin/ &amp;&amp; ln -s busybox rootfs/bin/sh
+$ (cd rootfs &amp;&amp; find . | cpio -o -H newhdr | gzip) &gt; initramfs.cpio.gz
+
+# 3) 用 qemu 启动
+$ qemu-system-x86_64 -kernel arch/x86/boot/bzImage \
+    -initrd initramfs.cpio.gz \
+    -append "console=ttyS0 rdinit=/bin/sh" \
+    -m 1024 -smp 4 -nographic
+
+# 4) 在 busybox shell 里
+/ # modprobe rcutorture
+/ # cat /sys/module/rcutorture/parameters/nreaders
+/ # dmesg | tail -30
+</code></pre>
+
+<p>为了让 torture 更有压力，可以调大读者数并加上“故意卡住某 CPU”的场景：</p>
+
+<pre><code>/ # echo 8 &gt; /sys/module/rcutorture/parameters/nreaders
+/ # echo 1 &gt; /sys/module/rcutorture/parameters/stall_cpu
+/ # echo 30 &gt; /sys/module/rcutorture/parameters/stall_cpu_holdoff
+/ # dmesg | grep -A20 "RCU Stall"    # 应当能看到 stall 警告被正确打印</code></pre>
+
+<h3>5.5 推荐的入门文档</h3>
+
+<p>内核源码树 <code>Documentation/RCU/</code> 下有一整套精心编排的文档，<code>index.rst</code> 里列出了阅读顺序。建议按这个顺序读：</p>
+
+<table>
+  <tr><th>文档</th><th>内容</th></tr>
+  <tr><td><code>whatisRCU.rst</code></td><td>“RCU 到底是什么”，附 LWN 系列文章链接，<b>从这里开始</b></td></tr>
+  <tr><td><code>rcu.rst</code></td><td>RCU 基础机制与 API 概览</td></tr>
+  <tr><td><code>rcu_dereference.rst</code></td><td><code>rcu_dereference()</code> 与稀疏指针的内存序细节</td></tr>
+  <tr><td><code>listRCU.rst</code></td><td>RCU 链表用法（本文第 4.7/4.8 节的官方版本）</td></tr>
+  <tr><td><code>arrayRCU.rst</code></td><td>RCU 数组用法</td></tr>
+  <tr><td><code>checklist.rst</code></td><td><b>写 RCU 代码的检查清单</b>，提交补丁前必读</td></tr>
+  <tr><td><code>stallwarn.rst</code></td><td>如何读懂 RCU stall 警告</td></tr>
+  <tr><td><code>torture.rst</code></td><td><code>rcutorture</code> 的使用说明</td></tr>
+  <tr><td><code>lockdep.rst</code></td><td>RCU 与 lockdep 的配合</td></tr>
+  <tr><td><code>rcubarrier.rst</code></td><td>模块卸载时的 <code>rcu_barrier()</code></td></tr>
+  <tr><td><code>UP.rst</code></td><td>卸载（unload）路径上的 RCU 注意事项</td></tr>
+  <tr><td><code>Design/Requirements/Requirements</code></td><td>RCU 的设计需求清单，理解实现取舍的最佳材料</td></tr>
+</table>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. RCU 和读写锁（rwsem）到底差在哪？</b>读写锁的读者要拿锁：一次原子读-改-写 + 计数 + 屏障，多核读者之间虽然可以并发，但仍有写者要等所有读者退出。RCU 的读者<strong>完全不加锁</strong>，只做一个嵌套计数加一条编译器屏障；写者复制一份、改好、发布新指针；旧数据延迟到宽限期之后再释放。所以 RCU 的读侧几乎零成本，代价全在写侧（复制）和内存（老数据不能立刻回收）以及回收侧（异步回调）。</div>
+
+<div class="qa"><b>Q2. 什么是宽限期和静止态？</b>宽限期是从写者发起 <code>synchronize_rcu()</code> 开始、到“所有可能持有旧指针的读者都退出”为止的一段时间。静止态（quiescent state）指“某颗 CPU 上此刻没有 RCU 读侧临界区”的一个瞬间。宽限期结束的判据是：每颗 CPU 都至少报告过一次静止态。非抢占式 RCU 在读者退出临界区、重新允许抢占时报告；抢占式 RCU 在最外层 <code>rcu_read_unlock()</code> 时报告，被抢占的情况由上下文切换路径补报。</div>
+
+<div class="qa"><b>Q3. 为什么 <code>rcu_assign_pointer()</code> 和 <code>rcu_dereference()</code> 不能用普通的赋值和读取代替？</b>两个都是<strong>内存序</strong>问题。<code>rcu_assign_pointer()</code> 用 release 语义发布指针，保证“副本里的所有初始化对看到该指针的读者可见”；<code>rcu_dereference()</code> 用 acquire 语义读指针，保证“读到指针之后的读取不会被重排到指针读取之前”。用普通赋值/读取，编译器或 CPU 可能重排，读者就可能拿到“新指针 + 未初始化内容”，也就是经典的 release/acquire 失效。此外 <code>rcu_dereference()</code> 还带 lockdep 检查，会验证你确实在读侧临界区里。</div>
+
+<div class="qa"><b>Q4. <code>list_del_rcu()</code> 之后为什么必须用 <code>kfree_rcu()</code> 而不是直接 <code>kfree()</code>？</b>因为读者可能正拿着刚被摘掉的节点的指针在遍历：<code>list_for_each_entry_rcu()</code> 逐步用 <code>list_entry_rcu()</code> 取 <code>next</code>，读者可能刚拿到指向 B 的指针，还没来得及用，B 就被 <code>kfree()</code> 掉了 → use-after-free。<code>kfree_rcu()</code> 把释放推迟到宽限期之后，保证那时已经没有读者能碰到 B。它的实现很巧：不在回调里存函数地址，而是存 <code>rcu_head</code> 在结构体中的<strong>偏移量</strong>（内核地址空间低 4096 字节不可分配，所以偏移量必然小于 4096），省掉了为每个类型写一个回调函数的开销。</div>
+
+<div class="qa"><b>Q5. 什么时候不该用 RCU？</b>官方检查清单第一条：更新率超过大约 10% 就别用，因为 RCU 是拿写侧开销和内存开销换读侧开销，读写比例不悬殊时这笔买卖不划算。另外读侧临界区里不能睡眠（非抢占式内核里绝对禁止），也不能做可能长时间等待的操作。如果数据结构简单、访问不频繁，一把普通的 mutex 或 rwsem 往往更省事。</div>
+
+<div class="qa"><b>Q6. RCU stall 警告是什么意思？该找谁？</b>意思是“某个 CPU 太久没有报告静止态，导致宽限期无法结束”，最常见的原因是某个任务在 RCU 读侧临界区里死循环、或者长时间关着中断/关着抢占。警告里会列出卡住的 CPU 号和任务名，还可能附带 NMI backtrace 指出它卡在哪一行。它的用途是定位“某个 CPU 长时间占着不放”这类问题（比如驱动里忘了开中断）。在 5.10 上这个警告通过 <code>dmesg</code> 查看；<code>/sys/kernel/debug/rcu/stall_warnings</code> 是 5.11 才加的。</div>
+
+<footer>
+  <p>上一篇：<a href="11-locking.html">11 内核锁</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="13-atomic.html">13 原子与内存屏障</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>28-netfilter 防火墙框架</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="29-lsm.html">下一篇：29-lsm →</a>
+</nav>
+
+<h1>🔥 28-netfilter 防火墙框架</h1>
+<p class="subtitle">内核在包的五个必经之路上埋下检查点，让 iptables/nftables 在不改协议栈的前提下决定包的生死 · 约 14 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>想象一栋写字楼有五个必过的关卡：进门、前台、内网走廊、出楼、屋顶。每道关卡都有一群保安，每个人只负责判断"放行、拦下、还是转交下一位"。写字楼主人（管理员）可以随时给保安队换人、调整保安的检查顺序，但楼里的公司（TCP/IP 协议栈）完全不需要知道保安存在，照常办自己的事。</p>
+<p>netfilter 就是这栋楼。<b>协议栈在五个固定位置调用 <code>NF_HOOK(...)</code>，把包交给钩子链</b>；钩子链上挂的是各种模块——iptables、nftables、conntrack、NAT、iptables 的透明代理等。钩子返回一个"判决"（verdict）：<code>NF_ACCEPT</code> 放行、<code>NF_DROP</code> 丢弃、<code>NF_STOLEN</code> 抢走（这个包我处理了，别往下传了）、<code>NF_QUEUE</code> 交给用户态程序处理。整个设计的关键是<b>协议栈与防火墙解耦</b>：<code>ip_rcv</code> 里只有一行 <code>NF_HOOK</code>，不管你装的是 iptables 还是 nftables，它都长一样。</p>
+<p>第二个问题是<b>有状态</b>。防火墙最常见的规则是"允许已建立的连接通过，只允许我主动发起的连接出去"。这需要内核记住"哪些连接存在"，否则无法区分"回应包的 SYN+ACK"和" unsolicited 的 SYN+ACK"。netfilter 用 <b>conntrack（连接跟踪）</b>解决：它给每条连接建一张表，按四元组记录状态和超时，规则里可以写 <code>--ctstate ESTABLISHED</code> 来引用它。</p>
+<p>第三个问题是<b>老 iptables 的表达能力不够</b>。iptables 的表/链模型要求"一个表里先遍历所有链"，链之间跳转靠 <code>-j</code> 加上返回栈，规则多了以后性能下降，而且新特性（如 nftables 的集合、状态对象、动态集合）很难加进去。nftables 重新设计了：所有表、链、规则、集合都是独立的 netlink 对象，规则里可以直接引用集合，数据包处理是"编译"成一棵表达式树由 eBPF 式的解释器执行。新内核同时支持两者，iptables 其实是 nftables 之上的兼容层（<code>iptables-nft</code>）。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">钩子</td><td>hook</td><td>协议栈里的一个检查点，NF_HOOK 宏在此把包交给钩子链。</td></tr>
+  <tr><td class="term">钩子操作</td><td>struct nf_hook_ops</td><td>一个模块向 netfilter 注册的挂载描述：函数指针、协议族、钩子号、优先级。</td></tr>
+  <tr><td class="term">判决</td><td>verdict</td><td>钩子函数的返回值：NF_ACCEPT / NF_DROP / NF_STOLEN / NF_QUEUE / NF_REPEAT。</td></tr>
+  <tr><td class="term">五挂载点</td><td>NF_INET_*_HOOK</td><td>PRE_ROUTING、LOCAL_IN、FORWARD、LOCAL_OUT、POST_ROUTING 五个必经点。</td></tr>
+  <tr><td class="term">表</td><td>table</td><td>iptables 的一层规则集合，如 filter、nat、mangle、raw、security。</td></tr>
+  <tr><td class="term">链</td><td>chain</td><td>表内的一条规则序列；内建链固定存在，用户链可被跳转。</td></tr>
+  <tr><td class="term">匹配</td><td>match / extension</td><td>判断包是否符合条件的模块，如 -p tcp、--dport 22。</td></tr>
+  <tr><td class="term">目标</td><td>target</td><td>匹配成功后执行的动作，如 ACCEPT、DROP、REJECT、LOG。</td></tr>
+  <tr><td class="term">连接跟踪</td><td>conntrack</td><td>内核为每条连接保存状态表，让规则能按连接状态匹配。</td></tr>
+  <tr><td class="term">连接元组</td><td>tuple</td><td>标识一条连接的四元组：源/目的 IP + 源/目的端口。</td></tr>
+  <tr><td class="term">状态</td><td>ctstate</td><td>NEW、ESTABLISHED、RELATED、INVALID 等连接状态标签。</td></tr>
+  <tr><td class="term">网络地址转换</td><td>NAT</td><td>改写包里的地址，常用于让内网共享一个公网 IP。</td></tr>
+  <tr><td class="term">网络命名空间</td><td>network namespace</td><td>隔离网络栈的容器，每份 netns 有独立的 iptables 规则。</td></tr>
+  <tr><td class="term">优先级</td><td>priority</td><td>同一钩子上多个模块的执行顺序，数字小的先跑。</td></tr>
+  <tr><td class="term">nftables 基础链</td><td>base chain</td><td>nftables 中直接绑定到钩子的链，类型有 filter / nat / route。</td></tr>
+  <tr><td class="term">nftables 集合</td><td>set</td><td>高效的批量匹配结构，如 IP 地址集合、端口集合。</td></tr>
+  <tr><td class="term">用户态队列</td><td>NFQUEUE</td><td>把包交给用户态程序（如 fail2ban）决定放行还是丢弃。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 五个挂载点与包的流向</h3>
+<pre><code>                        ┌─────────────── 网卡 ───────────────┐
+                        │                                     │
+                   收包 ↓                                     ↑ 发包
+                        │                                     │
+        ╔═══════════════▼═════════════════════════════════════╧═══╗
+        ║ ① NF_INET_PRE_ROUTING                                 ║  ← 刚进内核，还不知道是给谁
+        ║      （DNAT / 路由前的目标地址改写在这里）             ║
+        ╚═══════════════╤═════════════════════════════════════╧═══╝
+                        │ 查路由表判断目标
+              ┌─────────┴─────────┐
+        本机收 ↓                   ↓ 转发给别的主机
+   ╔═════════════════╗      ╔═══════════════════════╗
+   ║ ② NF_INET_LOCAL_IN ║     ║ ③ NF_INET_FORWARD  ║
+   ╚═════════╤═════════╝      ╚═══════╤═══════════╝
+             │ 交给 socket                │
+             │                    ╔═══════▼═══════════════╗
+             │                    ║ ④ NF_INET_LOCAL_OUT  ║  ← 本机进程要发包
+             │                    ╚═══════╤═══════════════╝
+             │                            │
+             │                    ╔═══════▼═══════════════╗
+             │                    ║ ⑤ NF_INET_POST_ROUTING║ ← 已经选好出口网卡
+             │                    ╚═══════╤═══════════════╝
+             ↓                            ↓
+        应用 read()                   网卡驱动 xmit
+
+
+另一条路径（转发包，走 ③）：
+   PRE_ROUTING ──→ 查路由 ──→ FORWARD ──→ 查路由 ──→ POST_ROUTING</code></pre>
+<p>五个点的分工一句话：<b>PRE_ROUTING</b> 刚进门（做 DNAT）、<b>LOCAL_IN</b> 收给自己（做包过滤）、<b>FORWARD</b> 路过（做包过滤）、<b>LOCAL_OUT</b> 自己发出去（做过滤或 REDIRECT）、<b>POST_ROUTING</b> 出门前（做 SNAT 和伪装）。</p>
+<p>IPv4 的挂载点在 <code>include/uapi/linux/netfilter.h</code> 里定义：</p>
+<pre><code>enum nf_inet_hooks {
+	NF_INET_PRE_ROUTING,
+	NF_INET_LOCAL_IN,
+	NF_INET_FORWARD,
+	NF_INET_LOCAL_OUT,
+	NF_INET_POST_ROUTING,
+	NF_INET_NUMHOOKS,
+	NF_INET_INGRESS = NF_INET_NUMHOOKS,
+};</code></pre>
+<p>所以 <code>iptables -L FORWARD</code> 里的 FORWARD 就对应第 3 个枚举值。</p>
+
+<h3>3.2 判决：钩子如何回答</h3>
+<pre><code>包 → [hook A] → [hook B] → [hook C] → 继续往下走
+        │          │          │
+     NF_ACCEPT   NF_DROP   NF_STOLEN
+     （放行，    （丢弃，   （抢走：这个包
+       下一个      skb 被     归我了，别再
+       钩子）      free）     往下传）</code></pre>
+<p>判决常量的定义在同一个 uapi 头文件里：</p>
+<pre><code>#define NF_DROP 0
+#define NF_ACCEPT 1
+#define NF_STOLEN 2
+#define NF_QUEUE 3
+#define NF_REPEAT 4
+#define NF_STOP 5	/* Deprecated, for userspace nf_queue compatibility. */
+#define NF_MAX_VERDICT NF_STOP</code></pre>
+<p>注意 <code>NF_DROP</code> 的值是 <b>0</b>——这是 netfilter 的历史包袱：老代码里"返回 0"就等于丢包，所以新代码务必显式写 verdict 常量。</p>
+
+<h3>3.3 iptables 的表与链</h3>
+<table>
+  <tr><th>表</th><th>内建链</th><th>用途</th></tr>
+  <tr><td class="term">raw</td><td>PREROUTING, OUTPUT</td><td>最早处理，只用 mangle 表的一部分 match；跟踪模式和 NOTRACK 在这里。</td></tr>
+  <tr><td class="term">mangle</td><td>PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING</td><td>修改包的头部字段：TTL、标记 mark、TCP 选项等。不能改地址。</td></tr>
+  <tr><td class="term">nat</td><td>PREROUTING, INPUT, OUTPUT, POSTROUTING</td><td>地址转换（DNAT/SNAT/MASQUERADE）。nat 表只对一条连接的第一个包生效，后续包直接套用已有映射。</td></tr>
+  <tr><td class="term">filter</td><td>INPUT, FORWARD, OUTPUT</td><td>过滤：ACCEPT / DROP / REJECT。</td></tr>
+  <tr><td class="term">security</td><td>INPUT, FORWARD, OUTPUT</td><td>给 SELinux 打标签（老式做法）。</td></tr>
+</table>
+<pre><code>一个包在内核里穿过的表顺序（收包方向）：
+
+  raw.PREROUTING → conntrack → mangle.PREROUTING → nat.PREROUTING
+       → 路由决策 → filter.FORWARD / filter.INPUT
+       → security.INPUT → filter.OUTPUT(本机发包时)
+
+发包方向：
+  raw.OUTPUT → mangle.OUTPUT → nat.OUTPUT → filter.OUTPUT
+       → security.OUTPUT → mangle.POSTROUTING → nat.POSTROUTING</code></pre>
+
+<h3>3.4 conntrack 与有状态规则</h3>
+<pre><code>  第一个包（SYN）到达：
+    哈希表里没有这条连接 → 新建 nf_conn，状态 = NEW
+      → 规则匹配 --ctstate NEW --dport 22 -j ACCEPT
+      → 记下 (src_ip, src_port, dst_ip, dst_port, proto) → (dst_ip, dst_port, src_ip, src_port)
+
+  回包（SYN+ACK）到达：
+    用反向四元组在哈希表里查到 → 状态改为 ESTABLISHED
+      → 规则匹配 --ctstate ESTABLISHED -j ACCEPT   ← 放行，不需要显式写对端端口
+
+  连接结束时：超时定时器到期 → 从表里删除</code></pre>
+<p>conntrack 让"允许出站并允许回应"这两条规则可以分开写，而回应包不需要知道对端具体是谁。默认超时：TCP 建立 120 秒、已建立 5 天，UDP 30 秒。</p>
+
+<h3>3.5 nftables 的对象模型</h3>
+<pre><code>  table inet filter {            ← 一张表，family 可以是 ip/ip6/inet
+    chain input {                ← 一条链
+      type filter hook input priority 0; policy drop;   ← base chain，绑定到钩子
+      tcp dport 22 accept                             ← 规则
+      ip saddr 10.0.0.0/8 ct state established accept
+      ip saddr { 192.168.1.0/24, 10.0.0.5 } drop     ← 集合 set
+    }
+    chain forward { type filter hook forward priority 0; policy accept; }
+  }
+
+  set allowed {                  ← 集合：高效的 IP/端口批量匹配
+    type ipv4_addr
+    elements = { 10.0.0.1, 10.0.0.2 }
+  }</code></pre>
+<p>nftables 里"表"只是命名空间，"链"分两种：<b>base chain</b>（有 <code>type</code> 和 <code>hook</code>，真正挂到钩子上）和<b>regular chain</b>（只能被别的链跳转）。规则可以跨表引用，这是 iptables 做不到的。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 挂载描述：nf_hook_ops</h3>
+<p>每个想参与防火墙的模块都要声明一张 <code>nf_hook_ops</code> 表，告诉 netfilter"我在哪个协议族的哪个钩子上干活，我的优先级是多少"。</p>
+<p class="srcline">include/linux/netfilter.h:77-89</p>
+<pre><code>typedef unsigned int nf_hookfn(void *priv,
+			       struct sk_buff *skb,
+			       const struct nf_hook_state *state);
+struct nf_hook_ops {
+	/* User fills in from here down. */
+	nf_hookfn		*hook;
+	struct net_device	*dev;
+	void			*priv;
+	u_int8_t		pf;
+	unsigned int		hooknum;
+	/* Hooks are ordered in ascending priority. */
+	int			priority;
+};</code></pre>
+<p><code>pf</code> 是协议族（<code>NFPROTO_IPV4</code>、<code>NFPROTO_IPV6</code>、<code>NFPROTO_ARP</code>…），<code>hooknum</code> 就是上面的 <code>NF_INET_*</code> 枚举值，<code>priority</code> 决定同一钩子上谁先跑——数字小的先执行。<code>priv</code> 是模块私有数据，回调时原样传回。</p>
+<p>而钩子被调用时能看到的上下文，是这个结构：</p>
+<p class="srcline">include/linux/netfilter.h:67-75</p>
+<pre><code>struct nf_hook_state {
+	unsigned int hook;
+	u_int8_t pf;
+	struct net_device *in;
+	struct net_device *out;
+	struct sock *sk;
+	struct net *net;
+	int (*okfn)(struct net *, struct sock *, struct sk_buff *);
+};</code></pre>
+<p><code>in</code>/<code>out</code> 是进/出网卡，<code>sk</code> 是关联的 socket（没有就为 NULL），<code>net</code> 是网络命名空间（决定这套规则属于哪个 netns）。</p>
+
+<h3>4.2 快速路径：nf_hook</h3>
+<p>协议栈调用的是 <code>NF_HOOK</code> 宏，它转手调 <code>nf_hook</code> 这个内联函数。<b>没有挂任何钩子时，这条路径几乎零成本</b>——这是防火墙能内建在协议栈里的前提。</p>
+<p class="srcline">include/linux/netfilter.h:205-228</p>
+<pre><code>static inline int nf_hook(u_int8_t pf, unsigned int hook, struct net *net,
+			  struct sock *sk, struct sk_buff *skb,
+			  struct net_device *indev, struct net_device *outdev,
+			  int (*okfn)(struct net *, struct sock *, struct sk_buff *))
+{
+	struct nf_hook_entries *hook_head = NULL;
+	int ret = 1;
+
+#ifdef CONFIG_JUMP_LABEL
+	if (__builtin_constant_p(pf) &amp;&amp;
+	    __builtin_constant_p(hook) &amp;&amp;
+	    !static_key_false(&amp;nf_hooks_needed[pf][hook]))
+		return 1;
+#endif
+
+	rcu_read_lock();
+	switch (pf) {
+	case NFPROTO_IPV4:
+		hook_head = rcu_dereference(net-&gt;nf.hooks_ipv4[hook]);
+		break;
+	case NFPROTO_IPV6:
+		hook_head = rcu_dereference(net-&gt;nf.hooks_ipv6[hook]);
+		break;</code></pre>
+<p>两个关键优化：</p>
+<ul>
+<li><b>static key（jump label）</b>：<code>nf_hooks_needed[pf][hook]</code> 是一个 per-CPU 的跳转标签。系统里没人装防火墙时，<code>static_key_false</code> 直接为真，函数<b>立刻返回</b>，连分支都不跳。装上防火墙时，内核会 patch 掉这条指令直接跳到慢路径，连一次比较都省了。这是典型的"分支预测 + 动态重定向"优化。</li>
+<li><b>RCU 读侧</b>：钩子链表用 RCU 保护，遍历期间不阻塞卸载。代价是卸载钩子要等一个宽限期。</li>
+</ul>
+
+<h3>4.3 慢路径：nf_hook_slow</h3>
+<p>有钩子时才会进入这里。</p>
+<p class="srcline">net/netfilter/core.c:580-614</p>
+<pre><code>/* Returns 1 if okfn() needs to be executed by the caller,
+ * -EPERM for NF_DROP, 0 otherwise.  Caller must hold rcu_read_lock. */
+int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
+		 const struct nf_hook_entries *e, unsigned int s)
+{
+	unsigned int verdict;
+	int ret;
+
+	for (; s &lt; e-&gt;num_hook_entries; s++) {
+		verdict = nf_hook_entry_hookfn(&amp;e-&gt;hooks[s], skb, state);
+		switch (verdict &amp; NF_VERDICT_MASK) {
+		case NF_ACCEPT:
+			break;
+		case NF_DROP:
+			kfree_skb(skb);
+			ret = NF_DROP_GETERR(verdict);
+			if (ret == 0)
+				ret = -EPERM;
+			return ret;
+		case NF_QUEUE:
+			ret = nf_queue(skb, state, s, verdict);
+			if (ret == 1)
+				continue;
+			return ret;
+		default:
+			/* Implicit handling for NF_STOLEN, as well as any other
+			 * non conventional verdicts.
+			 */
+			return 0;
+		}
+	}
+
+	return 1;
+}</code></pre>
+<p>逐点解释：</p>
+<ul>
+<li><code>verdict &amp; NF_VERDICT_MASK</code>：低 8 位是判决类型，高位是附加信息（队列号或 errno），所以要掩掉高位再比较。</li>
+<li><code>NF_ACCEPT</code>：<b>不 break 出循环</b>，而是继续跑下一个钩子。"放行"只是不干预本钩子链，后续钩子仍有机会拦截。</li>
+<li><code>NF_DROP</code>：立刻 <code>kfree_skb(skb)</code> 释放包（不能泄漏！），返回负 errno 给上层，让协议栈知道包被丢了。<code>NF_DROP_GETERR</code> 取出判决高位里带的 errno，没有则用 <code>-EPERM</code>。</li>
+<li><code>NF_QUEUE</code>：把包交给用户态（<code>nf_queue</code>）。返回 1 表示已排队、稍后异步处理，此时<b>继续</b>后面的钩子；否则说明出错了，直接返回。</li>
+<li><code>default</code>：<code>NF_STOLEN</code> 落在这里。含义是"这个包我接管了，你（协议栈）别再处理它"。所以返回 0——协议栈看到 0 就知道包已经被别人拿走了，自己不再往下走。</li>
+<li>循环正常走完返回 <b>1</b>，表示"所有钩子都放行，请调用者继续执行 okfn"（okfn 就是协议栈原本要做的下一件事，比如 <code>ip_rcv_finish</code>）。</li>
+</ul>
+<p>而 <code>NF_HOOK</code> 宏把这件事串起来：</p>
+<p class="srcline">include/linux/netfilter.h:294-303</p>
+<pre><code>static inline int
+NF_HOOK(uint8_t pf, unsigned int hook, struct net *net, struct sock *sk, struct sk_buff *skb,
+	struct net_device *in, struct net_device *out,
+	int (*okfn)(struct net *, struct sock *, struct sk_buff *))
+{
+	int ret = nf_hook(pf, hook, net, sk, skb, in, out, okfn);
+	if (ret == 1)
+		ret = okfn(net, sk, skb);
+	return ret;
+}</code></pre>
+<p>只有 <code>ret == 1</code>（全部放行）时才调 okfn。若返回 0（被 STOLEN），协议栈就什么都不做，包已经不在它手上了。</p>
+
+<h3>4.4 iptables：表与链是怎么挂上去的</h3>
+<p>iptables 的 filter 表注册了一个钩子函数：</p>
+<p class="srcline">net/ipv4/netfilter/iptable_filter.c:19-38</p>
+<pre><code>#define FILTER_VALID_HOOKS ((1 &lt;&lt; NF_INET_LOCAL_IN) | \
+			    (1 &lt;&lt; NF_INET_FORWARD) | \
+			    (1 &lt;&lt; NF_INET_LOCAL_OUT))
+static int __net_init iptable_filter_table_init(struct net *net);
+
+static const struct xt_table packet_filter = {
+	.name		= "filter",
+	.valid_hooks	= FILTER_VALID_HOOKS,
+	.me		= THIS_MODULE,
+	.af		= NFPROTO_IPV4,
+	.priority	= NF_IP_PRI_FILTER,
+	.table_init	= iptable_filter_table_init,
+};
+
+static unsigned int
+iptable_filter_hook(void *priv, struct sk_buff *skb,
+		    const struct nf_hook_state *state)
+{
+	return ipt_do_table(skb, state, state-&gt;net-&gt;ipv4.iptable_filter);
+}</code></pre>
+<p><code>valid_hooks</code> 用位掩码表示这张表关心哪几个钩子：filter 表关心 LOCAL_IN、FORWARD、LOCAL_OUT 三个。<code>priority</code> 决定它在同一钩子上排在谁前面。<code>iptable_filter_hook</code> 是统一的入口，把包交给 <code>ipt_do_table</code> 去遍历规则。</p>
+<p><code>ipt_do_table</code> 是 iptables 规则的执行引擎（net/ipv4/netfilter/ip_tables.c:225），核心是一个 do-while 循环：匹配 → 执行 target → 根据判决决定是继续下一条规则、跳到别的链、还是结束。</p>
+<p class="srcline">net/ipv4/netfilter/ip_tables.c:278-302</p>
+<pre><code>	do {
+		const struct xt_entry_target *t;
+		const struct xt_entry_match *ematch;
+		struct xt_counters *counter;
+
+		WARN_ON(!e);
+		if (!ip_packet_match(ip, indev, outdev,
+		    &amp;e-&gt;ip, acpar.fragoff)) {
+ no_match:
+			e = ipt_next_entry(e);
+			continue;
+		}
+
+		xt_ematch_foreach(ematch, e) {
+			acpar.match     = ematch-&gt;u.kernel.match;
+			acpar.matchinfo = ematch-&gt;data;
+			if (!acpar.match-&gt;match(skb, &amp;acpar))
+				goto no_match;
+		}
+
+		counter = xt_get_this_cpu_counter(&amp;e-&gt;counters);
+		ADD_COUNTER(*counter, skb-&gt;len, 1);
+
+		t = ipt_get_target_c(e);
+		WARN_ON(!t-&gt;u.kernel.target);</code></pre>
+<p><code>ip_packet_match</code> 做最基础的匹配（源/目的地址、协议、入/出接口、片段偏移），不匹配就跳到下一条规则。<code>xt_ematch_foreach</code> 遍历扩展匹配模块（<code>-p tcp</code>、<code>--dport</code>、<code>-m conntrack</code> 等），任一不匹配同样跳过。匹配成功后给这条规则的计数器加一（<code>ADD_COUNTER</code>），这就是 <code>iptables -L -v</code> 里那个包计数和字节计数的来源。</p>
+<p>规则本身是一串变长结构：<code>struct xt_entry</code> 后面紧跟若干 <code>xt_entry_match</code>，再跟若干 <code>xt_entry_target</code>。<code>ipt_next_entry</code> 用 <code>next_offset</code> 跳到下一条——所以规则必须在编译期就知道自己的长度，不能有变长内容。</p>
+
+<h3>4.5 conntrack：给连接建档</h3>
+<p class="srcline">net/netfilter/nf_conntrack_core.c:1791-1815</p>
+<pre><code>unsigned int
+nf_conntrack_in(struct sk_buff *skb, const struct nf_hook_state *state)
+{
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct, *tmpl;
+	u_int8_t protonum;
+	int dataoff, ret;
+
+	tmpl = nf_ct_get(skb, &amp;ctinfo);
+	if (tmpl || ctinfo == IP_CT_UNTRACKED) {
+		/* Previously seen (loopback or untracked)?  Ignore. */
+		if ((tmpl &amp;&amp; !nf_ct_is_template(tmpl)) ||
+		     ctinfo == IP_CT_UNTRACKED)
+			return NF_ACCEPT;
+		skb-&gt;_nfct = 0;
+	}
+
+	/* rcu_read_lock()ed by nf_hook_thresh */
+	dataoff = get_l4proto(skb, skb_network_offset(skb), state-&gt;pf, &amp;protonum);
+	if (dataoff &lt;= 0) {
+		pr_debug("not prepared to track yet or error occurred\n");
+		NF_CT_STAT_INC_ATOMIC(state-&gt;net, invalid);
+		ret = NF_ACCEPT;
+		goto out;
+	}</code></pre>
+<p><code>nf_ct_get(skb, &amp;ctinfo)</code> 从 skb 上取出已挂载的 conntrack 对象。如果这个包已经跟踪过（有 <code>tmpl</code> 或者被标记为 UNTRACKED），直接 <code>NF_ACCEPT</code> 放行——不重复建档。</p>
+<p><code>get_l4proto</code> 从 IP 头里取出传输层协议号并算出传输层头部的位置。取不到（比如分片还没重组完）就放弃跟踪并放行。</p>
+<p>后续的 <code>resolve_normal_ct</code> 在哈希表里查四元组：查到就是已有连接（更新状态），查不到就新建 <code>struct nf_conn</code>。conntrack 对象的结构是：</p>
+<p class="srcline">include/net/netfilter/nf_conntrack.h:58-88</p>
+<pre><code>struct nf_conn {
+	/* Usage count in here is 1 for hash table, 1 per skb,
+	 * plus 1 for any connection(s) we are `master' for
+	 */
+	struct nf_conntrack ct_general;
+
+	spinlock_t	lock;
+	/* jiffies32 when this ct is considered dead */
+	u32 timeout;
+
+#ifdef CONFIG_NF_CONNTRACK_ZONES
+	struct nf_conntrack_zone zone;
+#endif
+	/* XXX should I move this to the tail ? - Y.K */
+	/* These are my tuples; original and reply */
+	struct nf_conntrack_tuple_hash tuplehash[IP_CT_DIR_MAX];
+
+	/* Have we seen traffic both ways yet? (bitset) */
+	unsigned long status;
+
+	u16		cpu;
+	possible_net_t ct_net;</code></pre>
+<p><code>tuplehash[IP_CT_DIR_MAX]</code> 是<b>两个</b>五元组哈希桶：<code>IP_CT_DIR_ORIGINAL</code> 存正向（原地址→目的地址），<code>IP_CT_DIR_REPLY</code> 存反向。这样回包只需用反向四元组查表即可命中，不用遍历。</p>
+
+<h3>4.6 nftables：链的执行</h3>
+<p>nftables 把规则编译成一棵表达式树，包到达时逐条规则求值。</p>
+<p class="srcline">net/netfilter/nf_tables_core.c:158-208</p>
+<pre><code>nft_do_chain(struct nft_pktinfo *pkt, void *priv)
+{
+	const struct nft_chain *chain = priv, *basechain = chain;
+	const struct net *net = nft_net(pkt);
+	struct nft_rule *const *rules;
+	const struct nft_rule *rule;
+	const struct nft_expr *expr, *last;
+	struct nft_regs regs;
+	unsigned int stackptr = 0;
+	struct nft_jumpstack jumpstack[NFT_JUMP_STACK_SIZE];
+	bool genbit = READ_ONCE(net-&gt;nft.gencursor);
+	struct nft_traceinfo info;
+
+	info.trace = false;
+	if (static_branch_unlikely(&amp;nft_trace_enabled))
+		nft_trace_init(&amp;info, pkt, &amp;regs.verdict, basechain);
+do_chain:
+	if (genbit)
+		rules = rcu_dereference(chain-&gt;rules_gen_1);
+	else
+		rules = rcu_dereference(chain-&gt;rules_gen_0);
+
+next_rule:
+	rule = *rules;
+	regs.verdict.code = NFT_CONTINUE;
+	for (; *rules ; rules++) {
+		rule = *rules;
+		nft_rule_for_each_expr(expr, last, rule) {
+			if (expr-&gt;ops == &amp;nft_cmp_fast_ops)
+				nft_cmp_fast_eval(expr, &amp;regs);
+			else if (expr-&gt;ops == &amp;nft_bitwise_fast_ops)
+				nft_bitwise_fast_eval(expr, &amp;regs);
+			else if (expr-&gt;ops != &amp;nft_payload_fast_ops ||
+				 !nft_payload_fast_eval(expr, &amp;regs, pkt))
+				expr_call_ops_eval(expr, &amp;regs, pkt);
+
+			if (regs.verdict.code != NFT_CONTINUE)
+				break;
+		}
+
+		switch (regs.verdict.code) {
+		case NFT_BREAK:
+			regs.verdict.code = NFT_CONTINUE;
+			continue;
+		case NFT_CONTINUE:
+			nft_trace_packet(&amp;info, chain, rule,
+					 NFT_TRACETYPE_RULE);
+			continue;
+		}
+		break;
+	}</code></pre>
+<p>一条规则里有多个<b>表达式</b>（expr），每个表达式做一件事：取载荷（payload）、比较（cmp）、设置 meta、查集合（lookup）等。任一表达式给出非 <code>NFT_CONTINUE</code> 的判决，就跳出这条规则。</p>
+<p>判决类型：<code>NFT_CONTINUE</code> 继续下一条规则；<code>NFT_BREAK</code> 跳出本链回到调用者；<code>NFT_JUMP</code>/<code>NFT_GOTO</code> 转到另一条链（<code>jumpstack</code> 记录返回点，<code>goto</code> 不记录）；<code>NFT_RETURN</code> 返回。链末尾如果还没判决，就用 base chain 的 <code>policy</code>。</p>
+<p>注意 <code>rules_gen_0</code>/<code>rules_gen_1</code> 双缓冲：更新规则时写入非当前的那一份，提交后切换 <code>genbit</code>。这样读侧（包处理路径）永远看到一份完整一致的规则集，不需要加锁。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看规则和计数器</h3>
+<pre><code>sudo iptables -L -n -v
+# Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+#  target     prot opt source               destination
+# ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0
+# Chain FORWARD (policy DROP 0 packets, 0 bytes)
+#  target     prot opt source               destination
+# ACCEPT     tcp  --  10.0.0.0/8           192.168.1.0/24  tcp dpt:22
+# Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+#  target     prot opt source               destination
+# ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0</code></pre>
+<p>逐列解释：<code>Chain INPUT (policy ACCEPT 0 packets, 0 bytes)</code>——这条内建链的默认策略是 ACCEPT，目前累计匹配 0 个包 0 字节；<code>target</code> 列是动作；<code>prot</code> 是协议；<code>source</code>/<code>destination</code> 是地址；<code>tcp dpt:22</code> 是匹配条件。<b>没有 <code>-n</code> 时地址会反解成域名（慢且可能失败），<code>-n</code> 让它显示原始 IP。</b></p>
+
+<h3>5.2 加一条 DROP 规则并观察</h3>
+<pre><code># 备份，避免把自己锁在外面
+sudo iptables-save &gt; /tmp/iptables.bak
+
+# 丢掉所有到 9999 端口的包，并记录日志
+sudo iptables -I INPUT -p tcp --dport 9999 -j LOG --log-prefix "DROP9999: "
+sudo iptables -A INPUT -p tcp --dport 9999 -j DROP
+
+# 验证规则生效
+nc -zv 127.0.0.1 9999        # 应该是 timeout 或 connection refused（被 DROP）
+sudo iptables -L -n -v --line-numbers
+# 观察 pkts 列开始增长
+
+# 看内核日志
+sudo dmesg | tail -5
+# 或 journalctl -k -f
+
+# 撤销
+sudo iptables -D INPUT -p tcp --dport 9999 -j DROP
+sudo iptables -D INPUT -p tcp --dport 9999 -j LOG --log-prefix "DROP9999: "</code></pre>
+<p><code>-I</code> 是 insert（插到第一条，优先级最高），<code>-A</code> 是 append（追加到最后）。<b>规则按顺序匹配，第一条命中就停止</b>，所以 DROP 规则要放在 ACCEPT 前面才有意义。</p>
+<p>DROP 和 REJECT 的区别：DROP 是<b>静默丢弃</b>，对端表现为超时；REJECT 会回一个 RST 或 ICMP unreachable，对端立刻看到 connection refused。前者更隐蔽但更难排查。</p>
+
+<h3>5.3 conntrack 观察有状态连接</h3>
+<pre><code># 查看当前被跟踪的连接
+sudo conntrack -L
+# tcp 6 120 ESTABLISHED src=192.168.1.100 dst=93.184.216.34 sport=52344 dport=443 src=93.184.216.34 dst=192.168.1.100 sport=443 dport=52344 [ASSURED] mark=0 use=1
+
+# 只看某条连接
+sudo conntrack -L -p tcp --dport 443
+
+# 用 conntrack 匹配规则
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -m conntrack --ctstate NEW -j LOG --log-prefix "NEWCONN: "
+
+# 删掉一条 conntrack 记录（强制断链）
+sudo conntrack -D -p tcp --dport 443</code></pre>
+<p>输出里两个方向的元组并排显示：<code>src=192.168.1.100 dst=... sport=52344 dport=443</code> 是正向，<code>src=93.184.216.34 dst=... sport=443 dport=52344</code> 是反向（源目的互换）。<code>[ASSURED]</code> 表示双向流量都已看到。<code>mark=0</code> 是打给该连接的标记位。</p>
+
+<h3>5.4 nftables</h3>
+<pre><code>sudo nft list ruleset
+# table inet filter {
+# 	chain input {
+# 		type filter hook input priority filter; policy accept;
+# 		tcp dport 22 accept comment "ssh"
+# 	}
+# }
+
+# 新建一条 nftables 规则集
+sudo nft add table inet myfilter
+sudo nft 'add chain inet myfilter input { type filter hook input priority 0; policy accept; }'
+sudo nft add rule inet myfilter input tcp dport 9999 drop
+sudo nft list ruleset
+
+# 用集合做批量匹配
+sudo nft add set inet myfilter blacklist { type ipv4_addr; elements = { 10.0.0.5, 10.0.0.6 }; }
+sudo nft add rule inet myfilter input ip saddr @blacklist drop
+
+# 删除
+sudo nft delete table inet myfilter</code></pre>
+<p>新内核上 <code>iptables</code> 和 <code>nft</code> 是两套独立规则，不会互相看到。要确认你用的是哪一套：<code>iptables -V</code> 显示 <code>nf_tables</code> 就是 nft 后端（旧内核显示 <code>legacy</code>）。</p>
+
+<h3>5.5 观察 netfilter 的五个挂载点</h3>
+<pre><code>cd /sys/kernel/debug/tracing
+echo 1 &gt; events/nf/nf_hook_pre_routing/enable
+echo 1 &gt; events/nf/nf_hook_local_in/enable
+echo 1 &gt; events/nf/nf_hook_forward/enable
+echo 1 &gt; events/nf/nf_hook_local_out/enable
+echo 1 &gt; events/nf/nf_hook_post_routing/enable
+cat trace_pipe
+# 然后 curl 一次，看包依次经过哪些 hook</code></pre>
+<p>这五个 tracepoint 就是本篇 3.1 那张图的直接证据：一个本机发起的请求会依次经过 local_out 和 post_routing（收包侧的 pre_routing / local_in 对本机发出的包不触发）。</p>
+
+<h3>5.6 qemu + busybox 最小实验</h3>
+<pre><code>make defconfig
+scripts/config --enable CONFIG_NETFILTER --enable CONFIG_NF_TABLES \
+               --enable CONFIG_NF_CONNTRACK --enable CONFIG_IP_NF_NAT
+make -j$(nproc)
+
+wget https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox
+chmod +x busybox &amp;&amp; ./busybox --install -h initramfs
+qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd initramfs \
+  -append "console=ttyS0" -nographic
+
+# 客控台里
+busybox iptables -L -n -v      # 若无 iptables，用 busybox 的 applet
+cat /proc/net/nf_conntrack     # conntrack 表（需要 CONFIG_NF_CONNTRACK 且已加载模块）</code></pre>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. IPv4 的五个挂载点分别是什么？各自的典型用途？</b>PRE_ROUTING（刚进内核，做 DNAT）、LOCAL_IN（收给自己，过滤）、FORWARD（路过，过滤）、LOCAL_OUT（本机发出，过滤/REDIRECT）、POST_ROUTING（出门前，做 SNAT/MASQUERADE）。</div>
+<div class="qa"><b>Q2. NF_ACCEPT 和 NF_DROP 在 nf_hook_slow 里的行为有什么不同？</b>ACCEPT 只是不 break，继续执行后面的钩子；DROP 立刻 kfree_skb 释放包并返回负 errno 给协议栈，协议栈据此停止后续处理。</div>
+<div class="qa"><b>Q3. NF_STOLEN 是什么意思？</b>"这个包我接管了"。命中后 nf_hook_slow 返回 0，NF_HOOK 宏因此不会调用 okfn，协议栈知道包已不在自己手上，继续往下走会出错。</div>
+<div class="qa"><b>Q4. 为什么 nf_hook 里要用 static key（jump label）？</b>没人装防火墙时，跳转标签为假，函数立刻返回，几乎零开销；装上后内核直接 patch 掉那条分支指令跳到慢路径，连一次比较都省。这是"防火墙能内建在协议栈里还不拖慢性能"的关键。</div>
+<div class="qa"><b>Q5. conntrack 为什么要存正反两个方向的元组？</b>回包的四元组是反的（源目的互换）。存两个哈希桶后，回包用反向元组直接哈希命中，不用遍历整个连接表，这是 conntrack 能跑高 PPS 的关键。</div>
+<div class="qa"><b>Q6. iptables 的规则是按什么顺序执行的？</b>按链内从上到下逐条匹配，第一条命中且给出终结判决（ACCEPT/DROP/REJECT）就停止；命中用户自定义链则跳过去执行，返回后从跳转处继续。</div>
+<div class="qa"><b>Q7. nftables 的 base chain 和 regular chain 有什么区别？</b>base chain 带 type 和 hook 属性，直接绑定到某个内核钩子上并有 policy；regular chain 只能被别的链跳转或引用，链末尾没有默认判决。</div>
+<div class="qa"><b>Q8. 为什么 nat 表的规则只对连接的第一个包生效？</b>连接跟踪在第一个包上完成地址转换并记住映射，后续同连接方向的包直接套用已有映射，不再重新执行 nat 表规则，这样才不会有性能问题和状态不一致。</div>
+
+<footer>
+  <p>上一篇：<a href="27-tcpip.html">27-tcpip TCP/IP 协议栈</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="29-lsm.html">29-lsm 安全模块框架</a></p>
+</footer>
+
+</body>
+</html>

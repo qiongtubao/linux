@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>26-socket 套接字层</title>
+<style>
+  :root { --fg:#1f2328;--muted:#59636e;--accent:#0969da;--accent-soft:#ddf4ff;--border:#d1d9e0;--surface:#f6f8fa;--code-bg:#f6f8fa;--warn-bg:#fff8c5;--warn-border:#d4a72c;--tip-bg:#dafbe1;--tip-border:#2da44e;--err-bg:#ffebe9;--err-border:#cf222e; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--fg); line-height:1.75; max-width:900px; margin:0 auto; padding:32px 24px 80px; font-size:16px; }
+  nav.top { display:flex; justify-content:space-between; align-items:center; font-size:0.85rem; padding-bottom:16px; margin-bottom:24px; border-bottom:1px solid var(--border); }
+  nav.top a { color:var(--accent); text-decoration:none; }
+  nav.top a:hover { text-decoration:underline; }
+  nav.top .next { margin-left:auto; }
+  h1 { font-size:1.7rem; line-height:1.35; margin-bottom:8px; border-bottom:3px solid var(--accent); padding-bottom:10px; }
+  .subtitle { color:var(--muted); font-size:0.92rem; margin-bottom:28px; }
+  h2 { font-size:1.25rem; margin:36px 0 12px; padding-left:10px; border-left:4px solid var(--accent); }
+  h3 { font-size:1.05rem; margin:24px 0 8px; }
+  p { margin:10px 0; }
+  ul,ol { margin:10px 0 10px 24px; }
+  li { margin:4px 0; }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:0.9rem; }
+  th,td { border:1px solid var(--border); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--surface); font-weight:600; }
+  code { font-family:Menlo,Consolas,monospace; font-size:0.86em; background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:1px 5px; }
+  pre { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:14px 16px; overflow-x:auto; margin:12px 0; }
+  pre code { background:none; border:none; padding:0; font-size:0.84rem; line-height:1.55; }
+  .srcline { font-size:0.78rem; color:var(--muted); font-family:Menlo,monospace; margin:14px 0 -6px; }
+  .note { border-left:4px solid var(--accent); background:var(--accent-soft); padding:10px 14px; margin:14px 0; font-size:0.92rem; border-radius:0 6px 6px 0; }
+  .warn { border-left:4px solid var(--warn-border); background:var(--warn-bg); padding:10px 14px; margin:14px 0; font-size:0.92rem; border-radius:0 6px 6px 0; }
+  .tip { border-left:4px solid var(--tip-border); background:var(--tip-bg); padding:10px 14px; margin:14px 0; font-size:0.92rem; border-radius:0 6px 6px 0; }
+  .term { color:var(--accent); font-weight:600; }
+  .qa { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:14px 18px; margin:16px 0; }
+  .qa b { display:block; margin-bottom:4px; }
+  footer { margin-top:48px; padding-top:16px; border-top:1px solid var(--border); font-size:0.85rem; color:var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="27-tcpip.html">下一篇：27-tcpip →</a>
+</nav>
+
+<h1>🔌 26-socket 套接字层</h1>
+<p class="subtitle">一个 fd 背后站着 socket / sock / proto 三层对象；讲清门面如何把 write/connect 变成协议函数调用 · 约 10 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>去银行办事你不会翻金库保险柜，而在<b>柜台窗口</b>递单子：窗口对所有业务一样，材料转交后台。socket 层就是内核网络的柜台。</p>
+<p>应用的世界极简单：<code>fd = socket(AF_INET, SOCK_STREAM, 0)</code> 拿到整数，之后 <code>read/write/close</code> 它，和普通文件无区别。但底层要区分 TCP 还是 UDP、IPv4 还是 Unix 域、数据落到哪个对象——差异全被门面吞掉。</p>
+<p>为什么不让应用直接调 TCP？同一套 API 要服务几十个协议族与三种语义（流、数据报、裸包），逐组合写系统调用会让头文件爆炸。于是内核把"协议无关的门面"（socket 层）与"协议相关的腿"（<code>proto_ops</code>、<code>proto</code>）拆开——经典门面/腿部设计。</p>
+<p>从进程看，socket 最终就是一个 <code>struct file</code>：挂在 <code>sockfs</code> 伪文件系统上，天然复用 VFS 的 file_operations。"网络 I/O 像文件 I/O"是刻意设计。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">门面对象</td><td>struct socket</td><td>协议无关，一个 socket 对应一个 fd，只记类型、状态、所属 file。</td></tr>
+  <tr><td class="term">协议对象</td><td>struct sock</td><td>协议相关的重对象，存收发队列、端口、状态机；TCP 实例是 tcp_sock。</td></tr>
+  <tr><td class="term">门面腿</td><td>struct proto_ops</td><td>bind/connect/sendmsg 函数表，按地址族+类型挑选。</td></tr>
+  <tr><td class="term">协议腿</td><td>struct proto</td><td>close/sendmsg/recvmsg 函数表，由 TCP/UDP 实现。</td></tr>
+  <tr><td class="term">协议族工厂</td><td>net_proto_family</td><td>按 family 号注册，<code>.create</code> 指向 inet_create。</td></tr>
+  <tr><td class="term">地址族/类型</td><td>AF_INET / SOCK_STREAM</td><td>IPv4 地址族 / 流式语义（type 传 0 时默认即 TCP）。</td></tr>
+  <tr><td class="term">IPv4 扩展</td><td>struct inet_sock</td><td>内嵌 sock，另加端口、IP 选项、TTL 等字段。</td></tr>
+  <tr><td class="term">内核侧创建</td><td>sock_create_kern</td><td>内核自己造 socket（NFS 等用），不占 fd 表。</td></tr>
+  <tr><td class="term">数据包对象</td><td>sk_buff</td><td>承载"一个包"，协议头逐层插入/剥离，只挪指针不拷贝。</td></tr>
+  <tr><td class="term">Nagle 算法</td><td>Nagle</td><td>把小段攒起来再发的合并策略；TCP_NODELAY 关掉它换低延迟。</td></tr>
+  <tr><td class="term">socketpair</td><td>socketpair(2)</td><td>一次创建两个互连 socket，多用于 Unix 域 IPC。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<pre><code>fd=3 → struct file (f_op = socket_file_ops)
+          └→ struct socket
+                ├── ops ─→ inet_stream_ops (.sendmsg = inet_sendmsg)
+                └── sk  ─→ inet_sock { struct sock sk; ... } → tcp_sock
+                     sk_prot ─→ tcp_prot (.sendmsg = tcp_sendmsg)
+
+__sys_socket → sock_create → __sock_create
+  ├ security_socket_create      LSM 第一道闸
+  ├ sock_alloc()                在 sockfs 造 inode 并取出 socket
+  ├ net_families[AF_INET] → inet_family_ops.create
+  └ inet_create：查 inetsw[type] → 取 ops+prot → sk_alloc → sock_init_data
+末尾 sock_map_fd → fd_install，返回整数 fd</code></pre>
+<p>三层职责：<b>socket</b> 对齐用户态接口、持 ops 与 sk；<b>sock</b> 是协议状态之家；<b>proto</b> 是无状态函数表，告诉 sock 层"该调谁"。<code>socket(AF_INET, SOCK_STREAM, 0)</code> 的 0 表示"用该类型默认协议"——<code>inetsw_array</code> 把 SOCK_STREAM 首项写成 IPPROTO_TCP，所以默认得到 TCP。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 门面：struct socket 与 proto_ops</h3>
+<p class="srcline">include/linux/net.h:116-128</p>
+<pre><code>struct socket {
+	socket_state		state;
+	short			type;
+	unsigned long		flags;
+	struct file		*file;
+	struct sock		*sk;
+	const struct proto_ops	*ops;
+	struct socket_wq	wq;
+};</code></pre>
+<p><code>state</code> 只是粗状态（SS_UNCONNECTED/CONNECTED），TCP 精细状态在 <code>sk-&gt;sk_state</code>；<code>ops</code> 是多态开关：SOCK_STREAM 装 inet_stream_ops，SOCK_DGRAM 装 inet_dgram_ops；<code>wq</code> 是 poll/epoll 睡眠的等待队列。<code>proto_ops</code>（net.h:139 起）是一张动作清单：<code>release/bind/connect/socketpair/accept/getname/poll/ioctl/sendmsg/recvmsg</code>，外加 <code>owner</code> 模块引用计数，防调函数时驱动被卸载。</p>
+
+<h3>4.2 协议腿：proto 与 sock</h3>
+<p class="srcline">include/net/sock.h:1127-1161</p>
+<pre><code>struct proto {	/* 注释原文：socket layer -&gt; transport layer interface */
+	void	(*close)(struct sock *sk, long timeout);
+	int	(*connect)(struct sock *sk, struct sockaddr *uaddr, int addr_len);
+	struct sock *(*accept)(struct sock *sk, int flags, int *err, bool kern);
+	int	(*sendmsg)(struct sock *sk, struct msghdr *msg, size_t len);
+	int	(*recvmsg)(struct sock *sk, struct msghdr *msg, size_t len,
+			   int noblock, int flags, int *addr_len);
+	// ... 省略 pre_connect/disconnect/setsockopt/sendpage 等
+};</code></pre>
+<p>协议对象 <code>struct sock</code>（include/net/sock.h:347 起）首个成员必须是 <code>sock_common</code>：TIME_WAIT 的"死 socket"只复用这块头部做哈希与地址比较，前面插字段会让偏移错位。它用一串 <code>#define</code> 把 <code>__sk_common.skc_xxx</code> 变短名，所以 <code>sk_state</code> 就是 <code>skc_state</code>。TCP 实例 <code>tcp_prot</code>（net/ipv4/tcp_ipv4.c:2762）把 <code>.sendmsg=tcp_sendmsg</code>、<code>.connect=tcp_v4_connect</code>、<code>.backlog_rcv=tcp_v4_do_rcv</code> 绑好。</p>
+
+<h3>4.3 socket()：__sys_socket</h3>
+<p class="srcline">net/socket.c:1540-1565</p>
+<pre><code>int __sys_socket(int family, int type, int protocol)
+{
+	struct socket *sock;
+	int flags;
+
+	BUILD_BUG_ON(SOCK_CLOEXEC != O_CLOEXEC);
+	// ... 另三个 BUILD_BUG_ON 保证位掩码不冲突
+	flags = type &amp; ~SOCK_TYPE_MASK;
+	if (flags &amp; ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+		return -EINVAL;
+	type &amp;= SOCK_TYPE_MASK;
+	// ... SOCK_NONBLOCK 与 O_NONBLOCK 数值不同则换算
+
+	retval = sock_create(family, type, protocol, &amp;sock);
+	if (retval &lt; 0)
+		return retval;
+	return sock_map_fd(sock, flags &amp; (O_CLOEXEC | O_NONBLOCK));
+}</code></pre>
+<p><code>BUILD_BUG_ON</code> 是编译期自检，保证 SOCK_* 与 O_* 数值一致；<code>SOCK_NONBLOCK</code>/<code>SOCK_CLOEXEC</code> 藏在 type 高位，必须先剥出，低 4 位才是真类型。<code>sock_map_fd</code>（net/socket.c:426）三步：占 fd → <code>sock_alloc_file</code> → <code>fd_install</code>，先占 fd 再建 file，回滚路径最短。</p>
+
+<h3>4.4 工厂：__sock_create → inet_create</h3>
+<p class="srcline">net/socket.c:1422-1438, 1461-1468</p>
+<pre><code>	err = security_socket_create(family, type, protocol, kern);
+	if (err) return err;
+	sock = sock_alloc();
+	if (!sock) { /* net_warn_ratelimited(...) */ return -ENFILE; }
+	sock-&gt;type = type;
+	// ... net_families[family] 为空时 request_module("net-pf-%d", family)
+	if (!try_module_get(pf-&gt;owner)) goto out_release;
+	rcu_read_unlock();
+	err = pf-&gt;create(net, sock, protocol, kern);</code></pre>
+<p><code>sock_alloc()</code> 不是 kmalloc：在 sockfs 上 <code>new_inode_pseudo</code>，再用 <code>SOCKET_I(inode)</code> 反推 socket——每个 socket 天生有 inode。RCU 只保护表查找，调 <code>pf-&gt;create</code> 前必须放掉（可能睡眠），故用模块引用计数钉住工厂。</p>
+<p class="srcline">net/ipv4/af_inet.c:265-285, 314-317</p>
+<pre><code>lookup_protocol:	rcu_read_lock();
+	list_for_each_entry_rcu(answer, &amp;inetsw[sock-&gt;type], list) {
+		if (protocol == answer-&gt;protocol) {
+			if (protocol != IPPROTO_IP) break;
+		} else if (IPPROTO_IP == protocol) {	/* type 传 0：取默认协议 */
+			protocol = answer-&gt;protocol; break;
+		} else if (IPPROTO_IP == answer-&gt;protocol) break;
+		err = -EPROTONOSUPPORT;
+	}
+	// ... 失败时 request_module("net-pf-2-proto-...") 重试
+	sock-&gt;ops = answer-&gt;ops;	/* 门面腿 */
+	answer_prot = answer-&gt;prot;	/* 协议腿 */
+	rcu_read_unlock();</code></pre>
+<p>链表里第一个匹配 type 的项胜出，注册项同时带两套函数表；随后 <code>sk_alloc(..., answer_prot, kern)</code> 按协议 slab 分配，<code>sock_init_data</code> 把 <code>sock-&gt;sk</code> 与 <code>sk_set_socket</code> 双向绑定。SOCK_RAW 且 kern=0 时还需 <code>ns_capable(CAP_NET_RAW)</code>，否则 <code>-EPERM</code>（af_inet.c:309-312）。</p>
+
+<h3>4.5 门面腿实例：inet_stream_ops</h3>
+<p class="srcline">net/ipv4/af_inet.c:1037-1055</p>
+<pre><code>const struct proto_ops inet_stream_ops = {
+	.family		= PF_INET,   .owner = THIS_MODULE,
+	.release	= inet_release,   .bind = inet_bind,
+	.connect	= inet_stream_connect,   .socketpair = sock_no_socketpair,
+	.accept		= inet_accept,   .poll = tcp_poll,   .listen = inet_listen,
+	.sendmsg	= inet_sendmsg,   .recvmsg = inet_recvmsg, };
+	// ... 另有 ioctl/mmap/sendpage/splice_read 等</code></pre>
+<p><code>.socketpair = sock_no_socketpair</code> 说明 TCP 不支持 socketpair（返回 <code>-EOPNOTSUPP</code>）；<code>.poll = tcp_poll</code> 说明 epoll 等的是 TCP 队列状态。</p>
+
+<h3>4.6 bind 与 sendmsg：一次调用的两跳</h3>
+<p class="srcline">net/socket.c:1682-1703</p>
+<pre><code>	sock = sockfd_lookup_light(fd, &amp;err, &amp;fput_needed);
+	if (sock) {
+		err = move_addr_to_kernel(umyaddr, addrlen, &amp;address);
+		if (!err)
+			err = security_socket_bind(sock, (struct sockaddr *)&amp;address, addrlen);
+		if (!err)
+			err = sock-&gt;ops-&gt;bind(sock, (struct sockaddr *)&amp;address, addrlen);
+		fput_light(sock-&gt;file, fput_needed);
+	}
+	return err;</code></pre>
+<p>顺序固定：查 fd → 拷地址 → LSM → <code>ops-&gt;bind</code>。<code>move_addr_to_kernel</code> 是 <code>copy_from_user</code> 的封装，防畸形容错 addrlen 撑爆内核栈。</p>
+<p class="srcline">net/socket.c:688-696 · net/ipv4/af_inet.c:829-837</p>
+<pre><code>int sock_sendmsg(struct socket *sock, struct msghdr *msg)
+{
+	int err = security_socket_sendmsg(sock, msg, msg_data_left(msg));
+	return err ?: sock_sendmsg_nosec(sock, msg);	/* 转 ops-&gt;sendmsg */
+}
+// ... inet_sendmsg 内：
+	if (unlikely(inet_send_prepare(sk))) return -EAGAIN;
+	return INDIRECT_CALL_2(sk-&gt;sk_prot-&gt;sendmsg, tcp_sendmsg, udp_sendmsg,
+			       sk, msg, size);</code></pre>
+<p><code>INDIRECT_CALL_2</code> 是给分支预测器的提示：先比较指针是否等于 <code>tcp_sendmsg</code>，相等就直调，省一次间接跳转，语义等价。</p>
+
+<h3>4.7 socketpair 与内核侧 socket</h3>
+<p class="srcline">net/socket.c:1618-1626, 1635 · 1516-1519, 1534-1537</p>
+<pre><code>	err = sock_create(family, type, protocol, &amp;sock1);
+	if (unlikely(err &lt; 0)) goto out;
+	err = sock_create(family, type, protocol, &amp;sock2);
+	if (unlikely(err &lt; 0)) { sock_release(sock1); goto out; }
+	err = security_socket_socketpair(sock1, sock2);	/* 失败则释放两个 */
+	err = sock1-&gt;ops-&gt;socketpair(sock1, sock2);
+// ... 内核侧版本，只差 kern 位：
+int sock_create(int f, int t, int p, struct socket **res)
+{ return __sock_create(current-&gt;nsproxy-&gt;net_ns, f, t, p, res, 0); }
+int sock_create_kern(struct net *net, int f, int t, int p, struct socket **res)
+{ return __sock_create(net, f, t, p, res, 1); }</code></pre>
+<p>Unix 域实现只让两个 sock 互记 peer 并置已连接（net/unix/af_unix.c:1416-1434）：<code>unix_peer(ska)=skb; unix_peer(skb)=ska;</code>，数据不碰网卡，直接入对端队列。<code>kern</code> 位则标记 <code>sk_kern_sock</code>、决定网络命名空间引用计数，并让 SOCK_RAW 的 CAP_NET_RAW 检查放行——内核对象没有"进程身份"，故留单独入口。</p>
+<p>顺带一句 <code>sk_buff</code>：网络栈里"一个包"的搬运工，带一段线性缓冲区，每层用 <code>skb_push</code> 插头、<code>__skb_pull</code> 剥头，只挪指针不复制（细节见第 27 篇）。</p>
+
+<h2>5. 动手验证</h2>
+<pre><code>python3 -c "import socket,time;s=socket.socket();s.bind(('127.0.0.1',8888));s.listen();time.sleep(60)" &amp;
+ls -l /proc/$!/fd     # 3 -&gt; 'socket:[12345]'，数字即 sockfs inode 号（ls -i 可核对）
+python3 -c "import socket;a,b=socket.socketpair();print(a.fileno(),b.fileno());a.send(b'hi');print(b.recv(2))"
+strace -e trace=network python3 -c "import socket;s=socket.socket(2,1,0);s.bind(('127.0.0.1',9))"
+#   socket(AF_INET, SOCK_STREAM, 0) = 3
+#   bind(3, {sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+ss -ltnp   # 监听 TCP；ss -tanp 看全部连接；netstat -tnlp 列一致</code></pre>
+<p>socketpair 两个 fd 号不同，<code>send</code> 后 <code>recv</code> 立刻返回，因为内核里两 sock 已互为 peer；<code>strace -e trace=socketpair</code> 会看到一次 <code>socketpair(AF_UNIX, SOCK_STREAM, 0, [3, 4])</code> 吐两个 fd。</p>
+<p><b>ss 列含义</b>：典型行 <code>LISTEN 0 128 127.0.0.1:8888 0.0.0.0:* users:("python3",fd=3)</code>。State 来自 <code>sk-&gt;sk_state</code>；Recv-Q 是已收未读字节（接收队列长度）；Send-Q 是已发未 ACK 字节，监听态则是 backlog 上限；Local/Peer 来自 <code>inet_sport/saddr</code> 与 <code>inet_dport/daddr</code>；users 是反查 inode→file→fd 表得到的持有者。</p>
+<p><b>TCP_NODELAY</b>：<code>tcpdump -i lo -A port 9001</code> 一边跑，另一边 <code>setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)</code> 后连发三个 1 字节。设了 NODELAY 时三个包各自立刻发出；不设时后段可能攒进下一段"捎带"，一个报文里看到多个 x。</p>
+<p class="srcline">net/ipv4/tcp.c:3211-3213 · 2995-3003</p>
+<pre><code>	case TCP_NODELAY:
+		__tcp_sock_set_nodelay(sk, val);
+		break;
+// ... 被调用的函数：
+	if (on) {
+		tcp_sk(sk)-&gt;nonagle |= TCP_NAGLE_OFF|TCP_NAGLE_PUSH;
+		tcp_push_pending_frames(sk);	/* 立刻把攒着的发掉 */
+	} else
+		tcp_sk(sk)-&gt;nonagle &amp;= ~TCP_NAGLE_OFF;</code></pre>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 为什么 struct sock 首个成员必须是 sock_common？</b>inet_timewait_sock 只复用这块头部做哈希与地址比较；前面插字段会让偏移错位，<code>sk_daddr</code> 等宏读到错误内存。</div>
+<div class="qa"><b>Q2. socket() 的 type 高位标志怎么处理？</b><code>__sys_socket</code> 先 <code>type &amp; ~SOCK_TYPE_MASK</code> 剥出 CLOEXEC/NONBLOCK，再取低 4 位作真类型。</div>
+<div class="qa"><b>Q3. proto_ops 与 proto 都有 sendmsg，为何两份？</b>门面腿收 <code>struct socket*</code> 做通用检查，协议腿收 <code>struct sock*</code> 做真正协议工作，<code>inet_sendmsg</code> 是翻译器。</div>
+<div class="qa"><b>Q4. socket(AF_INET, SOCK_STREAM, 0) 的 0 是什么意思？</b>即 <code>IPPROTO_IP</code> 通配，让 inet_create 在 inetsw 链表挑第一个匹配 type 的项，即 IPPROTO_TCP。</div>
+<div class="qa"><b>Q5. 为何 /proc/&lt;pid&gt;/fd 显示 socket:[inode]？</b>socket 寄居 sockfs 伪文件系统：<code>sock_alloc</code> 先造 inode 再取出 socket，fd 指向该 inode，内核态只能显示 inode 号。</div>
+
+<footer>
+  <p>上一篇：<a href="25-nvme.html">25-nvme</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

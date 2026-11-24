@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · 原子与内存屏障</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="14-buddy.html">下一篇：14 伙伴系统 →</a>
+</nav>
+
+<h1>⚛️ 原子操作与内存屏障</h1>
+<p class="subtitle">一条 <code>lock addl</code> 的来历、<code>READ_ONCE</code> 到底挡住了什么，以及“编译器重排 + CPU 乱序”这两层坑 · 预计阅读 23 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>超市收银台旁边有个柜台，上面放着“一瓶酱油”和“一瓶醋”。收银员要同时把两样东西递给顾客。如果他先递酱油、转身去拿醋、这时另一位店员看到柜台空了就把醋收走了——顾客手里就只剩酱油。<strong>“取酱油”和“取醋”必须合成一个不可分割的整体</strong>，这正是“原子性”的意思：要么两样都拿到，要么一样都拿不到，中间绝不能被别人插进来。</p>
+
+<p>在单线程程序里这件事天经地义（没人会插进来）。但内核是多线程、多核、还带中断的。单看多核，还只是“原子性”问题；一旦把<strong>编译器</strong>也算进来，就变成两层完全不同的麻烦：</p>
+
+<ul>
+  <li><strong>第一层：编译器重排。</strong>你写的源码顺序不等于机器实际执行的顺序。GCC 看到 <code>a = 1; b = 2;</code> 两句没有数据依赖，完全可以先写 <code>b</code> 再写 <code>a</code>；甚至可以把 <code>a</code> 优化成寄存器里一直不放、直到函数返回才写回内存。这纯粹是编译器的“自作聪明”，跟硬件无关。</li>
+  <li><strong>第二层：CPU 乱序与可见性延迟。</strong>现代 CPU 为了跑满流水线，会把<strong>写</strong>先放进 Store Buffer 稍后再刷出去，于是“写 A”可能先于“写 B”对别的 CPU 可见；<strong>读</strong>也可能绕过还没到货的写（读到旧值），而且不同 CPU 之间看到同一份数据的时刻可能相差很久（缓存一致性协议不是瞬时的）。</li>
+</ul>
+
+<p>内核因此准备了三个工具箱，各管一层：<span class="term">原子操作</span>（保证“这个读-改-写不可分割”，顺便解决硬件层的乱序）、<span class="term">内存屏障</span>（保证“某两件事的执行顺序/可见性顺序”）、<span class="term">READ_ONCE / WRITE_ONCE</span>（只禁止编译器优化，<strong>不加</strong>任何 CPU 屏障——它是“只挡第一层”的轻量武器）。</p>
+
+<p>还有一类问题连“原子”都不需要：<strong>per-CPU 变量</strong>。既然每个 CPU 各有一份、只有自己会改，那自然不需要任何锁——但必须保证“任务被调度到别的 CPU 上时，值被正确搬过去”。这就是 per-CPU 变量要解决的问题。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">原子操作</td><td>atomic operation</td><td>不可分割的读-改-写，别的 CPU 看不到中间状态</td></tr>
+  <tr><td class="term">atomic_t</td><td>atomic_t</td><td>内核的原子整数类型，结构体里只有一个 <code>int counter</code></td></tr>
+  <tr><td class="term">读-改-写</td><td>read-modify-write (RMW)</td><td>先读出旧值、算一下、再写回，必须一步完成</td></tr>
+  <tr><td class="term">refcount_t</td><td>refcount_t</td><td>带饱和保护与下溢告警的引用计数类型</td></tr>
+  <tr><td class="term">内存屏障</td><td>memory barrier / fence</td><td>限制指令或访存的重排顺序</td></tr>
+  <tr><td class="term">编译器屏障</td><td>compiler barrier</td><td>只禁止编译器重排，不产生任何 CPU 指令</td></tr>
+  <tr><td class="term">硬件屏障</td><td>CPU fence</td><td>真正在 CPU 上执行的指令（mfence/lfence/sfence）</td></tr>
+  <tr><td class="term">barrier()</td><td>barrier()</td><td>内核的编译器屏障宏，展开成一条空的内联汇编</td></tr>
+  <tr><td class="term">smp_mb</td><td>smp_mb()</td><td>全序屏障：屏障之前的写对之后的所有核可见</td></tr>
+  <tr><td class="term">smp_rmb</td><td>smp_rmb()</td><td>读屏障：保证屏障之前的读不被重排到之后</td></tr>
+  <tr><td class="term">smp_wmb</td><td>smp_wmb()</td><td>写屏障：保证屏障之前的写不被重排到之后</td></tr>
+  <tr><td class="term">READ_ONCE</td><td>READ_ONCE()</td><td>只禁止编译器合并/重复这次读取，不加 CPU 屏障</td></tr>
+  <tr><td class="term">WRITE_ONCE</td><td>WRITE_ONCE()</td><td>只禁止编译器把这次写入优化掉或合并，不加 CPU 屏障</td></tr>
+  <tr><td class="term">内存序</td><td>memory ordering</td><td>relaxed / acquire / release / seq_cst 四档强度</td></tr>
+  <tr><td class="term">per-CPU 变量</td><td>per-CPU variable</td><td>每个 CPU 一份的变量，靠偏移量索引，无锁访问</td></tr>
+  <tr><td class="term">this_cpu_*</td><td>this_cpu_inc()</td><td>操作“当前 CPU 那一份”的 per-CPU 变量（自带抢占保护）</td></tr>
+  <tr><td class="term">raw_cpu_*</td><td>raw_cpu_add()</td><td>操作 per-CPU 变量但不做抢占检查（更底层）</td></tr>
+  <tr><td class="term">lock 前缀</td><td>LOCK prefix</td><td>x86 上让一条读-改-写指令变成全局原子的前缀</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 两层模型</h3>
+
+<pre><code>你写的代码：            a = 1;  b = 2;  use(a);  use(b);
+
+   ┌─────────────────────────────────────────────────────┐
+   │ 第一层：编译器重排                                     │
+   │   GCC 可能把 b=2 提到 a=1 之前                        │
+   │   可能把 a=1 缓存在寄存器里、直到函数返回才写回        │
+   │   ⇒ 工具：barrier() / READ_ONCE() / WRITE_ONCE()       │
+   │      （靠 "memory" clobber 告诉编译器"内存被改过了"）  │
+   └─────────────────────────────────────────────────────┘
+                          │  编译后
+                          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │ 第二层：CPU 乱序与可见性                                │
+   │   写先进 Store Buffer，晚点才刷出去                    │
+   │   读可能绕过还没到达的写                                │
+   │   ⇒ 工具：原子操作（lock 前缀）/ mfence / lfence / sfence│
+   │      以及 smp_mb() / smp_rmb() / smp_wmb()              │
+   └─────────────────────────────────────────────────────┘</code></pre>
+
+<div class="note">
+<b>关键区别：</b><code>barrier()</code>（编译器屏障）生成的是<strong>一条 CPU 指令都没有</strong>的空汇编；而 <code>smp_mb()</code> 在 x86 上会生成 <code>lock addl $0,-4(%rsp)</code>——真的会让 CPU 停下来把 Store Buffer 刷干净。两者的成本差着好几个数量级。
+</div>
+
+<h3>3.2 原子操作：四档内存序</h3>
+
+<table>
+  <tr><th>档位</th><th>后缀</th><th>保证</th><th>典型用途</th></tr>
+  <tr><td>relaxed</td><td><code>_relaxed</code></td><td>只有“不可分割”，不保证任何顺序</td><td>纯计数器，比如统计中断次数</td></tr>
+  <tr><td>acquire</td><td><code>_acquire</code></td><td>之后的读写不会被重排到之前</td><td>拿到指针后读它指向的数据</td></tr>
+  <tr><td>release</td><td><code>_release</code></td><td>之前的读写不会被重排到之后</td><td>填好数据后再发布指针</td></tr>
+  <tr><td>fully ordered</td><td>无后缀</td><td>全部顺序保证（等价于 seq_cst）</td><td>不确定该用哪档时的默认值</td></tr>
+</table>
+
+<p>在 <code>include/linux/atomic.h:14-25</code> 里，内核把这件事写得很清楚：</p>
+
+<pre><code> * We support four variants:
+ *
+ * - Fully ordered: The default implementation, no suffix required.
+ * - Acquire: Provides ACQUIRE semantics, _acquire suffix.
+ * - Release: Provides RELEASE semantics, _release suffix.
+ * - Relaxed: No ordering guarantees, _relaxed suffix.</code></pre>
+
+<h3>3.3 屏障速查</h3>
+
+<table>
+  <tr><th>宏</th><th>作用</th><th>x86 上的实现</th></tr>
+  <tr><td><code>barrier()</code></td><td>只挡编译器</td><td>空汇编，零成本</td></tr>
+  <tr><td><code>READ_ONCE(x)</code></td><td>只挡编译器（读）</td><td>加 <code>volatile</code> 的普通 load</td></tr>
+  <tr><td><code>WRITE_ONCE(x,v)</code></td><td>只挡编译器（写）</td><td>加 <code>volatile</code> 的普通 store</td></tr>
+  <tr><td><code>smp_wmb()</code></td><td>写屏障</td><td><code>barrier()</code>（x86 天然保序）</td></tr>
+  <tr><td><code>smp_rmb()</code></td><td>读屏障</td><td><code>barrier()</code>（x86 天然保序）</td></tr>
+  <tr><td><code>smp_mb()</code></td><td>全序屏障</td><td><code>lock addl $0,-4(%rsp)</code></td></tr>
+</table>
+
+<p>为什么 x86 上写屏障和读屏障是空的？因为 x86 是<strong>强序</strong>架构：所有写按程序顺序对所有核可见，所有读按程序顺序执行。<strong>唯一</strong>需要额外处理的是“读-改-写”（<code>lock</code> 前缀自带全序）。所以 x86 上只有 <code>smp_mb()</code> 真的要下指令。而 ARM/PowerPC/RISC-V 是弱序架构，三种屏障都要真下指令。</p>
+
+<h3>3.4 per-CPU 变量</h3>
+
+<pre><code>普通全局变量：      ┌──────────────────┐
+                    │   counter = 5     │   ← 所有 CPU 抢同一条缓存行
+                    └──────────────────┘      要加锁，否则缓存行乒乓
+
+per-CPU 变量：   CPU0      CPU1      CPU2      CPU3
+                ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐
+                │  12 │  │  7  │  │  0  │  │  3  │  ← 各写各的，互不干扰
+                └─────┘  └─────┘  └─────┘  └─────┘
+                  ↑        ↑        ↑        ↑
+               this_cpu_inc() 用当前 CPU 的偏移量定位到自己的那一份
+
+代价：变量本身占 N 份内存；任务被调度到别的 CPU 时，
+      它的值必须被“搬”过去（percpu 区的 __per_cpu_offset 机制）。</code></pre>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 <code>atomic_t</code>：一个结构体一个 int</h3>
+
+<p class="srcline">include/linux/types.h:166-170  atomic_t</p>
+<pre><code>typedef struct {
+	int counter;
+} atomic_t;
+
+#define ATOMIC_INIT(i) { (i) }</code></pre>
+
+<p>之所以包成结构体而不是直接用 <code>int</code>，是为了让 sparse/编译器知道“这个变量只能通过原子 API 访问”，从而在你直接写 <code>v.counter = 5</code> 时给出警告。</p>
+
+<h3>4.2 <code>atomic_inc</code> 在 x86 上就是 <code>lock incl</code></h3>
+
+<p class="srcline">arch/x86/include/asm/atomic.h:93-98  arch_atomic_inc</p>
+<pre><code>static __always_inline void arch_atomic_inc(atomic_t *v)
+{
+	asm volatile(LOCK_PREFIX "incl %0"
+		     : "+m" (v-&gt;counter) :: "memory");
+}
+#define arch_atomic_inc arch_atomic_inc</code></pre>
+
+<p>这就是全部魔法：<code>lock incl (%rax)</code>——<code>lock</code> 前缀让这条指令在多核上<strong>全局原子</strong>：在它执行期间，任何其他 CPU 对同一地址的读-改-写都会排队等待。代价是它要锁住总线/缓存行，周期数比普通指令高一个数量级。</p>
+
+<p>加法版本：</p>
+
+<p class="srcline">arch/x86/include/asm/atomic.h:51-56  arch_atomic_add</p>
+<pre><code>static __always_inline void arch_atomic_add(int i, atomic_t *v)
+{
+	asm volatile(LOCK_PREFIX "addl %1,%0"
+		     : "+m" (v-&gt;counter)
+		     : "ir" (i) : "memory");
+}</code></pre>
+
+<p>带返回值的版本用的是 <code>xadd</code>（x86 的“交换并相加”指令，本身就带隐式锁）：</p>
+
+<p class="srcline">arch/x86/include/asm/atomic.h:163-167  arch_atomic_add_return</p>
+<pre><code>static __always_inline int arch_atomic_add_return(int i, atomic_t *v)
+{
+	return i + xadd(&amp;v-&gt;counter, i);
+}
+#define arch_atomic_add_return arch_atomic_add_return</code></pre>
+
+<p>注意返回值是 <code>i + xadd(...)</code>：<code>xadd</code> 返回的是<strong>加之前</strong>的旧值，所以要再加上 <code>i</code> 才是新值。</p>
+
+<h3>4.3 通用层：<code>atomic_read</code> 与 <code>atomic_add</code></h3>
+
+<p>架构相关的 <code>arch_atomic_*</code> 之上还有一层通用 API。x86 定义了 <code>ARCH_ATOMIC</code> 宏，所以走的是 <code>include/asm-generic/atomic-instrumented.h</code>——这一层只做一件事：给操作加上 KASAN 插桩，然后转发给架构实现。</p>
+
+<p class="srcline">include/asm-generic/atomic-instrumented.h:60-65  atomic_add</p>
+<pre><code>static __always_inline void
+atomic_add(int i, atomic_t *v)
+{
+	instrument_atomic_read_write(v, sizeof(*v));
+	arch_atomic_add(i, v);
+}</code></pre>
+
+<p class="srcline">include/asm-generic/atomic-instrumented.h:237-242  atomic_inc</p>
+<pre><code>static __always_inline void
+atomic_inc(atomic_t *v)
+{
+	instrument_atomic_read_write(v, sizeof(*v));
+	arch_atomic_inc(v);
+}</code></pre>
+
+<p>所以完整的调用链是：<code>atomic_inc(&amp;v)</code> → <code>arch_atomic_inc(&amp;v)</code> → <code>lock incl (%mem)</code>。中间那层 <code>instrument_atomic_read_write()</code> 在没开 KASAN 时是空函数，编译后完全消失。</p>
+
+<p>而对于<strong>没有</strong>定义 <code>ARCH_ATOMIC</code> 的架构（比如某些 ARM、MIPS、RISC-V 老配置），走的是 <code>include/asm-generic/atomic.h</code> 这套纯软件回退实现：</p>
+
+<p class="srcline">include/asm-generic/atomic.h:163-187  atomic_read / atomic_set / atomic_add</p>
+<pre><code>/**
+ * atomic_read - read atomic variable
+ * @v: pointer of type atomic_t
+ *
+ * Atomically reads the value of @v.
+ */
+#ifndef atomic_read
+#define atomic_read(v)	READ_ONCE((v)-&gt;counter)
+#endif
+
+/**
+ * atomic_set - set atomic variable
+ * ...
+ */
+#define atomic_set(v, i) WRITE_ONCE(((v)-&gt;counter), (i))
+
+#include &lt;linux/irqflags.h&gt;
+
+static inline void atomic_add(int i, atomic_t *v)
+{
+	atomic_add_return(i, v);
+}</code></pre>
+
+<p>两个观察：</p>
+
+<ul>
+  <li>回退版本里 <code>atomic_read(v)</code> 就是 <code>READ_ONCE((v)-&gt;counter)</code>。在 x86 上这确实安全（x86 的读本身是原子的，且 <code>arch_atomic_read()</code> 用的也是 <code>__READ_ONCE</code>）；但弱序架构上普通的 load 可能读到<strong>撕裂</strong>的值（8 字节变量读一半），所以那些架构必须覆盖这个定义。</li>
+  <li>回退版本里 <code>atomic_add()</code> 是用 <code>atomic_add_return()</code> 实现的——明明天知道返回值用不上，还是多算了一遍。这是历史包袱：因为在多数架构上 <code>add</code> 和 <code>add_return</code> 本来就是同一条指令，懒得单独写一份。</li>
+</ul>
+
+<h3>4.4 <code>refcount_t</code>：给原子计数加上保险丝</h3>
+
+<p class="srcline">include/linux/refcount.h:111-117  refcount_t</p>
+<pre><code>typedef struct refcount_struct {
+	atomic_t refs;
+} refcount_t;
+
+#define REFCOUNT_INIT(n)	{ .refs = ATOMIC_INIT(n), }
+#define REFCOUNT_MAX		INT_MAX
+#define REFCOUNT_SATURATED	(INT_MIN / 2)</code></pre>
+
+<p>它和 <code>atomic_t</code> 的区别在于<strong>防呆</strong>：引用计数一旦下溢（有人多减了一次），普通 <code>atomic_t</code> 会从 0 变成 -1、-2……然后某次 <code>dec_and_test()</code> 返回 0 的时候就会<strong>提前释放</strong>还在被使用的对象——一个极难查的 use-after-free。<code>refcount_t</code> 的做法是：一旦检测到下溢或上溢，立刻 WARN，并把计数钉死在 <code>REFCOUNT_SATURATED</code>（一个很大的负数）上，让它再也不会被误判成 0。</p>
+
+<p>取引用的关键接口：</p>
+
+<p class="srcline">include/linux/refcount.h:243-246  refcount_inc_not_zero</p>
+<pre><code>static inline __must_check bool refcount_inc_not_zero(refcount_t *r)
+{
+	return __refcount_inc_not_zero(r, NULL);
+}</code></pre>
+
+<p>它是 <code>atomic_inc_not_zero()</code> 的“安全版”：<strong>只有计数不为 0 时才加一</strong>，返回 false 表示对象已经在被销毁，别碰。这是引用计数最常见的竞态——A 线程正要 <code>free(obj)</code>，B 线程同时想拿一个引用。</p>
+
+<p>释放引用：</p>
+
+<p class="srcline">include/linux/refcount.h:331-334  refcount_dec_and_test</p>
+<pre><code>static inline __must_check bool refcount_dec_and_test(refcount_t *r)
+{
+	return __refcount_dec_and_test(r, NULL);
+}</code></pre>
+
+<p>注释里写明了它的内存序：<em>“Provides release memory ordering, such that prior loads and stores are done before, and provides an acquire ordering on success such that free() must come after.”</em>——减到 0 的那个线程，会先 release（保证之前对对象的修改都已生效），再 acquire（保证自己后面看到的是最新数据），然后才能 <code>free()</code>。</p>
+
+<h3>4.5 <code>READ_ONCE</code> / <code>WRITE_ONCE</code>：只挡编译器</h3>
+
+<p class="srcline">include/asm-generic/rwonce.h:43-62  READ_ONCE / WRITE_ONCE</p>
+<pre><code>#ifndef __READ_ONCE
+#define __READ_ONCE(x)	(*(const volatile __unqual_scalar_typeof(x)) &amp;(x))
+#endif
+
+#define READ_ONCE(x)							\
+({									\
+	compiletime_assert_rwonce_type(x);				\
+	__READ_ONCE(x);							\
+})
+
+#define __WRITE_ONCE(x, val)						\
+do {									\
+	*(volatile typeof(x) *)&amp;(x) = (val);				\
+} while (0)
+
+#define WRITE_ONCE(x, val)						\
+do {									\
+	compiletime_assert_rwonce_type(x);				\
+	__WRITE_ONCE(x, val);						\
+} while (0)</code></pre>
+
+<p>核心就是把变量“强转成 <code>volatile</code>”再访问。效果是：</p>
+
+<ul>
+  <li>编译器<strong>不会</strong>把这个读取优化掉，也不会把它和相邻的读取<strong>合并</strong>成一次（普通情况下 <code>if (a) { x = p->v; } if (b) { x = p->v; }</code> 会被合并成一次 load）；</li>
+  <li>编译器<strong>不会</strong>把对它的写入优化掉或延后；</li>
+  <li>但是——它<strong>不产生任何 CPU 指令</strong>，也<strong>不做任何跨 CPU 的顺序保证</strong>。</li>
+</ul>
+
+<p>所以 <code>READ_ONCE</code> 的典型用途是“读一个会被别人并发修改的标志位，我只关心这一刻的值，不关心它和别的内存访问的相对顺序”。真正需要顺序保证时，得用 <code>smp_load_acquire()</code> 或 <code>rcu_dereference()</code>。</p>
+
+<h3>4.6 <code>barrier()</code>：一条空汇编</h3>
+
+<p class="srcline">include/linux/compiler.h:81-85  barrier</p>
+<pre><code>/* Optimization barrier */
+#ifndef barrier
+/* The "volatile" is due to gcc bugs */
+# define barrier() __asm__ __volatile__("": : :"memory")
+#endif</code></pre>
+
+<p>看懂这三段：</p>
+
+<ul>
+  <li><code>__asm__ __volatile__("")</code>：生成一条<strong>空</strong>的汇编语句。之所以要 <code>volatile</code>，是因为 GCC 有一个已知 bug：非 volatile 的空汇编可能被删掉。</li>
+  <li><code>: : :"memory"</code>：<code>"memory"</code> 是<strong>clobber 列表</strong>，意思是“我这条汇编可能读了也可能写了任意内存”。编译器因此必须假设：<code>barrier()</code> 前后所有对内存的读写都可能互相影响，于是<strong>不敢</strong>把内存访问跨过这条屏障重排。</li>
+  <li>注意它<strong>不</strong>产生 CPU 指令，所以对硬件层的乱序毫无约束力。</li>
+</ul>
+
+<h3>4.7 <code>smp_mb</code> / <code>smp_rmb</code> / <code>smp_wmb</code></h3>
+
+<p>通用层在 <code>include/asm-generic/barrier.h:65-73</code>：</p>
+
+<pre><code>#ifndef smp_mb
+#define smp_mb()	__smp_mb()
+#endif
+
+#ifndef smp_rmb
+#define smp_rmb()	__smp_rmb()
+#endif
+
+#ifndef smp_wmb
+#define smp_wmb()	__smp_wmb()
+#endif</code></pre>
+
+<p>x86 的实现（<code>arch/x86/include/asm/barrier.h:14-25</code>）：</p>
+
+<p class="srcline">arch/x86/include/asm/barrier.h:14-25  mb / rmb / wmb</p>
+<pre><code>#ifdef CONFIG_X86_32
+#define mb() asm volatile(ALTERNATIVE("lock; addl $0,-4(%%esp)", "mfence", \
+				      X86_FEATURE_XMM2) ::: "memory", "cc")
+#define rmb() asm volatile(ALTERNATIVE("lock; addl $0,-4(%%esp)", "lfence", \
+				       X86_FEATURE_XMM2) ::: "memory", "cc")
+#define wmb() asm volatile(ALTERNATIVE("lock; addl $0,-4(%%esp)", "sfence", \
+				       X86_FEATURE_XMM2) ::: "memory", "cc")
+#else
+#define mb() 	asm volatile("mfence":::"memory")
+#define rmb()	asm volatile("lfence":::"memory")
+#define wmb()	asm volatile("sfence" ::: "memory")
+#endif</code></pre>
+
+<p>x86_64 上：全序屏障 = <code>mfence</code>，读屏障 = <code>lfence</code>，写屏障 = <code>sfence</code>。这三条是 Intel 定义的真正的硬件屏障指令。</p>
+
+<p>而内核真正用的是 <code>__smp_mb()</code>（<code>arch/x86/include/asm/barrier.h:57-63</code>）：</p>
+
+<pre><code>#ifdef CONFIG_X86_32
+#define __smp_mb()	asm volatile("lock; addl $0,-4(%%esp)" ::: "memory", "cc")
+#else
+#define __smp_mb()	asm volatile("lock; addl $0,-4(%%rsp)" ::: "memory", "cc")
+#endif
+#define __smp_rmb()	dma_rmb()
+#define __smp_wmb()	barrier()</code></pre>
+
+<p><code>lock addl $0,-4(%rsp)</code> 是比 <code>mfence</code> 更老的“全屏障”写法（Intel 手册推荐 <code>mfence</code>，但 <code>lock</code> 前缀在老 CPU 上更可靠、且在 x86_32 上没有 <code>mfence</code>）。</p>
+
+<p>同文件里还有一对更常用的“半屏障”：</p>
+
+<p class="srcline">arch/x86/include/asm/barrier.h:66-79  __smp_store_release / __smp_load_acquire</p>
+<pre><code>#define __smp_store_release(p, v)					\
+do {									\
+	compiletime_assert_atomic_type(*p);				\
+	barrier();							\
+	WRITE_ONCE(*p, v);						\
+} while (0)
+
+#define __smp_load_acquire(p)						\
+({									\
+	typeof(*p) ___p1 = READ_ONCE(*p);				\
+	compiletime_assert_atomic_type(*p);				\
+	barrier();							\
+	___p1;								\
+})</code></pre>
+
+<p>在 x86 上，acquire/release 只需要一个<strong>编译器</strong>屏障就够了——因为 x86 的硬件本身不会把读重排到写之后、也不会把写重排到读之前。这两个宏正是第 12 篇里 <code>rcu_assign_pointer()</code> 用的 <code>smp_store_release()</code> 的底层实现。</p>
+
+<h3>4.8 per-CPU 变量：<code>this_cpu_inc</code></h3>
+
+<p class="srcline">include/linux/percpu-defs.h:507-521  this_cpu_*</p>
+<pre><code>#define this_cpu_read(pcp)		__pcpu_size_call_return(this_cpu_read_, pcp)
+#define this_cpu_write(pcp, val)	__pcpu_size_call(this_cpu_write_, pcp, val)
+#define this_cpu_add(pcp, val)		__pcpu_size_call(this_cpu_add_, pcp, val)
+/* ... */
+#define this_cpu_sub(pcp, val)		this_cpu_add(pcp, -(typeof(pcp))(val))
+#define this_cpu_inc(pcp)		this_cpu_add(pcp, 1)
+#define this_cpu_dec(pcp)		this_cpu_sub(pcp, 1)</code></pre>
+
+<p><code>this_cpu_inc()</code> 就是 <code>this_cpu_add(pcp, 1)</code>。它和 <code>raw_cpu_add()</code>（<code>include/linux/percpu-defs.h:422</code>）的差别在注释里写得很清楚：</p>
+
+<pre><code>/*
+ * Operations for contexts where we do not want to do any checks for
+ * preemptions.  Unless strictly necessary, always use [__]this_cpu_*()
+ * instead.
+ *
+ * If there is no other protection through preempt disable and/or disabling
+ * interupts then one of these RMW operations can show unexpected behavior
+ * because the execution thread was rescheduled on another processor or an
+ * interrupt occurred and the same percpu variable was modified from the
+ * interrupt context.
+ */
+#define raw_cpu_read(pcp)		__pcpu_size_call_return(raw_cpu_read_, pcp)
+#define raw_cpu_write(pcp, val)	__pcpu_size_call(raw_cpu_write_, pcp, val)
+#define raw_cpu_add(pcp, val)		__pcpu_size_call(raw_cpu_add_, pcp, val)</code></pre>
+
+<p>翻译成人话：<code>this_cpu_*</code> 会先检查“当前是不是还在原来那颗 CPU 上”（靠 <code>__this_cpu_preempt_check()</code>），保证整个操作不会因为中途被抢占/迁移而落到别的 CPU 上；<code>raw_cpu_*</code> 不做这个检查，所以调用者必须自己保证（比如已经关了抢占和中断）。</p>
+
+<p>“定位到当前 CPU 那一份”的动作由 <code>this_cpu_ptr()</code> 完成（<code>include/linux/percpu-defs.h:246-253</code>）：</p>
+
+<pre><code>#ifdef CONFIG_DEBUG_PREEMPT
+#define this_cpu_ptr(ptr)						\
+({									\
+	__verify_pcpu_ptr(ptr);						\
+	SHIFT_PERCPU_PTR(ptr, my_cpu_offset);				\
+	...
+#else
+#define this_cpu_ptr(ptr) raw_cpu_ptr(ptr)
+#endif</code></pre>
+
+<p><code>my_cpu_offset</code> 就是“当前 CPU 在 percpu 区里的基址偏移”。percpu 区的所有变量都按 CPU 号排在一起，加上偏移量就得到“我这一份”的地址——不需要任何锁，因为只有这颗 CPU 会访问它。</p>
+
+<h3>4.9 一个真实的 per-CPU 计数器：中断统计</h3>
+
+<p>内核统计每个 IRQ 在每颗 CPU 上被触发多少次，用的正是 per-CPU 数组：</p>
+
+<p class="srcline">kernel/irq/proc.c:498-501  show_interrupts</p>
+<pre><code>	seq_printf(p, "%*d: ", prec, i);
+	for_each_online_cpu(j)
+		seq_printf(p, "%10u ", desc-&gt;kstat_irqs ?
+					*per_cpu_ptr(desc-&gt;kstat_irqs, j) : 0);</code></pre>
+
+<p>每颗 CPU 各写自己那一份（用 <code>this_cpu_inc()</code>），打印时再逐颗读出来——全程无锁、无原子操作，因为每份数据只有一个主人。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 用 <code>/proc/interrupts</code> 观察 per-CPU 计数</h3>
+
+<pre><code>$ cat /proc/interrupts | head -8
+           CPU0       CPU1       CPU2       CPU3
+  0:         28          0          0          0   IO-APIC   2-edge      timer
+  1:          2          0          0          0   IO-APIC   1-edge      i8042
+  9:          0          0          0          0   IO-APIC   9-fasteoi   acpi
+ 12:     143311     135204     142890     139876  IO-APIC  12-fasteoi   xhci_hcd
+ NMI:       1042        986       1011        998   Non-maskable interrupts
+ LOC:      55123      54980      55012      54971   Local timer interrupts
+</code></pre>
+
+<p>表头就是 <code>for_each_online_cpu()</code> 生成的（<code>kernel/irq/proc.c:480-483</code>）。下面每一行是一个 IRQ，每一列是一颗 CPU。你可以看到：绝大多数中断都落在“当前正在处理该设备中断的那颗 CPU”上，所以某一列特别大——比如 <code>12: xhci_hcd</code>（USB 控制器）在 CPU0~CPU3 上都有分布，因为 USB 中断会被迁移到完成处理的 CPU。</p>
+
+<p>制造一点负载，再看变化：</p>
+
+<pre><code>$ cat /proc/interrupts | head -1
+$ # 制造网络/磁盘/定时器负载
+$ stress-ng --cpu 4 --timeout 10s &amp;
+$ sleep 5 &amp;&amp; cat /proc/interrupts | head -6
+$ cat /proc/interrupts | head -1</code></pre>
+
+<p>两次快照做差，就能算出“这段时间里每个 IRQ 每颗 CPU 各处理了多少次”，以及负载是否被均衡到了多颗 CPU 上。这是排查“某个 CPU 负载不均”“中断亲和性（irqbalance）配错了”的第一手工具。</p>
+
+<h3>5.2 <code>/proc/stat</code>：每 CPU 的统计</h3>
+
+<pre><code>$ grep ^cpu /proc/stat
+cpu  123456 7890 43210 98765432 1234 0 5555
+cpu0 30864 1972 10802 24691358 308 0 1388
+cpu1 30864 1972 10802 24691358 308 0 1388
+cpu2 30864 1972 10802 24691358 308 0 1388
+cpu3 30864 1972 10802 24691358 308 0 1388
+intr 12345678 ...
+ctxt 987654321
+btime 1700000000
+processes 123456
+procs_running 3
+procs_blocked 0
+</code></pre>
+
+<p>每颗 CPU 一行，字段依次是 user / nice / system / idle / iowait / irq / softirq 时间（单位 USER_HZ=100，即 jiffies）。同样是 per-CPU 结构的典型例子。</p>
+
+<h3>5.3 亲眼看到 <code>lock incl</code></h3>
+
+<p>写一个最小模块，然后 objdump 它的机器码：</p>
+
+<pre><code>// atomic_demo.c
+#include &lt;linux/module.h&gt;
+#include &lt;linux/atomic.h&gt;
+
+static atomic_t counter = ATOMIC_INIT(0);
+
+static int __init ad_init(void)
+{
+	atomic_inc(&amp;counter);
+	atomic_add(41, &amp;counter);
+	pr_info("counter = %d\n", atomic_read(&amp;counter));
+	return 0;
+}
+
+static void __exit ad_exit(void) { }
+module_init(ad_init);
+module_exit(ad_exit);
+MODULE_LICENSE("GPL");</code></pre>
+
+<pre><code>$ make -C /lib/modules/$(uname -r)/build M=$PWD modules
+$ objdump -d atomic_demo.ko | sed -n '/&lt;ad_init&gt;/,/ret/p'
+0000000000000000 &lt;ad_init&gt;:
+   0:	55                    	push   %rbp
+   1:	48 89 e5              	mov    %rsp,%rbp
+   4:	f0 83 05 3f 00 00 00 01 	lock addl $0x1,0x3f(%rip)        # 1000 &lt;counter&gt;
+   e:	f0 83 05 38 00 00 00 29 	lock addl $0x29,0x38(%rip)       # 1000 &lt;counter&gt;
+  18:	8b 05 31 00 00 00    	mov    0x31(%rip),%eax           # 1000 &lt;counter&gt;
+   ...
+</code></pre>
+
+<p>三条关键指令一目了然：<code>atomic_inc()</code> 变成 <code>lock addl $0x1</code>，<code>atomic_add(41, ...)</code> 变成 <code>lock addl $0x29</code>（41 的十六进制），而 <code>atomic_read()</code> 只是一条普通的 <code>mov</code>——因为 x86 的读本来就是原子的，不需要 <code>lock</code>。</p>
+
+<div class="tip">
+<b>关于 <code>lock addl</code> 和 <code>lock incl</code>：</b>内核源码里写的是 <code>lock incl</code>（<code>arch/x86/include/asm/atomic.h:95</code>），但 GCC 常把它改写成 <code>lock addl $0x1</code>，两者语义完全等价。到底生成哪一条取决于编译器版本和优化选项——你用 <code>objdump</code> 看到的就是真相。
+</div>
+
+<h3>5.4 亲眼看到编译器重排（用户态小实验）</h3>
+
+<p>这个实验不需要内核，直接在普通 Linux 机器上跑，它演示的正是 <code>barrier()</code> 挡住的那一层：</p>
+
+<pre><code>// reorder.c
+#include &lt;stdio.h&gt;
+
+int a, b;
+
+int no_barrier(void)
+{
+	a = 1;
+	b = 2;
+	return a + b;
+}
+
+int with_barrier(void)
+{
+	a = 1;
+	__asm__ __volatile__("" ::: "memory");   /* 内核 barrier() 的等价物 */
+	b = 2;
+	return a + b;
+}
+
+int main(void)
+{
+	printf("no_barrier   = %d\n", no_barrier());
+	printf("with_barrier = %d\n", with_barrier());
+	return 0;
+}</code></pre>
+
+<pre><code>$ gcc -O2 -o reorder reorder.c
+$ ./reorder
+no_barrier   = 3
+with_barrier = 3
+
+$ gcc -O2 -S -o - reorder.c | sed -n '/no_barrier:/,/ret/p'
+no_barrier:
+.LFB0:
+	.cfi_startproc
+	movl	$1, a(%rip)
+	movl	$2, b(%rip)
+	movl	a(%rip), %eax
+	movl	b(%rip), %edx
+	addl	%edx, %eax
+	ret
+.LFE0:</code></pre>
+
+<p>看汇编：<code>no_barrier()</code> 里两条 store 的顺序被保留了——因为它们写的是两个不同的全局变量，编译器没有动力去换。但如果你把 <code>b = 2;</code> 换成“<code>b</code> 的值依赖于 <code>a</code>”或者把 <code>a</code> 放进一个循环里，编译器就会开始合并、消除、换序。<code>barrier()</code> 的 <code>"memory"</code> clobber 就是在告诉编译器“别动我周围的内存访问”。</p>
+
+<div class="tip">
+<b>更强的实验：</b>把 <code>no_barrier()</code> 改成循环里反复 <code>a = a + 1;</code>，用 <code>gcc -O2</code> 编译后用 <code>objdump</code> 看，会发现编译器把它优化成了一条 <code>addl</code>（把多次加法合并成一次）——这就是“编译器合并访存”，也正是 <code>READ_ONCE</code> 要防的事。
+</div>
+
+<h3>5.5 经典例子：无锁计数器与顺序锁读侧</h3>
+
+<p><b>无锁计数器</b>——最常见的原子操作用法：</p>
+
+<pre><code>static atomic_t irq_count[NR_IRQS];
+
+/* 中断处理程序里 */
+void irq_handler(int irq, void *dev)
+{
+	atomic_inc(&amp;irq_count[irq]);      /* 一次 lock addl，别的 CPU 看不到中间值 */
+	handle_event();
+}
+
+/* 读的时候 */
+unsigned long count = atomic_read(&amp;irq_count[irq]);</code></pre>
+
+<p><b>顺序锁（seqlock）的读侧</b>——完全不加锁的读法，核心是“读序号 → 读数据 → 再读序号”：</p>
+
+<pre><code>	unsigned seq;
+	int val;
+
+	do {
+		seq = read_seqcount_begin(&amp;seqcount);   /* 读偶数序号 */
+		val = READ_ONCE(data);                    /* 读数据 */
+	} while (read_seqcount_retry(&amp;seqcount, seq));  /* 序号变了就重来 */</code></pre>
+
+<p>这里 <code>READ_ONCE</code> 的作用是“禁止编译器把这个 load 提到循环外面去或者合并掉”——因为它每次都必须真的去内存里读一次。真正保证顺序的是 <code>smp_rmb()</code>（见 <code>include/linux/seqlock.h:346-352</code> 和 <code>450-454</code>，详见第 11 篇）。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. <code>atomic_inc()</code> 在 x86 上编译出来是什么指令？为什么需要它？</b>是 <code>lock incl %mem</code>（或编译器选择的等价形式 <code>lock addl $1,%mem</code>）。<code>lock</code> 前缀让这条读-改-写指令在多核上全局原子：执行期间总线/缓存行被独占，其它 CPU 对同一地址的读-改-写会排队。普通 <code>incl</code> 不是原子的——两个 CPU 可能同时读到旧值、各自加一再写回，结果只加了一次（lost update）。</div>
+
+<div class="qa"><b>Q2. <code>barrier()</code> 和 <code>smp_mb()</code> 有什么区别？</b><code>barrier()</code> 是<strong>编译器</strong>屏障：展开成 <code>__asm__ __volatile__("": : :"memory")</code>，不产生任何 CPU 指令，零成本，作用是告诉编译器“我前后对内存的访问别重排”。<code>smp_mb()</code> 是<strong>硬件</strong>屏障：在 x86_64 上生成 <code>lock addl $0,-4(%rsp)</code>（或 <code>mfence</code>），会真正让 CPU 把 Store Buffer 刷出去、挡住所有未完成的访存，代价是几十个周期。跨 CPU 的可见性顺序必须靠后者。</div>
+
+<div class="qa"><b>Q3. <code>READ_ONCE()</code> 到底防住了什么？它防不住什么？</b>它防的是<strong>编译器</strong>把这次读取优化掉、延后，或与相邻的读取<strong>合并</strong>（比如两次 <code>p-&gt;v</code> 只读一次内存）——实现手法是把地址强转成 <code>volatile</code>。它<strong>不防</strong>：CPU 层面的乱序、其他 CPU 读到过期值、读到撕裂值（弱序架构上）。要跨 CPU 的顺序保证，得用 <code>smp_load_acquire()</code>、<code>smp_mb()</code> 或 <code>rcu_dereference()</code>。</div>
+
+<div class="qa"><b>Q4. 为什么要用 <code>refcount_t</code> 而不是直接用 <code>atomic_t</code> 做引用计数？</b>因为 <code>atomic_t</code> 的下溢是静默灾难：计数从 0 减成 -1、-2，某次 <code>dec_and_test()</code> 误判为 0 就会提前 <code>free()</code> 一个还在被使用的对象，表现为极难复现的 use-after-free。<code>refcount_t</code> 在检测到下溢/上溢时立刻 WARN，并把计数钉死在 <code>REFCOUNT_SATURATED</code> 上，让它永远不会被误判为 0。另外它还提供正确的 release/acquire 内存序，保证减到 0 的那个线程之前的修改对后续读者可见。</div>
+
+<div class="qa"><b>Q5. per-CPU 变量为什么不需要锁？它的代价是什么？</b>因为每个 CPU 各有一份副本（percpu 区里按 CPU 号排列），只有“当前 CPU”这一份会被访问它的代码修改，所以天然没有竞争。定位当前那一份靠 <code>this_cpu_ptr()</code>（用 <code>my_cpu_offset</code> 加偏移）。代价有三个：<b>①</b> 内存占用乘以 CPU 数；<b>②</b> 任务被调度到别的 CPU 时，它的值必须被搬运过去（这由 percpu 区的迁移机制负责）；<b>③</b> 中断上下文访问同一份数据时要小心——所以 <code>raw_cpu_*</code> 不做抢占检查，调用者必须自己保证关好抢占/中断。</div>
+
+<div class="qa"><b>Q6. 为什么 x86 上 <code>smp_rmb()</code> 和 <code>smp_wmb()</code> 是空操作，只有 <code>smp_mb()</code> 要下指令？</b>因为 x86 是强序架构：写按程序顺序对所有核可见，读按程序顺序执行，只有“读-改-写”需要额外保证（由 <code>lock</code> 前缀提供）。所以 <code>smp_rmb()</code>/<code>smp_wmb()</code> 退化成 <code>barrier()</code>（纯编译器屏障），而 <code>smp_mb()</code> 需要 <code>lock addl</code> 或 <code>mfence</code> 来真正拦住未完成的访存。ARM、RISC-V 等弱序架构上三种屏障都要真下指令——这也是为什么内核代码要用通用的 <code>smp_*</code> 宏而不是直接写 x86 汇编。</div>
+
+<footer>
+  <p>上一篇：<a href="12-rcu.html">12 RCU</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="14-buddy.html">14 伙伴系统</a></p>
+</footer>
+
+</body>
+</html>

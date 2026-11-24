@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>23-伪文件系统：procfs / sysfs / debugfs</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75; max-width: 900px; margin: 0 auto;
+    padding: 32px 24px 80px; font-size: 16px; }
+  nav.top { display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border); }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="24-block.html">下一篇：块层 →</a>
+</nav>
+
+<h1>🧪 伪文件系统：procfs / sysfs / debugfs</h1>
+<p class="subtitle">没有真实存储，却能用 cat/echo 读写的“文件”：内核给用户开的窗口 · 预计阅读 10 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>内核里有一堆状态：当前哪些进程在跑、每个进程什么状态、CPU 有多少个、网卡收了多少包、某驱动内部计数器是多少。这些数据<strong>根本不存在磁盘上</strong>，都是内存里结构体的即时值。可用户又想查看甚至修改它们，怎么办？</p>
+<p>若为每个数据开一个专门系统调用，内核会膨胀成几百个 syscall，用户态还要配几百个工具。Linux 的答案很巧妙：<strong>把内核数据“伪装成文件”</strong>。你 <code>cat /proc/self/status</code>，内核临时生成文本；你 <code>echo 1 &gt; /sys/...</code>，内核解码字符串并改内部变量。这套机制叫<span class="term">伪文件系统</span>：有 inode 和 dentry，却没有磁盘块。<span class="term">VFS</span> 不知道也不关心背后有没有硬盘，它只看函数指针。</p>
+<p>于是复用了现成的一切：权限用文件权限、查看用 <code>cat</code>、脚本用 shell 管道、远程用 ssh、编程用 <code>open/read</code>。<strong>文件成为内核与用户之间的通用接口</strong>。本篇讲三类最重要的：procfs（进程与内核状态）、sysfs（设备模型的结构化视图）、debugfs（调试用的“什么都往里塞”）。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">伪文件系统</td><td>pseudo fs</td><td>用 inode/dentry 抽象暴露内核数据，但不在磁盘上存任何内容。</td></tr>
+  <tr><td class="term">procfs</td><td>proc filesystem</td><td>挂在 <code>/proc</code>；<code>/proc/[pid]/</code> 是进程视图，<code>/proc/meminfo</code> 等是全局状态。</td></tr>
+  <tr><td class="term">sysfs</td><td>sysfs</td><td>挂在 <code>/sys</code>；按“设备/总线/驱动/类”的目录层级展示 kobject 树。</td></tr>
+  <tr><td class="term">debugfs</td><td>debugfs</td><td>挂在 <code>/sys/kernel/debug</code>；驱动随意暴露调试信息，无稳定 ABI 保证。</td></tr>
+  <tr><td class="term">kobject</td><td>kobject</td><td>设备模型的基本节点（名字/父节点/引用计数），sysfs 目录就是它的投影。</td></tr>
+  <tr><td class="term">kernfs</td><td>kernfs</td><td>sysfs 的底层实现：内核对象树与用户态文件树之间的映射层。</td></tr>
+  <tr><td class="term">seq_file</td><td>seq_file</td><td>输出较长文本的标准库：start/next/show/stop 逐条产生，自动处理翻页。</td></tr>
+  <tr><td class="term">proc_ops</td><td>proc_ops</td><td>5.10 中 procfs 文件的操作表（取代旧 <code>file_operations</code> 用法）。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<pre><code>/proc                        /sys                      /sys/kernel/debug
+├ self -&gt; [pid]              ├ devices/  (设备清单)     ├ tracing/   (ftrace)
+├ [pid]/status               ├ bus/      (总线)         ├ block/     (块层调试)
+│   ├ Name/State/Pid...      │   └ pci/               ├ bdi/
+│   └ 由 proc_pid_status     ├ class/    (按功能分类)    └ &lt;驱动自建目录&gt;
+├ meminfo / cpuinfo          │   └ net/
+├ sys/  (可写开关)           ├ block/    (每个块设备)
+└ tty/                       └ module/   (模块参数)</code></pre>
+<p>三者共享同一条路：VFS 的 <code>read()</code>/<code>write()</code> 调到伪文件系统注册的回调。procfs 用 <code>proc_ops</code>（<code>proc_read</code> 实际是 <code>single_open</code> 包装的 seq 回调）；sysfs 用 kernfs 的 <code>sysfs_ops</code>（<code>show/store</code>），属性通过 <code>DEVICE_ATTR</code> 声明；debugfs 用普通 <code>file_operations</code>，实现最自由。cgroupfs 也是 kernfs 之上的一层，一句话：它用同样的目录/文件形式做“资源分组”，把 <code>cpu.max</code>、<code>memory.max</code> 这类限额写进文件。</p>
+<p>读一个 proc 文件的流程：<code>cat</code> → <code>vfs_read</code> → <code>proc_reg_read</code> → <code>seq_read</code> → 反复调 <code>proc_pid_status</code> 里的 <code>seq_printf</code> 直到缓冲区够填。写则相反：<code>proc_reg_write</code> → 驱动自己的解析函数。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 注册一个 proc 文件</h3>
+<p class="srcline">fs/proc/generic.c:564-570  proc_create</p>
+<pre><code>struct proc_dir_entry *proc_create(const char *name, umode_t mode,
+				   struct proc_dir_entry *parent,
+				   const struct proc_ops *proc_ops)
+{
+	return proc_create_data(name, mode, parent, proc_ops, NULL);
+}
+EXPORT_SYMBOL(proc_create);</code></pre>
+<p class="srcline">fs/proc/generic.c:549-562  proc_create_data</p>
+<pre><code>	p = proc_create_reg(name, mode, &amp;parent, data);
+	if (!p)
+		return NULL;
+	p-&gt;proc_ops = proc_ops;
+	pde_set_flags(p);
+	return proc_register(parent, p);   /* 挂进 parent 的子项链表并分配 inode */</code></pre>
+<p>驱动一行就能在 <code>/proc</code> 下建文件：<code>proc_create("hello", 0444, NULL, &amp;hello_ops)</code>。它只分配 <code>proc_dir_entry</code>、记下 <code>proc_ops</code>，然后挂到父目录项列表；文件真正“出现”是在 VFS 下一次 lookup 时由 procfs 的 <code>proc_lookup</code> 按名字找到该 entry 并造 inode。</p>
+
+<h3>4.2 进程状态文本从哪来</h3>
+<p class="srcline">fs/proc/base.c:3170  status 文件声明</p>
+<pre><code>	ONE("status",     S_IRUGO, proc_pid_status),</code></pre>
+<p><code>ONE</code> 宏（<code>base.c:144</code>）把 <code>proc_pid_status</code> 包成 <code>proc_single_file_operations</code> 的 <code>.proc_show</code>。于是 <code>/proc/[pid]/status</code> 的读回调就是下面这个函数：</p>
+<p class="srcline">fs/proc/array.c:404-415  proc_pid_status（开头）</p>
+<pre><code>int proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
+			struct pid *pid, struct task_struct *task)
+{
+	struct mm_struct *mm = get_task_mm(task);
+
+	seq_puts(m, "Name:\t");
+	proc_task_name(m, task, true);
+	seq_putc(m, '\n');
+
+	task_state(m, ns, pid, task);
+	// ... 省略后面几十行：内存、信号、capabilities 输出</code></pre>
+<p>它用 <code>seq_file</code> 逐行输出：先打名字，再打状态块。名字来源是 <code>task_struct-&gt;comm</code>（若为内核 worker 需特殊处理）。<code>get_task_mm</code> 拿内存描述符的引用，防止读取中被释放。</p>
+
+<h3>4.3 State 字段与状态数组</h3>
+<p class="srcline">fs/proc/array.c:129-140  task_state_array</p>
+<pre><code>static const char * const task_state_array[] = {
+	/* states in TASK_REPORT: */
+	"R (running)",		/* 0x00 */
+	"S (sleeping)",		/* 0x01 */
+	"D (disk sleep)",	/* 0x02 */
+	"T (stopped)",		/* 0x04 */
+	"t (tracing stop)",	/* 0x08 */
+	"X (dead)",		/* 0x10 */
+	"Z (zombie)",		/* 0x20 */
+	"P (parked)",		/* 0x40 */
+	/* states beyond TASK_REPORT: */
+	"I (idle)",		/* 0x80 */
+};</code></pre>
+<p><code>task_state_index()</code> 把 <code>task_struct</code> 的状态位（可能是多个位或）映射成这个数组的下标，再由 <code>get_task_state()</code> 返回字符串。这就是你 <code>ps</code> 看到的 <code>R/S/D/Z</code> 字母的真身：<code>S</code> = 可中断睡眠、<code>D</code> = 不可中断（一般在等 IO）、<code>Z</code> = 僵尸（已退出等父进程回收）。特殊状态如 <code>I</code>（idle 内核线程）在正常位图之外单独处理。</p>
+
+<h3>4.4 sysfs 属性：DEVICE_ATTR 与 device_create_file</h3>
+<p class="srcline">include/linux/device.h:125-126  DEVICE_ATTR</p>
+<pre><code>#define DEVICE_ATTR(_name, _mode, _show, _store) \
+	struct device_attribute dev_attr_##_name = __ATTR(_name, _mode, _show, _store)</code></pre>
+<p>这个宏只声明一个 <code>struct device_attribute</code>（内含名字、权限、show/store 回调）。要让它出现在 <code>/sys/devices/...</code> 下，还需注册：</p>
+<p class="srcline">drivers/base/core.c:2298-2312  device_create_file</p>
+<pre><code>int device_create_file(struct device *dev,
+		       const struct device_attribute *attr)
+{
+	int error = 0;
+
+	if (dev) {
+		WARN(((attr-&gt;attr.mode &amp; S_IWUGO) &amp;&amp; !attr-&gt;store),
+			"Attribute %s: write permission without 'store'\n",
+			attr-&gt;attr.name);
+		WARN(((attr-&gt;attr.mode &amp; S_IRUGO) &amp;&amp; !attr-&gt;show),
+			"Attribute %s: read permission without 'show'\n",
+			attr-&gt;attr.name);
+		error = sysfs_create_file(&amp;dev-&gt;kobj, &amp;attr-&gt;attr);
+	}
+
+	return error;
+}</code></pre>
+<p>两个 WARN 是权限自检：给了写权限却没 <code>store</code>、给了读权限却没 <code>show</code>，都是驱动 bug，会打出栈。真正的建文件是 <code>sysfs_create_file(&amp;dev-&gt;kobj, ...)</code>：把属性挂到设备的 <span class="term">kobject</span> 上，由 kernfs 在 <code>/sys</code> 目录树里生成对应文件。读时 kernfs 调 <code>->show(dev, attr, buf)</code>，写时调 <code>->store(...)</code>。</p>
+<p>sysfs 的目录结构不是人工维护的，而是 <code>kobject</code> 树（<code>include/linux/kobject.h:64</code>：<code>name</code>、<code>parent</code>、<code>sd</code> 指向 kernfs_node）的投影：设备注册到总线/类，目录就自动出现。这就是“设备模型”的展示层。</p>
+
+<h3>4.5 debugfs 与 cgroupfs</h3>
+<p>debugfs 没有固定格式：<code>debugfs_create_file(name, mode, parent, data, fops)</code> 传一个普通 <code>file_operations</code>，读写出什么完全由驱动决定。它<strong>不承诺稳定 ABI</strong>，也不该在生产脚本里依赖。<code>tracing/</code>（ftrace 控制）、<code>block/</code>、<code>bdi/</code> 都在这里。cgroupfs v2 则是 kernfs 之上的控制器框架：<code>/sys/fs/cgroup/</code> 下每个目录表示一个资源组，文件如 <code>cpu.max</code>、<code>memory.max</code> 是控制接口，写入字符串即调控制器回调。</p>
+
+<h2>5. 动手验证</h2>
+<p><strong>先看现成的伪文件。</strong></p>
+<pre><code>cat /proc/self/status | head -8
+ls -l /proc/self/fd                 # 每个 fd 都是一个“魔法符号链接”
+cat /sys/class/net/$(ls /sys/class/net | head -1)/statistics/rx_bytes
+ls /sys/bus/pci/devices/ | head -3; cat /sys/bus/pci/devices/*/vendor 2&gt;/dev/null | head -3</code></pre>
+<p><code>/proc/self</code> 是动态符号链接，指向当前 cat 进程的 pid 目录；<code>/sys/class/net/eth0/statistics/</code> 下每个文件对应一个计数器的 show 回调；<code>vendor</code> 是 PCI 设备的 16 进制厂商号。</p>
+<p><strong>写一个模块创建 /proc/hello。</strong>（需内核头文件，可在 qemu 实验机或装了 headers 的本机做）</p>
+<pre><code>// hello_proc.c
+#include &lt;linux/module.h&gt;
+#include &lt;linux/proc_fs.h&gt;
+#include &lt;linux/seq_file.h&gt;
+
+static int hello_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "hello from kernel, jiffies=%lu\n", jiffies);
+    return 0;
+}
+static int hello_open(struct inode *i, struct file *f)
+{ return single_open(f, hello_show, NULL); }
+
+static const struct proc_ops hello_ops = {
+    .proc_open = hello_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static int __init hello_init(void)
+{
+    proc_create("hello", 0444, NULL, &amp;hello_ops);
+    return 0;
+}
+static void __exit hello_exit(void) { remove_proc_entry("hello", NULL); }
+module_init(hello_init); module_exit(hello_exit);
+MODULE_LICENSE("GPL");</code></pre>
+<pre><code>make -C /lib/modules/$(uname -r)/build M=$PWD modules
+sudo insmod hello_proc.ko
+cat /proc/hello          # 每读一次 jiffies 都不同 → 内容是“现算”的
+sudo rmmod hello_proc</code></pre>
+<p><strong>sysfs 属性同理</strong>：在模块里定义 <code>static DEVICE_ATTR(hello, 0444, show_fn, NULL);</code>，拿到 <code>struct device *</code> 后 <code>device_create_file(dev, &amp;dev_attr_hello)</code>，文件就出现在该设备目录下；<code>cat</code> 它会调用 <code>show_fn</code>，返回缓冲区内容。若换成 <code>0644</code> 并实现 <code>store</code>，<code>echo 1 &gt; ...</code> 会写到内核变量。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 伪文件系统的文件为什么没有磁盘块？</b>它的 inode 由文件系统代码现场构造（如 <code>proc_lookup</code>），数据由 <code>read</code> 回调即时生成，不经过 page cache 的磁盘读路径。</div>
+<div class="qa"><b>Q2. <code>/proc/[pid]/status</code> 的内容由哪个函数产生？</b><code>proc_pid_status</code>（<code>fs/proc/array.c</code>），内部先调 <code>proc_task_name</code> 打名字，再调 <code>task_state</code> 打状态块；State 字符串来自 <code>task_state_array</code>。</div>
+<div class="qa"><b>Q3. <code>DEVICE_ATTR</code> 与 <code>device_create_file</code> 各自做什么？</b>前者声明一个带名字/权限/show/store 的属性结构，后者把它挂到设备的 kobject 上，由 kernfs 在 <code>/sys</code> 生成文件。</div>
+<div class="qa"><b>Q4. sysfs 的目录结构怎么来的？</b>由 kobject 树自动投影：设备/总线/驱动注册时建 kobject，kernfs 据此生成目录与属性文件，而不是手工 mkdir。</div>
+<div class="qa"><b>Q5. 为什么脚本不应依赖 debugfs？</b>它没有稳定 ABI，接口随内核版本变化；生产脚本依赖它会在升级后失效。稳定接口应使用 sysfs/procfs 中已文档化的文件。</div>
+
+<footer>
+  <p>上一篇：<a href="22-ext4.html">22-ext4 文件系统</a> · 下一篇：<a href="24-block.html">24-block 块层</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

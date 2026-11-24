@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>38-cgroup 资源控制</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="index.html">下一篇：返回主题目录 →</a>
+</nav>
+
+<h1>📦 38-cgroup 资源控制</h1>
+<p class="subtitle">把"一群进程"当作一个整体来限制 CPU、内存、IO 与进程数；容器资源限制的实现底座 · 约 14 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>想象一栋公寓楼，每户人家有自己的电表和水量表。物业想给某户设定"每月用电不超过 200 度"，超额就自动断电；同时也要保证整栋楼的总用电不超过变压器容量。这套"按<b>住户</b>而不是按<b>电线</b>计量和限流"的机制，就是 cgroup。</p>
+<p>在没有 cgroup 的年代，Unix 只有"用户"这一个资源计量单位——<code>setrlimit()</code> 限制的是单个进程的地址空间和文件大小。但真实需求是"一组进程共享一份配额"：一个 Java 应用有几十个线程加上若干子进程，它们应该<b>合起来</b>不超过 1 GB 内存，而不是每个进程各自 1 GB。cgroup 提供的正是这个"进程组"概念。</p>
+<p>第二个需求是<b>分层</b>。不能只有"一组进程"，还需要"组里的子组"：整台机器 16 GB → 交给"测试环境" 8 GB → 测试环境里的"单个用例" 2 GB。资源用量<b>自底向上汇总</b>，限制<b>自顶向下传递</b>。这和容器的 image 层级、namespace 的嵌套是同构的设计。</p>
+<p>第三个需求是<b>资源控制器的可插拔</b>。CPU 限速、内存上限、磁盘 IO 限速、进程数上限——这些是完全不同的机制，但都遵循同一个模式：<b>内核在关键路径上问一句"这个进程组现在用了多少？超了吗？"</b>。cgroup 框架提供这个提问机制和记账框架，各控制器（controller）自己去实现。</p>
+<p>第四个需求是<b>与 namespace 配合</b>。namespace 负责"隔离视野"（这个容器只能看到自己的进程、自己的网络、自己的文件系统），cgroup 负责"限制资源"。两者合起来才构成完整的容器：<b>namespace 是围墙，cgroup 是配额表</b>。Docker 的 <code>docker run --memory=512m</code> 就是往 cgroup 里写一个 <code>memory.max = 536870912</code>。</p>
+<p>最后一个现实问题是<b>历史包袱</b>。cgroup v1 为每个控制器单独做一套层级：内存一套、CPU 一套、IO 一套……同一个进程在每套层级里各有一个位置。结果是"进程属于哪个组"这个问题有多个答案，容器要同时配好几套。cgroup v2 把所有控制器合并成<b>一棵统一的树</b>，一个进程在整棵树里只有一个位置，简单得多。v1 在 5.10 里仍然完整保留，但新系统默认用 v2。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">cgroup</td><td>control group</td><td>一个节点，既是"进程组"也是"子组容器"，树形结构。</td></tr>
+  <tr><td class="term">层级</td><td>hierarchy</td><td>一棵 cgroup 树；v1 每个控制器一棵，v2 全部控制器共用一棵。</td></tr>
+  <tr><td class="term">根</td><td>root cgroup</td><td>树的顶端，v2 里是 "/"，v1 里是各控制器的挂载点。</td></tr>
+  <tr><td class="term">控制器</td><td>controller</td><td>实现某种资源限制的模块，如 memory、cpu、io、pids。</td></tr>
+  <tr><td class="term">子树控制</td><td>cgroup.subtree_control</td><td>决定哪些控制器向下传播给子 cgroup（写 "+cpu" 启用）。</td></tr>
+  <tr><td class="term">可用控制器</td><td>cgroup.controllers</td><td>当前节点可以启用的控制器列表（父节点的 subtree_control 决定）。</td></tr>
+  <tr><td class="term">无内部进程</td><td>no internal process</td><td>v2 的规则：有子 cgroup 的节点自己不能直接放进程，只能放子组。</td></tr>
+  <tr><td class="term">线程模式</td><td>threaded mode</td><td>v2 的例外：允许 cgroup 内部再放进程，突破"无内部进程"限制。</td></tr>
+  <tr><td class="term">内存上限</td><td>memory.max</td><td>v2 里该组的内存硬上限，超过就触发 OOM killer。</td></tr>
+  <tr><td class="term">当前用量</td><td>memory.current</td><td>v2 里该组当前占用的内存字节数（含 page cache）。</td></tr>
+  <tr><td class="term">低水位/高水位</td><td>memory.low / memory.high</td><td>软限制：超过 high 时开始回收，超过 low 时加强回收。</td></tr>
+  <tr><td class="term">进程数上限</td><td>pids.max</td><td>限制该组里能同时存在的进程/线程总数。</td></tr>
+  <tr><td class="term">CPU 权重</td><td>cpu.weight</td><td>v2 里 cgroup 的 CPU 分享权重（默认 100）。</td></tr>
+  <tr><td class="term">CPU 配额</td><td>cpu.max</td><td>v2 里的硬性 CPU 限制，如 "50000 100000" = 50%。</td></tr>
+  <tr><td class="term">IO 权重</td><td>io.weight</td><td>v2 里块设备的 IO 调度权重。</td></tr>
+  <tr><td class="term">css_set</td><td>cgroup_subsys_set</td><td>内核内部结构：一个进程在所有控制器上的状态指针集合。</td></tr>
+  <tr><td class="term">cgroup.procs</td><td>—</td><td>列出/迁入该 cgroup 的进程 PID（写 PID 即迁入）。</td></tr>
+  <tr><td class="term">cgroup 命名空间</td><td>cgroup namespace</td><td>让容器内的进程看到"以自己为根"的 cgroup 视图。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 一棵树的形状</h3>
+<pre><code>  cgroup v2 统一层级（挂载在 /sys/fs/cgroup）
+
+  /sys/fs/cgroup/                     ← 根 cgroup
+  ├── user.slice/                     ← systemd 的用户切片
+  │   ├── user-1000.slice/
+  │   │   ├── user-1000.slice.scope/  ← 一个服务
+  │   │   └── session-3.scope/
+  │   └── user-1001.slice/
+  ├── system.slice/
+  │   ├── sshd.service/
+  │   │   ├── 1234/                  ← 进程迁入这里
+  │   │   └── ...
+  │   └── docker-abc.scope/
+  └── machine.slice/
+
+  每个节点下都有这些文件（片段）：
+    cgroup.procs          该组里的进程 PID 列表
+    cgroup.threads        该组里的线程 TID 列表
+    cgroup.controllers    本节点可用的控制器
+    cgroup.subtree_control  已下发给子组的控制器
+    cgroup.type           domain / threaded / threaded-domain
+    memory.max            内存上限
+    memory.current        当前用量
+    memory.events         low/high/max/oom/oom_kill 计数
+    cpu.max               CPU 配额
+    pids.max              进程数上限</code></pre>
+
+<h3>3.2 v1 与 v2 的差别</h3>
+<pre><code>  v1：每个控制器一棵独立的树
+  ─────────────────────────────
+  /sys/fs/cgroup/memory/         ← 内存树
+      ├── docker/
+      │   └── abc/
+      └── user.slice/
+  /sys/fs/cgroup/cpu/            ← CPU 树（跟内存树完全无关）
+      ├── docker/
+      │   └── abc/
+      └── user.slice/
+  /sys/fs/cgroup/cpuset/         ← 第三棵树
+  ...
+  同一个进程在每棵树里各有一个位置，容器要配 N 遍。
+
+  v2：所有控制器共用一棵树
+  ─────────────────────────────
+  /sys/fs/cgroup/                 ← 唯一的树
+      ├── docker/
+      │   └── abc/                ← 这里同时管内存、CPU、IO、pids
+      └── user.slice/
+  一个进程在整棵树里只有一个位置。</code></pre>
+<table>
+  <tr><th>维度</th><th>v1</th><th>v2</th></tr>
+  <tr><td>层级数</td><td>每个控制器一棵</td><td>全部控制器共用一棵</td></tr>
+  <tr><td>挂载</td><td><code>mount -t cgroup -o memory</code> 等，每控制器挂一次</td><td><code>mount -t cgroup2 none /sys/fs/cgroup</code></td></tr>
+  <tr><td>限制文件位置</td><td>在控制器自己的目录下，如 <code>memory/memory.limit_in_bytes</code></td><td>统一在节点下，如 <code>memory.max</code></td></tr>
+  <tr><td>内部进程</td><td>允许（有进程和子组并存）</td><td>默认禁止（no internal process）</td></tr>
+  <tr><td>CPU 限制</td><td>cpu.cfs_quota_us + cpu.cfs_period_us</td><td>cpu.max = "quota period"</td></tr>
+  <tr><td>内存限制</td><td>memory.limit_in_bytes（软硬两级）</td><td>memory.max（硬）+ memory.high（软）</td></tr>
+  <tr><td>启用子组控制器</td><td>不用显式开（各树独立）</td><td>要往 cgroup.subtree_control 里写 "+cpu"</td></tr>
+  <tr><td>状态</td><td>仍在维护，但已冻结新功能</td><td>当前推荐</td></tr>
+</table>
+
+<h3>3.3 内部对象关系</h3>
+<pre><code>  task_struct
+      │
+      │ current-&gt;cgroups ──► css_set（每个进程一个）
+      │                          │
+      │                          ├── subsys[0] ──► cgroup_subsys_state (memory)
+      │                          ├── subsys[1] ──► cgroup_subsys_state (cpu)
+      │                          ├── subsys[2] ──► cgroup_subsys_state (io)
+      │                          └── subsys[3] ──► cgroup_subsys_state (pids)
+      │                                    │
+      │                                    └── cgroup ──► struct cgroup
+      │                                                        │
+      │                                                        └── kn ──► kernfs_node
+      │                                                                     │
+      └── cg_list ◄────────── tasks 链表（每个 css_set 一条）        └── 子 cgroup 树
+
+  为什么用 css_set？
+  一个进程可能在 4 棵控制器树里各有一个状态指针。
+  打包成一个 css_set 后，fork 时只要 refcount++ 和 list_add 一次，
+  而不是对每个控制器各做一遍 —— 大幅加快 fork/exit。</code></pre>
+<p><code>css_set</code> 是本篇最关键的设计。它把"一个进程在所有控制器上的位置"打包成一个对象，进程只持有这一个指针。</p>
+
+<h3>3.4 内存限制的生效路径</h3>
+<pre><code>  进程 malloc/mmap 缺页 → 分配物理页
+        │
+        ▼
+  mem_cgroup_charge(page, mm, gfp)      ← mm/memcontrol.c:6766
+        │
+        ▼
+  try_charge(memcg, gfp_mask, nr_pages) ← mm/memcontrol.c:2681
+        │
+        ├── page_counter_try_charge(&amp;memcg-&gt;memory, ...)
+        │        │
+        │        ├── 成功 → 返回 0，继续
+        │        │
+        │        └── 失败（超过 memory.max）
+        │                 │
+        │                 ▼
+        │           try_to_free_mem_cgroup_pages()   ← 尝试在本组内回收
+        │                 │
+        │                 ├── 回收够了 → retry 成功
+        │                 │
+        │                 └── 回收不出来
+        │                          │
+        │                          ▼
+        │                    mem_cgroup_out_of_memory()
+        │                          │
+        │                          ▼
+        │                    OOM killer 杀进程
+        │                    （本组里内存占用最大的那个）
+        │
+        └── 内存不够且不许阻塞 → 返回 -ENOMEM / -ENOMEM
+
+
+  路径对应关系：
+    memory.max    → memcg-&gt;memory.max     ← 上限
+    memory.current → page_counter_read(&amp;memcg-&gt;memory) * PAGE_SIZE
+    memory.high   → memcg-&gt;memory.high    ← 软限制，触发回收不杀进程</code></pre>
+
+<h3>3.5 容器是怎么用 cgroup 的</h3>
+<pre><code>  docker run --memory=512m --cpus=1.5 --pids-limit=100 ubuntu
+        │
+        ▼
+  containerd/runc 创建容器
+        │
+        ├── mkdir /sys/fs/cgroup/docker/id
+        │
+        ├── echo 536870912  .../memory.max       （512 MiB）
+        ├── echo "150000 100000"  .../cpu.max    （1.5 核）
+        ├── echo 100  .../pids.max
+        │
+        ├── 把进程 PID 写进 .../cgroup.procs
+        │
+        └── clone 时带上 CLONE_NEWCGROUP（cgroup namespace）
+              → 容器内看到 /sys/fs/cgroup 是以自己为根的视图</code></pre>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 创建一个 cgroup</h3>
+<p class="srcline">kernel/cgroup/cgroup.c:5180-5217</p>
+<pre><code>static struct cgroup *cgroup_create(struct cgroup *parent, const char *name,
+				    umode_t mode)
+{
+	struct cgroup_root *root = parent-&gt;root;
+	struct cgroup *cgrp, *tcgrp;
+	struct kernfs_node *kn;
+	int level = parent-&gt;level + 1;
+	int ret;
+
+	/* allocate the cgroup and its ID, 0 is reserved for the root */
+	cgrp = kzalloc(struct_size(cgrp, ancestor_ids, (level + 1)),
+		       GFP_KERNEL);
+	if (!cgrp)
+		return ERR_PTR(-ENOMEM);
+
+	ret = percpu_ref_init(&amp;cgrp-&gt;self.refcnt, css_release, 0, GFP_KERNEL);
+	if (ret)
+		goto out_free_cgrp;
+
+	if (cgroup_on_dfl(parent)) {
+		ret = cgroup_rstat_init(cgrp);
+		if (ret)
+			goto out_cancel_ref;
+	}
+
+	/* create the directory */
+	kn = kernfs_create_dir(parent-&gt;kn, name, mode, cgrp);
+	if (IS_ERR(kn)) {
+		ret = PTR_ERR(kn);
+		goto out_stat_exit;
+	}
+	cgrp-&gt;kn = kn;
+
+	init_cgroup_housekeeping(cgrp);
+
+	cgrp-&gt;self.parent = &amp;parent-&gt;self;
+	cgrp-&gt;root = root;
+	cgrp-&gt;level = level;</code></pre>
+<p>创建顺序很清楚：<b>先分配 cgroup 对象 → 初始化引用计数 → 建 kernfs 目录 → 挂到父节点</b>。用 kernfs 而不是自己实现文件系统，是因为 kernfs 提供了"每个目录带一组自定义文件"的机制（正是 <code>cgroup.procs</code>、<code>memory.max</code> 这些控制文件的载体）。</p>
+<p><code>struct_size(cgrp, ancestor_ids, (level + 1))</code> 是变长数组技巧：<code>ancestor_ids</code> 是个 flexible array member，要按层级深度分配——每个 cgroup 记住自己所有祖先的 ID，这样从任意节点都能 O(1) 查到根路径。</p>
+
+<h3>4.2 把进程迁入 cgroup</h3>
+<p>往 <code>cgroup.procs</code> 里写 PID 就触发迁移，代码路径是 <code>cgroup_procs_write</code> → <code>cgroup_attach_task</code>。</p>
+<p class="srcline">kernel/cgroup/cgroup.c:2717-2747</p>
+<pre><code>int cgroup_attach_task(struct cgroup *dst_cgrp, struct task_struct *leader,
+		       bool threadgroup)
+{
+	DEFINE_CGROUP_MGCTX(mgctx);
+	struct task_struct *task;
+	int ret = 0;
+
+	/* look up all src csets */
+	spin_lock_irq(&amp;css_set_lock);
+	rcu_read_lock();
+	task = leader;
+	do {
+		cgroup_migrate_add_src(task_css_set(task), dst_cgrp, &amp;mgctx);
+		if (!threadgroup)
+			break;
+	} while_each_thread(leader, task);
+	rcu_read_unlock();
+	spin_unlock_irq(&amp;css_set_lock);
+
+	/* prepare dst csets and commit */
+	ret = cgroup_migrate_prepare_dst(&amp;mgctx);
+	if (!ret)
+		ret = cgroup_migrate(leader, threadgroup, &amp;mgctx);
+
+	cgroup_migrate_finish(&amp;mgctx);
+
+	if (!ret)
+		TRACE_CGROUP_PATH(attach_task, dst_cgrp, leader, threadgroup);
+
+	return ret;
+}</code></pre>
+<p>整个迁移分四步，这是 cgroup 里最需要小心的并发逻辑：</p>
+<ol>
+<li><b>收集源</b>（<code>cgroup_migrate_add_src</code>）：在 <code>css_set_lock</code> + RCU 读侧保护下，把进程当前的 <code>css_set</code> 记到迁移上下文里。<code>while_each_thread</code> 遍历整个线程组（<code>threadgroup</code> 为真时），保证多线程进程整体搬迁。</li>
+<li><b>准备目标</b>（<code>cgroup_migrate_prepare_dst</code>）：算出目标 cgroup 对应的 <code>css_set</code>（可能已存在，<code>find_existing_css_set</code> 会复用），并做合法性检查。</li>
+<li><b>提交</b>（<code>cgroup_migrate</code> → <code>cgroup_migrate_execute</code>）：真正把进程从旧 css_set 的链表移到新的。这是最关键的一步——先调各控制器的 <code>can_attach</code>（任何一个拒绝就整体取消），全部通过后才在 <code>css_set_lock</code> 下真正移动任务，并调用各控制器的 <code>attach</code> 回调。</li>
+<li><b>收尾</b>（<code>cgroup_migrate_finish</code>）：释放迁移期间临时持有的引用。</li>
+</ol>
+<p>关键性质：<b>要么全成功，要么全失败</b>（<code>cgroup_migrate_execute</code> 里 <code>can_attach</code> 失败会调 <code>cancel_attach</code> 回滚）。这保证不会出现"进程在内存控制器里搬了、在 CPU 控制器里没搬"的半吊子状态。</p>
+
+<h3>4.3 css_set：进程持有的那一个指针</h3>
+<p class="srcline">include/linux/cgroup-defs.h:188-218</p>
+<pre><code>/*
+ * A css_set is a structure holding pointers to a set of
+ * cgroup_subsys_state objects. This saves space in the task struct
+ * object and speeds up fork()/exit(), since a single inc/dec and a
+ * list_add()/del() can bump the reference count on the entire cgroup
+ * set for a task.
+ */
+struct css_set {
+	/*
+	 * Set of subsystem states, one for each subsystem. This array is
+	 * immutable after creation apart from the init_css_set during
+	 * subsystem registration (at boot time).
+	 */
+	struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
+
+	/* reference count */
+	refcount_t refcount;
+
+	/*
+	 * For a domain cgroup, the following points to self.  If threaded,
+	 * to the matching cset of the nearest domain ancestor.  The
+	 * dom_cset provides access to the domain cgroup and its csses to
+	 * which domain level resource consumptions should be charged.
+	 */
+	struct css_set *dom_cset;
+
+	/* the default cgroup associated with this css_set */
+	struct cgroup *dfl_cgrp;
+
+	/* internal task count, protected by css_set_lock */
+	int nr_tasks;</code></pre>
+<p>注释说得很清楚：<b>这个结构是为了省 task_struct 的空间、加速 fork/exit 而存在的</b>。<code>subsys[]</code> 数组在创建后<b>不可变</b>（除了启动时的 <code>init_css_set</code>），所以能放心地被多个进程共享。</p>
+<p><code>dom_cset</code> 是 threaded 模式的关键：普通 cgroup 指向自己；threaded cgroup 指向最近的 domain 祖先的 css_set，这样资源记账总是算到 domain 层级去。</p>
+
+<h3>4.4 控制器的注册表</h3>
+<p>每个控制器通过一张 <code>struct cgroup_subsys</code> 表注册自己：</p>
+<p class="srcline">include/linux/cgroup-defs.h:621-650</p>
+<pre><code>struct cgroup_subsys {
+	struct cgroup_subsys_state *(*css_alloc)(struct cgroup_subsys_state *parent_css);
+	int (*css_online)(struct cgroup_subsys_state *css);
+	void (*css_offline)(struct cgroup_subsys_state *css);
+	void (*css_released)(struct cgroup_subsys_state *css);
+	void (*css_free)(struct cgroup_subsys_state *css);
+	void (*css_reset)(struct cgroup_subsys_state *css);
+	void (*css_rstat_flush)(struct cgroup_subsys_state *css, int cpu);
+	int (*css_extra_stat_show)(struct seq_file *seq,
+				   struct cgroup_subsys_state *css);
+
+	int (*can_attach)(struct cgroup_taskset *tset);
+	void (*cancel_attach)(struct cgroup_taskset *tset);
+	void (*attach)(struct cgroup_taskset *tset);
+	void (*post_attach)(void);
+	int (*can_fork)(struct task_struct *task,
+			struct css_set *cset);
+	void (*cancel_fork)(struct task_struct *task, struct css_set *cset);
+	void (*fork)(struct task_struct *task);
+	void (*exit)(struct task_struct *task);
+	void (*release)(struct task_struct *task);
+	void (*bind)(struct cgroup_subsys_state *root_css);</code></pre>
+<p>三类回调：<b>生命周期</b>（<code>css_alloc</code> 分配、<code>css_online</code> 上线、<code>css_free</code> 释放）、<b>迁移</b>（<code>can_attach</code>/<code>attach</code>/<code>cancel_attach</code>、<code>can_fork</code>/<code>fork</code>）、<b>控制文件</b>（<code>dfl_cftypes</code> 和 <code>legacy_cftypes</code> 两套文件列表）。</p>
+<p>内存控制器的注册：</p>
+<p class="srcline">mm/memcontrol.c:6565-6579</p>
+<pre><code>struct cgroup_subsys memory_cgrp_subsys = {
+	.css_alloc = mem_cgroup_css_alloc,
+	.css_online = mem_cgroup_css_online,
+	.css_offline = mem_cgroup_css_offline,
+	.css_released = mem_cgroup_css_released,
+	.css_free = mem_cgroup_css_free,
+	.css_reset = mem_cgroup_css_reset,
+	.can_attach = mem_cgroup_can_attach,
+	.cancel_attach = mem_cgroup_cancel_attach,
+	.post_attach = mem_cgroup_move_task,
+	.bind = mem_cgroup_bind,
+	.dfl_cftypes = memory_files,
+	.legacy_cftypes = mem_cgroup_legacy_files,
+	.early_init = 0,
+};</code></pre>
+<p><code>.dfl_cftypes</code> 是 v2 的文件列表（<code>memory.max</code>、<code>memory.current</code>…），<code>.legacy_cftypes</code> 是 v1 的（<code>memory.limit_in_bytes</code>…）。两个列表可以完全不同——这正是 v1/v2 能在同一套内核框架下并存的原因。</p>
+<p>所有控制器的名单在一个头文件里：</p>
+<p class="srcline">include/linux/cgroup_subsys.h:12-30</p>
+<pre><code>/*
+ * This file *must* be included with SUBSYS() defined.
+ */
+
+#if IS_ENABLED(CONFIG_CPUSETS)
+SUBSYS(cpuset)
+#endif
+
+#if IS_ENABLED(CONFIG_CGROUP_SCHED)
+SUBSYS(cpu)
+#endif
+
+#if IS_ENABLED(CONFIG_CGROUP_CPUACCT)
+SUBSYS(cpuacct)
+#endif
+
+#if IS_ENABLED(CONFIG_BLK_CGROUP)
+SUBSYS(io)
+#endif
+
+#if IS_ENABLED(CONFIG_MEMCG)
+SUBSYS(memory)
+#endif</code></pre>
+<p>这个文件被 <code>kernel/cgroup/cgroup.c</code> 用不同的 <code>SUBSYS()</code> 宏 include 多次，生成控制器名字数组、static key 数组等。<b>加一个新控制器只要在这里加一行</b>，框架自动完成编号分配和注册。</p>
+
+<h3>4.5 memory.max 的写入与读取</h3>
+<p class="srcline">mm/memcontrol.c:6358-6387</p>
+<pre><code>static ssize_t memory_max_write(struct kernfs_open_file *of,
+				char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	unsigned int nr_reclaims = MAX_RECLAIM_RETRIES;
+	bool drained = false;
+	unsigned long max;
+	int err;
+
+	buf = strstrip(buf);
+	err = page_counter_memparse(buf, "max", &amp;max);
+	if (err)
+		return err;
+
+	xchg(&amp;memcg-&gt;memory.max, max);
+
+	for (;;) {
+		unsigned long nr_pages = page_counter_read(&amp;memcg-&gt;memory);
+
+		if (nr_pages &lt;= max)
+			break;
+
+		if (signal_pending(current))
+			break;
+
+		if (!drained) {
+			drain_all_stock(memcg);
+			drained = true;
+			continue;
+		}</code></pre>
+<p>写 <code>memory.max</code> 时内核不只存下这个值，还会<b>立刻检查当前用量</b>：如果当前用量已经超过新设的上限，就进入回收循环（<code>try_to_free_mem_cgroup_pages</code>），回收不出来就触发 OOM（<code>mem_cgroup_out_of_memory</code>）。这解释了为什么"把 <code>memory.max</code> 改小"可能当场杀掉进程。</p>
+<p><code>xchg</code> 是原子交换，保证并发写时的可见性。</p>
+<p>读 <code>memory.current</code>：</p>
+<p class="srcline">mm/memcontrol.c:6248-6254</p>
+<pre><code>static u64 memory_current_read(struct cgroup_subsys_state *css,
+			       struct cftype *cft)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+	return (u64)page_counter_read(&amp;memcg-&gt;memory) * PAGE_SIZE;
+}</code></pre>
+<p>就是 <code>page_counter</code> 的当前值乘以页大小。<code>page_counter</code> 是内核里的通用"带上限的计数器"，用 per-CPU 的批量记账 + 原子汇总来减少争用——高并发下这个计数器的性能是关键。</p>
+
+<h3>4.6 "无内部进程"规则</h3>
+<p>v2 的一条重要约束：<b>一个要启用控制器的 cgroup 节点，自己不能直接放进程</b>，否则父组的控制器和子组的控制器会争抢同一份资源，记账就乱了。</p>
+<p class="srcline">kernel/cgroup/cgroup.c:3173-3211</p>
+<pre><code>static int cgroup_vet_subtree_control_enable(struct cgroup *cgrp, u16 enable)
+{
+	u16 domain_enable = enable &amp; ~cgrp_dfl_threaded_ss_mask;
+
+	/* if nothing is getting enabled, nothing to worry about */
+	if (!enable)
+		return 0;
+
+	/* can @cgrp host any resources? */
+	if (!cgroup_is_valid_domain(cgrp-&gt;dom_cgrp))
+		return -EOPNOTSUPP;
+
+	/* mixables don't care */
+	if (cgroup_is_mixable(cgrp))
+		return 0;
+
+	if (domain_enable) {
+		/* can't enable domain controllers inside a thread subtree */
+		if (cgroup_is_thread_root(cgrp) || cgroup_is_threaded(cgrp))
+			return -EOPNOTSUPP;
+	} else {
+		/*
+		 * Threaded controllers can handle internal competitions
+		 * and are always allowed inside a (prospective) thread
+		 * subtree.
+		 */
+		if (cgroup_can_be_thread_root(cgrp) || cgroup_is_threaded(cgrp))
+			return 0;
+	}
+
+	/*
+	 * Controllers can't be enabled for a cgroup with tasks to avoid
+	 * child cgroups competing against tasks.
+	 */
+	if (cgroup_has_tasks(cgrp))
+		return -EBUSY;
+
+	return 0;
+}</code></pre>
+<p><code>cgroup_has_tasks(cgrp)</code> 返回 <code>-EBUSY</code> 就是这条规则的实现：<b>这个节点里还有进程，就不能往下发控制器</b>。所以 v2 里正确的用法是"root → 建子组 → 把进程放进子组"，而不是"root → 放进程 → 建子组"。</p>
+<p>threaded 模式是官方给的例外：<code>cgroup.type</code> 写成 <code>threaded</code> 后，节点内部可以再放进程和线程组，用于"把一个多线程进程的线程拆开分别限制"的场景。</p>
+
+<h3>4.7 控制文件是怎么挂上去的</h3>
+<p class="srcline">kernel/cgroup/cgroup.c:4815-4850</p>
+<pre><code>static struct cftype cgroup_base_files[] = {
+	{
+		.name = "cgroup.type",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cgroup_type_show,
+		.write = cgroup_type_write,
+	},
+	{
+		.name = "cgroup.procs",
+		.flags = CFTYPE_NS_DELEGATABLE,
+		.file_offset = offsetof(struct cgroup, procs_file),
+		.release = cgroup_procs_release,
+		.seq_start = cgroup_procs_start,
+		.seq_next = cgroup_procs_next,
+		.seq_show = cgroup_procs_show,
+		.write = cgroup_procs_write,
+	},
+	{
+		.name = "cgroup.threads",
+		.flags = CFTYPE_NS_DELEGATABLE,
+		.release = cgroup_procs_release,
+		.seq_start = cgroup_threads_start,
+		.seq_next = cgroup_procs_next,
+		.seq_show = cgroup_procs_show,
+		.write = cgroup_threads_write,
+	},
+	{
+		.name = "cgroup.controllers",
+		.seq_show = cgroup_controllers_show,
+	},
+	{
+		.name = "cgroup.subtree_control",
+		.flags = CFTYPE_NS_DELEGATABLE,
+		.seq_show = cgroup_subtree_control_show,
+		.write = cgroup_subtree_control_write,
+	},</code></pre>
+<p><code>struct cftype</code> 就是"控制文件描述符"：<code>seq_show</code> 是读回调，<code>write</code> 是写回调，<code>seq_start</code>/<code>seq_next</code> 是遍历时的迭代钩子。<code>cgroup.procs</code> 的写回调 <code>cgroup_procs_write</code> 就是第 4.2 节那条迁移路径的入口。</p>
+<p>写 <code>cgroup.subtree_control</code> 的实现：</p>
+<p class="srcline">kernel/cgroup/cgroup.c:3214-3250</p>
+<pre><code>static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
+					    char *buf, size_t nbytes,
+					    loff_t off)
+{
+	u16 enable = 0, disable = 0;
+	struct cgroup *cgrp, *child;
+	struct cgroup_subsys *ss;
+	char *tok;
+	int ssid, ret;
+
+	/*
+	 * Parse input - space separated list of subsystem names prefixed
+	 * with either + or -.
+	 */
+	buf = strstrip(buf);
+	while ((tok = strsep(&amp;buf, " "))) {
+		if (tok[0] == '\0')
+			continue;
+		do_each_subsys_mask(ss, ssid, ~cgrp_dfl_inhibit_ss_mask) {
+			if (!cgroup_ssid_enabled(ssid) ||
+			    strcmp(tok + 1, ss-&gt;name))
+				continue;
+
+			if (*tok == '+') {
+				enable |= 1 &lt;&lt; ssid;
+				disable &amp;= ~(1 &lt;&lt; ssid);
+			} else if (*tok == '-') {
+				disable |= 1 &lt;&lt; ssid;
+				enable &amp;= ~(1 &lt;&lt; ssid);
+			} else {
+				return -EINVAL;
+			}
+			break;
+		} while_each_subsys_mask();
+		if (ssid == CGROUP_SUBSYS_COUNT)
+			return -EINVAL;
+	}</code></pre>
+<p>解析 "<code>+cpu +memory</code>" 这样的字符串，转换成位掩码。<code>enable</code> 是要新增的，<code>disable</code> 是要移除的。之后会检查"这个控制器在本节点可用吗"（<code>cgroup_control(cgrp)</code>）、"子节点是否还在用要禁用的控制器"（会返回 <code>-EBUSY</code>），最后才真正应用。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 挂载并导读 /sys/fs/cgroup</h3>
+<pre><code># 看当前挂载情况
+mount | grep cgroup
+# cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelegate)
+
+# 如果没挂载（老系统）：
+sudo mount -t cgroup2 none /sys/fs/cgroup
+
+# 顶层导读
+ls /sys/fs/cgroup/
+# cgroup.controllers  cgroup.events  cgroup.freeze  cgroup.kill
+# cgroup.max.depth  cgroup.max.descendants  cgroup.procs  cgroup.stat
+# cgroup.subtree_control  cgroup.threads  cgroup.type
+# cpu  io  memory  pids  ...
+
+# 每个子目录里都有控制器自己的文件
+ls /sys/fs/cgroup/memory/
+# memory.current  memory.events  memory.high  memory.low
+# memory.max  memory.min  memory.numa_stat  memory.peak  memory.stat
+
+# 当前有哪些控制器可用
+cat /sys/fs/cgroup/cgroup.controllers
+# cpuset cpu io memory hugetlb pids rdma misc
+
+# 当前下发给子组的有哪些
+cat /sys/fs/cgroup/cgroup.subtree_control
+# cpu io memory pids
+
+# 我的进程在哪个组里
+cat /proc/self/cgroup
+# 0::/user.slice/user-1000.slice/user-1000.slice/session-3.scope</code></pre>
+<p><code>/proc/self/cgroup</code> 的格式是 <code>层级ID:控制器列表:路径</code>。v2 只有一个层级，控制器列表为空，所以是 <code>0::/path</code>。这就是 cgroup 路径。</p>
+
+<h3>5.2 用 memory.max 限制内存并观察 OOM</h3>
+<pre><code># 1. 建一个组，并启用 memory 控制器
+sudo mkdir /sys/fs/cgroup/mytest
+echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+
+# 2. 设一个很小的上限：32 MiB
+echo $((32*1024*1024)) | sudo tee /sys/fs/cgroup/mytest/memory.max
+cat /sys/fs/cgroup/mytest/memory.max
+# 33554432
+
+# 3. 把当前 shell 放进去
+echo $$ | sudo tee /sys/fs/cgroup/mytest/cgroup.procs
+# 此时你的 shell 已经在 mytest 组里了
+
+# 4. 在另一个终端启动一个吃内存的程序
+python3 -c "
+a = []
+while True:
+    a.append(bytearray(10*1024*1024))
+    import time; time.sleep(0.1)"
+
+# 5. 观察：另一个终端
+watch -n1 'cat /sys/fs/cgroup/mytest/memory.current; cat /sys/fs/cgroup/mytest/memory.events'
+# 当前用量会一路涨到 33554432 附近
+# memory.events 里：
+#   low 0
+#   high 3       ← 超过 memory.high 触发了回收
+#   max 1        ← 超过 memory.max
+#   oom 1        ← 触发了 OOM
+#   oom_kill 1   ← 杀了进程
+
+# 6. 看内核日志
+sudo dmesg | tail -20
+# Memory cgroup out of memory: Killed process 12345 (python3)
+#   total-vm:..., anon-rss:..., file-rss:..., shmem-rss:..., ...
+#   Memory cgroup stats for /mytest: ...
+#   inactive_anon:..., active_anon:..., inactive_file:..., active_file:...
+
+# 7. 清理
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs   # 先把自己移出来
+sudo rmdir /sys/fs/cgroup/mytest</code></pre>
+<p>关键观察点：<b>memory.current 涨到 memory.max 附近就不再涨</b>（内核强制回收），回收不出来时 <code>oom_kill</code> 计数增加、进程被 SIGKILL 掉。<code>dmesg</code> 里的 "Memory cgroup out of memory: Killed process" 就是证据。</p>
+
+<h3>5.3 memory.high 与 memory.max 的区别</h3>
+<pre><code># 设一个软限制：24 MiB
+echo $((24*1024*1024)) | sudo tee /sys/fs/cgroup/mytest/memory.high
+# 再跑吃内存的程序
+# 观察：程序会明显变慢（大量时间花在回收上），
+#       但不会被杀
+# memory.events 里 high 计数猛增，oom_kill 保持 0</code></pre>
+<p><code>memory.high</code> 是"软限制"：超过就开始疯狂回收，进程变慢但活着。<code>memory.max</code> 是"硬限制"：超过就 OOM kill。<code>memory.low</code> 则是保护线——本组内存紧张时，内核会优先回收<b>其它</b>组的页面，而不是动本组低于 low 的部分。</p>
+
+<h3>5.4 CPU 配额</h3>
+<pre><code># 限制为 0.5 核：quota=50000, period=100000
+echo "50000 100000" | sudo tee /sys/fs/cgroup/mytest/cpu.max
+cat /sys/fs/cgroup/mytest/cpu.max
+# 50000 100000
+
+# 或者用权重（相对份额）
+echo 200 | sudo tee /sys/fs/cgroup/mytest/cpu.weight
+
+# 观察 CPU 使用
+apt install sysstat
+mpstat -P ALL 1
+# 或者
+top -H -p $(cat /sys/fs/cgroup/mytest/cgroup.procs)
+
+# cpu.stat 里的信息
+cat /sys/fs/cgroup/mytest/cpu.stat
+# usage_usec 1234567      ← 实际用了多少 CPU 时间
+# user_usec 1000000
+# system_usec 234567
+# nr_periods 100          ← 被限速的周期数
+# nr_throttled 50         ← 被限速了几次
+# throttled_usec 50000</code></pre>
+<p><code>cpu.max</code> 的两个数是"每 <code>period</code> 微秒内最多用 <code>quota</code> 微秒 CPU"。超出后进程被挂起直到下个周期开始。<code>nr_throttled</code> 增长说明限速生效了。</p>
+
+<h3>5.5 进程数限制</h3>
+<pre><code>echo 50 | sudo tee /sys/fs/cgroup/mytest/pids.max
+cat /sys/fs/cgroup/mytest/pids.max
+# 50
+cat /sys/fs/cgroup/mytest/pids.current
+# 3
+
+# 试着 fork 100 个
+for i in $(seq 100); do sleep 100 &amp; done
+# 报 "fork: Resource temporarily unavailable"
+cat /sys/fs/cgroup/mytest/pids.events
+# max 1     ← 触发了上限
+# fork 97</code></pre>
+
+<h3>5.6 systemd-cgtop 实时观察</h3>
+<pre><code>sudo systemd-cgtop
+# Control Group             Tasks  Memory    CPU   IO          Command
+# /user.slice              3      152.3M   0.5%  1.2M        -
+# /system.slice            28     412.7M   3.2%  55.4M       systemd-journal
+# /system.slice/sshd.service 1    8.1M     0.0%  64.0K       sshd
+# /system.slice/docker-...scope 5 1.2G    12.5% 300.1M       docker
+
+# 实时刷新
+sudo systemd-cgtop -d 2
+
+# 只看某个控制器
+sudo systemd-cgtop -m
+# Memory  CPU  IO  Tasks  - 三个视图切换</code></pre>
+<p><code>systemd-cgtop</code> 相当于 cgroup 版的 <code>top</code>，每一行是一个 cgroup，按 CPU/内存/IO 排序。它读的是各 cgroup 的 <code>memory.current</code>、<code>cpu.stat</code> 等文件。</p>
+
+<h3>5.7 systemd 直接管理 cgroup</h3>
+<pre><code># 用 systemd-run 起一个受限的服务
+sudo systemd-run --scope -p MemoryMax=64M -p CPUQuota=50% \
+     sleep 300
+
+# 或者写一个 service 单元
+sudo tee /etc/systemd/system/limited.service 'EOF'
+[Unit]
+Description=Limited service
+
+[Service]
+Type=oneshot
+MemoryMax=64M
+CPUQuota=50%
+TasksMax=50
+ExecStart=/bin/sleep 300
+EOF
+sudo systemctl daemon-reload
+sudo systemctl start limited
+systemctl show limited -p MemoryMax -p CPUQuotaPerSecUSec
+systemctl status limited</code></pre>
+<p>systemd 的 <code>MemoryMax=</code> / <code>CPUQuota=</code> / <code>TasksMax=</code> 就是往 cgroup 文件里写的包装。这是生产环境最常见的用法。</p>
+
+<h3>5.8 在容器里验证</h3>
+<pre><code>docker run --rm --memory=64m --memory-swap=64m alpine \
+  sh -c 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/memory.current'
+# 67108864
+# 1433600
+
+# 超出限制会被 OOM kill
+docker run --rm --memory=32m alpine \
+  sh -c 'dd if=/dev/zero of=/dev/null &amp; sleep 5'
+# docker: Error response from daemon: ... OOMKilled ... exit code 137
+
+# 退出码 137 = 128 + 9 (SIGKILL)
+
+# 看容器对应的 cgroup
+docker inspect --format '{{.State.OOMKilled}}' &lt;container_id&gt;
+docker ps -a --filter "status=exited" --format '{{.Names}} {{.Status}}'</code></pre>
+<p>容器里的 <code>/sys/fs/cgroup/memory.max</code> 显示的是容器 cgroup 的值。退出码 137 表示被 SIGKILL（OOM kill 或用户 kill）。</p>
+
+<h3>5.9 qemu + busybox 最小实验</h3>
+<pre><code>make defconfig
+scripts/config --enable CONFIG_CGROUPS --enable CONFIG_CGROUP_SCHED \
+               --enable CONFIG_MEMCG --enable CONFIG_CGROUP_PIDS \
+               --enable CONFIG_CGROUP_BPF
+make -j$(nproc)
+
+wget https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox
+chmod +x busybox &amp;&amp; ./busybox --install -h initramfs
+qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd initramfs \
+  -append "console=ttyS0 cgroup_no_v1=all" -nographic
+
+# 客控台里
+mount -t cgroup2 none /sys/fs/cgroup
+ls /sys/fs/cgroup/
+cat /sys/fs/cgroup/cgroup.controllers
+mkdir /sys/fs/cgroup/demo
+echo 67108864 &gt; /sys/fs/cgroup/demo/memory.max
+cat /sys/fs/cgroup/demo/memory.max</code></pre>
+<p><code>cgroup_no_v1=all</code> 启动参数强制只用 v2，方便在实验环境里看清单一层级的结构。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. cgroup v1 和 v2 最本质的区别是什么？</b>v1 每个控制器一棵独立的树，一个进程在每棵树里各有一个位置；v2 所有控制器共用一棵统一的树，一个进程在整棵树里只有一个位置。v2 还引入了"无内部进程"约束和统一的 memory.max / cpu.max 文件接口。</div>
+<div class="qa"><b>Q2. 什么是"no internal process"约束？</b>v2 规定：一个要向下启用控制器的 cgroup 节点，自己不能直接放进程（否则父组控制器和子组控制器会争抢资源）。实现见 cgroup_vet_subtree_control_enable 里 cgroup_has_tasks() 返回 -EBUSY。threaded 模式是官方例外。</div>
+<div class="qa"><b>Q3. css_set 这个结构解决什么问题？</b>把一个进程在所有控制器上的状态指针打包成一个对象，进程只持有这一个指针。好处是 task_struct 变小，且 fork/exit 时只需一次 refcount++ 和 list_add，而不是对每个控制器各做一遍。</div>
+<div class="qa"><b>Q4. 往 cgroup.procs 里写 PID 发生了什么？</b>触发 cgroup_procs_write → cgroup_attach_task：收集源 css_set、准备目标 css_set、提交迁移（先 can_attach 后 attach，全成功或全失败）、收尾释放引用。过程中会遍历整个线程组。</div>
+<div class="qa"><b>Q5. 把 memory.max 改小为什么可能立刻杀掉进程？</b>memory_max_write 存下新值后会进入循环检查当前用量，若已超限就先回收（try_to_free_mem_cgroup_pages），回收不出来就调 mem_cgroup_out_of_memory 触发 OOM killer。</div>
+<div class="qa"><b>Q6. memory.high 和 memory.max 有什么区别？</b>high 是软限制：超过就开始激进回收，进程变慢但不会被杀（memory.events 里 high 计数增长）；max 是硬限制：超过触发 OOM kill（oom / oom_kill 计数增长）。low 则是保护线，本组低于 low 的内存优先不被回收。</div>
+<div class="qa"><b>Q7. cpu.max 的两个数字是什么意思？</b>quota 和 period。每 period 微秒的调度周期内，该 cgroup 最多使用 quota 微秒的 CPU 时间。超出后被挂起到下个周期。默认 period 是 100000 微秒（100ms），cpu.max = "50000 100000" 即 50% CPU。</div>
+<div class="qa"><b>Q8. cgroup namespace 是什么？</b>让容器内的进程看到"以容器自身为根"的 cgroup 视图，而不是宿主机的完整 cgroup 树。clone 时带 CLONE_NEWCGROUP 即可创建，是容器隔离方案的一部分。</div>
+
+<footer>
+  <p>上一篇：<a href="37-power.html">37-power 电源管理</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="index.html">返回主题目录</a></p>
+</footer>
+
+</body>
+</html>

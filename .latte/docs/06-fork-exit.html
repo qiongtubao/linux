@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · fork 与 exit</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="07-scheduler.html">下一篇：07 调度器 →</a>
+</nav>
+
+<h1>🌱 fork 与 exit：进程的诞生与消亡</h1>
+<p class="subtitle">一次 fork 复制了整个 task_struct 却几乎不复制内存，一次 exit 让进程“死而不腐”等父进程来收尸 · 预计阅读 28 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>细胞分裂：一个细胞长到一定程度，把自己一分为二。新细胞要有自己的细胞核（独立身份）、独立的代谢状态，但遗传物质在分裂瞬间是“同一份拷贝”——而且为了省事，很多细胞器先共享，直到真正需要分离才复制。</p>
+
+<p>Linux 的 <code>fork()</code> 就是这个过程的最佳工程实现。用户敲下 <code>ls</code>，shell 要执行它：shell 不能自己变成 <code>ls</code>（那样 shell 就消失了），所以要“复制一个自己”，让副本去 <code>execve</code> 成 <code>ls</code>，自己继续等待。这就是 <span class="term">fork</span>——创建一个几乎完全相同的子进程。</p>
+
+<p>问题在于：复制一整个进程的地址空间（几百 MB 的页表加数据）非常昂贵，而 fork 之后最常见的动作是 execve 立刻丢掉这些内存。所以 Linux 用 <span class="term">写时复制（COW）</span>：fork 时只复制页表项、把父子双方都标成只读，共享同一批物理页；谁先写，谁触发缺页，缺页处理程序再复制那一页。既保证语义（父子互不影响），又避免无谓拷贝。</p>
+
+<p>另一半是 <span class="term">exit</span>：进程死了不能立刻把 <code>task_struct</code> 和内核对它的记账全部抹掉，因为父进程可能还想知道“它怎么死的、退出码是多少、用了多少 CPU”。于是进程先进入 <span class="term">僵尸</span> 状态，只保留最小记录；父进程 <code>wait()</code> 之后，内核才真正释放它。这套“生—死—收尸”的协议，就是本篇要讲的两段代码。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">fork</td><td>fork(2)</td><td>复制当前进程，返回两次（父进程拿到子 pid，子进程拿到 0）</td></tr>
+  <tr><td class="term">clone</td><td>clone(2)</td><td>fork 的通用形式，靠标志位决定哪些资源共享、哪些复制</td></tr>
+  <tr><td class="term">vfork</td><td>vfork(2)</td><td>共享地址空间、父进程阻塞直到子进程 exec 或 exit 的古老优化</td></tr>
+  <tr><td class="term">写时复制</td><td>COW / copy-on-write</td><td>先共享只读，写的时候才真正复制那一页</td></tr>
+  <tr><td class="term">copy_process</td><td>copy_process()</td><td>fork/clone 的核心：按 clone_flags 逐项复制或共享资源</td></tr>
+  <tr><td class="term">dup_task_struct</td><td>dup_task_struct()</td><td>分配新 task_struct 与内核栈，并拷贝父进程结构体内容</td></tr>
+  <tr><td class="term">dup_mm</td><td>dup_mm()</td><td>复制地址空间：新建 mm_struct、复制 VMA 与页表（COW）</td></tr>
+  <tr><td class="term">dup_fd</td><td>dup_fd()</td><td>复制 fd 表：表结构新分配，<code>struct file</code> 对象共享引用</td></tr>
+  <tr><td class="term">CLONE_VM</td><td>CLONE_VM</td><td>共享地址空间（线程）</td></tr>
+  <tr><td class="term">CLONE_THREAD</td><td>CLONE_THREAD</td><td>把新 task 放进同一个线程组（tgid 相同）</td></tr>
+  <tr><td class="term">CLONE_NEWNS</td><td>CLONE_NEWNS</td><td>给子进程新建 mount 命名空间（容器用）</td></tr>
+  <tr><td class="term">kernel_clone</td><td>kernel_clone()</td><td>5.10 中 fork/clone/vfork 共用的内核入口</td></tr>
+  <tr><td class="term">copy_thread</td><td>copy_thread()</td><td>架构相关：造子进程的 pt_regs 与初始栈帧，使其从 ret_from_fork 开始</td></tr>
+  <tr><td class="term">do_exit</td><td>do_exit()</td><td>进程退出主流程：释放资源、置僵尸、调 schedule 永不返回</td></tr>
+  <tr><td class="term">exit_notify</td><td>exit_notify()</td><td>给父进程发 SIGCHLD、处理孤儿 reparent、决定是否自己收尸</td></tr>
+  <tr><td class="term">僵尸</td><td>zombie</td><td>已退出但未被 wait 的进程，只留 task_struct 记账</td></tr>
+  <tr><td class="term">孤儿</td><td>orphan</td><td>父进程先死，被 reparent 到 init/subreaper 的子进程</td></tr>
+  <tr><td class="term">wait4</td><td>wait4(2) / do_wait</td><td>父进程等待子进程状态变化并回收其僵尸</td></tr>
+  <tr><td class="term">release_task</td><td>release_task()</td><td>真正释放 task_struct 的最后一步</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 fork 的三层调用栈</h3>
+
+<pre><code>用户态 fork()                ← libc 包装成 clone(SIGCHLD, 0)
+   │
+   ▼
+SYSCALL_DEFINE5(clone, ...)  ← fork/vfork/线程共用它
+   │
+   ▼
+kernel_clone(args)           ← 组装参数、ptrace 事件、vfork 完成量
+   │
+   ▼
+copy_process(NULL, trace, node, args)   ← 逐项复制，构造子进程
+   │
+   ├── dup_task_struct()   新 task_struct + 新内核栈
+   ├── sched_fork()        分配 CPU、设优先级
+   ├── copy_files()        fd 表 或 CLONE_FILES 共享
+   ├── copy_fs()           cwd/root 或 CLONE_FS 共享
+   ├── copy_sighand()      处理函数表 或 CLONE_SIGHAND 共享
+   ├── copy_signal()       线程组信号结构
+   ├── copy_mm()           地址空间 或 CLONE_VM 共享
+   ├── copy_namespaces()   nsproxy 或 CLONE_NEW* 新建
+   ├── copy_io()           io 上下文
+   └── copy_thread()       CPU 寄存器初始值 / 返回路径
+                    │
+                    ▼
+              wake_up_new_task() 挂进 runqueue
+</code></pre>
+
+<p>顺序不是随便排的：出错回滚要按逆序释放；<code>copy_mm</code> 在 <code>copy_namespaces</code> 之前，因为新建 pid namespace 时要重新 <code>alloc_pid</code>，而它依赖 <code>nsproxy</code>；<code>copy_thread</code> 最后，因为它要用到已经建好的栈和 mm。</p>
+
+<h3>3.2 COW 到底“省”在哪</h3>
+
+<pre><code>fork 前：父进程                       fork 后初始状态
+  虚拟页 0x400000 ─┐                   父 PTE ──┐
+                   ├─► 物理页 A                   ├─► 物理页 A（只读，refcount=2）
+  虚拟页 0x401000 ─┘                   子 PTE ──┘
+
+父进程写 0x400000 触发 #PF（页只读）：
+   alloc 物理页 B，拷贝 A 的内容
+   父 PTE 改为 → B（可写），A 留给子进程
+</code></pre>
+
+<p>所以 fork 的开销 ≈ 复制页表（不是复制数据页）+ 复制 VMA 元数据。对一个 1GB 的进程，页表可能几 MB，这仍然可观；但对共享库、<code>fork</code> 后立即 <code>execve</code> 的场景，省掉了 1GB 的数据拷贝，收益巨大。</p>
+
+<h3>3.3 clone 标志位决定“复制还是共享”</h3>
+
+<table>
+  <tr><th>标志</th><th>值</th><th>效果</th><th>典型用途</th></tr>
+  <tr><td><code>CLONE_VM</code></td><td>0x00000100</td><td>共享 mm（不复制页表）</td><td>线程、vfork</td></tr>
+  <tr><td><code>CLONE_FS</code></td><td>0x00000200</td><td>共享 fs（cwd/root/umask）</td><td>线程</td></tr>
+  <tr><td><code>CLONE_FILES</code></td><td>0x00000400</td><td>共享 fd 表</td><td>线程</td></tr>
+  <tr><td><code>CLONE_SIGHAND</code></td><td>0x00000800</td><td>共享信号处理函数表</td><td>线程（隐含要求 CLONE_VM）</td></tr>
+  <tr><td><code>CLONE_THREAD</code></td><td>0x00010000</td><td>同线程组，tgid 相同，<code>exit_signal=-1</code></td><td>pthread_create</td></tr>
+  <tr><td><code>CLONE_VFORK</code></td><td>0x00004000</td><td>父进程睡到子进程 exec/exit</td><td>vfork、posix_spawn</td></tr>
+  <tr><td><code>CLONE_NEWNS</code></td><td>0x00020000</td><td>新 mount 命名空间</td><td>容器</td></tr>
+  <tr><td><code>CLONE_NEWPID</code></td><td>0x20000000</td><td>新 pid 命名空间，子进程成新 namespace 的 1 号</td><td>容器</td></tr>
+  <tr><td><code>CLONE_NEWNET</code></td><td>0x40000000</td><td>新网络命名空间</td><td>容器</td></tr>
+  <tr><td><code>CLONE_NEWUSER</code></td><td>0x10000000</td><td>新 user 命名空间（免 root 的容器）</td><td>rootless 容器</td></tr>
+  <tr><td><code>CLONE_PARENT</code></td><td>0x00008000</td><td>子进程的父进程 = 调用者的父进程</td><td>rare</td></tr>
+  <tr><td><code>CLONE_SETTLS</code></td><td>0x00080000</td><td>用 tls 参数设子进程 TLS（FS 基址）</td><td>线程</td></tr>
+</table>
+
+<div class="warn"><code>copy_process</code> 里有一组硬性校验：<code>CLONE_THREAD</code> 必须伴随 <code>CLONE_SIGHAND</code>，<code>CLONE_SIGHAND</code> 必须伴随 <code>CLONE_VM</code>，<code>CLONE_NEWNS|CLONE_FS</code> 互斥。理由很直白：共享信号处理函数却各自有地址空间，处理函数指针会在对方地址空间里无效。</div>
+
+<h3>3.4 线程 vs vfork vs fork</h3>
+
+<table>
+  <tr><th></th><th>fork</th><th>vfork</th><th>pthread_create（clone）</th></tr>
+  <tr><td>地址空间</td><td>复制（COW）</td><td>共享</td><td>共享</td></tr>
+  <tr><td>fd 表</td><td>复制</td><td>复制</td><td>共享</td></tr>
+  <tr><td>信号处理表</td><td>复制</td><td>复制</td><td>共享</td></tr>
+  <tr><td>tgid</td><td>新值</td><td>新值</td><td>同父进程</td></tr>
+  <tr><td>父进程是否阻塞</td><td>否</td><td>是（直到 exec/exit）</td><td>否</td></tr>
+  <tr><td>返回方式</td><td>父子各返回一次</td><td>父子各返回一次，但共用栈</td><td>子从函数入口开始，父立即返回</td></tr>
+</table>
+
+<p>vfork 的“共享地址空间 + 父进程阻塞”是 1970 年代为解决 fork 太贵而发明的。它极其危险：子进程不能改任何变量（会改到父进程的栈），只能立即 execve。现代 glibc 的 <code>posix_spawn</code> 会用 <code>CLONE_VFORK|CLONE_VM</code> 来加速 spawn。</p>
+
+<h3>3.5 退出路径</h3>
+
+<pre><code>用户态 exit(0) / main 返回
+   │
+   ▼
+do_group_exit() ──► 组内还有线程？先置 SIGNAL_GROUP_EXIT，唤醒组员
+   │
+   ▼  最后一个线程
+do_exit(code)
+   ├── exit_signals()        置 PF_EXITING、处理 stop
+   ├── exit_mm()             放掉 mm
+   ├── exit_files()/exit_fs()/exit_sem()/exit_shm()
+   ├── exit_task_namespaces()
+   ├── exit_notify()         发 SIGCHLD、孤儿 reparent、置 EXIT_ZOMBIE
+   └── do_task_dead()        state=TASK_DEAD，schedule() 永不返回
+                                   │
+                          父进程 wait4() → release_task() → 内存归还
+</code></pre>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 clone 系统调用与 kernel_clone</h3>
+
+<p><code>fork()</code> 在 libc 里其实就是 <code>clone(SIGCHLD, 0)</code>。<code>clone</code> 的参数按 ABI 打包成 <code>kernel_clone_args</code>，然后进入统一入口。</p>
+
+<p class="srcline">kernel/fork.c:3039-3057  SYSCALL_DEFINE5(clone)</p>
+<pre><code>SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+		 int __user *, parent_tidptr,
+		 int __user *, child_tidptr,
+		 unsigned long, tls)
+#endif
+{
+	struct kernel_clone_args args = {
+		.flags		= (lower_32_bits(clone_flags) &amp; ~CSIGNAL),
+		.pidfd		= parent_tidptr,
+		.child_tid	= child_tidptr,
+		.parent_tid	= parent_tidptr,
+		.exit_signal	= (lower_32_bits(clone_flags) &amp; CSIGNAL),
+		.stack		= newsp,
+		.tls		= tls,
+	};
+
+	return kernel_clone(&amp;args);
+}
+</code></pre>
+
+<ul>
+  <li><code>clone_flags</code> 的低 8 位是 <code>CSIGNAL</code>（退出时给父进程发哪个信号，fork 是 SIGCHLD，线程是 0），所以拆出来放进 <code>exit_signal</code>，其余位放进 <code>flags</code>。</li>
+  <li><code>newsp</code> 是新栈指针：分叉线程时由用户传入新栈；fork 时是 0，表示沿用父进程用户栈（实际是复制父栈内容）。</li>
+  <li><code>.child_tid</code> 用于 <code>CLONE_CHILD_CLEARTID</code>：子线程退出时内核把这块用户内存清零并 futex 唤醒，这是 pthread_join 的底层机制。</li>
+</ul>
+
+<h3>4.2 copy_process 的复制顺序</h3>
+
+<p class="srcline">kernel/fork.c:2483-2525  copy_process 的逐项复制</p>
+<pre><code>	/* Perform scheduler related setup. Assign this task to a CPU. */
+	retval = sched_fork(clone_flags, p);	/* 调度器相关设置，分配CPU */
+	if (retval)
+		goto bad_fork_cleanup_policy;
+	/* ... 此处省略 perf/audit/shm/security 的初始化 ... */
+	retval = copy_semundo(clone_flags, p);	/* 复制信号量撤销信息 */
+	if (retval)
+		goto bad_fork_cleanup_security;
+	retval = copy_files(clone_flags, p);	/* 复制文件描述符表 */
+	if (retval)
+		goto bad_fork_cleanup_semundo;
+	retval = copy_fs(clone_flags, p);	/* 复制文件系统信息 */
+	if (retval)
+		goto bad_fork_cleanup_files;
+	retval = copy_sighand(clone_flags, p);	/* 复制信号处理函数 */
+	if (retval)
+		goto bad_fork_cleanup_fs;
+	retval = copy_signal(clone_flags, p);	/* 复制信号结构 */
+	if (retval)
+		goto bad_fork_cleanup_sighand;
+	retval = copy_mm(clone_flags, p);	/* 复制内存管理结构 */
+	if (retval)
+		goto bad_fork_cleanup_signal;
+	retval = copy_namespaces(clone_flags, p);	/* 复制命名空间 */
+	if (retval)
+		goto bad_fork_cleanup_mm;
+	retval = copy_io(clone_flags, p);	/* 复制IO上下文 */
+	if (retval)
+		goto bad_fork_cleanup_namespaces;
+	retval = copy_thread(clone_flags, args-&gt;stack, args-&gt;stack_size, p, args-&gt;tls);	/* 复制线程特定信息 */
+	if (retval)
+		goto bad_fork_cleanup_io;
+</code></pre>
+
+<ul>
+  <li>每个步骤失败都跳到“上一步的清理标签”，<code>bad_fork_cleanup_xxx</code> 标签链是一条逆序的清理流水线。这是内核里非常标准的“goto 错误处理”写法。</li>
+  <li><code>copy_sighand</code> 在 <code>copy_signal</code> 之前：<code>copy_signal</code> 需要拿 <code>sighand-&gt;siglock</code>，也要判断是否新线程组。</li>
+  <li><code>copy_mm</code> 在 <code>copy_namespaces</code> 之前：新建 pid namespace 时要重新 <code>alloc_pid</code>，而它用 <code>p-&gt;nsproxy-&gt;pid_ns_for_children</code>，所以 nsproxy 必须先就位；反过来 mm 失败时 nsproxy 还没被改，便于回滚。</li>
+  <li><code>sched_fork</code> 在最前面就把 task 塞进某个 CPU 的 runqueue 的准备结构（<code>p-&gt;on_rq=0</code>，但 <code>p-&gt;cpu</code> 已定），但它还不会被调度——<code>wake_up_new_task</code> 才真正 <code>activate_task</code>。</li>
+</ul>
+
+<h3>4.3 dup_task_struct：结构体可以复制，栈必须新建</h3>
+
+<p>父进程的 <code>task_struct</code> 是“模板”，但内核栈不能共用——否则父子会用同一段栈帧互相踩。所以流程是：分配新 <code>task_struct</code>、分配新内核栈、把父结构体内容 memcpy 过去、再把新栈指针覆盖回 <code>tsk-&gt;stack</code>（因为 memcpy 把父进程的栈指针也抄过来了）。</p>
+
+<p class="srcline">kernel/fork.c:1050-1086  dup_task_struct</p>
+<pre><code>static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+{
+	struct task_struct *tsk;
+	unsigned long *stack;
+	struct vm_struct *stack_vm_area __maybe_unused;
+	int err;
+
+	if (node == NUMA_NO_NODE)
+		node = tsk_fork_get_node(orig);		/* 获取合适的NUMA节点 */
+	tsk = alloc_task_struct_node(node);		/* 分配任务结构体 */
+	if (!tsk)
+		return NULL;
+
+	stack = alloc_thread_stack_node(tsk, node);	/* 分配线程栈 */
+	if (!stack)
+		goto free_tsk;
+
+	if (memcg_charge_kernel_stack(tsk))		/* 对内核栈进行内存控制组计费 */
+		goto free_stack;
+
+	stack_vm_area = task_stack_vm_area(tsk);
+
+	err = arch_dup_task_struct(tsk, orig);		/* 执行架构特定的复制 */
+	/* ... 省略注释 ... */
+	tsk-&gt;stack = stack;				/* 恢复栈指针 */
+#ifdef CONFIG_VMAP_STACK
+	tsk-&gt;stack_vm_area = stack_vm_area;		/* 恢复栈虚拟内存区域 */
+#endif
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	refcount_set(&amp;tsk-&gt;stack_refcount, 1);		/* 设置栈引用计数 */
+#endif
+</code></pre>
+
+<ul>
+  <li><code>alloc_task_struct_node(node)</code> 从 slab 缓存（<code>task_struct_cachep</code>）分配约 9KB 的对象；<code>node</code> 是 NUMA 节点，尽量与父进程同节点以减少跨节点内存访问。</li>
+  <li><code>alloc_thread_stack_node</code> 分配 16KB 内核栈。开了 <code>CONFIG_VMAP_STACK</code> 时从 vmalloc 区拿，好处是可以在栈区放 guard page，溢出会触发 page fault 而不是悄悄踩坏邻接对象。</li>
+  <li><code>arch_dup_task_struct</code> 就是 <code>*dst = *orig</code> 加一些架构特定动作。它会整体覆盖 <code>tsk-&gt;stack</code>，所以之后必须手工写回新栈指针——<code>memcpy</code> 语义下，凡是“指向自身的字段”都必须重新初始化，这是 C 结构体复制的经典坑。</li>
+</ul>
+
+<h3>4.4 copy_mm：CLONE_VM 还是 dup_mm</h3>
+
+<p class="srcline">kernel/fork.c:1779-1826  copy_mm</p>
+<pre><code>static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
+{
+	struct mm_struct *mm, *oldmm;
+	int retval;
+
+	tsk-&gt;min_flt = tsk-&gt;maj_flt = 0;
+	tsk-&gt;nvcsw = tsk-&gt;nivcsw = 0;
+	/* ... 省略 hung task 初始化 ... */
+
+	tsk-&gt;mm = NULL;
+	tsk-&gt;active_mm = NULL;
+
+	/*
+	 * Are we cloning a kernel thread?
+	 *
+	 * We need to steal a active VM for that..
+	 */
+	oldmm = current-&gt;mm;
+	if (!oldmm)
+		return 0;
+
+	/* initialize the new vmacache entries */
+	vmacache_flush(tsk);
+
+	if (clone_flags &amp; CLONE_VM) {
+		mmget(oldmm);
+		mm = oldmm;
+		goto good_mm;
+	}
+
+	retval = -ENOMEM;
+	mm = dup_mm(tsk, current-&gt;mm);
+	if (!mm)
+		goto fail_nomem;
+
+good_mm:
+	tsk-&gt;mm = mm;
+	tsk-&gt;active_mm = mm;
+	return 0;
+
+fail_nomem:
+	return retval;
+}
+</code></pre>
+
+<ul>
+  <li><code>current-&gt;mm == NULL</code> 表示父进程是内核线程（用户态没有地址空间）。内核线程 fork 出的子进程也是内核线程，直接返回，<code>tsk-&gt;mm</code> 保持 NULL。</li>
+  <li><code>CLONE_VM</code> 分支只做 <code>mmget()</code>（引用计数 +1），指针复用——这就是线程共享地址空间的实现。写一个变量，另一个线程立刻看到。</li>
+  <li><code>dup_mm()</code> 才是 fork 的重量级步骤：分配新 <code>mm_struct</code>、复制 <code>vm_area_struct</code> 链表、<code>copy_page_range()</code> 复制页表。注意它复制的是<strong>页表项</strong>，物理页共享并置只读。</li>
+  <li><code>active_mm = mm</code>：新进程马上要上 CPU，需要知道该加载哪张页表。</li>
+</ul>
+
+<h3>4.5 copy_files：表复制，file 共享</h3>
+
+<p class="srcline">kernel/fork.c:1846-1871  copy_files</p>
+<pre><code>static int copy_files(unsigned long clone_flags, struct task_struct *tsk)
+{
+	struct files_struct *oldf, *newf;
+	int error = 0;
+
+	/*
+	 * A background process may not have any files ...
+	 */
+	oldf = current-&gt;files;
+	if (!oldf)
+		goto out;
+
+	if (clone_flags &amp; CLONE_FILES) {
+		atomic_inc(&amp;oldf-&gt;count);
+		goto out;
+	}
+
+	newf = dup_fd(oldf, NR_OPEN_MAX, &amp;error);
+	if (!newf)
+		goto out;
+
+	tsk-&gt;files = newf;
+	error = 0;
+out:
+	return error;
+}
+</code></pre>
+
+<ul>
+  <li>注意 <code>tsk-&gt;files</code> 在 <code>CLONE_FILES</code> 分支里没有赋值——因为 <code>dup_task_struct</code> 已经把父进程的指针抄过来了，这里只需要把计数加一。</li>
+  <li><code>dup_fd</code> 分配新的 <code>files_struct</code> 与 fd 数组，但每个 <code>struct file</code> 只把引用计数 +1，不复制文件对象本身。所以 fork 后父子<strong>共享同一个打开文件</strong>：共享文件偏移 <code>f_pos</code>、共享 <code>O_APPEND</code> 语义。这正是“父子同时写同一个 fd 会互相穿插”的原因（要独立偏移必须 <code>open</code> 两次）。</li>
+  <li>而 close 是各自独立的：父进程 close(fd) 只减父进程表里的引用，子进程的 fd 仍然有效，直到两边都 close，<code>struct file</code> 才真正释放——所以 <code>unlink</code> 之后文件仍占空间，就是有进程还开着它。</li>
+</ul>
+
+<h3>4.6 COW：copy_present_pte 把双方都改成只读</h3>
+
+<p>fork 复制页表时，不能直接复制“可写”的 PTE——那父子就真的共享可写页了。内核的做法是：复制 PTE 内容，然后把<strong>父子双方</strong>的这条 PTE 都改成只读（写保护），并增加物理页引用计数。</p>
+
+<p class="srcline">mm/memory.c:962-993  copy_present_pte</p>
+<pre><code>copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		 pte_t *dst_pte, pte_t *src_pte, unsigned long addr, int *rss,
+		 struct page **prealloc)
+{
+	struct mm_struct *src_mm = src_vma-&gt;vm_mm;
+	unsigned long vm_flags = src_vma-&gt;vm_flags;
+	pte_t pte = *src_pte;
+	struct page *page;
+
+	page = vm_normal_page(src_vma, addr, pte);
+	if (page) {
+		int retval;
+
+		retval = copy_present_page(dst_vma, src_vma, dst_pte, src_pte,
+					   addr, rss, prealloc, pte, page);
+		if (retval &lt;= 0)
+			return retval;
+
+		get_page(page); /* 增加页面引用计数 */
+		page_dup_rmap(page, false);
+		rss[mm_counter(page)]++;
+	}
+
+	/*
+	 * If it's a COW mapping, write protect it both
+	 * in the parent and the child
+	 */
+	if (is_cow_mapping(vm_flags) &amp;&amp; pte_write(pte)) {
+		ptep_set_wrprotect(src_mm, addr, src_pte);
+		pte = pte_wrprotect(pte);
+	}
+</code></pre>
+
+<ul>
+  <li><code>is_cow_mapping(vm_flags)</code> 判断这个 VMA 是不是“私有可写”（<code>VM_MAYWRITE &amp;&amp; !VM_SHARED</code>）。私有只读映射（比如代码段）本来就是只读，不需要 COW；共享映射（<code>MAP_SHARED</code>）本来就该共享可写。</li>
+  <li><code>ptep_set_wrprotect(src_mm, ...)</code> 改的是<strong>父进程</strong>的页表，<code>pte_wrprotect(pte)</code> 改的是即将写入<strong>子进程</strong>页表的副本。两边的 PTE 都变成只读，谁写谁 #PF。</li>
+  <li>缺页后 <code>do_wp_page()</code>（mm/memory.c:3202）→ <code>wp_page_copy()</code>（2940）分配新页并复制内容，让写者拿到私有的可写页。引用计数为 1 时还有优化：直接复用原页，避免拷贝。</li>
+</ul>
+
+<h3>4.7 copy_thread：子进程从哪开始执行</h3>
+
+<p>结构体复制完了，但“子进程的第一条指令是哪条”？答案在 <code>copy_thread</code>：它伪造一个内核栈帧，让子进程第一次被调度时，从 <code>ret_from_fork</code> 返回，然后像“刚刚从系统调用返回”一样回到用户态。</p>
+
+<p class="srcline">arch/x86/kernel/process.c:130-140  copy_thread 头部</p>
+<pre><code>	struct pt_regs *childregs;
+	int ret = 0;
+
+	childregs = task_pt_regs(p);
+	fork_frame = container_of(childregs, struct fork_frame, regs);
+	frame = &amp;fork_frame-&gt;frame;
+
+	frame-&gt;bp = encode_frame_pointer(childregs);
+	frame-&gt;ret_addr = (unsigned long) ret_from_fork;
+	p-&gt;thread.sp = (unsigned long) fork_frame;
+	p-&gt;thread.io_bitmap = NULL;
+	memset(p-&gt;thread.ptrace_bps, 0, sizeof(p-&gt;thread.ptrace_bps));
+</code></pre>
+
+<ul>
+  <li><code>task_pt_regs(p)</code> 指向新内核栈顶部预留的 <code>pt_regs</code> 区域；<code>fork_frame</code> 是它外面再包一层“调用帧”。</li>
+  <li><code>frame-&gt;ret_addr = ret_from_fork</code> 是关键：子进程被 <code>switch_to</code> 切上去时，栈帧里的返回地址是 <code>ret_from_fork</code>，于是它从汇编返回路径开始跑，而不是从 <code>copy_process</code> 中间。</li>
+  <li><code>p-&gt;thread.sp</code> 是这个新帧的地址，<code>__switch_to</code> 会把它写进 TSS 的 <code>sp0</code>。之后所有“从用户态进内核”都会落到这个栈上。</li>
+  <li>后半段（源码未摘）把父进程的 <code>pt_regs</code> 整体拷给子进程（<code>*childregs = *current_pt_regs()</code>），再把 <code>childregs-&gt;ax</code> 置 0——这就是“fork 在子进程返回 0”的实现。</li>
+</ul>
+
+<h3>4.8 vfork 的同步：completion 与 wait_for_vfork_done</h3>
+
+<p class="srcline">kernel/fork.c:2930-2949  kernel_clone 的 vfork 部分</p>
+<pre><code>	if (clone_flags &amp; CLONE_VFORK) {
+		p-&gt;vfork_done = &amp;vfork;	/* 设置vfork完成标志 */
+		init_completion(&amp;vfork);	/* 初始化完成量 */
+		get_task_struct(p);	/* 增加任务引用计数 */
+	}
+
+	wake_up_new_task(p);	/* 唤醒新任务 */
+
+	/* forking complete and child started to run, tell ptracer */
+	if (unlikely(trace))
+		ptrace_event_pid(trace, pid);	/* 通知跟踪器 */
+
+	if (clone_flags &amp; CLONE_VFORK) {
+		if (!wait_for_vfork_done(p, &amp;vfork))	/* 等待vfork完成 */
+			ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
+	}
+</code></pre>
+
+<ul>
+  <li><code>p-&gt;vfork_done</code> 指向父进程栈上的一个 <code>completion</code>（注意：这是父进程栈上的变量，所以父进程必须活着等）。</li>
+  <li>子进程在 <code>execve</code> 成功替换地址空间时，或 <code>exit_mm()</code> 释放 mm 时，会调用 <code>complete_vfork_done()</code> 唤醒它。<code>mm_release()</code> 里那段 “if vfork_done … complete” 就是这个机制。</li>
+  <li><code>wake_up_new_task</code> 之后父进程立即进入 <code>wait_for_vfork_done</code> 睡眠——所以 vfork 语义上“父进程阻塞”，实现上是一个内核里的等待，而不是用户态忙等。</li>
+</ul>
+
+<h3>4.9 do_exit：从“活着”到“僵尸”</h3>
+
+<p class="srcline">kernel/exit.c:765-830  do_exit（节选）</p>
+<pre><code>	exit_signals(tsk);  /* sets PF_EXITING */
+
+	/* sync mm's RSS info before statistics gathering */
+	if (tsk-&gt;mm)
+		sync_mm_rss(tsk-&gt;mm);
+	acct_update_integrals(tsk);
+	group_dead = atomic_dec_and_test(&amp;tsk-&gt;signal-&gt;live);
+	if (group_dead) {
+		/* ... 省略 global init panic 检查与 posix timer 清理 ... */
+		if (tsk-&gt;mm)
+			setmax_mm_hiwater_rss(&amp;tsk-&gt;signal-&gt;maxrss, tsk-&gt;mm);
+	}
+	acct_collect(code, group_dead);
+	if (group_dead)
+		tty_audit_exit();
+	audit_free(tsk);
+
+	tsk-&gt;exit_code = code;
+	taskstats_exit(tsk, group_dead);
+
+	exit_mm();
+
+	if (group_dead)
+		acct_process();
+	trace_sched_process_exit(tsk);
+
+	exit_sem(tsk);
+	exit_shm(tsk);
+	exit_files(tsk);
+	exit_fs(tsk);
+	if (group_dead)
+		disassociate_ctty(1);
+	exit_task_namespaces(tsk);
+	exit_task_work(tsk);
+	exit_thread(tsk);
+	/* ... 省略 perf/cgroup/rcu 清理与 exit_notify 调用 ... */
+</code></pre>
+
+<ul>
+  <li><code>atomic_dec_and_test(&amp;tsk-&gt;signal-&gt;live)</code>：<code>live</code> 是线程组里“还活着的 task 数”。减到 0 说明<strong>整个线程组</strong>都死了，这时才做“组级”清理（tty 断开、统计上报）。单个线程退出 <code>group_dead</code> 为 false，很多动作跳过。</li>
+  <li><code>tsk-&gt;exit_code = code</code> 是给 <code>wait()</code> 读的退出码。注意它和 <code>exit_signal</code> 是两个不同字段。</li>
+  <li><code>exit_mm()</code> 在文件/命名空间之前：释放 mm 时要 <code>mm_release()</code>（清 child_tid、唤醒 vfork 父进程），此时还不能依赖文件系统。</li>
+  <li><code>exit_task_namespaces</code> 放在很后面，因为前面的一些清理还可能要访问 <code>/proc</code> 之类的挂载。</li>
+  <li>最后一行（源码节选外）是 <code>do_task_dead()</code>（kernel/sched/core.c:5539 附近）：它把 <code>state</code> 设成 <code>TASK_DEAD</code> 然后调 <code>schedule()</code>，并且<strong>永不返回</strong>。这个 task 的内核栈永远不会再被使用，之后由别的 task 在 <code>finish_task_switch</code> 里 <code>put_task_struct</code> 回收。</li>
+</ul>
+
+<h3>4.10 exit_notify：发讣告、托孤、决定要不要自己收尸</h3>
+
+<p class="srcline">kernel/exit.c:646-678  exit_notify</p>
+<pre><code>static void exit_notify(struct task_struct *tsk, int group_dead)
+{
+	bool autoreap;
+	struct task_struct *p, *n;
+	LIST_HEAD(dead);
+
+	write_lock_irq(&amp;tasklist_lock);
+	forget_original_parent(tsk, &amp;dead);
+
+	if (group_dead)
+		kill_orphaned_pgrp(tsk-&gt;group_leader, NULL);
+
+	tsk-&gt;exit_state = EXIT_ZOMBIE;
+	if (unlikely(tsk-&gt;ptrace)) {
+		int sig = thread_group_leader(tsk) &amp;&amp;
+				thread_group_empty(tsk) &amp;&amp;
+				!ptrace_reparented(tsk) ?
+			tsk-&gt;exit_signal : SIGCHLD;
+		autoreap = do_notify_parent(tsk, sig);
+	} else if (thread_group_leader(tsk)) {
+		autoreap = thread_group_empty(tsk) &amp;&amp;
+			do_notify_parent(tsk, tsk-&gt;exit_signal);
+	} else {
+		autoreap = true;
+	}
+
+	if (autoreap) {
+		tsk-&gt;exit_state = EXIT_DEAD;
+		list_add(&amp;tsk-&gt;ptrace_entry, &amp;dead);
+	}
+	/* ... 省略 de_thread 唤醒 ... */
+	write_unlock_irq(&amp;tasklist_lock);
+
+	list_for_each_entry_safe(p, n, &amp;dead, ptrace_entry) {
+		list_del_init(&amp;p-&gt;ptrace_entry);
+		release_task(p);
+	}
+}
+</code></pre>
+
+<ul>
+  <li><code>forget_original_parent(tsk, &amp;dead)</code> 处理<strong>托孤</strong>：把这个 task 的子进程 reparent 给 init 或最近的 subreaper，如果有子进程已经是僵尸，就收集到 <code>dead</code> 链表里一起释放。</li>
+  <li><code>tsk-&gt;exit_state = EXIT_ZOMBIE</code>：从这一刻起，它就是僵尸。<code>ps</code> 读 <code>state | exit_state</code> 看到的是 Z。</li>
+  <li><code>do_notify_parent</code> 返回 <code>autoreap</code>：如果父进程明确表示“不关心”（<code>SIGCHLD</code> 被设成 <code>SIG_IGN</code> 或 <code>SA_NOCLDWAIT</code>），内核就不留僵尸，直接 <code>EXIT_DEAD</code> + <code>release_task</code>。这就是 <code>signal(SIGCHLD, SIG_IGN)</code> 能自动收割僵尸的原因。</li>
+  <li>非组长线程（普通线程）<code>autoreap = true</code>，因为线程退出不需要父进程 wait，pthread_join 是另一套（futex）机制。</li>
+  <li><code>release_task(p)</code> 在这里被调用的条件很窄——只对“已经确定无人认领”的；正常僵尸要等父进程 <code>wait4()</code> 才走到这一步。</li>
+</ul>
+
+<h3>4.11 wait4：父进程收尸</h3>
+
+<p>父进程调 <code>wait4(pid, &amp;status, options, &amp;rusage)</code>，内核进入 <code>kernel_wait4()</code> → <code>do_wait()</code>。核心逻辑是一个“扫一遍子进程链表，看谁状态变了”的循环，找不到就把自己挂到 <code>signal-&gt;wait_chldexit</code> 等待队列上睡一觉：</p>
+
+<p class="srcline">kernel/exit.c:1442-1497  do_wait 主体</p>
+<pre><code>	wo-&gt;notask_error = -ECHILD;
+	if ((wo-&gt;wo_type &lt; PIDTYPE_MAX) &amp;&amp;
+	   (!wo-&gt;wo_pid || !pid_has_task(wo-&gt;wo_pid, wo-&gt;wo_type)))
+		goto notask;
+
+	set_current_state(TASK_INTERRUPTIBLE);
+	read_lock(&amp;tasklist_lock);
+	tsk = current;
+	do {
+		retval = do_wait_thread(wo, tsk);
+		if (retval)
+			goto end;
+
+		retval = ptrace_do_wait(wo, tsk);
+		if (retval)
+			goto end;
+
+		if (wo-&gt;wo_flags &amp; __WNOTHREAD)
+			break;
+	} while_each_thread(current, tsk);
+	read_unlock(&amp;tasklist_lock);
+
+notask:
+	retval = wo-&gt;notask_error;
+	if (!retval &amp;&amp; !(wo-&gt;wo_flags &amp; WNOHANG)) {
+		retval = -ERESTARTSYS;
+		if (!signal_pending(current)) {
+			schedule();
+			goto repeat;
+		}
+	}
+end:
+	__set_current_state(TASK_RUNNING);
+	remove_wait_queue(&amp;current-&gt;signal-&gt;wait_chldexit, &amp;wo-&gt;child_wait);
+	return retval;
+}
+</code></pre>
+
+<ul>
+  <li><code>set_current_state(TASK_INTERRUPTIBLE)</code> 必须在拿 <code>tasklist_lock</code> <strong>之前</strong>：这样即使子进程在你拿锁前就死了并发 SIGCHLD 唤醒你，<code>schedule()</code> 也不会真的睡下去（<code>signal_pending</code> 或 <code>try_to_wake_up</code> 会把 state 改回 RUNNING）。这是内核里经典的“先设状态再检查、再睡”的无丢唤醒模式。</li>
+  <li><code>WNOHANG</code> 表示“不等，没死就立刻返回 0”；<code>__WNOTHREAD</code> 表示不代其他线程 wait；<code>WUNTRACED</code> 让 stop 状态也报。</li>
+  <li><code>do_wait_thread(wo, tsk)</code> 内部遍历 <code>tsk-&gt;children</code> 链表，对每个子进程调 <code>wait_consider_task()</code>，再按状态分派到 <code>wait_task_zombie()</code>、<code>wait_task_stopped()</code>、<code>wait_task_continued()</code>。</li>
+  <li>一旦找到僵尸，<code>wait_task_zombie()</code>（981 行）用 <code>cmpxchg(&amp;p-&gt;exit_state, EXIT_ZOMBIE, EXIT_DEAD)</code> 抢占“收尸权”（多线程父进程可能同时 wait，只有一个能成功），然后 <code>release_task(p)</code>（1091 行）真正释放。</li>
+</ul>
+
+<h3>4.12 release_task：最后一步</h3>
+
+<p class="srcline">kernel/exit.c:181-214  release_task（节选）</p>
+<pre><code>	write_lock_irq(&amp;tasklist_lock);
+	ptrace_release_task(p);
+	thread_pid = get_pid(p-&gt;thread_pid);
+	__exit_signal(p);
+	/* ... 此处省略组长判定、do_notify_parent、退出锁 ... */
+	seccomp_filter_release(p);
+	proc_flush_pid(thread_pid);
+	put_pid(thread_pid);
+	release_thread(p);
+	put_task_struct_rcu_user(p);
+</code></pre>
+
+<ul>
+  <li><code>__exit_signal(p)</code> 把 task 从线程组链表里摘掉、结算 CPU 时间、清 pending 信号。</li>
+  <li><code>put_pid(thread_pid)</code> 释放 pid 号——所以僵尸期间 PID 仍被占用，<code>ps</code> 能看到它；一旦收尸，PID 才能被复用。</li>
+  <li><code>put_task_struct_rcu_user</code> 递减 <code>task_struct</code> 的 refcount，最后一个引用消失后由 RCU 回调 <code>free_task</code> 释放 9KB 结构与 16KB 内核栈。</li>
+  <li>函数尾部在 <code>zap_leader</code> 情形会 <code>goto repeat</code> 再收一次组长，因为收一个线程可能让其组长也满足释放条件。</li>
+</ul>
+
+<h2>5. 动手验证</h2>
+
+<p><strong>实验一：看 fork 返回两次与 PID 关系。</strong></p>
+<pre><code>$ cat &gt; /tmp/f.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+int main(void) {
+    pid_t p = fork();
+    if (p == 0) printf("child  pid=%d ppid=%d\n", getpid(), getppid());
+    else        printf("parent pid=%d child=%d\n", getpid(), p);
+    return 0;
+}
+EOF
+$ cc -o /tmp/f /tmp/f.c &amp;&amp; /tmp/f
+parent pid=12345 child=12346
+child  pid=12346 ppid=12345
+</code></pre>
+
+<p>预期：子进程拿到的返回值是 0，父进程拿到的是子 PID；子进程的 PPID 等于父进程 PID，这就是 <code>copy_process</code> 里 <code>p-&gt;real_parent = current</code> 与 <code>list_add_tail(&amp;p-&gt;sibling, &amp;p-&gt;real_parent-&gt;children)</code> 的结果。</p>
+
+<p><strong>实验二：验证 COW——fork 后内存不复制，写才复制。</strong></p>
+<pre><code>$ cat &gt; /tmp/cow.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+int main(void) {
+    char *p = malloc(200*1024*1024);   /* 200MB */
+    memset(p, 1, 200*1024*1024);       /* 先全部写实 */
+    pid_t c = fork();
+    if (c == 0) { sleep(3); _exit(0); }
+    char cmd[128]; snprintf(cmd, sizeof cmd, "grep VmRSS /proc/%d/status", c);
+    system(cmd);                       /* 子进程 RSS 应该接近 200MB */
+    sleep(4);
+    return 0;
+}
+EOF
+$ cc -O0 -o /tmp/cow /tmp/cow.c &amp;&amp; /tmp/cow
+VmRSS:	  204808 kB
+</code></pre>
+
+<p>子进程没写任何数据，RSS 却接近 200MB——因为 RSS 统计的是“映射到的物理页”，COW 后子进程的页表指向同一批物理页，引用计数为 2。如果在子进程里 <code>memset(p, 2, ...)</code>，RSS 会再涨一份（真正复制）；用 <code>/proc/&lt;pid&gt;/smaps</code> 的 <code>Private_Dirty</code> 字段对比更直观。</p>
+
+<p><strong>实验三：僵尸与 <code>ps -o pid,ppid,stat</code>。</strong></p>
+<pre><code>$ python3 - &lt;&lt;'EOF' &amp;
+import os, time
+if os.fork() == 0:
+    os._exit(0)          # 子进程立刻退出
+time.sleep(0.2)          # 父进程不 wait，直接睡
+EOF
+$ ps -o pid,ppid,stat,comm -C python3
+  PID  PPID STAT COMMAND
+ 5601     1 Z    python3
+</code></pre>
+
+<p>预期：STAT 是 <code>Z</code>（<code>EXIT_ZOMBIE</code> = 0x20），PPID 变成 1（被 reparent）。这个 Z 进程不占地址空间（mm 已经释放），只占一个 task_struct 和 PID，<code>kill -9</code> 无效——只有父进程 wait，或父进程退出、init 接管并 wait，才会消失。</p>
+
+<p><strong>实验四：用 strace 看 clone / wait4 一次全家桶。</strong></p>
+<pre><code>$ strace -f -e trace=clone,clone3,wait4,exit_group sh -c 'true' 2&gt;&amp;1 | head
+clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, ...) = 5702
+wait4(5702, NULL, 0, NULL)              = 5702
+--- SIGCHLD {si_signo=SIGCHLD, ...} ---
+exit_group(0)                           = ?
+</code></pre>
+
+<p>注意 <code>sh</code> 调 <code>clone</code> 时没有 <code>CLONE_VM</code>——它 fork 了一个新进程去 exec <code>true</code>；如果是 <code>pthread_create</code>，你会看到 <code>CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|...</code> 一长串。</p>
+
+<p><strong>实验五：vfork 的阻塞语义。</strong></p>
+<pre><code>$ cat &gt; /tmp/v.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+int main(void) {
+    pid_t p = vfork();
+    if (p == 0) { printf("child before exit\n"); _exit(0); }
+    printf("parent after vfork, child=%d\n", p);
+    return 0;
+}
+EOF
+$ cc -o /tmp/v /tmp/v.c &amp;&amp; /tmp/v
+child before exit
+parent after vfork, child=5901
+</code></pre>
+
+<p>输出顺序是子进程那句先出现——因为父进程在 <code>wait_for_vfork_done</code> 里睡着，直到子进程 <code>_exit</code> 释放 mm 才被唤醒。对比 <code>fork()</code> 版本，输出顺序可能相反（取决于调度）。</p>
+
+<p><strong>实验六：核对源码里的复制顺序。</strong></p>
+<pre><code>$ grep -n "retval = copy_" kernel/fork.c | head -12
+2499:	retval = copy_semundo(clone_flags, p);
+2502:	retval = copy_files(clone_flags, p);
+2505:	retval = copy_fs(clone_flags, p);
+2508:	retval = copy_sighand(clone_flags, p);
+2511:	retval = copy_signal(clone_flags, p);
+2514:	retval = copy_mm(clone_flags, p);
+2517:	retval = copy_namespaces(clone_flags, p);
+2520:	retval = copy_io(clone_flags, p);
+2523:	retval = copy_thread(clone_flags, args-&gt;stack, args-&gt;stack_size, p, args-&gt;tls);
+</code></pre>
+
+<p>顺序与文档一致：files → fs → sighand → signal → mm → namespaces → io → thread。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. <code>fork()</code> 为什么不在内核里直接“拷贝内存页”？</b>因为绝大多数 fork 后面紧跟 execve，拷贝的内存立刻会被丢弃；而 fork 出的子进程可能只读写其中很少一部分。COW 把“复制”推迟到真正写的那一刻，摊薄了成本。代价是每次写首次触页都会 #PF，且页表仍要复制。</div>
+
+<div class="qa"><b>Q2. 线程和进程在 <code>copy_process</code> 中真正不同的只有哪几个标志？</b>主要是 <code>CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID</code>。其中 <code>CLONE_THREAD</code> 决定 tgid 继承与 <code>exit_signal=-1</code>；<code>CLONE_VM</code> 决定 mm 共享。线程不是另一种数据结构，只是共享程度更高的一组 clone 标志。</div>
+
+<div class="qa"><b>Q3. 为什么 <code>copy_files</code> 里共享分支不需要给 <code>tsk-&gt;files</code> 赋值？</b>因为 <code>dup_task_struct</code> 已经用 <code>*dst = *orig</code> 整体复制了父进程的 <code>files</code> 指针。共享语义恰好就等于“指针相同”，所以只需把被共享对象的引用计数 +1，防止父进程 close 之后对象被释放。</div>
+
+<div class="qa"><b>Q4. 僵尸进程占不占内存？能不能 <code>kill -9</code> 掉？</b>不占地址空间（<code>exit_mm()</code> 已释放 mm），但占一个 <code>task_struct</code>（约 9KB）、内核栈（16KB）以及一个 PID。它已经不在运行队列里，没有代码可以“执行”信号处理，所以 <code>kill -9</code> 不能让它消失。只能靠父进程 <code>wait()</code>，或父进程先死让它变成孤儿被 init 收割。</div>
+
+<div class="qa"><b>Q5. <code>vfork</code> 为什么要求父进程阻塞，而 <code>fork</code> 不用？</b>因为 vfork 共享同一个地址空间和同一套用户栈。如果父子同时跑，子进程往栈上压一个返回地址就会覆盖父进程的栈帧，导致父进程数据损坏。阻塞保证“同一时刻只有一个执行流在使用这套栈”，因此子进程只能立即 exec（exec 会换掉地址空间并唤醒父进程）或 exit。</div>
+
+<footer>
+  <p>上一篇：<a href="05-task-struct.html">05 进程描述符</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="07-scheduler.html">07 调度器</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>37 · 电源管理：suspend、cpuidle、cpufreq</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="38-cgroup.html">下一篇：cgroup 资源控制 →</a>
+</nav>
+
+<h1>🔋 电源管理：suspend、cpuidle、cpufreq</h1>
+<p class="subtitle">合盖后为什么还能收到邮件：四个层次的省电与唤醒 · 预计阅读 25 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>晚上合上笔记本，第二天打开，电池只掉了 3%，风扇没转，可手机推送居然同步过来了。若 CPU 一直满速空转，一夜能烧掉半块电池；若整机彻底断电，网卡就再也收不到数据。<span class="term">电源管理</span>要解决的就是这个矛盾：在“深睡省电”和“随时能醒”之间分层取舍，并且对每个设备单独决定——屏幕可以立刻关，网卡不能。</p>
+
+<p>从操作系统看，这里有四个层次，常被混为一谈：<b>系统级睡眠</b>（整机挂起 / 休眠，一次性的大动作）、<b>CPU 空闲</b>（这颗核此刻无事可做，进哪种低功耗状态）、<b>频率调节</b>（真要跑时用多快、多耗电）、<b>运行时电源管理</b>（单个设备空闲就关掉，常态发生）。它们串成一条链：设备各自挂起，CPU 再进深睡，最后整机断电或维持浅睡。</p>
+
+<p>为什么必须分层？因为省电和响应是死对头。睡得越深唤醒越慢：CPU 从 C6 醒来要几十微秒，整机从 S3 醒来要几百毫秒。整个电源管理的工程学就两句话：<b>尽可能深地睡，又在正确的时间醒</b>。于是出现了“预测下次定时器还有多久”的 cpuidle 调节器、“跟着负载调频率”的 cpufreq 调节器、“谁在阻止我睡”的 wakeup source 记账——骨架全是预测与记账。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">系统睡眠</td><td>system suspend</td><td>整机进低功耗：冻结进程、挂起设备、停 CPU，靠唤醒源恢复。</td></tr>
+  <tr><td class="term">休眠</td><td>hibernate</td><td>把内存镜像写进 swap 再断电，恢复时读回，掉电也不丢现场。</td></tr>
+  <tr><td class="term">s2idle</td><td>suspend-to-idle</td><td>不依赖固件的浅睡：冻结进程 + 挂起设备 + CPU 进 idle。</td></tr>
+  <tr><td class="term">C 状态</td><td>C-state</td><td>CPU 空闲等级，C0 运行，越深越省电、退出越慢。</td></tr>
+  <tr><td class="term">P 状态</td><td>P-state</td><td>CPU 性能等级，即“现在跑多少 MHz、多少伏”。</td></tr>
+  <tr><td class="term">调节器</td><td>governor</td><td>做决策的纯策略代码：cpuidle 选 C 状态，cpufreq 选频率。</td></tr>
+  <tr><td class="term">驻留时间</td><td>target residency</td><td>进该 C 状态后至少要待这么久才划算，否则进出的开销大于省的电。</td></tr>
+  <tr><td class="term">退出延迟</td><td>exit latency</td><td>从该 C 状态回到 C0 的时间，决定它能被多急的事件用。</td></tr>
+  <tr><td class="term">利用率</td><td>utilization</td><td>调度器统计的“这颗 CPU 有多忙”，schedutil 用它换算频率。</td></tr>
+  <tr><td class="term">运行时 PM</td><td>runtime PM</td><td>单个设备的自动休眠/唤醒机制，由使用计数驱动。</td></tr>
+  <tr><td class="term">唤醒源</td><td>wakeup source</td><td>能唤醒系统的对象（网卡、按键、RTC），带计时与阻止睡眠的语义。</td></tr>
+  <tr><td class="term">PM QoS</td><td>PM quality of service</td><td>对延迟/频率的约束请求：谁敢说“最多只能睡 100μs”。</td></tr>
+  <tr><td class="term">时钟/稳压</td><td>clk / regulator</td><td>给设备提供时钟与供电电压的子系统，电源管理最底一层。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 四个层次各管什么</h3>
+<pre><code>用户动作（合盖 / 空闲 / 负载上升）
+   │
+   ├─► /sys/power/state ──► kernel/power/main.c  state_store ──► pm_suspend()
+   │        系统级：freeze / mem / disk
+   │             └─ suspend_enter(): 挂设备 → 关从核 → 停中断 → 固件睡
+   │
+   ├─► CPU 无事可做 ──► cpuidle governor（menu / teo）选 C 状态
+   │        └─ 依据：下次定时器到期时间、退出延迟、PM QoS 约束
+   │
+   ├─► 负载变化 ──► cpufreq governor（schedutil）选频率
+   │        └─ schedutil 在调度器更新利用率时被回调
+   │
+   └─► 设备空闲 ──► runtime PM（usage counter 归零 → rpm_idle → suspend 回调）
+            └─ 驱动的 pm_runtime_get_sync() / pm_runtime_put_autosuspend()
+</code></pre>
+
+<h3>3.2 <code>/sys/power/state</code> 的取值</h3>
+<table>
+  <tr><th>写入值</th><th>内核状态</th><th>实际行为</th></tr>
+  <tr><td><code>freeze</code></td><td><code>PM_SUSPEND_TO_IDLE</code></td><td>s2idle：冻结进程、挂起设备，CPU 只进 idle，不进固件睡眠。</td></tr>
+  <tr><td><code>standby</code></td><td><code>PM_SUSPEND_STANDBY</code></td><td>浅睡，需平台 <code>valid()</code> 支持。</td></tr>
+  <tr><td><code>mem</code></td><td><code>PM_SUSPEND_MEM</code></td><td>S3（挂起到内存），实际深度还由 <code>/sys/power/mem_sleep</code> 细分成 s2idle/shallow/deep。</td></tr>
+  <tr><td><code>disk</code></td><td><code>PM_SUSPEND_MAX</code></td><td>休眠，走 <code>hibernate()</code>。</td></tr>
+</table>
+<p>这些字符串来自 <code>kernel/power/suspend.c:36-40</code> 的 <code>pm_labels[]</code>；<code>mem_sleep</code> 的三个取值来自同文件 42-46 行的 <code>mem_sleep_labels[]</code>。注意 <code>freeze</code> 与 <code>mem_sleep</code> 里的 <code>s2idle</code> 是同一个内核状态，两个文件的叫法不同。</p>
+
+<h3>3.3 一次 suspend 的步骤</h3>
+<p>核心是“层层递进、失败就逐层回滚”：</p>
+<pre><code>pm_suspend(state)
+ ├─ suspend_console()
+ ├─ dpm_suspend_start(PMSG_SUSPEND)     ← 普通设备 suspend 回调
+ ├─ suspend_enter()
+ │    ├─ platform_suspend_prepare()
+ │    ├─ dpm_suspend_late()             ← late 阶段
+ │    ├─ dpm_suspend_noirq()            ← 关中断后再挂
+ │    ├─ suspend_disable_secondary_cpus()
+ │    ├─ arch_suspend_disable_irqs()
+ │    ├─ syscore_suspend()              ← 时钟 / 中断控制器
+ │    └─ suspend_ops-&gt;enter(state)      ← 真正睡下去
+ └─ 唤醒后原路反向 resume
+</code></pre>
+<p>顺序刻意“从外到内”：先停一般设备，再停需要中断的最后一批（noirq），最后才关 CPU 与系统核心。任何一步失败都反着回去，保证设备醒来时它的依赖（时钟、总线）还在。</p>
+
+<h3>3.4 谁在阻止我睡：wakeup source 与 QoS</h3>
+<p>设备驱动程序在收到可能唤醒系统的事件后调用 <code>pm_stay_awake()</code>，处理完再 <code>pm_relax()</code>。内核为每个设备维护一个 <code>struct wakeup_source</code>（<code>include/linux/pm_wakeup.h:43-64</code>），里面记着 <code>total_time</code>、<code>max_time</code>、<code>event_count</code>、<code>wakeup_count</code>——这就是 <code>/sys/kernel/debug/wakeup_sources</code> 与 powertop “谁最费电”的数据来源。只要还有 active 的 wakeup source，系统就认为不该进入深睡。</p>
+<p>另一类约束来自 <span class="term">PM QoS</span>：设备可以注册“我最多能忍受 50μs 唤醒延迟”，<code>dev_pm_qos_add_request()</code>（<code>include/linux/pm_qos.h:170-173</code>）登记后，所有请求按类型取最严值。这类约束会直接喂给 cpuidle 的 <code>latency_req</code>，也会限制 cpufreq 的 <code>min/max frequency</code>。</p>
+<h2>4. 源码走读</h2>
+
+<h3>4.1 用户写 /sys/power/state 之后</h3>
+<p>sysfs 属性只做参数解析和分发：把 <code>mem</code> 换成当前选定的 mem 睡眠模式，把 <code>disk</code> 交给 hibernate。</p>
+<p class="srcline">kernel/power/main.c:638-666  state_store</p>
+<pre><code>static ssize_t state_store(struct kobject *kobj, struct kobj_attribute *attr,
+			   const char *buf, size_t n)
+{
+	suspend_state_t state;
+	int error;
+
+	error = pm_autosleep_lock();
+	if (error)
+		return error;
+
+	if (pm_autosleep_state() &gt; PM_SUSPEND_ON) {
+		error = -EBUSY;
+		goto out;
+	}
+
+	state = decode_state(buf, n);
+	if (state &lt; PM_SUSPEND_MAX) {
+		if (state == PM_SUSPEND_MEM)
+			state = mem_sleep_current;
+
+		error = pm_suspend(state);
+	} else if (state == PM_SUSPEND_MAX) {
+		error = hibernate();
+	} else {
+		error = -EINVAL;
+	}
+
+ out:
+	pm_autosleep_unlock();
+	return error ? error : n;
+}</code></pre>
+<ul>
+  <li><code>pm_autosleep_lock()</code>：自动睡眠正在进行时，手写 <code>state</code> 返回 <code>-EBUSY</code>，两套机制不能同时驱动睡眠。</li>
+  <li><code>decode_state()</code> 在 <code>pm_states[]</code> 里逐项比对字符串，不认识的值返回 <code>PM_SUSPEND_ON</code>，最终落到 <code>-EINVAL</code>。</li>
+  <li><code>state == PM_SUSPEND_MEM</code> 时替换成 <code>mem_sleep_current</code>：写 <code>mem</code> 到底多深，取决于 <code>/sys/power/mem_sleep</code> 的选择。这是用户最常踩的“为什么写 mem 却是 s2idle”的原因。</li>
+  <li>成功时返回写入长度 <code>n</code>，符合 sysfs 约定。</li>
+</ul>
+
+<h3>4.2 suspend 的最后一跳</h3>
+<p>真正“睡下去”只有一行 <code>suspend_ops-&gt;enter()</code>，前后是设备与中断的层层收拢。</p>
+<p class="srcline">kernel/power/suspend.c:389-440  suspend_enter（节选）</p>
+<pre><code>static int suspend_enter(suspend_state_t state, bool *wakeup)
+{
+	int error;
+
+	error = platform_suspend_prepare(state);
+	if (error)
+		goto Platform_finish;
+
+	error = dpm_suspend_late(PMSG_SUSPEND);
+	if (error) {
+		pr_err("late suspend of devices failed\n");
+		goto Platform_finish;
+	}
+	// ... 省略 platform_suspend_prepare_late / dpm_suspend_noirq 及各回滚标签
+	if (state == PM_SUSPEND_TO_IDLE) {
+		s2idle_loop();
+		goto Platform_wake;
+	}
+
+	error = suspend_disable_secondary_cpus();
+	// ... 省略 suspend_test(TEST_CPUS) 分支
+
+	arch_suspend_disable_irqs();
+	BUG_ON(!irqs_disabled());
+
+	system_state = SYSTEM_SUSPEND;
+
+	error = syscore_suspend();
+	if (!error) {
+		*wakeup = pm_wakeup_pending();
+		if (!(suspend_test(TEST_CORE) || *wakeup)) {
+			trace_suspend_resume(TPS("machine_suspend"),
+				state, true);
+			error = suspend_ops-&gt;enter(state);
+			trace_suspend_resume(TPS("machine_suspend"),
+				state, false);
+		}
+	}</code></pre>
+<ul>
+  <li><code>state == PM_SUSPEND_TO_IDLE</code> 直接跳进 <code>s2idle_loop()</code>（同文件 120 行起）：不关从核、不进固件，只让 CPU 停在 idle 等唤醒——这就是“浅睡”的物理含义。</li>
+  <li><code>arch_suspend_disable_irqs()</code> 之后才 <code>syscore_suspend()</code>，因为 syscore 要关的正是中断控制器本身。</li>
+  <li><code>pm_wakeup_pending()</code> 是睡前最后一次检查：已有唤醒事件在排队就别睡了，直接返回，避免“刚睡下立刻醒”的抖动。</li>
+  <li><code>suspend_ops-&gt;enter()</code> 是平台钩子，x86 上最终写 ACPI 睡眠寄存器；它返回即代表已经醒来。</li>
+</ul>
+
+<h3>4.3 cpuidle：选哪一层睡</h3>
+<p>先看状态结构：驱动只登记硬件事实，选哪个由调节器算。</p>
+<p class="srcline">include/linux/cpuidle.h:48-61  cpuidle_state</p>
+<pre><code>struct cpuidle_state {
+	char		name[CPUIDLE_NAME_LEN];
+	char		desc[CPUIDLE_DESC_LEN];
+
+	u64		exit_latency_ns;
+	u64		target_residency_ns;
+	unsigned int	flags;
+	unsigned int	exit_latency; /* in US */
+	int		power_usage; /* in mW */
+	unsigned int	target_residency; /* in US */
+
+	int (*enter)	(struct cpuidle_device *dev,
+			struct cpuidle_driver *drv,
+			int index);
+</code></pre>
+<p><code>exit_latency_ns</code> 是“出来要多久”，<code>target_residency_ns</code> 是“至少待多久才划算”，<code>power_usage</code> 供 powertop 之类工具估算功耗。menu 调节器的判断顺序最能体现取舍：</p>
+<p class="srcline">drivers/cpuidle/governors/menu.c:265-298  menu_select（节选）</p>
+<pre><code>static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+		       bool *stop_tick)
+{
+	struct menu_device *data = this_cpu_ptr(&amp;menu_devices);
+	s64 latency_req = cpuidle_governor_latency_req(dev-&gt;cpu);
+	// ... 省略变量声明
+	if (data-&gt;needs_update) {
+		menu_update(drv, dev);
+		data-&gt;needs_update = 0;
+	}
+
+	/* determine the expected residency time, round up */
+	data-&gt;next_timer_ns = tick_nohz_get_sleep_length(&amp;delta_next);
+
+	nr_iowaiters = nr_iowait_cpu(dev-&gt;cpu);
+	data-&gt;bucket = which_bucket(data-&gt;next_timer_ns, nr_iowaiters);
+
+	if (unlikely(drv-&gt;state_count &lt;= 1 || latency_req == 0) ||
+	    ((data-&gt;next_timer_ns &lt; drv-&gt;states[1].target_residency_ns ||
+	      latency_req &lt; drv-&gt;states[1].exit_latency_ns) &amp;&amp;
+	     !dev-&gt;states_usage[0].disable)) {
+		*stop_tick = !(drv-&gt;states[0].flags &amp; CPUIDLE_FLAG_POLLING);
+		return 0;
+	}</code></pre>
+<ul>
+  <li><code>tick_nohz_get_sleep_length()</code> 返回“离最近一个定时器事件还有多久”，这就是本轮对空闲时长的<b>预测</b>；<code>delta_next</code> 带回精确值供后面校正。</li>
+  <li><code>latency_req</code> 来自 PM QoS：<code>cpuidle_governor_latency_req()</code> 把设备请求与全局 <code>cpu_latency_qos_limit()</code> 取严，再换算成纳秒（<code>drivers/cpuidle/governor.c:110-120</code>）。音频驱动会把它压到几十微秒，强逼 CPU 别进深睡。</li>
+  <li>那个 <code>if</code> 是“不值得深睡”的快速路径：状态不够、延迟约束为零、或预测时长连第二档的驻留时间与退出延迟都满足不了，直接返回状态 0。</li>
+  <li>后面 337-420 行的循环按 <code>target_residency_ns</code> 从浅到深逐级试，选出“驻留时间不超过预测值的最深一档”，再按 <code>exit_latency_ns</code> 与 <code>delta_next</code> 回退校正。思路是压着预测值往上顶，但不越界。</li>
+</ul>
+<p>teo 调节器的骨架相同（<code>drivers/cpuidle/governors/teo.c:240</code> 起），差别是它不做 interactivity 加成，而用“最近若干次空闲时长与本次预测的命中率”决定要不要退一档（<code>teo.c:377-415</code>）。两者靠 rating 竞争：menu 为 20、teo 为 19（<code>drivers/cpuidle/governors/menu.c:558-564</code>、<code>teo.c:481-487</code>），所以默认选中 menu；<code>drivers/cpuidle/Kconfig:7-8</code> 仅在开启 <code>NO_HZ</code> 且未启用 <code>CPU_IDLE_GOV_TEO</code> 时才自动选中 menu。</p>
+
+<h3>4.4 cpufreq：schedutil 跟着利用率走</h3>
+<p>调频的输入不是“负载百分比”，而是调度器算出的<span class="term">利用率</span>，映射公式只有一行：</p>
+<p class="srcline">include/linux/sched/cpufreq.h:26-30  map_util_freq</p>
+<pre><code>static inline unsigned long map_util_freq(unsigned long util,
+					unsigned long freq, unsigned long cap)
+{
+	return (freq + (freq &gt;&gt; 2)) * util / cap;
+}</code></pre>
+<p><code>cap</code> 是这颗 CPU 的最大算力，<code>util</code> 是当前需求，<code>freq &gt;&gt; 2</code> 预留 25% 余量，免得利用率估低了频率跟不上。本质就是按需求比例线性缩放。</p>
+<p class="srcline">kernel/sched/cpufreq_schedutil.c:159-172  get_next_freq</p>
+<pre><code>static unsigned int get_next_freq(struct sugov_policy *sg_policy,
+				  unsigned long util, unsigned long max)
+{
+	struct cpufreq_policy *policy = sg_policy-&gt;policy;
+	unsigned int freq = arch_scale_freq_invariant() ?
+				policy-&gt;cpuinfo.max_freq : policy-&gt;cur;
+
+	freq = map_util_freq(util, freq, max);
+
+	if (freq == sg_policy-&gt;cached_raw_freq &amp;&amp; !sg_policy-&gt;need_freq_update)
+		return sg_policy-&gt;next_freq;
+
+	sg_policy-&gt;cached_raw_freq = freq;
+	return cpufreq_driver_resolve_freq(policy, freq);
+}</code></pre>
+<ul>
+  <li><code>arch_scale_freq_invariant()</code> 为真时用 <code>max_freq</code> 做基准（硬件有频率无关计数器），否则退回 <code>policy-&gt;cur</code>，精度差一些。</li>
+  <li><code>cached_raw_freq</code> 相同就直接返回上次结果，避免每次 tick 都惊动驱动——利用率每 tick 都在小幅变化，这层缓存是必需的。</li>
+  <li><code>cpufreq_driver_resolve_freq()</code> 把连续频率对齐到驱动支持的档位（离散 P-state 或连续调节）。</li>
+</ul>
+<p>调用者是谁？调度器每次更新利用率就回调 schedutil，单 CPU 策略如下：</p>
+<p class="srcline">kernel/sched/cpufreq_schedutil.c:439-469  sugov_update_single（节选）</p>
+<pre><code>static void sugov_update_single(struct update_util_data *hook, u64 time,
+				unsigned int flags)
+{
+	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+	struct sugov_policy *sg_policy = sg_cpu-&gt;sg_policy;
+	unsigned long util, max;
+	unsigned int next_f;
+	unsigned int cached_freq = sg_policy-&gt;cached_raw_freq;
+
+	sugov_iowait_boost(sg_cpu, time, flags);
+	sg_cpu-&gt;last_update = time;
+
+	ignore_dl_rate_limit(sg_cpu, sg_policy);
+
+	if (!sugov_should_update_freq(sg_policy, time))
+		return;
+
+	util = sugov_get_util(sg_cpu);
+	max = sg_cpu-&gt;max;
+	util = sugov_iowait_apply(sg_cpu, time, util, max);
+	next_f = get_next_freq(sg_policy, util, max);
+	/*
+	 * Do not reduce the frequency if the CPU has not been idle
+	 * recently, as the reduction is likely to be premature then.
+	 */
+	if (sugov_cpu_is_busy(sg_cpu) &amp;&amp; next_f &lt; sg_policy-&gt;next_freq) {
+		next_f = sg_policy-&gt;next_freq;
+
+		/* Restore cached freq as next_freq has changed */
+		sg_policy-&gt;cached_raw_freq = cached_freq;
+	}</code></pre>
+<ul>
+  <li><code>sugov_should_update_freq()</code> 做速率限制（<code>rate_limit_us</code>），防止调频比硬件响应还快。</li>
+  <li><code>sugov_iowait_boost/apply</code>：CPU 在等 IO 时利用率接近零，但马上就有活干，于是临时抬频率，显著降低唤醒后的延迟。</li>
+  <li><code>sugov_cpu_is_busy()</code> 与后面的“只升不降”保护：最近没闲过就别降频，否则提前降频会立刻触发再升频，来回抖动。</li>
+  <li><code>sugov_get_util()</code>（同文件 281 行）先取 CFS 利用率，再经 <code>schedutil_cpu_util()</code> 加上 RT/DL 的带宽需求，才是最终 <code>util</code>。</li>
+</ul>
+
+<h3>4.5 运行时 PM：带计数器的开关</h3>
+<p>驱动要用设备时先“取用”，用完“放回”。取用是同步的：计数加一并确保设备已上电。</p>
+<p class="srcline">include/linux/pm_runtime.h:373-387  pm_runtime_get_sync</p>
+<pre><code>/**
+ * pm_runtime_get_sync - Bump up usage counter of a device and resume it.
+ * @dev: Target device.
+ *
+ * Bump up the runtime PM usage counter of @dev and carry out runtime-resume of
+ * it synchronously.
+ *
+ * The possible return values of this function are the same as for
+ * pm_runtime_resume() and the runtime PM usage counter of @dev remains
+ * incremented in all cases, even if it returns an error code.
+ */
+static inline int pm_runtime_get_sync(struct device *dev)
+{
+	return __pm_runtime_resume(dev, RPM_GET_PUT);
+}</code></pre>
+<p><code>RPM_GET_PUT</code> 是“同时操作 use_count”的标志（<code>include/linux/pm_runtime.h:21</code> 附近）。注释里那句“计数即使在出错时也已经增加”很关键：调用方无论成败都必须配一次 <code>pm_runtime_put*()</code>，否则计数永远不归零，设备再也不会自动休眠。</p>
+<p>真正的恢复流程在 <code>rpm_resume()</code>，要点是<b>先唤醒父设备</b>：</p>
+<p class="srcline">drivers/base/power/runtime.c:805-857  rpm_resume（节选）</p>
+<pre><code>	if (!parent &amp;&amp; dev-&gt;parent) {
+		/*
+		 * Increment the parent's usage counter and resume it if
+		 * necessary.  Not needed if dev is irq-safe; then the
+		 * parent is permanently resumed.
+		 */
+		parent = dev-&gt;parent;
+		if (dev-&gt;power.irq_safe)
+			goto skip_parent;
+		spin_unlock(&amp;dev-&gt;power.lock);
+
+		pm_runtime_get_noresume(parent);
+
+		spin_lock(&amp;parent-&gt;power.lock);
+		/*
+		 * Resume the parent if it has runtime PM enabled and not been
+		 * set to ignore its children.
+		 */
+		if (!parent-&gt;power.disable_depth
+		    &amp;&amp; !parent-&gt;power.ignore_children) {
+			rpm_resume(parent, 0);
+			if (parent-&gt;power.runtime_status != RPM_ACTIVE)
+				retval = -EBUSY;
+		}
+		spin_unlock(&amp;parent-&gt;power.lock);
+
+		spin_lock(&amp;dev-&gt;power.lock);
+		if (retval)
+			goto out;
+		goto repeat;
+	}
+ skip_parent:
+
+	if (dev-&gt;power.no_callbacks)
+		goto no_callback;	/* Assume success. */
+
+	__update_runtime_status(dev, RPM_RESUMING);
+
+	callback = RPM_GET_CALLBACK(dev, runtime_resume);
+
+	dev_pm_disable_wake_irq_check(dev);
+	retval = rpm_callback(callback, dev);</code></pre>
+<ul>
+  <li>父设备先 <code>pm_runtime_get_noresume()</code>（只加计数、不同步恢复，避免递归死锁），再递归 <code>rpm_resume()</code>。级联顺序保证“子设备醒来时总线/控制器已就绪”。</li>
+  <li><code>goto repeat</code>：唤醒父设备期间自己的状态可能变了，重新判断一遍。</li>
+  <li><code>dev-&gt;power.no_callbacks</code> 表示该设备没有实现 <code>runtime_resume</code> 回调，直接假定成功。</li>
+  <li><code>__update_runtime_status(dev, RPM_RESUMING)</code> 先置为“恢复中”，失败则回退为 <code>RPM_SUSPENDED</code>；成功才置 <code>RPM_ACTIVE</code>。中间态对外可见（<code>/sys/devices/…/power/runtime_status</code>），并让并发请求在 <code>wait_queue</code> 上排队（702-774 行）。</li>
+  <li>反过来，<code>pm_runtime_put_autosuspend()</code> 递减计数；归零后 <code>rpm_idle()</code>（同文件 396 行）检查条件并发起 <code>runtime_suspend</code> 回调；有 autosuspend 延迟时用定时器等一会儿，避免频繁开关。</li>
+</ul>
+<div class="note">最底层还有两个常被忽略的子系统：<span class="term">clk</span>（<code>clk_prepare_enable()</code> 打开时钟，关掉后寄存器都读写不了）和 <span class="term">regulator</span>（调供电电压）。运行时 PM 的回调里经常只是“关时钟 + 关稳压器”，这两步才是真省电；PM 框架负责的只是“什么时候该做”。</div>
+
+<h3>4.6 休眠：hibernate 与 suspend 的分叉</h3>
+<p class="srcline">kernel/power/hibernate.c:707-744  hibernate（节选）</p>
+<pre><code>int hibernate(void)
+{
+	bool snapshot_test = false;
+	int error;
+
+	if (!hibernation_available()) {
+		pm_pr_dbg("Hibernation not available.\n");
+		return -EPERM;
+	}
+
+	lock_system_sleep();
+	/* The snapshot device should not be opened while we're running */
+	if (!hibernate_acquire()) {
+		error = -EBUSY;
+		goto Unlock;
+	}
+
+	pr_info("hibernation entry\n");
+	pm_prepare_console();
+	error = pm_notifier_call_chain_robust(PM_HIBERNATION_PREPARE, PM_POST_HIBERNATION);
+	if (error)
+		goto Restore;
+
+	ksys_sync_helper();
+
+	error = freeze_processes();
+	if (error)
+		goto Exit;
+
+	lock_device_hotplug();
+	/* Allocate memory management structures */
+	error = create_basic_memory_bitmaps();
+	if (error)
+		goto Thaw;
+
+	error = hibernation_snapshot(hibernation_mode == HIBERNATION_PLATFORM);</code></pre>
+<ul>
+  <li><code>ksys_sync_helper()</code> 先把文件系统刷盘，镜像要写到干净的 swap 上。</li>
+  <li><code>freeze_processes()</code> 把用户进程全部冻住——它们的堆栈不再变化，镜像才是一致的。</li>
+  <li><code>create_basic_memory_bitmaps()</code> 标记哪些页必须保存、哪些是可丢弃的缓存，减小镜像体积。</li>
+  <li><code>hibernation_snapshot()</code> 把镜像写入 swap 后，系统会用一次特殊的“关机”睡过去；下次开机 <code>software_resume()</code>（同文件 909 行）读回镜像并跳回原处。</li>
+</ul>
+
+<h2>5. 动手验证</h2>
+
+<p><b>① 看 CPU 频率与调节器。</b>没有 root 也能读大部分文件：</p>
+<pre><code>$ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver
+intel_pstate
+$ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+performance powersave
+$ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+1200000
+$ cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
+400000
+3800000</code></pre>
+<p>单位都是 kHz。<code>scaling_driver</code> 是硬件驱动（<code>intel_pstate</code>、<code>acpi-cpufreq</code>、<code>cpufreq-dt</code>），<code>scaling_governor</code> 才是策略。这些属性名在 <code>drivers/cpufreq/cpufreq.c:912-936</code> 注册。切 governor 需要 root：<code>echo schedutil &gt; …/scaling_governor</code>（<code>intel_pstate</code> 驱动不接受它，只认 performance/powersave）。</p>
+
+<p><b>② 看空闲状态与 governor。</b></p>
+<pre><code>$ cat /sys/devices/system/cpu/cpuidle/current_governor
+menu
+$ ls /sys/devices/system/cpu/cpu0/cpuidle/
+state0  state1  state2  state3
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state3/name \
+      /sys/devices/system/cpu/cpu0/cpuidle/state3/exit_latency \
+      /sys/devices/system/cpu/cpu0/cpuidle/state3/target_residency
+C3
+133
+1067</code></pre>
+<p><code>exit_latency</code>/<code>target_residency</code> 单位是微秒（字段注释写的是 US，见 4.3）。想看实际进了多少次、待了多久，读 <code>/sys/devices/system/cpu/cpu0/cpuidle/state3/usage</code> 与 <code>time</code>。可用 <code>echo teo &gt; current_governor</code> 切换对比（7 个字母的 governor 名在 <code>drivers/cpuidle/sysfs.c:103</code> 写入）。</p>
+
+<p><b>③ 看谁能睡、谁在拦。</b></p>
+<pre><code>$ cat /sys/power/state
+freeze mem disk
+$ cat /sys/power/mem_sleep
+[s2idle] shallow deep        # 方括号是当前选择
+# dmesg | grep -i "PM:"
+PM: Preparing system for sleep (mem)
+PM: suspend entry (s2idle)</code></pre>
+<p>再看单个设备的运行时状态：</p>
+<pre><code>$ cat /sys/bus/i2c/devices/1-0028/power/runtime_status
+suspended
+$ cat /sys/bus/i2c/devices/1-0028/power/control
+auto
+$ cat /sys/bus/i2c/devices/1-0028/power/runtime_active_time</code></pre>
+<p><code>control=auto</code> 表示允许自动休眠；<code>on</code> 表示禁止（相当于永远持有计数）。<code>runtime_status</code> 的四种值在 <code>drivers/base/power/sysfs.c:150-180</code> 实现；<code>runtime_enabled</code> 则对应 <code>disable_depth</code>。</p>
+
+<p><b>④ 找耗电大户。</b></p>
+<pre><code># apt install powertop   &amp;&amp;  sudo powertop --time=60
+# tail -20 /sys/kernel/debug/wakeup_sources   # 需要 debugfs 挂载</code></pre>
+<p><code>powertop</code> 的 “Wakeups-from-idle per second” 一节直接列出每秒唤醒次数最高的进程/设备，<code>wakeup_sources</code> 则给出每个源的 <code>active_time</code>、<code>max_time</code>、<code>wakeup_count</code>，可以对上号。查看内核是否提供了 <code>CONFIG_PM_DEBUG</code> 与 <code>CONFIG_PM_TRACE</code>，后者能在 <code>/sys/power/pm_trace</code> 记录睡眠失败时的调用栈。</p>
+
+<p><b>⑤ 安全地试一次 suspend。</b>在虚拟机上先确认可恢复：</p>
+<pre><code># echo 1 &gt; /sys/power/pm_test       # 只走流程不真睡
+# echo freeze &gt; /sys/power/state
+（几秒后自动返回，dmesg 显示 PM: suspend entry / exit）
+# echo 0 &gt; /sys/power/pm_test       # 改回真实睡眠
+$ systemctl suspend                 # 或 rtcwake -m mem -s 10 定时唤醒</code></pre>
+<p><code>pm_test</code> 的级别由 <code>kernel/power/main.c:228-277</code> 的 <code>pm_test_level</code> 控制，逐级加深（devices / freezer / processor / core / platform），用来定位“是哪个阶段挂醒失败”。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. “写 mem 结果只进了 s2idle”是怎么回事？</b><code>state_store</code> 对 <code>PM_SUSPEND_MEM</code> 做了替换：<code>state = mem_sleep_current</code>。所以 <code>/sys/power/mem_sleep</code> 选的是 s2idle 时，<code>mem</code> 就等价于浅睡。把它改成 <code>deep</code> 才真正走固件 S3。</div>
+<div class="qa"><b>Q2. cpuidle 的 target_residency 与 exit_latency 有什么区别？各自决定什么？</b><code>exit_latency</code> 是“退出要多久”，用来和延迟约束（PM QoS、<code>latency_req</code>）比较，决定“能不能睡这么深”；<code>target_residency</code> 是“待多久才划算”，用来和预测空闲时长比较，决定“睡了划不划算”。</div>
+<div class="qa"><b>Q3. 为什么 schedutil 要在 io-wait 时抬高频率？</b>因为等 IO 的任务利用率显示接近零，但 IO 完成后会立刻占满 CPU。不提前提速，就会出现“醒来后先低频跑一段”的延迟尖峰；<code>sugov_iowait_boost()</code> 用临时 boost 补上这一段。</div>
+<div class="qa"><b>Q4. pm_runtime_get_sync() 失败了还要不要 pm_runtime_put()？</b>要。原注释写明“counting remains incremented in all cases, even if it returns an error code”。漏掉 put 会导致计数永不归零，设备无法再自动挂起，属于常见驱动 bug。</div>
+<div class="qa"><b>Q5. 有设备还在 active 的 wakeup source 时，系统会进入深睡吗？</b>不会。wakeup source 的语义就是“我正在处理可能唤醒系统的事件”，PM 核心据此判定不应进入深睡；它同时也是 powertop 统计“谁在阻止睡眠”的依据。<code>pm_stay_awake/pm_relax</code> 成对使用。</div>
+
+<footer>
+  <p>上一篇：<a href="36-preempt-rt.html">36 · PREEMPT_RT 与抢占模型</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="38-cgroup.html">38 · cgroup 资源控制</a></p>
+</footer>
+
+</body>
+</html>
+

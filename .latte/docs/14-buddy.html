@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · 伙伴系统：物理页的第一道分配器</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="15-slab.html">下一篇：对象缓存 slab/slub →</a>
+</nav>
+
+<h1>🧱 伙伴系统：物理内存的第一道分配器</h1>
+<p class="subtitle">把零散的物理内存块按“2 的幂”排队，让分配和回收都能在常数级完成 · 预计阅读 40 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>想一个学生公寓：房东手里有一整栋楼，但每次来的人只需要一间房、两间房、四间房……如果每次来一个租客就把一整层切开、走了再把碎片拼回去，很快就会碎成满地单间，后来者要四间连号房就永远找不到了。聪明的房东会做两件事：第一，所有房间按 1、2、4、8、16 间连号的“套房”为单位出租；第二，退房时如果发现隔壁同规格的套房也是空的，就把两间合成一间更大的。这样做的好处是分配和合并都只跟“相邻那一块”打交道，成本极低，而且能天然地保留大块连续空间。</p>
+<p>Linux 的物理页分配器用的就是这套规则，名字就叫<span class="term">伙伴系统</span>（buddy system）。内核启动后，物理内存被切成 4 KB 的<span class="term">页帧</span>（page frame），再按 2 的幂（1、2、4、8 … 1024 页）聚成“订单”级别的块，每个级别维护一条空闲链表。谁要内存，就报一个<span class="term">订单</span>（order）；要 4 页就报 order 2。分配器从 order 2 的链表里捞一块出来；如果链表是空的，就上 order 3 拿一块，把一半还回去、一半交给你——这正是“从大套房里切出所需面积”。</p>
+<p>从操作系统视角看，这个模块要解决的是三个互相矛盾的需求：<strong>速度</strong>（每次缺页、每次驱动申请缓冲区都走这条路）、<strong>连续性</strong>（DMA 设备和页表都得拿到物理连续的内存）、<strong>抗碎片</strong>（长时间运行后仍要能凑出大块）。伙伴系统的“2 的幂 + 相邻合并”给出了一个漂亮的折中；它不完美（外碎片依然存在），但它是整个内存管理最底层、最不能被绕开的一层。</p>
+<p>再往下还有一层更快的缓存：<span class="term">每 CPU 页缓存</span>（PCP, per-CPU pages）。单个页（order 0）的申请/释放太频繁，如果每次都去动 zone 的自旋锁，多核机器会被这把锁打成瓶颈。所以内核给每个 CPU 准备了一小把页，拿页还页都先动本地列表，批量到一定程度才与伙伴系统交互。这一点在第 3 节会展开。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">页帧</td><td>page frame</td><td>物理内存按 4 KB（PAGE_SIZE）切出的最小管理单位。</td></tr>
+  <tr><td class="term">页帧号</td><td>PFN (page frame number)</td><td>页帧在物理内存中的编号；<code>page_to_pfn()</code> 与 <code>pfn_to_page()</code> 互转。</td></tr>
+  <tr><td class="term">struct page</td><td>struct page</td><td>内核用来描述一个页帧状态的结构，全系统共用一个 <code>mem_map</code> 数组。</td></tr>
+  <tr><td class="term">NUMA 节点</td><td>NUMA node / pg_data_t</td><td>一组“离某些 CPU 更近”的内存；单机通常只有 node 0。</td></tr>
+  <tr><td class="term">内存区</td><td>zone</td><td>节点内按物理地址范围/用途再分的区域：DMA、DMA32、NORMAL、HIGHMEM、MOVABLE。</td></tr>
+  <tr><td class="term">订单</td><td>order</td><td>一次申请 2<sup>order</sup> 个连续页；order 0 = 1 页，order 1 = 2 页 …，最大 <code>MAX_ORDER</code>=11。</td></tr>
+  <tr><td class="term">伙伴</td><td>buddy</td><td>同一订单下与某块相邻、能合并成上一级的那块；由 PFN 异或运算直接算出。</td></tr>
+  <tr><td class="term">空闲区</td><td>struct free_area</td><td>某个 zone 中某个订单的空闲块链表集合，按迁移类型再分多条链表。</td></tr>
+  <tr><td class="term">迁移类型</td><td>migratetype</td><td>UNMOVABLE / RECLAIMABLE / MOVABLE / CMA / HIGHATOMIC …，用来把相似“可移动性”的页放在一起，减少碎片。</td></tr>
+  <tr><td class="term">每 CPU 页缓存</td><td>PCP, per-CPU pages</td><td>每个 CPU 私有的小页池，order 0 分配/释放优先走它，避免抢 zone 锁。</td></tr>
+  <tr><td class="term">水印</td><td>watermark (min/low/high)</td><td>zone 的三档空闲页阈值，低于 low 唤醒 kswapd，低于 min 才允许直接回收。</td></tr>
+  <tr><td class="term">kswapd</td><td>kswapd</td><td>每个节点一个的后台回收内核线程，被唤醒后把 low 抬回 high。</td></tr>
+  <tr><td class="term">GFP 标志</td><td>gfp_t / GFP flags</td><td>调用者告诉分配器“我能不能睡眠、能不能回收、能不能用紧急储备”的一组位标志。</td></tr>
+  <tr><td class="term">直接回收</td><td>direct reclaim</td><td>分配者在自己的上下文里同步地回收页面，代价是延迟。</td></tr>
+  <tr><td class="term">OOM killer</td><td>OOM killer</td><td>回收也救不回内存时，挑一个进程杀掉以释放内存。</td></tr>
+  <tr><td class="term">直接映射</td><td>direct map / page_address</td><td>内核虚拟地址与物理内存的线性对应区，<code>page_address()</code> 返回某页在此区的地址。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 物理内存是怎样被描述的</h3>
+<p>内核描述物理内存是一条自上而下的四层结构：</p>
+<pre><code>机器
+ └── NUMA 节点 (pg_data_t / pglist_data)   ← 一般 x86_64 单路机器只有 node 0
+      └── 内存区 (struct zone)             ← DMA / DMA32 / NORMAL / MOVABLE ...
+           └── 空闲区 (free_area[0..MAX_ORDER-1])   ← 每个订单一条或多条空闲链表
+                └── struct page               ← 每 4 KB 物理内存一个，全系统 mem_map 数组
+</code></pre>
+<p>节点内为什么还要分 zone？因为历史上有些设备只能对低 16 MB 物理地址做 DMA（ISA 设备），有些只能访问 32 位地址；另外 x86-32 时代高于 896 MB 的内存需要临时映射才能访问（HIGHMEM）。x86_64 上通常只剩 <code>ZONE_DMA</code>（16 MB 以下）、<code>ZONE_DMA32</code>（4 GB 以下）和 <code>ZONE_NORMAL</code>，桌面机器还常有 <code>ZONE_MOVABLE</code>。zone 之间的边界在 <code>include/linux/mmzone.h</code> 的 <code>enum zone_type</code> 里定义。每个 zone 内部再按订单维护空闲链表，这就是伙伴系统的“营业柜台”。</p>
+
+<p class="srcline">include/linux/mmzone.h:96-99  struct free_area</p>
+<pre><code>struct free_area {
+	struct list_head	free_list[MIGRATE_TYPES];
+	unsigned long		nr_free;
+};</code></pre>
+<p>一个订单只用一个 <code>struct free_area</code> 描述，里面却有 <code>MIGRATE_TYPES</code> 条链表——因为同样大小的空闲块还要按“将来能不能移动/回收”分开排队。可移动的页（用户匿名页、页缓存）放在 MOVABLE 链，不可移动的（内核数据结构）放在 UNMOVABLE 链。这样同一个 zone 内的高阶大块不容易被小结构页打散。<code>nr_free</code> 记录该订单的总空闲块数，上层的水位线检查会直接读它。</p>
+
+<p class="srcline">include/linux/mm_types.h:68-94  struct page（节选）</p>
+<pre><code>struct page {
+	unsigned long flags;		/* Atomic flags, some possibly
+					 * updated asynchronously */
+	/*
+	 * Five words (20/40 bytes) are available in this union.
+	 * WARNING: bit 0 of the first word is used for PageTail(). That
+	 * means the other users of this union MUST NOT use the bit to
+	 * avoid collision and false-positive PageTail().
+	 */
+	union {
+		struct {	/* Page cache and anonymous pages */
+			/**
+			 * @lru: Pageout list, eg. active_list protected by
+			 * pgdat-&gt;lru_lock.  Sometimes used as a generic list
+			 * by the page owner.
+			 */
+			struct list_head lru;
+			/* See page-flags.h for PAGE_MAPPING_FLAGS */
+			struct address_space *mapping;
+			pgoff_t index;		/* Our offset within mapping. */
+			/**
+			 * @private: Mapping-private opaque data.
+			 * Usually used for buffer_heads if PagePrivate.
+			 * Used for swp_entry_t if PageSwapCache.
+			 * Indicates order in the buddy system if PageBuddy.
+			 */
+			unsigned long private;
+		};</code></pre>
+<p>这里省略了该结构后面所有其它 union 分支（slab、compound tail、页表页等）。<code>struct page</code> 是物理内存的“档案卡”：每个页帧一张，占几十字节，全系统所有 <code>struct page</code> 连续排成一个数组（<code>vmemmap</code>/<code>mem_map</code>），因此由 PFN 可以直接算出结构体指针：<code>pfn_to_page(pfn)</code> 就是 <code>mem_map + pfn - ARCH_PFN_OFFSET</code>（见 <code>include/asm-generic/memory_model.h:33</code>）。</p>
+<ul>
+<li><code>flags</code>：一组位标志，<code>PageBuddy</code> 表示该页（或该块首页）正挂在伙伴系统里；<code>PageSlab</code> 表示它被 slab 用着；<code>PageLRU</code> 表示它在回收链表上。</li>
+<li><code>lru</code>：伙伴系统把空闲块的首页挂进 <code>free_area.free_list</code> 时，用的正是这个 <code>lru</code> 节点——一块内存的“身份证”在空闲时也当链表节点用。</li>
+<li><code>private</code>：<code>PageBuddy</code> 时存的是该块的 <strong>order</strong>，这就是 <code>buddy_order(page)</code> 的来源（<code>set_buddy_order()</code> 就是在写它）。</li>
+<li><code>mapping/index</code>：页缓存/匿名页时会用，空闲时无意义。union 的设计目标就是让一个描述符同时承担多种角色而不浪费时间。</li>
+</ul>
+<p><span class="term">PFN</span>（页帧号）是这一层的核心索引。物理地址与 PFN 的关系是 <code>pfn = phys_addr &gt;&gt; PAGE_SHIFT</code>，反过来 <code>phys = pfn &lt;&lt; PAGE_SHIFT</code>（简化起见忽略 <code>ARCH_PFN_OFFSET</code>）。伙伴系统内部全部用 PFN 做加减和异或，这比指针运算更省而且与内存模型解耦。</p>
+
+<h3>3.2 分配：从订单到页</h3>
+<pre><code>alloc_pages(gfp, order)
+ └─ __alloc_pages_nodemask
+     ├─ 快路径: get_page_from_freelist   ← 按 zonelist 顺序试水位线
+     │    └─ rmqueue
+     │        ├─ order==0 → rmqueue_pcplist（每 CPU 页缓存）
+     │        └─ 否则 → 拿 zone-&gt;lock → __rmqueue_smallest
+     │                 └─ 从 order 起往上找非空链表 → expand() 切块
+     └─ 慢路径: __alloc_pages_slowpath
+          ├─ wake_all_kswapds（唤醒后台回收）
+          ├─ 直接压缩 / 直接回收
+          └─ __alloc_pages_may_oom（OOM killer）
+</code></pre>
+<p>顺序很关键：快路径不动任何锁、不睡眠，只看一眼 zone 的空闲量是否高于<strong>低水位</strong>，高就立刻从链表切页返回。只有快路径失败才进入慢路径，慢路径会先叫醒 kswapd，再自己同步回收，最后才考虑 OOM。</p>
+
+<h3>3.3 释放与合并</h3>
+<p>释放是分配的逆过程，但合并方向相反：先看相邻的“伙伴”是不是也空闲，是就合成更高一级，再继续往上找，直到伙伴不空闲或者到了 <code>MAX_ORDER</code> 上限。</p>
+<pre><code>   order 3 块 [A B C D E F G H]   (8 页)
+   释放 A：伙伴 B 空闲 → 合并成 order 1
+   [AB] 的伙伴 [CD] 空闲 → 合并成 order 2
+   [ABCD] 的伙伴 [EFGH] 空闲 → 合并成 order 3，继续看 order 4 邻居
+   ── 一次释放可能触发连锁合并，直到遇到“不空闲的伙伴”
+</code></pre>
+<p>伙伴是谁？在第 o 级，伙伴 PFN = <code>pfn ^ (1 &lt;&lt; o)</code>。这行代码意味着：只要看 PFN 的第 o 位（从 0 数）翻转即可，不需要拜访邻居结构体，也不需要区间搜索。这正是伙伴系统“便宜”的根本原因。</p>
+
+<h3>3.4 三档水印与 kswapd</h3>
+<table>
+  <tr><th>水位</th><th>触发行为</th></tr>
+  <tr><td>high</td><td>kswapd 的目标：回收完成后把空闲页抬到这以上才去睡觉。</td></tr>
+  <tr><td>low</td><td>快路径申请默认在这条线之上；一旦跌破，分配者先唤醒 kswapd，再决定要不要自己回收。</td></tr>
+  <tr><td>min</td><td>绝对底线，只有允许“硬核”分配（带 <code>__GFP_HIGH</code>/<code>__GFP_ATOMIC</code> 或 OOM 受害者）才能越过。</td></tr>
+</table>
+<p>三者之间有一块缓冲带，让后台回收有机会在“真正吃紧”之前把内存腾出来。水印的计算在 <code>mm/page_alloc.c</code> 的 <code>__zone_watermark_ok()</code> 里。</p>
+
+<h3>3.5 GFP 标志：调用者的三种“态度”</h3>
+<table>
+  <tr><th>标志</th><th>可否睡眠/阻塞</th><th>能否进入直接回收</th><th>典型用途</th></tr>
+  <tr><td><code>GFP_KERNEL</code></td><td>可以睡眠</td><td>可以</td><td>进程上下文，最常见；可能因回收而变慢。</td></tr>
+  <tr><td><code>GFP_ATOMIC</code></td><td>不能睡眠</td><td>不进入直接回收，仅唤醒 kswapd</td><td>中断上下文、持自旋锁时。</td></tr>
+  <tr><td><code>GFP_NOWAIT</code></td><td>不能睡眠</td><td>不做任何回收</td><td>尽力而为，失败就返回 NULL。</td></tr>
+  <tr><td><code>GFP_NOFS</code></td><td>可以睡眠</td><td>可以，但不回调文件系统</td><td>文件系统内部，避免递归进 FS。</td></tr>
+  <tr><td><code>GFP_NOIO</code></td><td>可以睡眠</td><td>可以，但不发起任何 IO</td><td>块层/存储路径。</td></tr>
+  <tr><td><code>GFP_HIGHUSER_MOVABLE</code></td><td>可以睡眠</td><td>可以</td><td>用户页；页可迁移，利于抗碎片。</td></tr>
+  <tr><td><code>GFP_DMA</code>/<code>GFP_DMA32</code></td><td>视组合</td><td>视组合</td><td>有 DMA 地址限制的设备。</td></tr>
+</table>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 分配总入口：__alloc_pages_nodemask</h3>
+<p>这是几乎所有“要页”行为的最终汇聚点（<code>alloc_pages</code> 宏最终都调到这里）。它负责“选 zone、选 alloc_flags、跑快路径、跑慢路径、记 memcg 账、打 tracepoint”。</p>
+<p class="srcline">mm/page_alloc.c:5630-5691  __alloc_pages_nodemask（省略了 prepare_alloc_pages 的内部、memcg 细节与 tracepoint 参数解释）</p>
+<pre><code>__alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+							nodemask_t *nodemask)
+{
+	struct page *page;
+	unsigned int alloc_flags = ALLOC_WMARK_LOW; /* 默认使用低水位线 */
+	gfp_t alloc_mask; /* 实际用于分配的gfp_t */
+	struct alloc_context ac = { };
+
+	/*
+	 * 在多个地方我们假设order值是合理的，
+	 * 所以如果请求超出界限就提前退出。
+	 */
+	if (unlikely(order &gt;= MAX_ORDER)) {
+		WARN_ON_ONCE(!(gfp_mask &amp; __GFP_NOWARN)); /* 除非设置了__GFP_NOWARN，否则发出警告 */
+		return NULL;
+	}
+
+	gfp_mask &amp;= gfp_allowed_mask; /* 应用系统级的gfp掩码限制 */
+	alloc_mask = gfp_mask;
+	if (!prepare_alloc_pages(gfp_mask, order, preferred_nid, nodemask, &amp;ac, &amp;alloc_mask, &amp;alloc_flags))
+		return NULL;
+
+	/*
+	 * 禁止第一次尝试回退到会造成内存碎片的类型，
+	 * 直到所有本地zone都被考虑过。
+	 */
+	alloc_flags |= alloc_flags_nofragment(ac.preferred_zoneref-&gt;zone, gfp_mask);
+
+	/* 第一次分配尝试 - 快路径 */
+	page = get_page_from_freelist(alloc_mask, order, alloc_flags, &amp;ac);
+	if (likely(page))
+		goto out; /* 快路径成功，直接返回 */
+
+	/* ...（省略 current_gfp_context、nodemask 恢复等准备慢路径的代码）... */
+
+	page = __alloc_pages_slowpath(alloc_mask, order, &amp;ac); /* 进入慢路径 */
+
+out:
+	/* 如果启用了memcg kmem计费且需要计费，尝试对页面计费 */
+	if (memcg_kmem_enabled() &amp;&amp; (gfp_mask &amp; __GFP_ACCOUNT) &amp;&amp; page &amp;&amp;
+	    unlikely(__memcg_kmem_charge_page(page, gfp_mask, order) != 0)) {
+		__free_pages(page, order); /* 计费失败，释放页面 */
+		page = NULL;
+	}
+
+	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype); /* 跟踪分配事件 */
+
+	return page;
+}</code></pre>
+<ul>
+<li><code>order &gt;= MAX_ORDER</code> 直接拒绝：5.10 的 <code>MAX_ORDER</code> 是 11（<code>include/linux/mmzone.h:27</code>），也就是最大一次拿 2048 页 = 8 MB（4 KB 页）。要更大块必须走 vmalloc/CMA/hugetlb 等别的机制。</li>
+<li><code>alloc_flags = ALLOC_WMARK_LOW</code> 是“快路径接受的水位线”；慢路径会把 <code>gfp_to_alloc_flags()</code> 的换算结果接管（那一步会把 <code>__GFP_ATOMIC</code> 映射成 ALLOC_HARDER）。</li>
+<li><code>get_page_from_freelist</code> 是快路径的核心，它会按 zonelist（本地 node 的 zone 优先，DMA 限制也在这里体现）逐一试探。</li>
+<li>慢路径之前先 <code>current_gfp_context()</code>：这就是 <code>GFP_NOFS/GFP_NOIO</code> 的作用域传播——文件系统某段代码用 <code>memalloc_nofs_save()</code> 标记后，之后所有 <code>GFP_KERNEL</code> 申请都会被降级成 NOFS，防止“递归回文件系统”导致死锁。</li>
+<li>最后 memcg 计费失败要 <code>__free_pages</code> 回滚：分配成功不等于能用，账户额度也参与失败判定。</li>
+</ul>
+
+<h3>4.2 快路径里的水位线检查</h3>
+<p class="srcline">mm/page_alloc.c:4098-4137  __zone_watermark_ok（节选，省略了 HIGHATOMIC/CMA 的细节判断与后面 order&gt;0 的循环）</p>
+<pre><code>bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+			 int highest_zoneidx, unsigned int alloc_flags,
+			 long free_pages)
+{
+	long min = mark; /* 最小水位线，可能会被调整 */
+	int o;
+	const bool alloc_harder = (alloc_flags &amp; (ALLOC_HARDER|ALLOC_OOM));
+
+	/* free_pages可能变为负数 - 这是可以的 */
+	free_pages -= __zone_watermark_unusable_free(z, order, alloc_flags);
+
+	/* ALLOC_HIGH标志：降低一半的水位线要求，用于高优先级分配 */
+	if (alloc_flags &amp; ALLOC_HIGH)
+		min -= min / 2;
+
+	/* 更严格的分配条件：进一步降低水位线 */
+	if (unlikely(alloc_harder)) {
+		/* ...（省略 OOM/HARDER 的注释）... */
+		if (alloc_flags &amp; ALLOC_OOM)
+			min -= min / 2; /* OOM情况：降低一半水位线 */
+		else
+			min -= min / 4; /* ALLOC_HARDER：降低1/4水位线 */
+	}
+
+	/*
+	 * 检查order-0分配请求的水位线。如果不满足，
+	 * 那么即使有合适的页面空闲，高阶请求也无法进行。
+	 * lowmem_reserve确保低内存zone为更高zone保留一定内存，
+	 * 防止高zone内存耗尽时低zone被过度使用。
+	 */
+	if (free_pages &lt;= min + z-&gt;lowmem_reserve[highest_zoneidx])
+		return false;</code></pre>
+<ul>
+<li>第一刀先减掉 <code>__zone_watermark_unusable_free()</code>：一部分空闲页是低 zone 给高 zone 留的保留量，或者是不满足本次迁移类型的页，不能算进可用量。</li>
+<li><code>ALLOC_HIGH</code>/<code>ALLOC_HARDER</code>/<code>ALLOC_OOM</code> 让“紧急情况”的申请可以撕开更低的线。这就是为什么中断里用 <code>GFP_ATOMIC</code> 仍有机会在内存紧时拿到页，而普通 <code>GFP_KERNEL</code> 会先去回收。</li>
+<li><code>lowmem_reserve</code> 数组是 zone 级的“别人家的水缸不许舀”：高 zone 内存耗尽时，不能把低 zone（DMA 区）的保留量也吃光，否则 DMA 设备就真的要挂了。</li>
+<li>order 0 到这里就结束了；order &gt; 0 还要继续检查“该 order 及以上有没有空闲块”，因为一块高水位不代表能切出连续 8 页。</li>
+</ul>
+
+<h3>4.3 rmqueue：PCP 先行，伙伴系统兜底</h3>
+<p class="srcline">mm/page_alloc.c:3915-3960  rmqueue（省略了 out/failed 标签与统计细节；函数签名见 3907 行）</p>
+<pre><code>	if (likely(order == 0)) {
+		/*
+		 * MIGRATE_MOVABLE pcplist could have the pages on CMA area and
+		 * we need to skip it when CMA area isn't allowed.
+		 */
+		if (!IS_ENABLED(CONFIG_CMA) || alloc_flags &amp; ALLOC_CMA ||
+				migratetype != MIGRATE_MOVABLE) {
+			page = rmqueue_pcplist(preferred_zone, zone, gfp_flags,
+					migratetype, alloc_flags);
+			goto out;
+		}
+	}
+
+	/*
+	 * We most definitely don't want callers attempting to
+	 * allocate greater than order-1 page units with __GFP_NOFAIL.
+	 */
+	WARN_ON_ONCE((gfp_flags &amp; __GFP_NOFAIL) &amp;&amp; (order &gt; 1));
+	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
+
+	do {
+		page = NULL;
+		/*
+		 * order-0 request can reach here when the pcplist is skipped
+		 * due to non-CMA allocation context. HIGHATOMIC area is
+		 * reserved for high-order atomic allocation, so order-0
+		 * request should skip it.
+		 */
+		if (order &gt; 0 &amp;&amp; alloc_flags &amp; ALLOC_HARDER) {
+			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+			if (page)
+				trace_mm_page_alloc_zone_locked(page, order, migratetype);
+		}
+		if (!page)
+			page = __rmqueue(zone, order, migratetype, alloc_flags);
+	} while (page &amp;&amp; check_new_pages(page, order));
+	spin_unlock(&amp;zone-&gt;lock);</code></pre>
+<ul>
+<li>order 0 默认先走 <code>rmqueue_pcplist</code>：它取本 CPU 的 <code>per_cpu_pages</code>，从链表头摘一页，几乎不碰全局锁。唯一例外是“MOVABLE + 不允许用 CMA”的组合——因为 MOVABLE 的 pcp 列表里可能混着 CMA 页，不能随便给。</li>
+<li><code>spin_lock_irqsave(&amp;zone-&gt;lock)</code> 是每个 zone 一把锁，所有慢一点的高阶分配、合并都在它底下。</li>
+<li><code>ALLOC_HARDER</code>（来自 <code>__GFP_ATOMIC</code>）且 order &gt; 0 时，先试 <code>MIGRATE_HIGHATOMIC</code> 预留池，给“中断里还要拿连续页”留后路。</li>
+<li><code>__rmqueue</code> 才是真正的伙伴系统入口；它内部会在本迁移类型的链表找不到时按 <code>fallbacks[]</code> 表去“借”别的类型的块（这一步可能触发整块 pageblock 的迁移类型改写）。</li>
+<li><code>check_new_pages</code> 在开 <code>CONFIG_DEBUG_VM</code>/<code>debug_pagealloc</code> 时会逐页检查 <code>struct page</code> 状态是否干净；生产配置下基本是编译掉的空壳。</li>
+</ul>
+
+<h3>4.4 __rmqueue_smallest + expand：从大块切出所需</h3>
+<p class="srcline">mm/page_alloc.c:2684-2704  __rmqueue_smallest</p>
+<pre><code>struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+						int migratetype)
+{
+	unsigned int current_order;
+	struct free_area *area;
+	struct page *page;
+
+	/* Find a page of the appropriate size in the preferred list */
+	for (current_order = order; current_order &lt; MAX_ORDER; ++current_order) {
+		area = &amp;(zone-&gt;free_area[current_order]);
+		page = get_page_from_free_area(area, migratetype);
+		if (!page)
+			continue;
+		del_page_from_free_list(page, zone, current_order);
+		expand(zone, page, order, current_order, migratetype);
+		set_pcppage_migratetype(page, migratetype);
+		return page;
+	}
+
+	return NULL;
+}</code></pre>
+<p>循环从所需 order 往上找，找到第一个非空链表就把首页摘下来，然后 <code>expand()</code> 把它劈开：</p>
+<p class="srcline">mm/page_alloc.c:2520-2542  expand</p>
+<pre><code>static inline void expand(struct zone *zone, struct page *page,
+	int low, int high, int migratetype)
+{
+	unsigned long size = 1 &lt;&lt; high;
+
+	while (high &gt; low) {
+		high--;
+		size &gt;&gt;= 1;
+		VM_BUG_ON_PAGE(bad_range(zone, &amp;page[size]), &amp;page[size]);
+
+		/*
+		 * Mark as guard pages (or page), that will allow to
+		 * merge back to allocator when buddy will be freed.
+		 * Corresponding page table entries will not be touched,
+		 * pages will stay not present in virtual address space
+		 */
+		if (set_page_guard(zone, &amp;page[size], high, migratetype))
+			continue;
+
+		add_to_free_list(&amp;page[size], zone, high, migratetype);
+		set_buddy_order(&amp;page[size], high);
+	}
+}</code></pre>
+<ul>
+<li><code>size = 1 &lt;&lt; high</code> 是当前整块的页数；每降一级，<code>size</code> 减半，后半块 <code>&amp;page[size]</code> 挂回该级空闲链表，前半块继续往下切。最终留下的前半块正好是请求的 order，前缀对齐天然满足——这就是“伙伴”由异或算出的前提。</li>
+<li><code>set_page_guard()</code> 在 <code>CONFIG_DEBUG_PAGEALLOC</code> 的 <code>guard_page</code> 模式下会把切出来的半块标记成守卫页（不当空闲用但也不真的释放），用来检测越界访问；正常内核直接走 <code>add_to_free_list</code>。</li>
+<li>每一块归还到链表前都写 <code>set_buddy_order()</code>，也就是把 order 存进 <code>page-&gt;private</code>。日后 <code>page_is_buddy()</code> 靠这个值 + PageBuddy 标志判断邻居能不能合并。</li>
+</ul>
+
+<h3>4.5 释放与连锁合并：__free_one_page</h3>
+<p class="srcline">mm/page_alloc.c:1207-1257  __free_one_page（省略了 1258 行之后 isolate pageblock 的防误合并逻辑，以及最后的 to_tail/统计分支）</p>
+<pre><code>static inline void __free_one_page(struct page *page,
+		unsigned long pfn,
+		struct zone *zone, unsigned int order,
+		int migratetype, fpi_t fpi_flags)
+{
+	struct capture_control *capc = task_capc(zone);
+	unsigned long buddy_pfn;
+	unsigned long combined_pfn;
+	unsigned int max_order;
+	struct page *buddy;
+	bool to_tail;
+
+	max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
+
+	VM_BUG_ON(!zone_is_initialized(zone));
+	VM_BUG_ON_PAGE(page-&gt;flags &amp; PAGE_FLAGS_CHECK_AT_PREP, page);
+
+	VM_BUG_ON(migratetype == -1);
+	if (likely(!is_migrate_isolate(migratetype)))
+		__mod_zone_freepage_state(zone, 1 &lt;&lt; order, migratetype);
+
+	VM_BUG_ON_PAGE(pfn &amp; ((1 &lt;&lt; order) - 1), page);
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+
+continue_merging:
+	while (order &lt; max_order - 1) {
+		if (compaction_capture(capc, page, order, migratetype)) {
+			__mod_zone_freepage_state(zone, -(1 &lt;&lt; order),
+								migratetype);
+			return;
+		}
+		buddy_pfn = __find_buddy_pfn(pfn, order);
+		buddy = page + (buddy_pfn - pfn);
+
+		if (!pfn_valid_within(buddy_pfn))
+			goto done_merging;
+		if (!page_is_buddy(page, buddy, order))
+			goto done_merging;
+		/*
+		 * Our buddy is free or it is CONFIG_DEBUG_PAGEALLOC guard page,
+		 * merge with it and move up one order.
+		 */
+		if (page_is_guard(buddy))
+			clear_page_guard(zone, buddy, order, migratetype);
+		else
+			del_page_from_free_list(buddy, zone, order);
+		combined_pfn = buddy_pfn &amp; pfn;
+		page = page + (combined_pfn - pfn);
+		pfn = combined_pfn;
+		order++;
+	}
+	if (max_order &lt; MAX_ORDER) {
+		/* ...（省略：防止 isolate pageblock 与普通 pageblock 误合并）... */</code></pre>
+<p>关键行点位：</p>
+<ul>
+<li><code>VM_BUG_ON_PAGE(pfn &amp; ((1 &lt;&lt; order) - 1), page)</code>：释放的块必须按自身大小对齐，否则“伙伴异或”公式不成立，直接 BUG。</li>
+<li><code>__find_buddy_pfn(pfn, order)</code> 的定义就在 <code>mm/internal.h:174-177</code>：<code>return page_pfn ^ (1 &lt;&lt; order);</code>。只要理解“翻转第 order 位”，就理解了整个伙伴系统。</li>
+<li><code>pfn_valid_within</code> 检查跨越了内存空洞（memory hole）的情况：物理地址不一定连续，空洞另一侧的“假伙伴”不能合并。</li>
+<li><code>page_is_buddy(page, buddy, order)</code> 要求：对方是 <code>PageBuddy</code>、order 相同、且 migratetype 兼容。三者都满足才合并。</li>
+<li><code>combined_pfn = buddy_pfn &amp; pfn</code> 取两块的共同起点（低 order 位为 0 的那一个），<code>order++</code> 后继续循环——这就是连锁合并，可能一次释放把四块 2 页合成一块 8 页，甚至更大。</li>
+<li><code>max_order = min(MAX_ORDER, pageblock_order + 1)</code>：普通合并最多到 pageblock 边界，防止把不同迁移类型的 pageblock 混成大块；只有在没有 isolate pageblock 时才放宽到 <code>MAX_ORDER</code>。</li>
+</ul>
+
+<h3>4.6 单页释放走 PCP</h3>
+<p class="srcline">mm/page_alloc.c:3595-3627  free_unref_page_commit</p>
+<pre><code>static void free_unref_page_commit(struct page *page, unsigned long pfn)
+{
+	struct zone *zone = page_zone(page);
+	struct per_cpu_pages *pcp;
+	int migratetype;
+
+	migratetype = get_pcppage_migratetype(page);
+	__count_vm_event(PGFREE);
+
+	/*
+	 * We only track unmovable, reclaimable and movable on pcp lists.
+	 * Free ISOLATE pages back to the allocator because they are being
+	 * offlined but treat HIGHATOMIC as movable pages so we can get those
+	 * areas back if necessary. Otherwise, we may have to free
+	 * excessively into the page allocator
+	 */
+	if (migratetype &gt;= MIGRATE_PCPTYPES) {
+		if (unlikely(is_migrate_isolate(migratetype))) {
+			free_one_page(zone, page, pfn, 0, migratetype,
+				      FPI_NONE);
+			return;
+		}
+		migratetype = MIGRATE_MOVABLE;
+	}
+
+	pcp = &amp;this_cpu_ptr(zone-&gt;pageset)-&gt;pcp;
+	list_add(&amp;page-&gt;lru, &amp;pcp-&gt;lists[migratetype]);
+	pcp-&gt;count++;
+	if (pcp-&gt;count &gt;= pcp-&gt;high) {
+		unsigned long batch = READ_ONCE(pcp-&gt;batch);
+		free_pcppages_bulk(zone, batch, pcp);
+	}
+}</code></pre>
+<ul>
+<li>单页释放不直接进伙伴系统，先挂到本 CPU 的 <code>pcp-&gt;lists[migratetype]</code>；只有 <code>count &gt;= high</code> 时才整批 <code>free_pcppages_bulk</code> 还给伙伴系统（一次还 <code>batch</code> 个）。这相当于“脏衣服先丢进本屋的篮子，满了再统一拿去洗衣房”。</li>
+<li>ISOLATE 页必须直接回伙伴系统，因为它是被内存热插拔/迁移流程隔离的页，进 PCP 会让隔离语义失效。</li>
+<li>HIGHATOMIC 被当成 MOVABLE 处理是一种折中：它还回来时不应该再占着高价预留池。</li>
+<li>入口 <code>free_unref_page()</code>（<code>mm/page_alloc.c:3640-3651</code>）只做两件事：<code>free_unref_page_prepare()</code> 检查引用计数与 page 状态，然后关中断、调用 commit、开中断。关中断是为了让 <code>this_cpu_ptr</code> 的访问不被打断。</li>
+</ul>
+
+<h3>4.7 慢路径唤醒 kswapd + 直接回收 + OOM</h3>
+<p class="srcline">mm/page_alloc.c:5001-5014  wake_all_kswapds</p>
+<pre><code>static void wake_all_kswapds(unsigned int order, gfp_t gfp_mask,
+			     const struct alloc_context *ac)
+{
+	struct zoneref *z;
+	struct zone *zone;
+	pg_data_t *last_pgdat = NULL;
+	enum zone_type highest_zoneidx = ac-&gt;highest_zoneidx;
+
+	for_each_zone_zonelist_nodemask(zone, z, ac-&gt;zonelist, highest_zoneidx,
+					ac-&gt;nodemask) {
+		if (last_pgdat != zone-&gt;zone_pgdat)
+			wakeup_kswapd(zone, gfp_mask, order, highest_zoneidx);
+		last_pgdat = zone-&gt;zone_pgdat;
+	}
+}</code></pre>
+<p>它按 zonelist 顺序遍历 zone，但每个 NUMA 节点只叫一次 <code>wakeup_kswapd</code>——kswapd 是节点级的线程，不是 zone 级的。慢路径在这之后才尝试 <code>__alloc_pages_direct_reclaim</code>（<code>mm/page_alloc.c:4972</code> 起），那条路径会真正调 <code>try_to_free_pages()</code> 同步回收，这是第 18 篇的主角。最后的兜底在 <code>mm/page_alloc.c:5472-5473</code>：</p>
+<pre><code>	/* Reclaim has failed us, start killing things */
+	page = __alloc_pages_may_oom(gfp_mask, order, ac, &amp;did_some_progress);</code></pre>
+<p>OOM killer 选谁？看 <code>oom_badness</code>：</p>
+<p class="srcline">mm/oom_kill.c:201-239  oom_badness（省略了 209-217 行获取 mm 与 oom_unkillable 判断后的部分说明）</p>
+<pre><code>long oom_badness(struct task_struct *p, unsigned long totalpages)
+{
+	long points;
+	long adj;
+
+	if (oom_unkillable_task(p))
+		return LONG_MIN;
+
+	p = find_lock_task_mm(p);
+	if (!p)
+		return LONG_MIN;
+
+	/* ...（省略：注释说明为何排除 oom_unkillable / vfork / 已标记跳过的任务）... */
+	adj = (long)p-&gt;signal-&gt;oom_score_adj;
+	if (adj == OOM_SCORE_ADJ_MIN ||
+			test_bit(MMF_OOM_SKIP, &amp;p-&gt;mm-&gt;flags) ||
+			in_vfork(p)) {
+		task_unlock(p);
+		return LONG_MIN;
+	}
+
+	/*
+	 * The baseline for the badness score is the proportion of RAM that each
+	 * task's rss, pagetable and swap space use.
+	 */
+	points = get_mm_rss(p-&gt;mm) + get_mm_counter(p-&gt;mm, MM_SWAPENTS) +
+		mm_pgtables_bytes(p-&gt;mm) / PAGE_SIZE;
+	task_unlock(p);
+
+	/* Normalize to oom_score_adj units */
+	adj *= totalpages / 1000;
+	points += adj;
+
+	return points;
+}</code></pre>
+<ul>
+<li>分数 = 常驻页 + swap 页 + 页表页（换算成页数），再叠加 <code>oom_score_adj</code>（范围 -1000..1000，按总页数千分比换算）。分数最高者被杀。</li>
+<li>返回 <code>LONG_MIN</code> 表示“不可杀”：内核线程、<code>oom_score_adj=-1000</code>、正在 vfork 等。</li>
+<li><code>oom_score_adj</code> 是用户能调的“自我保护旋钮”：数据库进程可以设成 -500，日志流水线可以设成 +500。</li>
+</ul>
+
+<h2>5. 动手验证</h2>
+<p>以下命令在任意普通 x86_64 Linux 上都可用（不需要编译内核；读 <code>/proc</code> 只需要普通用户权限，写 <code>drop_caches</code> 需要 root）。</p>
+
+<h3>5.1 看伙伴系统的“存货清单”</h3>
+<pre><code>$ cat /proc/buddyinfo
+Node 0, zone      DMA      1      1      1      1      1      1      1      1      1      1      3
+Node 0, zone    DMA32    123    456   789   ... （共 11 列）
+Node 0, zone   Normal   5432   3210   1500    300     88     21      6      1      0      0      0
+</code></pre>
+<p>每行是一个 zone，后面 11 列对应 order 0..10，每列数字是该 order <strong>空闲块的个数</strong>。换算成字节：order o 的每块大小 = 2<sup>o</sup> × 4 KB。所以“Normal 行第 0 列 5432”意味着 5432 个单页空闲；最后一列通常很小甚至为 0，说明大块连续内存稀缺——这正是外碎片的直观画像。若想看到更大的 order 11，5.10 的 <code>MAX_ORDER=11</code> 只打印 0..10 共 11 列。</p>
+
+<h3>5.2 按迁移类型细分</h3>
+<pre><code>$ sudo cat /proc/pagetypeinfo            # 需要 root（mode 0400）
+Free pages count per migrate type at order       0      1      2      3 ...
+Node    0, zone   Normal, type    Unmovable      120     30      5      0 ...
+Node    0, zone   Normal, type      Movable     4000   2000    700    120 ...
+Node    0, zone   Normal, type  Reclaimable      900    100     10      0 ...
+Node    0, zone   Normal, type      Reserve        0      0      0      0 ...
+</code></pre>
+<p>如果某个 zone 的 Movable 大块很多但 Unmovable 的 order 3+ 全是 0，说明“大块被小内核对象切碎了”；反过来 Movable 的小块多、大块少则说明用户页把大块吃掉了。<code>Reserve</code> 是 HIGHATOMIC 预留池，数量通常很小。</p>
+
+<h3>5.3 观察水位与 kswapd 的活跃度</h3>
+<pre><code>$ cat /proc/zoneinfo | grep -A8 "Node 0, zone   Normal" | head -20
+        pages free     1234567
+        min      12034
+        low      15042
+        high     18050
+        ...
+        nr_free_pages   1234567
+</code></pre>
+<p>把 <code>min/low/high</code> 与 <code>pages free</code> 对照：<code>pages free &gt; high</code> 说明宽裕，kswapd 在睡觉；接近 low 时它会开始忙。再配合 <code>grep kswapd /proc/*/stat</code> 或 <code>ps -eo pid,comm | grep kswapd</code> 可看到每节点一个线程。</p>
+
+<h3>5.4 触发一次水位下降（安全的小实验）</h3>
+<pre><code>$ free -m            # 记录 MemFree
+$ (for i in $(seq 1 2000); do head -c 4M /dev/urandom &gt; /dev/null; done)   # 制造页缓存压力
+$ free -m            # MemFree 下降、Cached 上升
+$ grep -E "pgscan|pgsteal" /proc/vmstat | head -5
+pgscan_kswapd    12345
+pgscan_direct        12
+pgsteal_kswapd   11000
+pgsteal_direct      10
+</code></pre>
+<p>若 <code>pgscan_kswapd</code> 明显增长说明后台回收被唤醒；若 <code>pgscan_direct</code> 增长则说明分配者自己下场回收了（意味着压力来得比后台快）。如果两个数都不动，说明还远没到 low 水位。</p>
+<div class="warn">别在生产机上跑“一次吃掉大半内存”的脚本。对照实验建议在 qemu 里做（512 MB 内存足够触发）。</div>
+
+<h3>5.5 观察 kmalloc/页分配行为（可选，需 root 或 eBPF 工具）</h3>
+<pre><code>$ sudo cat /sys/kernel/debug/tracing/available_events | grep -E "kmalloc|mm_page_alloc"
+$ sudo trace-cmd record -e kmalloc -e mm_page_alloc sleep 5
+</code></pre>
+<p>没有 ftrace/trace-cmd 的机器可以用 <code>/proc/vmstat</code> 的 <code>pgalloc_normal</code>/<code>pgfree</code>/<code>pgmigrate_success</code> 计数器观察分配与合并的总体节奏。RT 内核或开启了 <code>CONFIG_SLUB_DEBUG</code> 的机器上，<code>/sys/kernel/debug/</code> 下也会有更细的条目。</p>
+
+<h3>5.6 在 qemu + busybox 里做最小验证</h3>
+<pre><code>$ qemu-system-x86_64 -m 256 -kernel bzImage -append "console=ttyS0" \
+    -initrd initramfs.cpio.gz -nographic
+/ # cat /proc/buddyinfo
+/ # cat /proc/zoneinfo | grep -E "min|low|high|free"
+/ # echo 3 &gt; /proc/sys/vm/drop_caches    # 只清页缓存/slab，不影响进程页
+</code></pre>
+<p>256 MB 的虚拟机，<code>buddyinfo</code> 里 order 9/10 应该还能看到一些块；跑 <code>free -m</code> 再跑几轮 <code>dd if=/dev/zero of=/dev/null bs=4M count=32</code> 之后可以对照观察 order 链表的变化，直观理解“页缓存会消耗 order 0，也偶尔需要 order 9 的连续块来装大页”。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 为什么伙伴系统只提供 2 的幂大小的块？不这么做不行吗？</b>因为 2 的幂让“伙伴是谁”可以用一次异或算出（<code>pfn ^ (1 &lt;&lt; order)</code>），合并时只看一个邻居，分配和释放都是 O(1)；同时每个 order 的起点天然对齐，任意相邻两块要么能合并成高一阶的块，要么就不能。如果允许任意大小分配，就必须做区间搜索和复杂的空洞管理（例如首次适应/最佳适应），碎片和维护成本都会大幅上升。</div>
+<div class="qa"><b>Q2. order 1 的块释放后，什么情况下会合并成 order 2？如果合并了，order 1 的空闲链表里还会剩这一块吗？</b>只有在它的伙伴（同 order、同 migratetype、PageBuddy 且未隔离）也在空闲链表里，并且两者跨不过内存空洞、也不会跨越 isolate 边界时才合并；合并后的整块从两个 order 1 条目中删除，变成 order 2 链表中一个条目。<code>combined_pfn = buddy_pfn &amp; pfn</code> 就是新块的起始 PFN。</div>
+<div class="qa"><b>Q3. 为什么需要每 CPU 页缓存（PCP）？直接每次都动伙伴系统不行吗？</b>order 0 的分配/释放在系统里极其频繁（缺页、slab 补货、网络收包等），每次都去抢 zone 的自旋锁并进行链表操作，会让多核机器在锁上花掉大量时间；PCP 让本 CPU 先用私有的小链表完成事务，只在批量补充/回吐时与服务端交互，极大降低了缓存行反弹和锁竞争。</div>
+<div class="qa"><b>Q4. GFP_KERNEL 和 GFP_ATOMIC 在“能不能睡眠”上为什么是决定性的？</b><code>GFP_KERNEL</code> 包含 <code>__GFP_DIRECT_RECLAIM</code>，意味着内存紧张时分配者可以进入直接回收、等 IO、写回页缓存——这些都会睡眠。中断上下文、持自旋锁、禁抢占区域里绝对不能睡眠，所以只能用不含 <code>__GFP_DIRECT_RECLAIM</code> 的 <code>GFP_ATOMIC</code>。如果误用，会触发内核的「sleeping function called from invalid context」告警，严重时死锁。</div>
+<div class="qa"><b>Q5. water mark 的 min/low/high 为什么有三档？只留一档不行吗？</b>如果只有一档（比如 min），那每次跌破它时才反应，已经来不及回收了；如果只用 high，任何小波动都触发回收，会浪费 CPU。三档给出“预警—缓冲—目标”的梯度：跌到 low 先叫 kswapd，后台慢慢回收；跌到 min 才允许同步直接回收；回收到 high 才停。这样后台与前台形成了流水线。</div>
+
+<footer>
+  <p>上一篇：<a href="13-atomic.html">13-atomic 原子操作与内存屏障</a> · 下一篇：<a href="15-slab.html">15-slab 对象缓存</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1089 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 内核启动流程</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="04-debug-tools.html">下一篇：04 调试与观测工具 →</a>
+</nav>
+
+<h1>🐣 03 · 内核启动流程：从加电到第一个用户进程</h1>
+<p class="subtitle">把"按下电源"到"看到登录界面"这 3 秒钟拆成 5 个阶段，看清每一步是谁在干活 · 预计阅读 25 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>想象你在组装一台打印机：零件买了一堆（CPU、内存、硬盘、网卡），但它现在只是一堆零件，还不会打印任何东西。真正让它"活过来"的，是一条<strong>严格的装配流水线</strong>——先通电看灯亮不亮（硬件自检），再装驱动（让 CPU 学会和硬盘说话），最后装上应用（浏览器、编辑器）。哪一步顺序错了，要么开机黑屏，要么识别不出硬盘。</p>
+
+<p>Linux 内核启动就是这条流水线。固件（BIOS/UEFI）先把 CPU 从"关机"唤醒并做最小自检，然后把控制权交给引导加载器（GRUB2）；GRUB2 把压缩的内核镜像和 initramfs 读进内存，交棒给内核；内核接管全部硬件，初始化内存、调度器、中断、文件系统，最后<strong>主动启动第一个用户态进程</strong>（<code>/sbin/init</code>，PID=1），把控制权彻底交出去，从此自己退居幕后当"后台管家"。</p>
+
+<p>从操作系统视角看，这段代码要回答三个核心问题：<strong>① 硬件从谁手里接过来？</strong>（固件 → 引导器 → 内核，是一条<strong>单向的所有权移交链</strong>）；<strong>② 内核内部几十个子系统按什么顺序初始化？</strong>（有严格依赖：先有内存才能分配缓存，先有调度器才能开中断，先有 VFS 才能挂载根）；<strong>③ 什么时候算"启动完毕"？</strong>（内核自己不算，PID 1 的 init 跑起来才算，所以你会看到"启动 3 秒"其实是 init 报告的，不是内核报告的）。</p>
+
+<p>本篇就把这条流水线拆开讲：汇编入口 <code>head_64.S</code> 做了什么、<code>start_kernel()</code> 里那两百多行初始化各自负责什么、<code>initcall</code> 分级机制为什么存在、<code>rest_init()</code> 怎么凭空造出 PID 0/1/2、以及根文件系统是怎么被挂上的。<strong>读完你应该能解释：为什么 dmesg 里第一条消息是内核版本，而第一条属于用户空间的消息往往是 init 打的。</strong></p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">固件</td><td>BIOS / UEFI</td><td>主板上的第一段程序，开机时先跑它：自检硬件、枚举设备、找到启动盘，然后加载引导加载器。</td></tr>
+  <tr><td class="term">引导加载器</td><td>bootloader / GRUB2</td><td>磁盘上的小程序，按配置把内核镜像 + initramfs 读进内存并跳转过去。GRUB2 还能启动多个系统。</td></tr>
+  <tr><td class="term">内核镜像</td><td>bzImage / vmlinuz</td><td><code>arch/x86/boot/bzImage</code> 是可引导的压缩包；<code>vmlinux</code> 是解压后的 ELF，带完整符号表，给 gdb 用。</td></tr>
+  <tr><td class="term">自解压</td><td>self-extracting</td><td>bzImage 前半段是 32 位解压代码 + 压缩数据，启动时把自己原地解压成真正的内核。</td></tr>
+  <tr><td class="term">实模式 / 长模式</td><td>real mode / long mode</td><td>x86 CPU 的运行模式。启动时是 16 位实模式，内核代码运行在 64 位长模式。</td></tr>
+  <tr><td class="term">恒等映射</td><td>identity mapping</td><td>虚拟地址 == 物理地址的映射。启动早期 CPU 必须能这样访问内存，才搬得动内核自己。</td></tr>
+  <tr><td class="term">boot_params</td><td>boot parameters</td><td>引导器通过 <code>0x1e0</code> 地址交给内核的一块数据结构：内存布局、命令行、initrd 位置等。</td></tr>
+  <tr><td class="term">start_kernel</td><td>start_kernel()</td><td>内核初始化的总控函数（<code>init/main.c:949</code>），按顺序初始化几十个子系统。</td></tr>
+  <tr><td class="term">initcall</td><td>initcall</td><td>把初始化函数指针放进特殊的链接段，开机时由内核遍历调用。等级越高跑得越晚。</td></tr>
+  <tr><td class="term">device_initcall</td><td>device_initcall()</td><td>initcall 的第 6 级，绝大多数驱动用它注册自己（等价于 <code>module_init()</code>）。</td></tr>
+  <tr><td class="term">module_init</td><td>module_init()</td><td>驱动初始化入口宏。编进内核时等价于 <code>device_initcall</code>；编成 .ko 时在 <code>insmod</code> 时调用。</td></tr>
+  <tr><td class="term">rest_init</td><td>rest_init()</td><td>启动末尾的"分家"函数：创建 PID 1 和 PID 2，自己变成 PID 0（idle）。</td></tr>
+  <tr><td class="term">kthreadd</td><td>kernel thread daemon</td><td>PID=2 的内核线程，专门负责创建其他内核线程（kworker、ksoftirqd 等）。</td></tr>
+  <tr><td class="term">init 进程</td><td>init / PID 1</td><td>第一个用户态进程，系统的"总管家"，负责启动其余服务并回收僵尸进程。</td></tr>
+  <tr><td class="term">idle 进程</td><td>swapper / PID 0</td><td>CPU 没事干时就跑它。它也是"引导线程"转世后的身份。</td></tr>
+  <tr><td class="term">根文件系统</td><td>rootfs</td><td>系统的根目录挂载点。内核启动后必须挂上它，否则用户空间没有地方落脚。</td></tr>
+  <tr><td class="term">initramfs</td><td>initial RAM filesystem</td><td>打包成 cpio 的临时根文件系统，常含真正根盘所需的模块和 init 脚本。</td></tr>
+  <tr><td class="term">prepare_namespace</td><td>prepare_namespace()</td><td>挂载根文件系统的总入口（<code>init/do_mounts.c:645</code>）。</td></tr>
+  <tr><td class="term">__init 段</td><td>.init.text / .init.data</td><td>标记"只在启动时用一次"的代码和数据段，用完在 <code>free_initmem()</code> 里释放掉。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 完整启动时序（一张图看完）</h3>
+<pre><code>┌──────────────── 固件阶段（BIOS/UEFI）─────────────────┐
+│ 上电 → 固件自检(POST) → 枚举设备 → 读 MBR/GPT         │
+│        → 找到引导分区 → 加载 GRUB2 → GRUB2 读配置      │
+└───────────────────────────┬───────────────────────────┘
+                            │ 加载 bzImage + initramfs 到内存
+                            ▼
+┌──────────────── 内核阶段 A：解压与进入长模式 ──────────┐
+│ arch/x86/boot/compressed/head_64.S                    │
+│   startup_32 → 解压内核 → startup_64(0x200 入口)      │
+│   → 建立临时页表 → 打开 PAE/PGE → 写 CR3 → 长模式     │
+│   → 设 %gs / 早期 IDT / EFER(SCE,NX) / CR0           │
+│   → 跳到 C 代码                                      │
+└───────────────────────────┬───────────────────────────┘
+                            ▼
+┌──────────────── 内核阶段 B：通用初始化 ───────────────┐
+│ arch/x86/kernel/head64.c: x86_64_start_kernel()        │
+│   clear_bss() → copy_bootdata() → 内存保留            │
+│   → x86_64_start_reservations() → start_kernel()      │
+│                                                            │
+│ init/main.c: start_kernel()  【约 250 行初始化】          │
+│   setup_arch → build_all_zonelists → parse_early_param   │
+│   → vfs_caches_init_early → mm_init → sched_init        │
+│   → console_init → ... 几十个子系统 ...                 │
+│   → arch_call_rest_init() → rest_init()                 │
+└───────────────────────────┬───────────────────────────┘
+                            ▼
+┌──────────────── 内核阶段 C：分家 ─────────────────────┐
+│ init/main.c: rest_init()                                │
+│   kernel_thread(kernel_init) → PID 1                    │
+│   kernel_thread(kthreadd)    → PID 2                    │
+│   schedule() + cpu_startup_entry() → 本线程变 PID 0     │
+└───────────────────────────┬───────────────────────────┘
+                            ▼
+┌──────────── 内核阶段 D：PID 1 干实事 ─────────────────┐
+│ init/main.c: kernel_init() → kernel_init_freeable()    │
+│   wait_for_completion(kthreadd_done)                    │
+│   smp_init() → sched_init_smp()                         │
+│   do_basic_setup() → do_initcalls()  ← 驱动在这里注册   │
+│   console_on_rootfs()   ← 打开 /dev/console            │
+│   prepare_namespace()   ← 挂载根文件系统                │
+│   kernel_execve("/sbin/init")  ← 交出控制权            │
+└───────────────────────────┬───────────────────────────┘
+                            ▼
+┌──────────────── 用户空间阶段 ──────────────────────────┐
+│ /sbin/init (PID 1) 启动 systemd → 挂载剩余文件系统     │
+│ → 启动各种服务 → 你看到登录界面                        │
+│ 此刻内核变成"后台管家"：只处理中断、异常、系统调用       │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+
+<p>整张图只有一个核心思想：<strong>控制权是单向流动的，而且每一步都有明确的"交接点"</strong>。固件交给 bootloader，bootloader 交给内核，内核交给用户态。<code>rest_init()</code> 和 <code>kernel_execve()</code> 就是内核交出控制权的那两个函数。</p>
+
+<h3>3.2 为什么顺序不能乱？</h3>
+<p>内核初始化看起来是一长串函数调用，但顺序是<strong>被依赖关系严格约束</strong>的，不然就会当场 panic：</p>
+<table>
+  <tr><th>顺序约束</th><th>原因</th></tr>
+  <tr><td><code>setup_arch()</code> 必须在最前</td><td>要先知道内存长什么样（e820 表）、CPU 支持哪些特性，才能决定后续怎么分配内存、要不要开某些指令。</td></tr>
+  <tr><td><code>build_all_zonelists()</code> 在 <code>mm_init()</code> 之前</td><td>内存区（zone）的划分依据是 e820 解析出来的物理内存布局。</td></tr>
+  <tr><td><code>vfs_caches_init_early()</code> 在 <code>mm_init()</code> 之前</td><td>它的注释写得很直白：这些缓存要"用大块启动内存（bootmem）分配"，必须在 slab 分配器就绪之前做完。</td></tr>
+  <tr><td><code>sched_init()</code> 在 <code>local_irq_enable()</code> 之前</td><td>中断一开，定时器中断就会来。如果那时调度器还没建好，会直接 oops。</td></tr>
+  <tr><td><code>console_init()</code> 在中途</td><td>太早打印，串口/显示器驱动还没准备好；太晚打印，前面出问题就什么都看不到了。</td></tr>
+  <tr><td>initcall 在 <code>do_basic_setup()</code> 里跑</td><td>此时内存、调度器、中断都已就绪，驱动初始化函数才可以自由地分配内存、注册中断。</td></tr>
+  <tr><td><code>prepare_namespace()</code> 在 <code>kernel_execve()</code> 之前</td><td>用户态进程要有地方读自己的可执行文件，根文件系统必须先挂上。</td></tr>
+</table>
+
+<h3>3.3 initcall 分级表：驱动什么时候注册自己</h3>
+<p>驱动需要在正确的时机初始化自己（注册设备、申请中断、挂载文件系统）。但"正确时机"因驱动而异：内存相关的要最早，块设备驱动要晚一些。用<strong>宏 + 链接段</strong>表达这个顺序，是内核最经典的设计之一。</p>
+
+<table>
+  <tr><th>等级</th><th>宏</th><th>所在链接段</th><th>运行时机</th><th>典型使用者</th></tr>
+  <tr><td class="term">early</td><td><code>early_initcall(fn)</code></td><td><code>.initcallearly</code></td><td>SMP 启动之前（<code>do_pre_smp_initcalls()</code>）</td><td>内存子系统、时序等极早期初始化</td></tr>
+  <tr><td class="term">0</td><td><code>pure_initcall(fn)</code></td><td><code>.initcall0</code></td><td><code>do_initcalls()</code> 最早</td><td>只做变量初始化、无依赖</td></tr>
+  <tr><td class="term">1</td><td><code>core_initcall(fn)</code></td><td><code>.initcall1</code></td><td></td><td>核心子系统</td></tr>
+  <tr><td class="term">2</td><td><code>postcore_initcall(fn)</code></td><td><code>.initcall2</code></td><td></td><td>核心之后</td></tr>
+  <tr><td class="term">3</td><td><code>arch_initcall(fn)</code></td><td><code>.initcall3</code></td><td></td><td>架构相关</td></tr>
+  <tr><td class="term">4</td><td><code>subsys_initcall(fn)</code></td><td><code>.initcall4</code></td><td></td><td>一般子系统</td></tr>
+  <tr><td class="term">5</td><td><code>fs_initcall(fn)</code></td><td><code>.initcall5</code></td><td></td><td>文件系统（ext4、xfs…）</td></tr>
+  <tr><td class="term">rootfs</td><td><code>rootfs_initcall(fn)</code></td><td><code>.initcallrootfs</code></td><td>在 5 和 6 之间</td><td>根文件系统相关</td></tr>
+  <tr><td class="term">6</td><td><code>device_initcall(fn)</code></td><td><code>.initcall6</code></td><td></td><td><strong>设备驱动（<code>module_init()</code> 默认落这里）</strong></td></tr>
+  <tr><td class="term">7</td><td><code>late_initcall(fn)</code></td><td><code>.initcall7</code></td><td>最后</td><td>收尾工作</td></tr>
+</table>
+
+<div class="note">
+<strong>关键点：等级不是"优先级"，而是"跑在第几梯队"。</strong>同等级内的先后顺序由<strong>链接顺序</strong>决定（即 Makefile 里的 <code>obj-y</code> 顺序），<strong>跨等级则严格按表格从上到下</strong>。而且还有 <code>_sync</code> 变体（如 <code>core_initcall_sync</code> → <code>.initcall1s</code>），表示这个 initcall 必须<strong>同步执行完</strong>（不能丢到异步队列）。
+</div>
+
+<h3>3.4 module_init 与 initcall 的关系</h3>
+<p>这是新手最容易混淆的一点。<code>module_init()</code> 有<strong>两副面孔</strong>，取决于代码是编进内核还是编成模块：</p>
+
+<table>
+  <tr><th>场景</th><th><code>module_init(x)</code> 展开成</th><th>什么时候被调用</th><th>谁调用</th></tr>
+  <tr><td>编进内核（builtin，<code>CONFIG_XXX=y</code>）</td><td><code>__initcall(x)</code> → <code>device_initcall(x)</code> → 函数指针放进 <code>.initcall6</code> 段</td><td>开机时</td><td><code>do_initcalls()</code> 遍历调用</td></tr>
+  <tr><td>编成模块（<code>CONFIG_XXX=m</code>，生成 <code>.ko</code>）</td><td>生成一个叫 <code>init_module</code> 的函数（用 <code>alias</code> 属性指向你写的 init 函数）</td><td><code>insmod</code> / <code>modprobe</code> 时</td><td><code>kernel/module.c:3604</code> 的 <code>do_init_module()</code></td></tr>
+</table>
+
+<p>所以：<strong>同一个驱动源码，编译方式不同，初始化时机完全不同</strong>。编进内核它在开机第 6 梯队被调用；编成模块，它在被加载的那一刻被调用。这就是为什么"驱动明明 <code>insmod</code> 成功了却不工作"——可能它的 <code>module_init</code> 依赖某个只在内核启动早期才存在的东西。</p>
+
+<h3>3.5 谁是 PID 0、1、2？</h3>
+<pre><code>  PID 0   swapper/0   ← 引导线程转世而来，就是那个跑 start_kernel() 的 CPU
+                          永远待在 idle 循环里，CPU 没事干就跑它
+                          它是所有进程的祖先（task_struct 的 parent 链最终指向它）
+
+  PID 1   init        ← rest_init() 里第一个 kernel_thread 创建的
+                          第一个用户态进程（由它 execve /sbin/init 而来）
+                          回收僵尸进程、挂载文件系统、启动服务
+
+  PID 2   kthreadd    ← rest_init() 里第二个 kernel_thread 创建的
+                          所有内核线程的父进程（kworker/0、ksoftirqd/0 的爹）
+</code></pre>
+<p>为什么 init 必须是 PID 1？因为 <strong>PID 1 有特权</strong>：它回收不到父进程的僵尸（自己是父），忽略未被处理的信号（除了它显式注册的），并且是<strong>命名空间的初始化者</strong>——容器里的 PID 1 就是一个新的命名空间根。这个"特权"正是容器需要 <code>--init</code> 或特殊 init 的原因。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 解压入口：arch/x86/boot/compressed/head_64.S</h3>
+<p>GRUB2 把 bzImage 读进内存后，CPU 还处于 16 位实模式（<code>startup_32</code>）。这段汇编先切换到 32 位保护模式、设置好栈，然后解压出真正的内核，最后跳到 64 位入口。注意 <code>0x200</code> 这个偏移是 <strong>ABI 约定，不能改</strong>——UEFI stub 依赖它。</p>
+
+<p class="srcline">arch/x86/boot/compressed/head_64.S:308-345  startup_64（压缩镜像里的 64 位入口）</p>
+<pre><code>	.org 0x200
+SYM_CODE_START(startup_64)
+	/*
+	 * 64bit entry is 0x200 and it is ABI so immutable!
+	 * We come here either from startup_32 or directly from a
+	 * 64bit bootloader.
+	 * If we come here from a bootloader, kernel(text+data+bss+brk),
+	 * ramdisk, zero_page, command line could be above 4G.
+	 * We depend on an identity mapped page table being provided
+	 * that maps our entire kernel(text+data+bss+brk), zero page
+	 * and command line.
+	 */
+
+	cld
+	cli
+
+	/* Setup data segments. */
+	xorl	%eax, %eax
+	movl	%eax, %ds
+	movl	%eax, %es
+	movl	%eax, %ss
+	movl	%eax, %fs
+	movl	%eax, %gs
+
+	/*
+	 * Compute the decompressed kernel start address.  It is where
+	 * we were loaded at aligned to a 2M boundary. %rbp contains
+	 * the decompressed kernel start address.
+	 *
+	 * If it is a relocatable kernel then decompress and run the kernel
+	 * from load address aligned to 2MB addr, otherwise decompress and
+	 * run kernel from LOAD_PHYSICAL_ADDR
+	 *
+	 * We cannot rely on the calculation done in 32-bit mode, since
+	 * we may have been invoked via the 64-bit entry point.
+	 */
+	// ... 省略 KASLR 随机偏移计算（CONFIG_RELOCATABLE 下的 image_offset 处理）
+</code></pre>
+<p>逐点解释：</p>
+<ul>
+  <li><code>cld; cli</code>：清方向标志、关中断。此刻中断向量表还没建好，任何中断都是灾难。</li>
+  <li><code>movl %eax, %ds/%es/%ss/%fs/%gs</code>：把段寄存器清零。x86 上加载段寄存器会触发特权级检查，此时还在 ring 0，清零最省事。</li>
+  <li>"Compute the decompressed kernel start address"：解压出来的内核必须放在 <strong>2MB 对齐</strong>的物理地址上（因为要用 2MB 大页映射），所以要算出目标地址并存进 <code>%rbp</code>。</li>
+  <li>注释里说的 "identity mapped page table being provided"：<strong>64 位路径要求引导器（或 EFI stub）已经建好了恒等映射页表</strong>，否则解压代码没法访问 4GB 以上的内存。</li>
+</ul>
+
+<h3>4.2 内核真正的入口：arch/x86/kernel/head_64.S</h3>
+<p>解压完成后，控制权交给<strong>未压缩</strong>的内核镜像里的 <code>startup_64</code>。这段汇编干的事可以概括为四步：<strong>建页表 → 切长模式 → 设好段/栈/IDT → 跳 C 代码</strong>。</p>
+
+<p class="srcline">arch/x86/kernel/head_64.S:73-107  startup_64（未压缩内核的 64 位入口）</p>
+<pre><code>	/* Set up the stack for verify_cpu(), similar to initial_stack below */
+	leaq	(__end_init_task - SIZEOF_PTREGS)(%rip), %rsp
+
+	leaq	_text(%rip), %rdi
+	pushq	%rsi
+	call	startup_64_setup_env
+	popq	%rsi
+
+	/* Now switch to __KERNEL_CS so IRET works reliably */
+	pushq	$__KERNEL_CS
+	leaq	.Lon_kernel_cs(%rip), %rax
+	pushq	%rax
+	lretq
+
+.Lon_kernel_cs:
+	UNWIND_HINT_EMPTY
+
+	/* Sanitize CPU configuration */
+	call verify_cpu
+
+	/*
+	 * Perform pagetable fixups. Additionally, if SME is active, encrypt
+	 * the kernel and retrieve the modifier (SME encryption mask if SME
+	 * is active) to be added to the initial pgdir entry that will be
+	 * programmed into CR3.
+	 */
+	leaq	_text(%rip), %rdi
+	pushq	%rsi
+	call	__startup_64
+	popq	%rsi
+
+	/* Form the CR3 value being sure to include the CR3 modifier */
+	addq	$(early_top_pgt - __START_KERNEL_map), %rax
+	jmp 1f
+SYM_CODE_END(startup_64)
+</code></pre>
+<p>逐点解释：</p>
+<ul>
+  <li><code>leaq (__end_init_task - SIZEOF_PTREGS)(%rip), %rsp</code>：用 <strong>RIP 相对寻址</strong>算栈顶。为什么不写绝对地址？因为内核可能被加载到任意物理地址（KASLR），RIP 相对是位置无关的。</li>
+  <li><code>startup_64_setup_env</code>：把引导器传来的 <code>boot_params</code> 地址等信息整理成 C 能用的形式。</li>
+  <li><code>pushq $__KERNEL_CS; lretq</code>：这是 x86 汇编里的经典技巧——<strong>用 <code>lretq</code> 一次性装载 CS 和 RIP</strong>，比 <code>jmp</code> 更灵活（AMD 不支持 64 位偏移的远跳转）。</li>
+  <li><code>call verify_cpu</code>：检查 CPU 的安全特性（NX、SMEP 等），把不支持的特性关掉。这是防止"内核被利用后跑用户态恶意代码"的第一道防线。</li>
+  <li><code>call __startup_64</code>：真正建立内核页表（<code>early_top_pgt</code>），返回 <code>%rax</code> 是新的 CR3 值。</li>
+  <li><code>addq $(early_top_pgt - __START_KERNEL_map), %rax</code>：<strong>把物理地址转成内核虚拟地址</strong>。内核被编译成链接在高地址（<code>0xffffffff8xxxxxxx</code>），但运行时页表里放的是物理地址，所以要加上这个偏移量。</li>
+</ul>
+
+<p class="srcline">arch/x86/kernel/head64.c:517-559  x86_64_start_kernel（跳入 C 世界的第一站）</p>
+<pre><code>	/* 初始化CR4控制寄存器的影子变量，用于追踪CR4状态（避免每次读取CR4） */
+	cr4_init_shadow();
+
+	/* Kill off the identity-map trampoline */
+	/* 重置并清除早期恒等映射页表（启动蹦床用的临时映射），避免低地址被错误访问 */
+	reset_early_page_tables();
+
+	/* 清零BSS段（存放未初始化全局变量的内存区域），确保全局变量初始为0 */
+	clear_bss();
+
+	/* 清空顶级页目录(PGD=init_top_pgt)，准备建立正式的内核页表 */
+	clear_page(init_top_pgt);
+
+	/*
+	 * SME support may update early_pmd_flags to include the memory
+	 * encryption mask, so it needs to be called before anything
+	 * that may generate a page fault.
+	 */
+	// ... 省略 sme_early_init() 与 kasan_early_init() 的调用
+	/* 设置早期IDT（中断描述符表）异常处理，捕获启动期间发生的CPU异常 */
+	// ... 省略 idt_setup_early_handler() 的调用
+
+	/* 将bootloader传递的实模式数据(boot_params)从低内存复制到内核数据段 */
+	copy_bootdata(__va(real_mode_data));
+
+	/*
+	 * Load microcode early on BSP.
+	 */
+	/* 在引导CPU(BSP)上尽早加载CPU微码，修复CPU硬件缺陷 */
+	load_ucode_bsp();
+
+	/* set init_top_pgt kernel high mapping*/
+	/* 将早期页表的最后一项(内核高地址映射)复制到正式的顶级页目录 */
+	init_top_pgt[511] = early_top_pgt[511];
+
+	/* 保留关键内存区域，然后调用通用内核初始化入口 start_kernel() */
+	x86_64_start_reservations(real_mode_data);
+}
+</code></pre>
+<p>几个关键点：</p>
+<ul>
+  <li><code>clear_bss()</code>：BSS 段是"未初始化的全局变量"。引导器加载内核时<strong>不会</strong>帮你清零 BSS，所以必须内核自己做。不清零的话，那些没显式赋初值的全局变量会带着内存里的垃圾值运行。</li>
+  <li><code>copy_bootdata()</code>：把 <code>boot_params</code>（含 <code>cmd_line</code>、内存布局、initrd 地址）从引导器留下的低地址内存复制到内核自己的数据段。</li>
+  <li><code>init_top_pgt[511] = early_top_pgt[511]</code>：<strong>只复制一项</strong>——内核高地址映射那一项。其余 510 项是恒等映射，属于启动蹦桥，用完就扔（<code>reset_early_page_tables()</code> 已经清掉了）。</li>
+</ul>
+
+<h3>4.3 start_kernel()：总控函数</h3>
+<p><code>start_kernel()</code> 是整个内核初始化的"总指挥"。它本身代码很长（<code>init/main.c:949</code> 起），但真正值得读的是<strong>关键调用的先后顺序</strong>。</p>
+
+<p class="srcline">init/main.c:954-1017  start_kernel（节选：架构/内存/参数/VFS 缓存）</p>
+<pre><code>	/* 在init_task(PID=0)的栈末尾设置魔数，用于栈溢出检测 */
+	set_task_stack_end_magic(&init_task);
+	smp_setup_processor_id();
+	debug_objects_early_init();
+
+	/* 早期cgroup初始化，建立根cgroup层级 */
+	cgroup_init_early();
+
+	/* 禁用本地CPU中断，早期初始化阶段不允许中断 */
+	local_irq_disable();
+	early_boot_irqs_disabled = true;
+
+	/*
+	 * Interrupts are still disabled. Do necessary setups, then
+	 * enable them.
+	 */
+	/* 初始化引导CPU，标记其在CPU位图中在线 */
+	boot_cpu_init();
+	page_address_init();
+	pr_notice("%s", linux_banner);
+	early_security_init();
+	/* 架构相关硬件初始化：解析e820内存表、ACPI、CPU特性检测等 */
+	setup_arch(&command_line);
+	setup_boot_config(command_line);
+	/* 保存内核命令行参数供后续使用 */
+	setup_command_line(command_line);
+	setup_nr_cpu_ids();
+	/* 为所有可能的CPU分配per-cpu数据区域 */
+	setup_per_cpu_areas();
+	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+	boot_cpu_hotplug_init();
+
+	/* 建立内存区域(DMA/Normal/HighMem)的备选列表，用于页分配 */
+	build_all_zonelists(NULL);
+	page_alloc_init();
+
+	pr_notice("Kernel command line: %s\n", saved_command_line);
+	/* parameters may set static keys */
+	jump_label_init();
+	/* 解析早期内核参数（console=、mem=等影响早期初始化的参数） */
+	parse_early_param();
+	// ... 省略 parse_args() 解析剩余命令行参数的几行
+
+	/*
+	 * These use large bootmem allocations and must precede
+	 * kmem_cache_init()
+	 */
+	setup_log_buf(0);
+	/* 初始化VFS早期缓存（dcache、inode cache），在slab之前完成 */
+	vfs_caches_init_early();
+	sort_main_extable();
+	/* 初始化CPU异常/陷阱向量表（IDT），设置缺页、除零等异常处理 */
+	trap_init();
+	/* 初始化内存管理子系统：伙伴系统、SLUB分配器、vmalloc */
+	mm_init();
+</code></pre>
+<p>逐点解释（挑最关键的）：</p>
+<ul>
+  <li><code>local_irq_disable()</code>：<strong>整个启动早期都关着中断</strong>。原因很简单：中断处理函数要访问的数据结构还没建好。</li>
+  <li><code>pr_notice("%s", linux_banner)</code>：这就是你在 dmesg 里看到的<strong>第一条消息</strong>（内核版本 + 编译时间）。</li>
+  <li><code>setup_arch(&amp;command_line)</code>：架构相关初始化，x86 版本在 <code>arch/x86/kernel/setup.c:876</code>。它解析 e820 内存表（得到"哪些物理地址可用"）、探测 CPU 特性，并把命令行字符串地址通过参数带出来。</li>
+  <li><code>build_all_zonelists(NULL)</code>：建立内存区（zone）列表。zone 是按用途分的内存池：<code>DMA</code>（32 位设备能访问的）、<code>Normal</code>（普通内存）、<code>HighMem</code>（4GB 以上）。这是后面页分配器的基础。</li>
+  <li><code>parse_early_param()</code>：解析"早期参数"，即那些<strong>影响后续初始化</strong>的命令行选项（<code>console=</code> 决定日志输出到哪、<code>mem=</code> 限制内存大小、<code>init=</code> 指定 init 路径）。它必须早，因为 <code>console_init()</code> 还没跑，此刻的参数不生效就永远不生效了。</li>
+  <li><code>vfs_caches_init_early()</code>：创建目录项缓存和 inode 缓存。注意它上面的注释：<strong>"These use large bootmem allocations and must precede kmem_cache_init()"</strong>——这些缓存要用还没建好的 slab 分配器之前的启动内存来分配。</li>
+  <li><code>mm_init()</code>：内存管理子系统正式上线（伙伴系统 + SLUB + vmalloc）。<strong>从这里开始，<code>kmalloc()</code> 才能用。</strong></li>
+</ul>
+
+<p class="srcline">init/main.c:1029-1035, 1103-1114  start_kernel（节选：调度器与控制台）</p>
+<pre><code>	/* 初始化进程调度器，创建每CPU运行队列（rq），注册CFS/RT调度类 */
+	sched_init();
+	/*
+	 * Disable preemption - early bootup scheduling is extremely
+	 * fragile until we cpu_idle() for the first time.
+	 */
+	preempt_disable();
+	if (WARN(!irqs_disabled(),
+		 "Interrupts were enabled *very* early, fixing it\n"))
+		local_irq_disable();
+	// ... 中间省略：radix_tree_init / workqueue_init_early / rcu_init / trace_init
+	// ...          early_irq_init / init_IRQ / tick_init / init_timers / hrtimers_init
+	// ...          softirq_init / timekeeping_init / rand_initialize / boot_init_stack_canary
+	// ...          time_init / perf_event_init / call_function_init 等数十项
+
+	/* 重新开启本地CPU中断，基础硬件初始化完成 */
+	local_irq_enable();
+
+	kmem_cache_init_late();
+
+	/*
+	 * HACK ALERT! This is early. We're enabling the console before
+	 * we've done PCI setups etc, and console_init() must be aware of
+	 * this. But we do want output early, in case something goes wrong.
+	 */
+	/* 初始化控制台驱动，此后 printk() 可以输出到终端/串口 */
+	console_init();
+</code></pre>
+<p><code>preempt_disable()</code> 之后紧跟着一句 WARN：如果中断被"提前"打开了就把中断关回去。这说明<strong>内核开发者自己也认为早期初始化的顺序极其脆弱</strong>，所以用运行时检查兜底。</p>
+
+<p class="srcline">init/main.c:1204-1209  start_kernel 结尾：交棒</p>
+<pre><code>	/* Do the rest non-__init'ed, we're now alive */
+	/* 创建init线程(PID=1)和kthreadd(PID=2)，当前线程成为idle进程 */
+	arch_call_rest_init();
+
+	prevent_tail_call_optimization();
+}
+</code></pre>
+<p><code>arch_call_rest_init()</code> 在 <code>init/main.c:913</code> 是个 <code>__weak</code> 弱符号，默认实现就一行 <code>rest_init()</code>；某些架构（s390）会重写它做自己的收尾工作。</p>
+
+<h3>4.4 rest_init()：凭空造出 PID 0/1/2</h3>
+<p>这是启动流程里最"魔法"的一段：一个函数凭空变出三个进程。</p>
+
+<p class="srcline">init/main.c:720-772  rest_init</p>
+<pre><code>noinline void __ref rest_init(void)
+{
+	struct task_struct *tsk;
+	int pid;
+
+	/* 启动RCU调度器，允许后续代码使用RCU读临界区 */
+	rcu_scheduler_starting();
+	/*
+	 * We need to spawn init first so that it obtains pid 1, however
+	 * the init task will end up wanting to create kthreads, which, if
+	 * we schedule it before we create kthreadd, will OOPS.
+	 */
+	/* 创建 kernel_init 内核线程，它将成为用户空间的 init 进程(PID=1) */
+	pid = kernel_thread(kernel_init, NULL, CLONE_FS);
+	/*
+	 * Pin init on the boot CPU. Task migration is not properly working
+	 * until sched_init_smp() has been run. It will set the allowed
+	 * CPUs for init to the non isolated CPUs.
+	 */
+	/* 将 init 线程固定在引导CPU上运行，直到SMP初始化完成后才允许迁移 */
+	rcu_read_lock();
+	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
+	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id()));
+	rcu_read_unlock();
+
+	numa_default_policy();
+	/* 创建 kthreadd 内核线程(PID=2)，所有后续内核线程都由它 fork */
+	pid = kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_FILES);
+	rcu_read_lock();
+	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
+	rcu_read_unlock();
+
+	/*
+	 * Enable might_sleep() and smp_processor_id() checks.
+	 * They cannot be enabled earlier because with CONFIG_PREEMPTION=y
+	 * kernel_thread() would trigger might_sleep() splats. With
+	 * CONFIG_PREEMPT_VOLUNTARY=y the init task might have scheduled
+	 * already, but it's stuck on the kthreadd_done completion.
+	 */
+	system_state = SYSTEM_SCHEDULING;
+
+	/* 通知 kernel_init 线程：kthreadd 已就绪，可以开始创建内核线程了 */
+	complete(&kthreadd_done);
+
+	/*
+	 * The boot idle thread must execute schedule()
+	 * at least once to get things moving:
+	 */
+	/* 至少调用一次 schedule()，让调度器选择 kernel_init 运行 */
+	schedule_preempt_disabled();
+	/* 进入CPU空闲循环，引导线程永久成为 idle 进程(PID=0)，永不返回 */
+	cpu_startup_entry(CPUHP_ONLINE);
+}
+</code></pre>
+<p>逐点解释：</p>
+<ul>
+  <li><code>rcu_scheduler_starting()</code>：RCU（Read-Copy-Update）读侧无锁同步机制的调度器要开始了。</li>
+  <li><code>kernel_thread(kernel_init, NULL, CLONE_FS)</code>：<code>kernel_thread()</code> 是"内核版的 fork"——创建一个只有内核空间的线程。<strong>顺序很关键</strong>：必须先创建 init（拿到 PID 1），因为 init 马上就想创建内核线程，如果那时 kthreadd 还不存在会 OOPS。</li>
+  <li><code>set_cpus_allowed_ptr(...)</code>：把 init 钉在引导 CPU 上。因为此时 <code>sched_init_smp()</code> 还没跑，任务迁移机制还不完整。</li>
+  <li><code>kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_FILES)</code>：创建 kthreadd（PID 2）。</li>
+  <li><code>system_state = SYSTEM_SCHEDULING</code>：系统状态推进到"可以调度了"，此时 <code>might_sleep()</code> 和 <code>smp_processor_id()</code> 的检查才被打开。</li>
+  <li><code>complete(&amp;kthreadd_done)</code>：<strong>这是两个线程之间的握手信号</strong>。<code>kernel_init_freeable()</code> 开头就在 <code>wait_for_completion(&amp;kthreadd_done)</code> 等它。</li>
+  <li><code>schedule_preempt_disabled()</code>：主动让出 CPU。第一次 schedule 是"交接"仪式——从此引导线程不再往下走，而是进入 idle 循环。</li>
+  <li><code>cpu_startup_entry(CPUHP_ONLINE)</code>：<strong>永不返回</strong>。引导线程就此变成 PID 0 的 idle 进程。</li>
+</ul>
+
+<h3>4.5 kernel_init_freeable()：PID 1 干的活</h3>
+<p>现在把视角切到刚被创建出来的 PID 1（内核线程 <code>kernel_init</code>）。它的入口是 <code>kernel_init()</code>，真正的重活都在 <code>kernel_init_freeable()</code> 里。</p>
+
+<p class="srcline">init/main.c:1679-1747  kernel_init_freeable</p>
+<pre><code>static noinline void __init kernel_init_freeable(void)
+{
+	/*
+	 * Wait until kthreadd is all set-up.
+	 */
+	/* 阻塞等待 kthreadd(PID=2) 完全就绪，确保后续内核线程可以被创建 */
+	wait_for_completion(&amp;kthreadd_done);
+
+	/* Now the scheduler is fully set up and can do blocking allocations */
+	/* 调度器已完全初始化，现在允许所有GFP内存分配标志 */
+	gfp_allowed_mask = __GFP_BITS_MASK;
+
+	/*
+	 * init can allocate pages on any node
+	 */
+	/* 允许init进程从任意NUMA节点分配内存 */
+	set_mems_allowed(node_states[N_MEMORY]);
+
+	cad_pid = task_pid(current);
+
+	/* 准备所有辅助CPU（非引导CPU），为SMP启动做准备 */
+	smp_prepare_cpus(setup_max_cpus);
+
+	/* 启动工作队列线程（kworker），使异步任务可以真正执行 */
+	workqueue_init();
+
+	init_mm_internals();
+
+	do_pre_smp_initcalls();
+	lockup_detector_init();
+
+	/* 启动所有辅助CPU，实现真正的多核并行 */
+	smp_init();
+	/* 完成SMP感知的调度器初始化（负载均衡、CPU拓扑等） */
+	sched_init_smp();
+
+	padata_init();
+	page_alloc_init_late();
+	/* Initialize page ext after all struct pages are initialized. */
+	page_ext_init();
+
+	/* 触发所有 __initcall 级别的驱动初始化（设备驱动注册的核心时机） */
+	do_basic_setup();
+
+	kunit_run_all_tests();
+
+	/* 打开 /dev/console，为init进程提供 stdin(0)/stdout(1)/stderr(2) */
+	console_on_rootfs();
+
+	/*
+	 * check if there is an early userspace init.  If yes, let it do all
+	 * the work
+	 */
+	if (init_eaccess(ramdisk_execute_command) != 0) {
+		ramdisk_execute_command = NULL;
+		prepare_namespace();
+	}
+	// ... 省略 integrity_load_keys() 之前的说明性注释
+	integrity_load_keys();
+}
+</code></pre>
+<p>逐点解释：</p>
+<ul>
+  <li><code>wait_for_completion(&amp;kthreadd_done)</code>：等 <code>rest_init()</code> 里的握手信号。没有它，init 可能比 kthreadd 先跑。</li>
+  <li><code>gfp_allowed_mask = __GFP_BITS_MASK</code>：<strong>解锁所有 GFP 分配标志</strong>。之前调度器没好，睡眠类分配（会触发调度）是不允许的。</li>
+  <li><code>smp_prepare_cpus()</code> → <code>smp_init()</code> → <code>sched_init_smp()</code>：三步走。准备 CPU 状态 → 真正启动其他 CPU（它们会走 <code>secondary_startup_64</code>）→ 让调度器感知多核拓扑。顺序也是依赖关系：先有 CPU 在线，才能做拓扑感知的负载均衡。</li>
+  <li><code>do_pre_smp_initcalls()</code>：跑 <code>early_initcall</code> 那一档（见 4.6）。</li>
+  <li><code>do_basic_setup()</code>：<strong>驱动初始化的总开关</strong>，见下一节。</li>
+  <li><code>console_on_rootfs()</code>：打开 <code>/dev/console</code> 并 dup 成 0/1/2。这样用户态 init 的标准输入输出才有归宿。</li>
+  <li><code>prepare_namespace()</code>：挂载根文件系统，见 4.8。</li>
+</ul>
+
+<h3>4.6 do_basic_setup() 与 do_initcalls()：驱动在这里注册</h3>
+
+<p class="srcline">init/main.c:1464-1471  do_basic_setup</p>
+<pre><code>static void __init do_basic_setup(void)
+{
+	cpuset_init_smp();
+	driver_init();
+	init_irq_proc();
+	do_ctors();
+	usermodehelper_enable();
+	do_initcalls();
+}
+</code></pre>
+<ul>
+  <li><code>driver_init()</code>：初始化驱动总线模型（<code>/sys/bus</code> 那些目录的来源）。</li>
+  <li><code>usermodehelper_enable()</code>：允许内核通过 <code>call_usermodehelper()</code> 启动用户态程序（udev 就靠它）。</li>
+  <li><code>do_initcalls()</code>：<strong>驱动注册自己</strong>。</li>
+</ul>
+
+<p class="srcline">init/main.c:1423-1436  do_initcall_level（逐级调用）</p>
+<pre><code>static void __init do_initcall_level(int level, char *command_line)
+{
+	initcall_entry_t *fn;
+
+	parse_args(initcall_level_names[level],
+		   command_line, __start___param,
+		   __stop___param - __start___param,
+		   level, level,
+		   NULL, ignore_unknown_bootoption);
+
+	trace_initcall_level(initcall_level_names[level]);
+	for (fn = initcall_levels[level]; fn &lt; initcall_levels[level+1]; fn++)
+		do_one_initcall(initcall_from_entry(fn));
+}
+</code></pre>
+<p><code>initcall_levels[]</code> 是一张<strong>函数指针数组的边界表</strong>：<code>initcall_levels[level]</code> 到 <code>initcall_levels[level+1]</code> 之间的所有函数，就是该等级的全部 initcall。遍历它们，逐个 <code>do_one_initcall()</code>。</p>
+
+<p class="srcline">init/main.c:1393-1415  initcall 等级表与名称表</p>
+<pre><code>static initcall_entry_t *initcall_levels[] __initdata = {
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+};
+
+/* Keep these in sync with initcalls in include/linux/init.h */
+static const char *initcall_level_names[] __initdata = {
+	"pure",
+	"core",
+	"postcore",
+	"arch",
+	"subsys",
+	"fs",
+	"device",
+	"late",
+};
+</code></pre>
+<p>注释说得很清楚：<strong>这两张表必须和 <code>include/linux/init.h</code> 里的宏保持同步</strong>。改了一边忘了另一边，就是启动时某个驱动莫名其妙不跑。</p>
+
+<p class="srcline">include/asm-generic/vmlinux.lds.h:913-930  INIT_CALLS（链接脚本决定实际顺序）</p>
+<pre><code>#define INIT_CALLS_LEVEL(level)						\
+		__initcall##level##_start = .;				\
+		KEEP(*(.initcall##level##.init))			\
+		KEEP(*(.initcall##level##s.init))			\
+
+#define INIT_CALLS							\
+		__initcall_start = .;					\
+		KEEP(*(.initcallearly.init))				\
+		INIT_CALLS_LEVEL(0)					\
+		INIT_CALLS_LEVEL(1)					\
+		INIT_CALLS_LEVEL(2)					\
+		INIT_CALLS_LEVEL(3)					\
+		INIT_CALLS_LEVEL(4)					\
+		INIT_CALLS_LEVEL(5)					\
+		INIT_CALLS_LEVEL(rootfs)				\
+		INIT_CALLS_LEVEL(6)					\
+		INIT_CALLS_LEVEL(7)					\
+		__initcall_end = .;
+</code></pre>
+<p><code>KEEP(*(...))</code> 是给链接器的指令：<strong>即使这些段看起来没被任何代码引用，也必须保留</strong>（否则会被当成垃圾数据丢掉）。这段宏同时确定了 <code>__initcall0_start</code> … <code>__initcall_end</code> 这些符号的位置，从而定义了上表数组的边界。注意 <code>rootfs</code> 排在 5 和 6 之间——根文件系统要在设备驱动之前就绪。</p>
+
+<p class="srcline">include/linux/init.h:202-234  initcall 宏定义</p>
+<pre><code>/*
+ * Early initcalls run before initializing SMP.
+ *
+ * Only for built-in code, not modules.
+ */
+#define early_initcall(fn)		__define_initcall(fn, early)
+
+/*
+ * A "pure" initcall has no dependencies on anything else, and purely
+ * initializes variables that couldn't be statically initialized.
+ *
+ * This only exists for built-in code, not for modules.
+ * Keep main.c:initcall_level_names[] in sync.
+ */
+#define pure_initcall(fn)		__define_initcall(fn, 0)
+
+#define core_initcall(fn)		__define_initcall(fn, 1)
+#define core_initcall_sync(fn)		__define_initcall(fn, 1s)
+#define postcore_initcall(fn)		__define_initcall(fn, 2)
+#define postcore_initcall_sync(fn)	__define_initcall(fn, 2s)
+#define arch_initcall(fn)		__define_initcall(fn, 3)
+#define arch_initcall_sync(fn)		__define_initcall(fn, 3s)
+#define subsys_initcall(fn)		__define_initcall(fn, 4)
+#define subsys_initcall_sync(fn)	__define_initcall(fn, 4s)
+#define fs_initcall(fn)			__define_initcall(fn, 5)
+#define fs_initcall_sync(fn)		__define_initcall(fn, 5s)
+#define rootfs_initcall(fn)		__define_initcall(fn, rootfs)
+#define device_initcall(fn)		__define_initcall(fn, 6)
+#define device_initcall_sync(fn)		__define_initcall(fn, 6s)
+#define late_initcall(fn)		__define_initcall(fn, 7)
+#define late_initcall_sync(fn)		__define_initcall(fn, 7s)
+
+#define __initcall(fn) device_initcall(fn)
+</code></pre>
+<p><code>__define_initcall(fn, id)</code> 展开后（见 <code>include/linux/init.h:195-200</code>）是：</p>
+<pre><code>#define __define_initcall(fn, id) ___define_initcall(fn, id, .initcall##id)
+
+// 即：把函数指针放进名为 ".initcall6.init" 的链接段
+#define ___define_initcall(fn, id, __sec) \
+	static initcall_t __initcall_##fn##id __used \
+		__attribute__((__section__(#__sec ".init"))) = fn;
+</code></pre>
+<p>翻译成人话：<strong>"在编译期把函数 <code>fn</code> 的地址放进一个特殊段落，链接器会把同名的段落排在一起，内核运行时再按段遍历"</strong>。整个机制没有任何运行期注册表，全靠链接器排出来的顺序。</p>
+
+<h3>4.7 启动第一个用户态进程</h3>
+<p>根文件系统挂好后，内核就要"变出"第一个用户态进程。<code>kernel_init()</code> 会依次尝试若干路径。</p>
+
+<p class="srcline">init/main.c:1605-1647  kernel_init：寻找并执行 init</p>
+<pre><code>	/* 优先尝试运行ramdisk中指定的init程序 */
+	if (ramdisk_execute_command) {
+		ret = run_init_process(ramdisk_execute_command);
+		if (!ret)
+			return 0;
+		pr_err("Failed to execute %s (error %d)\n",
+		       ramdisk_execute_command, ret);
+	}
+
+	/*
+	 * We try each of these until one succeeds.
+	 *
+	 * The Bourne shell can be used instead of init if we are
+	 * trying to recover a really broken machine.
+	 */
+	if (execute_command) {
+		ret = run_init_process(execute_command);
+		if (!ret)
+			return 0;
+		panic("Requested init %s failed (error %d).",
+		      execute_command, ret);
+	}
+
+	if (CONFIG_DEFAULT_INIT[0] != '\0') {
+		ret = run_init_process(CONFIG_DEFAULT_INIT);
+		if (ret)
+			pr_err("Default init %s failed (error %d)\n",
+			       CONFIG_DEFAULT_INIT, ret);
+		else
+			return 0;
+	}
+
+	/* 依次尝试标准init路径：/sbin/init → /etc/init → /bin/init → /bin/sh */
+	if (!try_to_run_init_process("/sbin/init") ||
+	    !try_to_run_init_process("/etc/init") ||
+	    !try_to_run_init_process("/bin/init") ||
+	    !try_to_run_init_process("/bin/sh"))
+		return 0;
+
+	/* 所有init路径均失败，内核无法继续运行，触发panic */
+	panic("No working init found.  Try passing init= option to kernel. "
+	      "See Linux Documentation/admin-guide/init.rst for guidance.");
+}
+</code></pre>
+<p>优先级：<code>ramdisk_execute_command</code>（<code>rdinit=</code> 参数）→ <code>execute_command</code>（<code>init=</code> 参数）→ <code>CONFIG_DEFAULT_INIT</code> → <code>/sbin/init</code> → <code>/etc/init</code> → <code>/bin/init</code> → <code>/bin/sh</code>（急救用）。<strong>全失败就 panic</strong>，因为没有用户态进程的系统等于没有系统。</p>
+
+<p class="srcline">fs/exec.c:2388-2420  kernel_execve（内核态执行用户程序）</p>
+<pre><code>int kernel_execve(const char *kernel_filename,
+		  const char *const *argv, const char *const *envp)
+{
+	struct filename *filename;
+	struct linux_binprm *bprm;
+	int fd = AT_FDCWD;
+	int retval;
+
+	filename = getname_kernel(kernel_filename);
+	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+
+	bprm = alloc_bprm(fd, filename);
+	if (IS_ERR(bprm)) {
+		retval = PTR_ERR(bprm);
+		goto out_ret;
+	}
+
+	retval = count_strings_kernel(argv);
+	if (retval &lt; 0)
+		goto out_free;
+	bprm-&gt;argc = retval;
+
+	retval = count_strings_kernel(envp);
+	if (retval &lt; 0)
+		goto out_free;
+	bprm-&gt;envc = retval;
+
+	retval = bprm_stack_limits(bprm);
+	if (retval &lt; 0)
+		goto out_free;
+
+	retval = copy_string_kernel(bprm-&gt;filename, bprm);
+	if (retval &lt; 0)
+		goto out_free;
+	bprm-&gt;exec = bprm-&gt;p;
+	// ... 省略后面的 bprm_execve() 调用与错误处理路径
+}
+</code></pre>
+<p>最终 <code>bprm_execve()</code> 会加载 ELF、切换到新的地址空间、跳到用户态入口。<strong>内核态的 <code>kernel_init()</code> 从此不再返回</strong>——它"变身"成了 PID 1 的用户态进程。</p>
+
+<h3>4.8 prepare_namespace()：挂上根文件系统</h3>
+
+<p class="srcline">init/do_mounts.c:645-705  prepare_namespace</p>
+<pre><code>void __init prepare_namespace(void)
+{
+	if (root_delay) {
+		printk(KERN_INFO "Waiting %d sec before mounting root device...\n",
+		       root_delay);
+		/* 等待指定秒数，给慢速存储设备（USB、eMMC）足够时间完成初始化 */
+		ssleep(root_delay);
+	}
+
+	/*
+	 * wait for the known devices to complete their probing
+	 *
+	 * Note: this is a potential source of long boot delays.
+	 * For example, it is not atypical to wait 5 seconds here
+	 * for the touchpad of a laptop to initialize.
+	 */
+	/* 等待所有块设备驱动完成设备探测，确保根设备已就绪 */
+	wait_for_device_probe();
+
+	/* 初始化软件RAID(md)设备，处理多磁盘阵列配置 */
+	md_run_setup();
+
+	if (saved_root_name[0]) {
+		root_device_name = saved_root_name;
+		if (!strncmp(root_device_name, "mtd", 3) ||
+		    !strncmp(root_device_name, "ubi", 3)) {
+			/* MTD/UBI闪存设备直接挂载（嵌入式系统常用） */
+			mount_block_root(root_device_name, root_mountflags);
+			goto out;
+		}
+		/* 将设备名（如/dev/sda1、UUID=xxx）转换为内核设备号 */
+		ROOT_DEV = name_to_dev_t(root_device_name);
+		if (strncmp(root_device_name, "/dev/", 5) == 0)
+			root_device_name += 5;
+	}
+
+	/* 尝试加载initrd/initramfs，若成功则跳过块设备挂载 */
+	if (initrd_load())
+		goto out;
+
+	/* wait for any asynchronous scanning to complete */
+	if ((ROOT_DEV == 0) &amp;&amp; root_wait) {
+		printk(KERN_INFO "Waiting for root device %s...\n",
+			saved_root_name);
+		/* rootwait模式：持续等待直到根设备出现（适用于热插拔设备） */
+		while (driver_probe_done() != 0 ||
+			(ROOT_DEV = name_to_dev_t(saved_root_name)) == 0)
+			msleep(5);
+		async_synchronize_full();
+	}
+
+	/* 挂载根文件系统（NFS/CIFS/块设备） */
+	mount_root();
+out:
+	/* 将devtmpfs挂载到/dev，提供设备节点访问 */
+	devtmpfs_mount();
+	/* 将根文件系统移动挂载到/，替换早期的rootfs */
+	init_mount(".", "/", NULL, MS_MOVE, NULL);
+	/* 切换进程根目录到新挂载的根文件系统 */
+	init_chroot(".");
+}
+</code></pre>
+<p>逐点解释：</p>
+<ul>
+  <li><code>wait_for_device_probe()</code>：<strong>等所有设备探测完</strong>。这是启动慢的常见来源——笔记本的触摸板可能要 5 秒才应答。</li>
+  <li><code>ROOT_DEV = name_to_dev_t(root_device_name)</code>：把命令行里的 <code>root=/dev/sda2</code>、<code>root=UUID=xxx</code>、<code>root=LABEL=xxx</code> 翻译成内核内部的主设备号/次设备号。</li>
+  <li><code>initrd_load()</code>：如果给了 initramfs，先把它挂成根，成功了就 <code>goto out</code>——<strong>initramfs 里的 init 脚本会自己负责去挂真正的根盘</strong>。这正是"initramfs 里放磁盘驱动"的意义。</li>
+  <li><code>mount_root()</code>：挂真正的根。支持三种：NFS（<code>root=</code> 是 IP 形式）、CIFS、以及块设备。</li>
+  <li><code>init_mount(".", "/", NULL, MS_MOVE, NULL)</code> + <code>init_chroot(".")</code>：内核启动早期有个临时的 <code>rootfs</code>（内存里的空目录），挂载完真根后，用 <strong>MS_MOVE</strong> 把新根"搬"到 <code>/</code>，再把当前进程的根目录切过去。</li>
+</ul>
+
+<p class="srcline">init/do_mounts.c:414-449  do_mount_root（真正执行挂载）</p>
+<pre><code>static int __init do_mount_root(const char *name, const char *fs,
+				 const int flags, const void *data)
+{
+	struct super_block *s;
+	struct page *p = NULL;
+	char *data_page = NULL;
+	int ret;
+
+	if (data) {
+		/* init_mount() requires a full page as fifth argument */
+		p = alloc_page(GFP_KERNEL);
+		if (!p)
+			return -ENOMEM;
+		data_page = page_address(p);
+		/* zero-pad. init_mount() will make sure it's terminated */
+		strncpy(data_page, data, PAGE_SIZE);
+	}
+
+	ret = init_mount(name, "/root", fs, flags, data_page);
+	if (ret)
+		goto out;
+
+	init_chdir("/root");
+	s = current-&gt;fs-&gt;pwd.dentry-&gt;d_sb;
+	ROOT_DEV = s-&gt;s_dev;
+	printk(KERN_INFO
+	       "VFS: Mounted root (%s filesystem)%s on device %u:%u.\n",
+	       s-&gt;s_type-&gt;name,
+	       sb_rdonly(s) ? " readonly" : "",
+	       MAJOR(ROOT_DEV), MINOR(ROOT_DEV));
+
+out:
+	if (p)
+		put_page(p);
+	return ret;
+}
+</code></pre>
+<p>关键的那行是 <code>init_mount(name, "/root", fs, flags, data_page)</code>——它先挂到 <code>/root</code> 这个临时位置，成功后再 <code>init_chdir("/root")</code> 把当前工作目录切过去，最后 <code>prepare_namespace()</code> 用 MS_MOVE 把它搬到 <code>/</code>。<strong>"先挂到临时点再搬走"是为了避免挂载过程中的路径混乱</strong>（挂载点必须存在，且不能在挂载过程中被当作路径解析的一部分）。</p>
+
+<div class="tip">
+<strong>一句话总结本节：</strong>内核启动不是"一段代码"，而是<strong>一次有严格依赖关系的有序释放</strong>——每一步都在"交接"某样东西：固件交出硬件控制权，<code>setup_arch()</code> 交出内存布局知识，<code>initcall</code> 交出"驱动注册"的时机，<code>prepare_namespace()</code> 交出根文件系统，<code>kernel_execve()</code> 最后交出整个机器。
+</div>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看看启动日志的三个"分水岭"</h3>
+<pre><code># 1) 内核第一条消息：内核横幅
+dmesg | head -3
+# 预期：
+# [    0.000000] Linux version 5.10.0 (gcc ...) #1 SMP ...
+# [    0.000000] Command line: BOOT_IMAGE=/vmlinuz root=UUID=... ro quiet
+
+# 2) 根文件系统挂上的那一刻（VFS: Mounted root）
+dmesg | grep -n "Mounted root"
+# 预期： [    1.234567] VFS: Mounted root (ext4 filesystem) readonly on device 8:2
+
+# 3) 交出控制权给用户态（Run /sbin/init as init process）
+dmesg | grep -n "as init process"
+# 预期： [    1.567890] Run /sbin/init as init process
+
+# 整条时间线：内核从 0.000000 到 "Run ... as init process"
+dmesg | head -60</code></pre>
+<p>这三条消息恰好对应本篇的三个阶段。<strong>时间戳还能告诉你启动慢在哪</strong>：如果 "Mounted root" 出现在 30 秒，说明卡在设备探测或磁盘上；如果 "Run /sbin/init" 出现在 40 秒，说明卡在 initcall（某个驱动初始化超时）。</p>
+
+<h3>5.2 确认 PID 0/1/2 的身份</h3>
+<pre><code># PID 1 是谁
+cat /proc/1/comm
+cat /proc/1/cmdline | tr '\0' ' '; echo
+ls -l /proc/1/exe
+
+# PID 2 是谁（kthreadd）
+cat /proc/2/comm
+
+# PID 0 是谁（idle），它的 parent 是 0 自己
+cat /proc/0/stat
+# 预期：第 4 个字段（ppid）是 0
+
+# 内核线程列表：所有由 kthreadd 派生的
+ps -e -o pid,ppid,stat,comm | head -20
+# 预期：能看到 kthreadd、kworker/0、ksoftirqd/0、rcu_sched 等，
+#       它们的 PPID 都是 2
+
+# 内核命令行（init= / root= 在这里）
+cat /proc/cmdline</code></pre>
+
+<h3>5.3 用 init= 参数改"第一个用户进程"</h3>
+<p>这是最直观的实验：让内核启动时执行一个你自己的脚本，而不是 <code>/sbin/init</code>。</p>
+<pre><code># 查看当前系统支持哪些内核参数（/proc/cmdline 就是解析结果）
+cat /proc/cmdline
+
+# 如果你用 GRUB2，在 linux 那一行末尾加：
+#   init=/bin/sh
+# 开机后你将直接得到一个 root shell（没有 systemd！）
+
+# 用 qemu + busybox 复现这个实验（不需要改磁盘）
+# --- 1) 造一个极简 initramfs ---
+mkdir -p /tmp/rootfs/bin /tmp/rootfs/proc /tmp/rootfs/sys
+busybox --install -s /tmp/rootfs/bin        # 需要本机已装 busybox
+cat &gt; /tmp/rootfs/init &lt;&lt;'EOF'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+echo "=== 我就是 init，PID 是 $$ ==="
+ls /proc | head -5
+exec /bin/sh
+EOF
+chmod +x /tmp/rootfs/init
+
+# --- 2) 打包成 cpio.gz ---
+cd /tmp/rootfs &amp;&amp; find . | cpio -o -H newc 2&gt;/dev/null | gzip &gt; /tmp/initramfs.cpio.gz
+cd -
+
+# --- 3) 用 qemu 启动（-kernel 直接给内核，不经过 GRUB） ---
+qemu-system-x86_64 -m 512M \
+  -kernel arch/x86/boot/bzImage \
+  -initrd /tmp/initramfs.cpio.gz \
+  -append "console=ttyS0 rdinit=/init panic=1" \
+  -nographic
+# 预期：先看到内核横幅（Linux version 5.10.0 ...），
+#       接着看到 "=== 我就是 init，PID 是 1 ==="
+#       最后进入 /bin/sh 提示符
+# 按 Ctrl-A X 退出 qemu</code></pre>
+<p>这个实验把本篇的整条链路都跑通了：<strong>固件阶段被 qemu 代替、initramfs 代替根文件系统、<code>rdinit=/init</code> 代替 <code>/sbin/init</code></strong>。你看到的"我就是 init，PID 是 1"，正是 <code>rest_init()</code> 造出来的那个 PID 1。</p>
+
+<h3>5.4 打开 initcall 调试输出</h3>
+<pre><code># 在内核命令行加 initcall_debug，或者运行时用 sysctl（5.10 支持 core_param）
+cat /proc/sys/kernel/initcall_debug 2&gt;/dev/null || echo "需要命令行 initcall_debug"
+
+# 用 qemu 复现：每个 initcall 都会打印 "calling initcall xxx" 和返回值
+qemu-system-x86_64 -m 512M \
+  -kernel arch/x86/boot/bzImage \
+  -initrd /tmp/initramfs.cpio.gz \
+  -append "console=ttyS0 rdinit=/init initcall_debug" \
+  -nographic 2&gt;&amp; | grep -E "initcall (pure|core|device|late)" | head -30
+# 预期：能看到几十行形如
+#   initcall pure ... 
+#   initcall core ... 
+#   initcall device ...
+#   initcall late ...
+# 每一行后面的名字就是该等级里注册的函数</code></pre>
+<p>这直接印证了 3.3 的分级表：<strong>日志里出现的第一批是 <code>pure</code>，最后是 <code>late</code></strong>。</p>
+
+<h3>5.5 在源码里搜 initcall 的真实使用者</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+
+# 看看哪些驱动用了 device_initcall（等价于 module_init）
+grep -rn "device_initcall(" drivers/ --include=*.c | head -10
+
+# 看看谁用了 early_initcall（极早期）
+grep -rn "early_initcall(" --include=*.c . | head -10
+
+# 看看 module_init 在内核内建场景下的展开
+grep -rn "module_init(" drivers/char/ --include=*.c | head -5
+
+# 统计各等级的使用数量
+for m in early_initcall pure_initcall core_initcall postcore_initcall \
+         arch_initcall subsys_initcall fs_initcall device_initcall late_initcall; do
+  printf "%-22s %s\n" "$m" "$(grep -rn "$m(" --include=*.c . | wc -l | tr -d ' ')"
+done</code></pre>
+<p>你会发现 <code>device_initcall</code>（也就是 <code>module_init</code>）数量遥遥领先——因为绝大多数驱动只需要"设备都就绪之后"再注册自己就够了。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. <code>module_init(my_init)</code> 在"编进内核"和"编成模块"两种情况下分别是谁调用？</b>编进内核时，<code>module_init(x)</code> 展开为 <code>__initcall(x)</code> → <code>device_initcall(x)</code> → 函数指针放进 <code>.initcall6.init</code> 链接段，开机时由 <code>do_initcalls()</code> 遍历调用。编成 <code>.ko</code> 时，宏生成一个名为 <code>init_module</code> 的函数（alias 到 <code>my_init</code>），在 <code>insmod</code>/<code>modprobe</code> 时由 <code>kernel/module.c</code> 的 <code>do_init_module()</code> 调用。</div>
+<div class="qa"><b>Q2. 为什么 <code>vfs_caches_init_early()</code> 必须在 <code>mm_init()</code> 之前？</b>因为它创建的是 dcache / inode 这些"大对象"，代码注释写明它们要使用 bootmem（启动内存）分配，而 bootmem 必须在 slab 分配器（<code>kmem_cache_init()</code>）初始化之前使用。放到 <code>mm_init()</code> 之后就晚了——那时 bootmem 已经被释放或不再可用。同理，<code>sched_init()</code> 必须在 <code>local_irq_enable()</code> 之前，否则定时器中断一来，调度器还没建好就会 oops。</div>
+<div class="qa"><b>Q3. <code>early_initcall</code> 和 <code>device_initcall</code> 的区别只是"早晚"吗？</b>不只是早晚，<strong>运行的时机点也不同</strong>。<code>early_initcall</code> 在 <code>do_pre_smp_initcalls()</code> 中运行，此时 SMP 还没启动（只有引导 CPU），调度器也不完全就绪；<code>device_initcall</code> 在 <code>do_initcalls()</code> 中运行，此时多核已经启动、调度器完全可用。另外 <code>early_initcall</code> 只对内建代码有效（模块编译时它被重定义为 <code>module_init</code>）。</div>
+<div class="qa"><b>Q4. 内核自己怎么知道"启动成功了"？</b>它不知道。内核的判定标准是"我已经把控制权交给用户态了"——<code>kernel_execve("/sbin/init")</code> 成功执行、且不返回，就意味着交接完成。所以在 dmesg 里，<strong>"Run /sbin/init as init process" 这行才是内核启动的终点</strong>；之后 systemd 还要再花几秒，那段时间内核已经在正常服务了，机器却还"没启动完"。</div>
+<div class="qa"><b>Q5. 为什么 init 必须是 PID 1，根文件系统又是怎么被"搬"到 <code>/</code> 的？</b>因为 PID 1 有三样特权：① 它的父进程不存在，所以由它回收僵尸进程；② 它是命名空间的"根"，容器里的 PID 1 就是容器的 init，namespace 的建立依赖于它；③ 它忽略大部分默认信号。PID 编号由 <code>rest_init()</code> 中创建线程的先后顺序决定——先创建 <code>kernel_init</code> 拿到 1，再创建 <code>kthreadd</code> 拿到 2，而引导线程自己保留 0。<br>挂载方面：内核启动早期有一个内存里的空 <code>rootfs</code> 挂在 <code>/</code>。真正挂载时先挂到临时目录 <code>/root</code>（<code>do_mount_root()</code> 里的 <code>init_mount(name, "/root", ...)</code>），成功后 <code>init_chdir("/root")</code> 切进目录；最后 <code>prepare_namespace()</code> 用 <code>init_mount(".", "/", NULL, MS_MOVE, NULL)</code> 把这个挂载点整体移动到 <code>/</code>，再 <code>init_chroot(".")</code> 把进程根目录切过去。先挂临时点再 MS_MOVE，是为了避免挂载过程中 <code>/</code> 自身被当作路径解析的一部分而引起混乱。</div>
+
+<footer>
+  <p>上一篇：<a href="02-kernel-tree.html">02 内核源码树导读</a> · 下一篇：<a href="04-debug-tools.html">04 调试与观测工具</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

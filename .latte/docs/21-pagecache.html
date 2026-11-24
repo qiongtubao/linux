@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>21-Page Cache：文件内容的页缓存</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75; max-width: 900px; margin: 0 auto;
+    padding: 32px 24px 80px; font-size: 16px; }
+  nav.top { display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border); }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="22-ext4.html">下一篇：ext4 →</a>
+</nav>
+
+<h1>🗄️ Page Cache：文件内容的页缓存</h1>
+<p class="subtitle">把读过的文件页留在内存里，让第二次读盘变成一次内存拷贝 · 预计阅读 10 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>图书馆的书在几十米外的书库，阅览室就在手边。每次查一句话都跑去书库取书，一天走断腿。聪明的做法是<strong>把刚翻过的书页复印一份留在阅览室</strong>，下次直接看，只有第一次要跑一趟。Linux 的 <span class="term">page cache</span>（页缓存）就是这间阅览室：内存是复印夹，磁盘是书库。</p>
+<p>没有页缓存，<code>read()</code> 每次都发磁盘 IO；程序 A 刚读过 <code>/etc/passwd</code>，程序 B 再读还得再读盘。有了页缓存，文件内容按 4KB 一页缓存在内存，以“inode + 页号”为键；命中就 <code>memcpy</code> 到用户缓冲区，未命中才分配页、读盘、入缓存。第二次读同一文件几乎纯内存操作，这就是“系统越跑越快”的原因。</p>
+<p>写也如此：<span class="term">延迟写</span>把修改只写进页缓存并标 <span class="term">dirty</span>，<code>write()</code> 立刻返回；回写线程再批量刷盘，磁盘因此能做顺序合并。代价是掉电可能丢最近几秒数据——<code>fsync()</code> 就是“马上送去书库装订”。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">页缓存</td><td>page cache</td><td>内存中缓存“文件内容页”的区域，按 inode + 页偏移索引。</td></tr>
+  <tr><td class="term">地址空间</td><td>address_space</td><td>一个 inode 的页缓存容器；每个 inode 内嵌一个 <code>i_data</code>。</td></tr>
+  <tr><td class="term">XArray</td><td>XArray</td><td>5.10 中替代 radix tree 的稀疏数组，按页索引直接查页，带标记。</td></tr>
+  <tr><td class="term">页索引</td><td>index / pgoff_t</td><td>文件内页号，等于 <code>偏移 &gt;&gt; 12</code>。</td></tr>
+  <tr><td class="term">脏页</td><td>dirty page</td><td>内容比磁盘新、尚未写回的缓存页，被 XArray 的 DIRTY 标记标出。</td></tr>
+  <tr><td class="term">回写</td><td>writeback</td><td>把脏页写回磁盘，由 <code>kworker</code> 与脏页阈值节流。</td></tr>
+  <tr><td class="term">预读</td><td>readahead</td><td>读到某页时顺带把后几页也读进缓存，随机 IO 变顺序 IO。</td></tr>
+  <tr><td class="term">缺页</td><td>page fault</td><td>访问 mmap 的文件页但页表无映射时触发，由 <code>filemap_fault</code> 填页。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<pre><code>struct inode                     struct page
+ ├ i_mapping ─┐                  ┌ index = 文件内页号
+ └ i_data ────┴─► address_space  │ mapping ─► address_space
+                   ├ i_pages: XArray ─► [0][1]...[N]  ← 标记 DIRTY/WRITEBACK
+                   ├ nrpages
+                   ├ writeback_index
+                   └ a_ops ─► readpage / writepages / write_begin / direct_IO</code></pre>
+<p>写路径：<code>write()</code> → <code>generic_perform_write</code> 调 <code>a_ops-&gt;write_begin</code> 拿到一个锁住的缓存页 → 从用户空间拷贝 → <code>write_end</code> 标记 dirty → 返回。页内容在内存，磁盘位置还是旧的，等回写。</p>
+<p>读路径：<code>read()</code> → <code>generic_file_buffered_read</code> 用 <code>find_get_page</code> 查 XArray → 命中且 <code>PageUptodate</code> 就拷贝；否则分配页、调 <code>a_ops-&gt;readpage</code> 读盘、<code>add_to_page_cache_lru</code> 入缓存。mmap 缺页走 <code>filemap_fault</code>，与 read 共享同一份页缓存，所以 <code>read()</code> 一定读到 mmap 写过的内容。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 address_space 与 XArray</h3>
+<p class="srcline">include/linux/fs.h:451-466  struct address_space</p>
+<pre><code>struct address_space {
+	struct inode		*host;
+	struct xarray		i_pages;      /* 页缓存本体：index → struct page */
+	gfp_t			gfp_mask;
+	struct rb_root_cached	i_mmap;    /* 映射本文件的所有 VMA */
+	struct rw_semaphore	i_mmap_rwsem;
+	unsigned long		nrpages;
+	pgoff_t			writeback_index;   /* 循环回写的起点 */
+	const struct address_space_operations *a_ops;
+	unsigned long		flags;
+};</code></pre>
+<p>5.10 已把老式 radix tree 换成 <span class="term">XArray</span>：<code>i_pages</code> 是可稀疏的“大数组”，用页索引直接定位，空槽不占内存。标记位 <code>PAGECACHE_TAG_DIRTY/WRITEBACK</code>（定义为 <code>XA_MARK_0/1</code>）让“找出所有脏页”不必遍历全树。<code>a_ops</code> 是页级操作表，ext4 的 <code>writepages/readpage/write_begin</code> 都在里面。</p>
+
+<h3>4.2 找页或造页：pagecache_get_page</h3>
+<p class="srcline">mm/filemap.c:1842-1872  pagecache_get_page（节选）</p>
+<pre><code>	struct page *page;
+repeat:
+	page = find_get_entry(mapping, index);   /* 查 XArray，取引用 */
+	if (xa_is_value(page))                   /* swap 影子条目视为没有 */
+		page = NULL;
+	if (!page)
+		goto no_page;
+	if (fgp_flags &amp; FGP_LOCK) {
+		if (fgp_flags &amp; FGP_NOWAIT) {
+			if (!trylock_page(page)) { put_page(page); return NULL; }
+		} else
+			lock_page(page);
+		if (unlikely(page-&gt;mapping != mapping)) {   /* 期间被截断 */
+			unlock_page(page);  put_page(page);  goto repeat;
+		}
+	}
+no_page:  /* FGP_CREAT 时在此分配页并 add_to_page_cache_lru */</code></pre>
+<p>这是页缓存的统一取页口。<code>FGP_LOCK</code> 保证调用者拿到独占页（读写互斥）；<code>mapping != mapping</code> 是截断竞争检查，页被截断后不能再使用；<code>FGP_CREAT</code> 时走“分配 + 插入 + 挂 LRU”慢路径。</p>
+
+<h3>4.3 新页入缓存：add_to_page_cache_lru</h3>
+<p class="srcline">mm/filemap.c:932-949  add_to_page_cache_lru</p>
+<pre><code>	__SetPageLocked(page);                 /* 先锁页再入表 */
+	ret = __add_to_page_cache_locked(page, mapping, offset, gfp_mask, &amp;shadow);
+	if (unlikely(ret))
+		__ClearPageLocked(page);
+	else {
+		WARN_ON_ONCE(PageActive(page));
+		if (!(gfp_mask &amp; __GFP_WRITE) &amp;&amp; shadow)
+			workingset_refault(page, shadow);   /* 统计“刚回收又读回” */
+		lru_cache_add(page);               /* 加入 LRU，可被回收 */
+	}</code></pre>
+<p>顺序不可乱：锁页 → 插入 XArray。插入时若发现同 index 已有页就返回 <code>-EEXIST</code>，调用方丢弃自己这页改用已有的。<code>lru_cache_add</code> 把页挂上 LRU，让 kswapd 在内存紧张时能找到并回收——缓存页可丢弃，但脏页被丢弃前必须先回写。</p>
+
+<h3>4.4 缓冲读与读盘</h3>
+<p class="srcline">mm/filemap.c:2613-2638  generic_file_read_iter（开头）</p>
+<pre><code>	size_t count = iov_iter_count(iter);
+	ssize_t retval = 0;
+	if (!count)
+		goto out;                 /* 0 字节读直接返回 */
+	if (iocb-&gt;ki_flags &amp; IOCB_DIRECT) {   /* O_DIRECT 绕过缓存 */
+		// ... 省略：范围检查、filemap_write_and_wait_range、
+		//     mapping-&gt;a_ops-&gt;direct_IO 与迭代器回退
+	}
+	retval = generic_file_buffered_read(iocb, iter, retval);
+out:
+	return retval;</code></pre>
+<p>缓冲读的核心循环按页推进；未命中时：</p>
+<p class="srcline">mm/filemap.c:2492-2503  generic_file_buffered_read 内读盘</p>
+<pre><code>		ClearPageError(page);
+		/* Start the actual read. The read will unlock the page. */
+		error = mapping-&gt;a_ops-&gt;readpage(filp, page);
+		if (unlikely(error)) {
+			if (error == AOP_TRUNCATED_PAGE) {
+				put_page(page);  error = 0;  goto find_page;  /* 被截断，重查 */
+			}
+			goto readpage_error;
+		}
+		// ... 省略 lock_page_killable 等待 IO、检查 PageUptodate</code></pre>
+<p>注释“read will unlock the page”很关键：<code>readpage</code> 提交 IO 后返回，IO 完成时由 bio 回调把页标 <code>Uptodate</code> 并解锁；读线程在 <code>lock_page_killable</code> 上等。于是“一个页只读一次盘，其他线程等锁”成立。</p>
+
+<h3>4.5 缓冲写：write_begin / write_end</h3>
+<p class="srcline">mm/filemap.c:3417-3446  generic_perform_write（节选）</p>
+<pre><code>	do {
+		unsigned long offset = (pos &amp; (PAGE_SIZE - 1));
+		unsigned long bytes = min_t(unsigned long, PAGE_SIZE - offset,
+						iov_iter_count(i));
+again:
+		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
+			status = -EFAULT;  break;      /* 用户页不可读，提前失败 */
+		}
+		if (fatal_signal_pending(current)) {
+			status = -EINTR;  break;
+		}
+		status = a_ops-&gt;write_begin(file, mapping, pos, bytes, flags,
+						&amp;page, &amp;fsdata);   /* 拿到锁住的页 */
+		if (unlikely(status &lt; 0))
+			break;
+		// ... 省略：copy_from_user、write_end 标 dirty、更新 pos/written
+	} while (iov_iter_count(i));</code></pre>
+<p>写以页为单位循环。先 <code>fault_in_readable</code> 把用户页触进来，避免持页锁时再缺页死锁；<code>write_begin</code> 负责定位缓存页并可能预留磁盘块（ext4 延迟分配的入口就在这里）；<code>write_end</code> 在拷贝后标 dirty 并解锁。</p>
+
+<h3>4.6 缺页填页：filemap_fault</h3>
+<p class="srcline">mm/filemap.c:2826-2862  filemap_fault（节选）</p>
+<pre><code>	pgoff_t offset = vmf-&gt;pgoff;      /* 缺页的文件内页号 */
+	max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+	if (unlikely(offset &gt;= max_off))
+		return VM_FAULT_SIGBUS;       /* 访问越界 → SIGBUS */
+	page = find_get_page(mapping, offset);
+	if (likely(page) &amp;&amp; !(vmf-&gt;flags &amp; FAULT_FLAG_TRIED)) {
+		fpin = do_async_mmap_readahead(vmf, page);
+	} else if (!page) {
+		count_vm_event(PGMAJFAULT);   /* 统计“主缺页” */
+		ret = VM_FAULT_MAJOR;
+		fpin = do_sync_mmap_readahead(vmf);
+retry_find:
+		page = pagecache_get_page(mapping, offset,
+					  FGP_CREAT|FGP_FOR_MMAP, vmf-&gt;gfp_mask);
+		// ... 省略 lock_page、截断重查、!PageUptodate 时读盘</code></pre>
+<p>缺页与 <code>read()</code> 用同一份缓存：命中只建 PTE（次要缺页，极廉价），未命中才造页并预读。这解释了为什么 <code>cat</code> 读过的文件 mmap 再访问几乎零 IO。</p>
+
+<h3>4.7 脏页、回写与 meminfo</h3>
+<p>脏页会被回写线程扫到：<code>wb_workfn</code> → <code>do_writepages</code> → <code>mapping-&gt;a_ops-&gt;writepages</code>（ext4 是 <code>ext4_writepages</code>）。<code>/proc/meminfo</code> 的数字来自全局页状态：</p>
+<p class="srcline">fs/proc/meminfo.c:62,89-91  页面计数出口</p>
+<pre><code>	show_val_kb(m, "Cached:         ", cached);
+	...
+	show_val_kb(m, "Dirty:          ",
+		    global_node_page_state(NR_FILE_DIRTY));
+	show_val_kb(m, "Writeback:      ",
+		    global_node_page_state(NR_WRITEBACK));</code></pre>
+<p><code>Cached</code> 约等于 page cache + tmpfs；<code>Dirty</code> 是等待回写的字节数；<code>Writeback</code> 是正在 IO 中的字节数。回写节流参数：<code>/proc/sys/vm/dirty_background_ratio</code>（达到后唤醒后台回写）、<code>dirty_ratio</code>（达到后写进程自身被阻塞）、<code>dirty_expire_centisecs</code>（脏页最久多久必须回写）。</p>
+
+<h2>5. 动手验证</h2>
+<p><strong>实验一：缓存增长与丢弃。</strong></p>
+<pre><code>grep -E 'Cached|Dirty|Writeback' /proc/meminfo
+cat /usr/bin/* &gt; /dev/null 2&gt;&amp;1 || true      # 制造大量冷读
+grep Cached /proc/meminfo                     # 明显上升
+sync; echo 3 &gt; /proc/sys/vm/drop_caches       # 需 root，实验环境
+grep Cached /proc/meminfo                     # 明显下降</code></pre>
+<p><code>echo 1</code> 只丢页缓存，<code>2</code> 丢 dentry/inode 缓存，<code>3</code> 都丢。清空后重读同一文件变慢，说明之前命中缓存。</p>
+<p><strong>实验二：脏页与回写。</strong></p>
+<pre><code>dd if=/dev/zero of=/tmp/dirty.bin bs=1M count=256
+watch -n1 'grep -E "Dirty|Writeback" /proc/meminfo'</code></pre>
+<p><code>dd</code> 结束瞬间 <code>Dirty</code> 可达数百 MB；数秒内先升 <code>Writeback</code> 再回落。加 <code>conv=fsync</code> 则 <code>dd</code> 返回时已是 <code>Dirty≈0</code>。</p>
+<p><strong>实验三：命中率。</strong><code>/usr/bin/time -v cat bigfile</code> 比较首次与再次；或对比 <code>/proc/diskstats</code> 前后 sectors 读——第二次读同一文件，磁盘读计数基本不变。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 5.10 里页缓存用什么索引？为什么？</b>XArray（<code>i_pages</code>）。它以页索引直接定位、可稀疏、支持 DIRTY/WRITEBACK 标记批量查找，比旧 radix tree 省锁。</div>
+<div class="qa"><b>Q2. <code>add_to_page_cache_lru</code> 为什么先锁页再插入？</b>插入后其他线程可能立即查到并使用；不锁会读到半初始化页。插入失败（已有同 index 页）则丢弃自己这页。</div>
+<div class="qa"><b>Q3. <code>read()</code> 命中与未命中分别做什么？</b>命中且 <code>PageUptodate</code>：直接拷贝；未命中：分配页、<code>a_ops-&gt;readpage</code> 读盘、入缓存，等锁后拷贝。</div>
+<div class="qa"><b>Q4. 脏页不 <code>fsync</code> 会怎样？</b>留在缓存数秒后由后台回写；此时掉电会丢这部分修改。<code>fsync</code> 强制立即写回并等 IO 完成。</div>
+<div class="qa"><b>Q5. mmap 与 <code>read()</code> 为什么看到同一份数据？</b>两者都以 <code>address_space-&gt;i_pages</code> 为唯一数据源：read 拷贝页内容，缺页把同一页映射进页表。</div>
+
+<footer>
+  <p>上一篇：<a href="20-vfs.html">20-vfs 虚拟文件系统</a> · 下一篇：<a href="22-ext4.html">22-ext4 文件系统</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

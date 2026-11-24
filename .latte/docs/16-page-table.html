@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 · 页表与缺页异常：MMU 怎么把虚拟地址翻译成物理地址</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="17-vma.html">下一篇：VMA 与进程地址空间布局 →</a>
+</nav>
+
+<h1>🗺️ 页表与缺页异常：MMU 怎么把虚拟地址翻译成物理地址</h1>
+<p class="subtitle">让每个进程都以为自己独占一整台电脑的内存，代价是一张多级"地址翻译表"和一次"翻译失败就现场补页"的缺页异常 · 预计阅读 40 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>先想象一个四合院，院里住了老王、老张、小李三家。每户人家寄快递，收件地址写的都是"XX 路 3 号 201 室"——同一个门牌号，送信的快递员不用知道哪家是哪家，因为三家各自都有��己的信箱柜。老王家的柜子只归老王开，老张家的是老张的。快递员把包裹按地址送进来，柜子怎么分、包裹谁签收，外人（甚至快递员本人）都看不出一丝差别。<b>这就是虚拟内存的核心思想</b>：把物理内存切成一块块 4 KB 的"物理页"，然后给每个进程发一套"虚拟页号"，让所有进程都用同一套虚拟地址写代码，但各自映射到不同的物理页上，互不干扰。</p>
+<p>但"各发一套虚拟页号"这个动作本身有成本。CPU 拿到的只是一串地址，它并不知道这串地址属于哪个进程，也不该为每个进程分别准备一份翻译表。于是硬件（x86 上是 MMU，Memory Management Unit，内存管理单元）采用了一个折中方案：<b>把翻译表本身也做成虚拟的</b>。翻译表放在内存里，CPU 手里只握一个"翻译表在哪"的指针——x86 上就是 <code>CR3</code> 寄存器。CPU 翻译一个地址时，会自动去内存里查那张表；如果查不到，CPU 抛出一个异常（x86 的 #PF，Page Fault），把这个"我翻译不了"的问题交给内核处理。</p>
+<p>为什么一定要做成"多级"的表？因为虚拟地址空间是巨大的（x86-64 上用户空间 128 TB），如果用一张平铺的大表，就算只用了一个字节也要为整个地址空间分配表项。所以硬件把地址切成几段，每段当"目录索引"，像"省 → 市 → 区 → 小区 → 门牌号"一样逐级往下查。x86-64 上是 <b>PGD → PUD → PMD → PTE 四级</b>，每级 512 项（9 位索引），最后 12 位是页内偏移。这样，一次翻译最多查四次表，代价恒定，与实际用了多少内存无关。</p>
+<p>内核这一侧要做的事情是三件：<b>一是</b>维护每个进程的页表（<code>mm_struct-&gt;pgd</code>，切换进程时装进 <code>CR3</code>）；<b>二是</b>在缺页异常到来时，判断"这个地址本来该有什么"，然后现场把缺的页补上——这就是缺页处理路径 <code>handle_mm_fault → __handle_mm_fault → handle_pte_fault</code>；<b>三是</b>提供反向映射：从"某个物理页"能查出"哪些进程的哪个虚拟地址映射着它"，这样才能做页面回收、COW、迁移等操作。本文按这三条主线展开。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">虚拟地址</td><td>virtual address</td><td>进程（和用户态程序）能看见的地址；由"页号 + 页内偏移"组成，页号部分要翻译，偏移部分原样加到物理地址上。</td></tr>
+  <tr><td class="term">物理地址</td><td>physical address</td><td>内存条上真实的地址；只有 CPU 和内核看得见。</td></tr>
+  <tr><td class="term">页</td><td>page / frame</td><td>内存管理的最小单位，x86-64 上是 4 KB（<code>PAGE_SIZE</code>）。虚拟侧叫"页"，物理侧叫"页框"。</td></tr>
+  <tr><td class="term">页表</td><td>page table</td><td>存放"虚拟页 → 物理页"映射关系的表，每张表正好占一个 4 KB 页（512 个 8 字节表项）。</td></tr>
+  <tr><td class="term">PGD</td><td>Page Global Directory</td><td>页表第 1 级（全局目录），索引 9 位，一个表项管 512 GB。</td></tr>
+  <tr><td class="term">PUD</td><td>Page Upper Directory</td><td>页表第 2 级（上层目录），索引 9 位，一个表项管 1 GB。</td></tr>
+  <tr><td class="term">PMD</td><td>Page Middle Directory</td><td>页表第 3 级（中间目录），索引 9 位，一个表项管 2 MB。</td></tr>
+  <tr><td class="term">PTE</td><td>Page Table Entry</td><td>页表第 4 级（末级表项），索引 9 位，一个表项管 4 KB；真正存放物理页帧号。</td></tr>
+  <tr><td class="term">CR3</td><td>Control Register 3</td><td>x86 的页表基址寄存器，存放当前进程 PGD 的物理地址；切换地址空间就是换 CR3。</td></tr>
+  <tr><td class="term">mm_struct</td><td>struct mm_struct</td><td>进程的内存描述符，定义整个地址空间；里面挂着 <code>pgd</code>、VMA 红黑树、内存统计计数。</td></tr>
+  <tr><td class="term">缺页异常</td><td>page fault / #PF</td><td>CPU 翻译地址失败时抛出的异常，Linux 用它实现"按需分页"和"写时复制"。</td></tr>
+  <tr><td class="term">缺页处理</td><td>fault handler</td><td>内核处理缺页异常的代码路径：找到 VMA、判断缺页类型、补上页表项、返回用户态重试那条指令。</td></tr>
+  <tr><td class="term">VMA</td><td>Virtual Memory Area</td><td>地址空间中一段有相同权限和属性的连续区间，是内核描述地址空间的基本单位（第 17 篇专题）。</td></tr>
+  <tr><td class="term">匿名页</td><td>anonymous page</td><td>没有文件做后备的页，内容由内核提供（读零页或新分配的内存）。</td></tr>
+  <tr><td class="term">文件映射页</td><td>file-backed page</td><td>由文件内容填充的页，通常同时存在于页缓存里。</td></tr>
+  <tr><td class="term">写时复制</td><td>Copy-On-Write, COW</td><td>fork 时不真复制物理页，而是把写权限去掉；被写的那个进程触发缺页时才真正复制一份。</td></tr>
+  <tr><td class="term">换出页</td><td>swapped-out page</td><td>内容被写入 swap 区、页表项被标记为"不在内存"的页；访问它触发缺页并从 swap 读回。</td></tr>
+  <tr><td class="term">反向映射</td><td>reverse mapping, rmap</td><td>从物理页反查"哪些进程的哪些虚拟地址映射着它"的索引；匿名页靠 <code>anon_vma</code>，文件页靠 <code>address_space</code> 的区间树。</td></tr>
+  <tr><td class="term">TLB</td><td>Translation Lookaside Buffer</td><td>CPU 内部缓存地址翻译结果的“小抽屉”，页表没改时翻译不必走内存。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 一张虚拟地址的"位域切片"</h3>
+<p>在 x86-64（未开启 5 级分页）上，一个 48 位虚拟地址被切成 5 段：4 段 9 位的"目录索引" + 12 位的"页内偏移"。CPU 从最高位开始逐级查表。</p>
+<pre><code> 虚拟地址（48 位有效，bit 47..0）
+
+  47        39        30        21        12         0
+ +----------+----------+----------+----------+----------+
+ |  PGD 9位 |  PUD 9位 |  PMD 9位 |  PTE 9位 | 页内偏移 |
+ |  索引    |  索引    |  索引    |  索引    |  12 位   |
+ +----------+----------+----------+----------+----------+
+   CR3 --&gt; [PGD 表] --&gt; [PUD 表] --&gt; [PMD 表] --&gt; [PTE 表] --&gt; 物理页框号
+                                                  |
+                                          页内偏移原样相加
+                                                  v
+                                        物理地址 = (页框号 &lt;&lt; 12) | 偏移
+
+ 每一级覆盖范围：
+   PGD 项 -&gt; 512 GB      PUD 项 -&gt; 1 GB
+   PMD 项 -&gt; 2 MB        PTE 项 -&gt; 4 KB（1 个物理页）
+</code></pre>
+<p>反过来看"每级 512 项"意味着什么：一个 PGD 表项覆盖 512 GB，一个 PUD 表项覆盖 1 GB，一个 PMD 表项覆盖 2 MB，一个 PTE 表项覆盖 4 KB。所以"一个进程把 128 TB 用户空间全映射上"只需要 512 个 PGD 项；"把 1 GB 内存映射上"只需要 512 个 PMD 表项。这就是多级页表的全部意义：<b>用固定的 4 次访存代价，支持稀疏的、巨大的地址空间</b>。</p>
+
+<h3>3.2 CR3、mm_struct 与"进程切换"</h3>
+<pre><code>  进程 A 的地址空间                    进程 B 的地址空间
+  +--------------------+               +--------------------+
+  | mm_struct A        |               | mm_struct B        |
+  |  pgd ----+         |               |  pgd ----+         |
+  +----------|---------+               +----------+---------+
+             |                                       |
+        [PGD A 表]                              [PGD B 表]
+             |                                       |
+   CR3 寄存器 --&gt; PGD A 物理地址          CR3 寄存器 --&gt; PGD B 物理地址
+
+   switch_mm() 时：把 mm-&gt;pgd 的物理地址写进 CR3，
+   CPU 之前的翻译缓存（TLB）被标记为失效。
+</code></pre>
+<p>所以"进程隔离"在硬件层面是靠一件东西实现的：<b>每个进程一份独立的 PGD</b>。地址串本身在两个进程里可以一模一样，但查表得到的结果完全不同。</p>
+
+<h3>3.3 缺页异常的完整流程</h3>
+<pre><code>  用户态执行一条访存指令
+            |
+            v
+  CPU 拿虚拟地址查 TLB —— 命中？---是---&gt; 直接用物理地址
+            | 否
+            v
+  CPU 用 CR3 逐级查页表（PGD→PUD→PMD→PTE）
+            |
+      +-----+------+
+      |            |
+   表项有效     表项无效 / 权限不符
+      |            |
+      v            v
+  物理地址    抛 #PF 异常 --&gt; 内核态
+                             |
+                             v
+                 do_user_addr_fault()  (arch/x86/mm/fault.c)
+                    |  取 mm、加 mmap_read_lock
+                    |  find_vma(mm, addr)  找到"这段地址该是什么属性"
+                    |  权限不匹配 -&gt; bad_area() -&gt; 发 SIGSEGV
+                    v
+                 handle_mm_fault()      (mm/memory.c)
+                    |  计数、hugetlb 特判
+                    v
+                 __handle_mm_fault()    (mm/memory.c)
+                    |  pgd_offset(mm, addr)  逐级定位/分配页表
+                    |  遇到 PMD 是大页 -&gt; 走 THP 路径
+                    v
+                 handle_pte_fault()     (mm/memory.c)
+                    |
+        +-----------+-----------+------------+------------+
+        |                       |            |            |
+   PTE 不存在             PTE 不在内存     PTE 只读     PTE 正常
+   (pte_none)            (swap out)      (写访问)      但需置位
+        |                       |            |         accessed/dirty
+        v                       v            v
+  vma 是匿名?              do_swap_page   do_wp_page   更新 PTE
+   是 -&gt; do_anonymous_page   (从 swap 读回)  (写时复制)  + TLB 刷新
+   否 -&gt; do_fault
+        (文件映射，读页缓存)
+        |
+        v
+   返回用户态，重新执行那条访存指令 —— 这次能翻译了
+</code></pre>
+<p>这条路径上有个非常反直觉但极其关键的点：<b>缺页处理完并不是"跳到出错的地方"，而是直接返回用户态，让 CPU 重新执行刚才那条指令</b>。因为此刻页表项已经补好了，第二次执行就能成功。内核只负责"把路修通"，不负责"替你走完"。</p>
+
+<h3>3.4 四种缺页，分别意味着什么</h3>
+<table>
+  <tr><th>缺页类型</th><th>触发条件</th><th>内核动作</th><th>你看到的现象</th></tr>
+  <tr><td>匿名缺页</td><td>访问一块从没碰过的匿名内存（malloc 堆、栈）</td><td><code>do_anonymous_page()</code>：分配一个物理页并清零</td><td>第一次读写这块内存会慢一点；<code>mincore</code> 报"不在内存"</td></tr>
+  <tr><td>文件缺页</td><td>访问一个 mmap 进来的文件区域，页还没进内存</td><td><code>do_fault()</code>：从页缓存取页，或从磁盘读进来</td><td>首次读文件内容慢（major fault）</td></tr>
+  <tr><td>COW 缺页</td><td>写一个"共享的只读"页（fork 出来的子进程写父进程的数据）</td><td><code>do_wp_page()</code>：复制一份物理页，把当前进程的可写位打开</td><td>fork 后子进程写内存会突然变慢</td></tr>
+  <tr><td>换出缺页</td><td>访问被换到 swap 里的页</td><td><code>do_swap_page()</code>：从 swap 读回</td><td>冷启动后第一次访问旧程序会卡一下</td></tr>
+</table>
+<p>其中 <b>minor fault（次要缺页）</b>和 <b>major fault（主要缺页）</b>是按"是否需要真的读磁盘"来分的：匿名缺页、COW 缺页（复制已在内存的页）都是 minor；文件缺页如果页缓存里没有、要真去读磁盘，就是 major。统计在 <code>/proc/vmstat</code> 的 <code>pgmajfault</code> / <code>pgminfault</code> 里。</p>
+
+<h3>3.5 反向映射：回收与 COW 的前提</h3>
+<p>正向映射是"虚拟地址 → 物理页"，页表天然提供。但内核还有一类需求是反过来的：<b>我要把这块物理内存回收了，谁在用它？</b>这需要"物理页 → 虚拟地址"的索引，叫 <span class="term">rmap</span>。</p>
+<ul>
+  <li><b>匿名页</b>：靠 <code>struct anon_vma</code>。一句话：<b>一个 anon_vma 代表"一份共享的匿名内存"，多个进程的 VMA 挂在它的链表上，于是从物理页可以顺藤摸瓜找到所有映射它的地址空间。</b></li>
+  <li><b>文件页</b>：靠 <code>struct address_space</code> 里的区间树（<code>i_mmap</code>），文件页都指向同一份页缓存，映射它的 VMA 都登记在这棵树上。</li>
+</ul>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 从地址算出各级索引：<code>pgd_index</code> / <code>pte_index</code></h3>
+<p>翻译的第一步是把地址切段。x86 没有自己实现这组宏，用的是内核通用版本 <code>include/linux/pgtable.h</code>，规则简单到可以背下来：<b>先右移，屏蔽掉低一级能管的位数</b>。</p>
+<p class="srcline">include/linux/pgtable.h:43-67  pte_index / pmd_index / pud_index / pgd_index</p>
+<pre><code>static inline unsigned long pte_index(unsigned long address)
+{
+	return (address &gt;&gt; PAGE_SHIFT) &amp; (PTRS_PER_PTE - 1);
+}
+
+#ifndef pmd_index
+static inline unsigned long pmd_index(unsigned long address)
+{
+	return (address &gt;&gt; PMD_SHIFT) &amp; (PTRS_PER_PMD - 1);
+}
+#define pmd_index pmd_index
+#endif
+
+#ifndef pud_index
+static inline unsigned long pud_index(unsigned long address)
+{
+	return (address &gt;&gt; PUD_SHIFT) &amp; (PTRS_PER_PUD - 1);
+}
+#define pud_index pud_index
+#endif
+
+#ifndef pgd_index
+/* Must be a compile-time constant, so implement it as a macro */
+#define pgd_index(a)  (((a) &gt;&gt; PGDIR_SHIFT) &amp; (PTRS_PER_PGD - 1))
+#endif
+</code></pre>
+<p>逐行看：<code>pte_index</code> 把地址右移 12 位（<code>PAGE_SHIFT</code>，丢掉页内偏移），再 <code>&amp; (PTRS_PER_PTE - 1)</code>。因为 <code>PTRS_PER_PTE</code> 是 512，<code>512 - 1 = 0x1FF</code>，正好是 9 个 1，所以这一步等价于"取第 20..12 位"。<code>pmd_index</code> 右移 21 位后取 9 位，就是"取第 29..21 位"。<code>pgd_index</code> 特别注明"必须是编译期常量"，因为它被用在 <code>KERNEL_PGD_BOUNDARY</code> 这种数组维度里，所以写成了宏而不是函数。</p>
+
+<h3>4.2 各级表的宽度与覆盖范围</h3>
+<p class="srcline">arch/x86/include/asm/pgtable_64_types.h:79-96  PUD_SHIFT / PMD_SHIFT / PTRS_PER_*</p>
+<pre><code>/*
+ * 3rd level page
+ */
+#define PUD_SHIFT	30
+#define PTRS_PER_PUD	512
+
+/*
+ * PMD_SHIFT determines the size of the area a middle-level
+ * page table can map
+ */
+#define PMD_SHIFT	21
+#define PTRS_PER_PMD	512
+
+/*
+ * entries per page directory level
+ */
+#define PTRS_PER_PTE	512
+</code></pre>
+<p>这就是位域图的源码依据：<code>PUD_SHIFT=30</code> 表示"PUD 索引占第 30..38 位"，<code>PMD_SHIFT=21</code> 表示"PMD 索引占第 21..29 位"，往下 <code>PAGE_SHIFT=12</code>（在 <code>arch/x86/include/asm/page_types.h:10</code>）是页内偏移。三个 <code>PTRS_PER_*</code> 都是 512，说明<b>每一级页表正好填满一个 4 KB 页</b>——每项 8 字节 × 512 项 = 4096 字节。这一点在第 14 篇（buddy）讲过：页表页本身就是从伙伴系统里申请的普通页。</p>
+
+<h3>4.3 CR3：CPU 手里的那根"目录指针"</h3>
+<p class="srcline">arch/x86/include/asm/processor.h:242-258  read_cr3_pa / load_cr3</p>
+<pre><code>/*
+ * Friendlier CR3 helpers.
+ */
+static inline unsigned long read_cr3_pa(void)
+{
+	return __read_cr3() &amp; CR3_ADDR_MASK;
+}
+
+static inline unsigned long native_read_cr3_pa(void)
+{
+	return __native_read_cr3() &amp; CR3_ADDR_MASK;
+}
+
+static inline void load_cr3(pgd_t *pgdir)
+{
+	write_cr3(__sme_pa(pgdir));
+}
+</code></pre>
+<p>注意 <code>load_cr3(pgd_t *pgdir)</code> 的参数类型：传进来的不是物理地址，而是 <b>PGD 的内核虚拟地址指针</b>。因为在 x86-64 上内核地址和物理地址是"恒等映射"（偏移量固定），所以 <code>__sme_pa()</code> 拿到的就是物理地址。掩码 <code>CR3_ADDR_MASK</code>（在 <code>arch/x86/include/asm/processor-flags.h:38</code>，值为 <code>0x7FFFFFFFFFFFF000</code>）会把低 12 位的 PCID 和 SME 加密位清掉——因为 CR3 里塞的不止一个地址。</p>
+
+<h3>4.4 <code>mm_struct</code> 里的页表根</h3>
+<p class="srcline">include/linux/mm_types.h:388-407  struct mm_struct（节选）</p>
+<pre><code>struct mm_struct {
+	struct {
+		struct vm_area_struct *mmap;		/* list of VMAs */
+		struct rb_root mm_rb;
+		u64 vmacache_seqnum;                   /* per-thread vmacache */
+#ifdef CONFIG_MMU
+		unsigned long (*get_unmapped_area) (struct file *filp,
+				unsigned long addr, unsigned long len,
+				unsigned long pgoff, unsigned long flags);
+#endif
+		unsigned long mmap_base;	/* base of mmap area */
+		unsigned long mmap_legacy_base;	/* base of mmap area in bottom-up allocations */
+#ifdef CONFIG_HAVE_ARCH_COMPAT_MMAP_BASES
+		/* Base adresses for compatible mmap() */
+		unsigned long mmap_compat_base;
+		unsigned long mmap_compat_legacy_base;
+#endif
+		unsigned long task_size;	/* size of task vm space */
+		unsigned long highest_vm_end;	/* highest vma end address */
+		pgd_t * pgd;
+</code></pre>
+<p><code>pgd_t * pgd;</code> 就是这个进程页表的根。<code>mmap</code> 是 VMA 单链表的头，<code>mm_rb</code> 是 VMA 红黑树的根——<b>注意 Linux 5.10 用的是红黑树，不是 6.1 之后才引入的 maple tree</b>，第 17 篇会详细讲。切换进程时，内核执行 <code>switch_mm()</code>，把 <code>mm-&gt;pgd</code> 装进 CR3。</p>
+
+<h3>4.5 缺页的第一站：x86 层的 <code>do_user_addr_fault</code></h3>
+<p>CPU 抛出 #PF 后进入内核态的缺页入口。我们看它做的第一件实事——<b>找到这个地址属于哪个 VMA</b>。</p>
+<p class="srcline">arch/x86/mm/fault.c:1333-1346  do_user_addr_fault</p>
+<pre><code>	vma = find_vma(mm, address);
+	if (unlikely(!vma)) {
+		bad_area(regs, hw_error_code, address);
+		return;
+	}
+	if (likely(vma-&gt;vm_start &lt;= address))
+		goto good_area;
+	if (unlikely(!(vma-&gt;vm_flags &amp; VM_GROWSDOWN))) {
+		bad_area(regs, hw_error_code, address);
+		return;
+	}
+	if (unlikely(expand_stack(vma, address))) {
+		bad_area(regs, hw_error_code, address);
+		return;
+	}
+</code></pre>
+<p><code>find_vma(mm, address)</code> 返回的是"第一个 <code>vm_end &gt; address</code> 的 VMA"。三种情况：<b>找不到</b>（地址完全不在任何合法区间）→ 发 SIGSEGV；<b>找到了但 <code>vm_start &gt; address</code></b>（落在某个 VMA 之前的空洞里）→ 只有当这个 VMA 带 <code>VM_GROWSDOWN</code>（栈）时才尝试 <code>expand_stack()</code> 往下扩展栈，否则也是 SIGSEGV；<b>地址落在 VMA 内部</b> → <code>good_area</code>，继续检查权限。</p>
+
+<h3>4.6 <code>handle_mm_fault</code>：通用入口</h3>
+<p class="srcline">mm/memory.c:4758-4787  handle_mm_fault</p>
+<pre><code>vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+			   unsigned int flags, struct pt_regs *regs)
+{
+	vm_fault_t ret;
+
+	__set_current_state(TASK_RUNNING);
+
+	count_vm_event(PGFAULT);
+	count_memcg_event_mm(vma-&gt;vm_mm, PGFAULT);
+
+	/* do counter updates before entering really critical section. */
+	check_sync_rss_stat(current);
+
+	if (!arch_vma_access_permitted(vma, flags &amp; FAULT_FLAG_WRITE,
+					    flags &amp; FAULT_FLAG_INSTRUCTION,
+					    flags &amp; FAULT_FLAG_REMOTE))
+		return VM_FAULT_SIGSEGV;
+
+	/*
+	 * Enable the memcg OOM handling for faults triggered in user
+	 * space.  Kernel faults are handled more gracefully.
+	 */
+	if (flags &amp; FAULT_FLAG_USER)
+		mem_cgroup_enter_user_fault();
+
+	if (unlikely(is_vm_hugetlb_page(vma)))
+		ret = hugetlb_fault(vma-&gt;vm_mm, vma, address, flags);
+	else
+		ret = __handle_mm_fault(vma, address, flags);
+</code></pre>
+<p>这个函数本身很短，做三件事：<b>①</b>把进程从"睡眠中"标成运行中并做计数（<code>PGFAULT</code> 事件就是 <code>/proc/vmstat</code> 里缺页计数的来源）；<b>②</b>用 <code>arch_vma_access_permitted()</code> 做一次架构相关的权限检查（比如 x86 上内核态访问用户页受 SMAP 限制）；<b>③</b>分诊：如果是 hugetlb 映射走 <code>hugetlb_fault()</code>，否则交给通用的 <code>__handle_mm_fault()</code>。</p>
+
+<h3>4.7 <code>__handle_mm_fault</code>：逐级定位页表</h3>
+<p class="srcline">mm/memory.c:4602-4626  __handle_mm_fault</p>
+<pre><code>vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+		unsigned long address, unsigned int flags)
+{
+	struct vm_fault vmf = {
+		.vma = vma,
+		.address = address &amp; PAGE_MASK,
+		.flags = flags,
+		.pgoff = linear_page_index(vma, address),
+		.gfp_mask = __get_fault_gfp_mask(vma),
+	};
+	unsigned int dirty = flags &amp; FAULT_FLAG_WRITE;
+	struct mm_struct *mm = vma-&gt;vm_mm;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	vm_fault_t ret;
+
+	pgd = pgd_offset(mm, address);
+	p4d = p4d_alloc(mm, pgd, address);
+	if (!p4d)
+		return VM_FAULT_OOM;
+
+	vmf.pud = pud_alloc(mm, p4d, address);
+	if (!vmf.pud)
+		return VM_FAULT_OOM;
+</code></pre>
+<p>先看 <code>.address = address &amp; PAGE_MASK</code>：把地址向下取整到页边界——因为 PTE 是按页对齐的，页内偏移在查表阶段要丢掉。</p>
+<p>然后是核心三行：<code>pgd_offset(mm, address)</code> 用第 4.1 节那套位运算算出 PGD 里的第几项；<code>p4d_alloc()</code> 顺着 PGD 往下走一级，如果那一项是空的，就<b>当场申请一页内存来建这张下级表</b>（这就是"懒分配页表"——没人碰过的地址空间，页表页根本不占内存）；<code>pud_alloc()</code> 同理。返回 <code>VM_FAULT_OOM</code> 表示连页表页都申请不出来（内存耗尽），这会一路传上去变成 OOM。</p>
+<p>再往下（<code>mm/memory.c:4654-4657</code>）还有 <code>vmf.pmd = pmd_alloc(mm, vmf.pud, address);</code>，以及专门处理透明大页的分支：<code>if (pmd_none(*vmf.pmd) &amp;&amp; __transparent_hugepage_enabled(vma))</code> → <code>create_huge_pmd(&amp;vmf)</code>。这就是第 19 篇讲的 THP 在缺页路径上的入口。</p>
+
+<h3>4.8 <code>handle_pte_fault</code>：分诊四种缺页</h3>
+<p>这是整个缺页处理的核心分诊台。注意本仓库的源码里已经带了中文注释，可以对照着读。</p>
+<p class="srcline">mm/memory.c:4498-4544  handle_pte_fault</p>
+<pre><code>static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+{
+	pte_t entry;
+
+	if (unlikely(pmd_none(*vmf-&gt;pmd /* 故障地址对应的PMD指针 */))) {
+		/*
+		 * 延迟到稍后调用__pte_alloc()：因为vm_ops-&gt;fault可能
+		 * 想要分配巨页，如果我们瞬间暴露页表，将很难从
+		 * 并发错误和rmap查找中撤回
+		 */
+		vmf-&gt;pte /* 故障地址对应的PTE指针 */ = NULL;
+	} else {
+		/* 参见pte_alloc_one_map()中的注释 */
+		if (pmd_devmap_trans_unstable(vmf-&gt;pmd /* 故障地址对应的PMD指针 */))
+			return 0;
+		/*
+		 * 常规PMD已建立，在此点之后不能再变形为巨PMD，
+		 * 因为我们持有mmap_lock读模式，而khugepaged以写模式获取它。
+		 * 所以现在运行pte_offset_map()是安全的。
+		 */
+		vmf-&gt;pte /* 故障地址对应的PTE指针 */ = pte_offset_map(vmf-&gt;pmd /* 故障地址对应的PMD指针 */, vmf-&gt;address /* 故障发生的虚拟地址 */);
+		vmf-&gt;orig_pte /* 原始PTE值 */ = *vmf-&gt;pte /* 故障地址对应的PTE指针 */; /* 保存原始PTE值 */
+
+		barrier();
+		if (pte_none(vmf-&gt;orig_pte /* 原始PTE值 */)) {
+			pte_unmap(vmf-&gt;pte /* 故障地址对应的PTE指针 */); /* PTE为空，取消映射 */
+			vmf-&gt;pte /* 故障地址对应的PTE指针 */ = NULL;
+		}
+	}
+
+	if (!vmf-&gt;pte /* 故障地址对应的PTE指针 */) {
+		/* PTE不存在，根据VMA类型选择处理方式 */
+		if (vma_is_anonymous(vmf-&gt;vma) /* 检查是否为匿名VMA */)
+			return do_anonymous_page(vmf); /* 匿名页面错误 */
+		else
+			return do_fault(vmf); /* 文件页面错误 */
+	}
+
+	if (!pte_present(vmf-&gt;orig_pte /* 原始PTE值 */))
+		return do_swap_page(vmf); /* 页面已换出，处理swap错误 */
+</code></pre>
+<p>分诊逻辑一目了然：</p>
+<ul>
+  <li><b>PTE 不存在</b>（<code>pte_none</code>）→ 看 VMA 有没有文件后备：匿名 VMA 走 <code>do_anonymous_page()</code>（新分配一页并清零）；文件 VMA 走 <code>do_fault()</code>（从页缓存/磁盘取页）。</li>
+  <li><b>PTE 存在但 <code>!pte_present</code></b> → 页被换出了，走 <code>do_swap_page()</code> 从 swap 读回。</li>
+  <li><b>PTE 存在、present，但写访问时 <code>!pte_write</code></b> → 走 <code>do_wp_page()</code> 做写时复制（见 4.9）。</li>
+  <li><b>一切正常</b> → 补上 accessed / dirty 位，刷新 TLB。</li>
+</ul>
+<p>注意代码里的 <code>barrier()</code>：这里读到 PTE 只是一份"一致的快照"，用来做分支判断；真正要改 PTE 时，会在 <code>vmf-&gt;ptl</code>（页表锁）保护下再检查一次 <code>pte_same()</code>，防止和并发的缺页处理互相踩踏。</p>
+
+<h3>4.9 <code>find_vma</code>：地址空间的红黑树查询</h3>
+<p class="srcline">mm/mmap.c:2581-2612  find_vma</p>
+<pre><code>struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+{
+	struct rb_node *rb_node;
+	struct vm_area_struct *vma;
+
+	/* Check the cache first. */
+	vma = vmacache_find(mm, addr);
+	if (likely(vma))
+		return vma;
+
+	rb_node = mm-&gt;mm_rb.rb_node;
+
+	while (rb_node) {
+		struct vm_area_struct *tmp;
+
+		tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+
+		if (tmp-&gt;vm_end &gt; addr) {
+			vma = tmp;
+			if (tmp-&gt;vm_start &lt;= addr)
+				break;
+			rb_node = rb_node-&gt;rb_left;
+		} else
+			rb_node = rb_node-&gt;rb_right;
+	}
+
+	if (vma)
+		vmacache_update(addr, vma);
+	return vma;
+}
+</code></pre>
+<p>先查 <code>vmacache</code>——一个每线程 4 槽的"VMA 查找缓存"。缺页处理是高频操作，绝大多数缺页都发生在"刚刚访问过的那个 VMA"里，缓存命中率极高，命中就是 O(1)。未命中才走红黑树：<b>因为 VMA 按地址有序排列</b>，所以"找第一个 <code>vm_end &gt; addr</code> 的节点"就是一次标准的 BST 查找，O(log n)。</p>
+<p>红黑树遍历的逻辑值得逐行体会：<code>tmp-&gt;vm_end &gt; addr</code> 说明这个节点在目标地址右边（它的范围可能包含 addr），要往左找更靠前的候选；如果 <code>tmp-&gt;vm_start &lt;= addr</code> 说明 addr 确实落在它里面，直接命中；否则 addr 在这个 VMA 之前的空洞里，继续往左子树找更早的 VMA。</p>
+
+<h3>4.10 <code>anon_vma</code>：匿名页的反向映射锚点</h3>
+<p class="srcline">include/linux/rmap.h:29-39  struct anon_vma</p>
+<pre><code>struct anon_vma {
+	struct anon_vma *root;		/* Root of this anon_vma tree */
+	struct rw_semaphore rwsem;	/* W: modification, R: walking the list */
+	/*
+	 * The refcount is taken on an anon_vma when there is no
+	 * guarantee that the vma of page tables will exist for
+	 * the duration of the operation. A caller that takes
+	 * the reference is responsible for clearing up the
+	 * anon_vma if they are the last user on release
+	 */
+	atomic_t refcount;
+</code></pre>
+<p><code>root</code> 指向这棵 anon_vma 树的根（fork 出来的多个进程共享同一个 root），<code>rwsem</code> 保护遍历与修改，<code>refcount</code> 管生命周期。物理页的 <code>struct page</code> 里有一个 <code>anon_vma</code> 指针指向它，于是"给定物理页 → 找到所有映射它的 VMA"就变成了：读 <code>page-&gt;anon_vma</code> → 沿 <code>anon_vma_chain</code> 链表遍历 → 每个 chain 上挂着一个 <code>struct vm_area_struct *vma</code>。这条链是第 18 篇内存回收和 COW 的基础设施。</p>
+
+<h3>4.11 <code>/proc/[pid]/maps</code> 是怎么生成的</h3>
+<p class="srcline">fs/proc/task_mmu.c:165-180  m_next</p>
+<pre><code>static void *m_next(struct seq_file *m, void *v, loff_t *ppos)
+{
+	struct proc_maps_private *priv = m-&gt;private;
+	struct vm_area_struct *next, *vma = v;
+
+	if (vma == priv-&gt;tail_vma)
+		next = NULL;
+	else if (vma-&gt;vm_next)
+		next = vma-&gt;vm_next;
+	else
+		next = priv-&gt;tail_vma;
+
+	*ppos = next ? next-&gt;vm_start : -1UL;
+
+	return next;
+}
+</code></pre>
+<p><code>/proc/[pid]/maps</code> 走的是 <code>seq_file</code> 框架：<code>m_start</code> 用 <code>find_vma()</code> 找到第一个 VMA，<code>m_next</code> 顺着 <code>vm_next</code> 链表走，<code>show_map</code> 负责格式化每一行。值得注意的是它用的是 <b>VMA 单链表</b>（<code>vm_next</code>）而不是红黑树——因为遍历全部时链表更省缓存。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看自己进程的地址空间</h3>
+<pre><code>$ cat /proc/self/maps
+55a8b0a00000-55a8b0a02100 r--p 00000000 08:01 1234567    /usr/bin/cat
+55a8b0a02100-55a8b0a02400 r-xp 00002100 08:01 1234567    /usr/bin/cat
+55a8b0a02400-55a8b0a02500 r--p 00002400 08:01 1234567    /usr/bin/cat
+55a8b0b7f0000-55a8b0b811000 rw-p 00000000 00:00 0         [heap]
+7ffd8b3ff000-7ffd8b401000 rw-p 00000000 00:00 0         [stack]
+</code></pre>
+<p>每一行的格式是：<code>起始地址-结束地址 权限 偏移 设备号 inode 路径</code>。权限那 4 个字符依次是 <code>r</code> 可读、<code>w</code> 可写、<code>x</code> 可执行、<code>p</code> 私有（<code>s</code> 则表示共享）。<b>起始地址一定是 4 KB 的整数倍</b>——因为 VMA 的边界必须落在页边界上，这就是第 4.7 节 <code>address &amp; PAGE_MASK</code> 的原因。</p>
+
+<h3>5.2 看页表占多少内存</h3>
+<pre><code>$ grep -E "PageTables|Active\(file\)|AnonPages" /proc/meminfo
+PageTables:      24448 kB
+AnonPages:      123456 kB
+Active\(file\):   23456 kB
+</code></pre>
+<p><code>PageTables</code> 就是当前所有页表页占用的内存总量（第 14 篇讲过页表页本身也是普通页）。它的开销和"映射了多少虚拟地址范围"成正比，而不是和"实际用了多少数据"成正比——这也是为什么给一个程序 <code>mmap</code> 一块 1 TB 的空间（不碰它）几乎不花内存，但页表还是会有零星开销。</p>
+
+<h3>5.3 用 CR3 亲眼看看页表在哪</h3>
+<pre><code>$ sudo gdb -p $(pidof sleep 1000)
+(gdb) p/x $cr3
+$5 = 0x7f2a1c000000
+(gdb) info proc mappings
+</code></pre>
+<p>CR3 里那个地址就是该进程 PGD 表的物理地址。用 <code>info proc mappings</code> 拿到 VMA 列表后，可以手工验证一下：随便挑一个 VMA 里的地址 <code>A</code>，按第 3.1 节的位域切片算出 PGD/PUD/PMD/PTE 四个索引，就能推出这个地址对应哪几张物理页。</p>
+
+<h3>5.4 <code>mincore</code> + <code>mmap</code>：亲眼看到"懒分配"</h3>
+<p>下面这个小程序映射 4 MB 匿名内存，然后用 <code>mincore()</code> 查询"哪些页真的在内存里"。注意 <code>mincore</code> 报的是"物理驻留状态"，不是"页表项是否存在"——这正是懒分配的直接证据。</p>
+<pre><code>$ cat &gt; mincore_demo.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void)
+{
+	size_t len = 4UL * 1024 * 1024;          /* 4 MB */
+	long   pages = len / sysconf(_SC_PAGESIZE);
+	unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	unsigned char *vec;
+	int resident, i;
+
+	if (p == MAP_FAILED) { perror("mmap"); return 1; }
+	vec = malloc(pages);
+	if (!vec) { perror("malloc"); return 1; }
+	printf("mapped  at %p  (%ld pages)\n", (void *)p, pages);
+
+	if (mincore(p, len, vec) != 0) { perror("mincore"); return 1; }
+	resident = 0;
+	for (i = 0; i &lt; pages; i++) resident += (vec[i] &amp; 1);
+	printf("before touch: resident = %d / %ld\n", resident, pages);
+
+	p[0] = 1;                               /* 只碰第一个页 */
+	mincore(p, len, vec);
+	resident = 0;
+	for (i = 0; i &lt; pages; i++) resident += (vec[i] &amp; 1);
+	printf("after  touch: resident = %d / %ld\n", resident, pages);
+	return 0;
+}
+EOF
+$ gcc -O0 -o mincore_demo mincore_demo.c &amp;&amp; ./mincore_demo
+mapped  at 0x7f5b4c000000  (1024 pages)
+before touch: resident = 0 / 1024
+after  touch: resident = 1 / 1024
+</code></pre>
+<p>预期输出就是上面那样：<b>映射了 1024 个页，但一个都没在内存里</b>；只有碰过第一个页之后，驻留数才变成 1。这说明 <code>mmap()</code> 只建立 VMA 和页表结构（甚至连 PTE 都还没建），真正分配物理页是在<b>第一次访问</b>时由缺页异常完成的。整段程序只 touch 了 1 个字节，物理内存开销也只有 1 页。</p>
+
+<h3>5.5 观察缺页计数</h3>
+<pre><code>$ grep -E "pgmajfault|pgminfault" /proc/vmstat
+$ ./mincore_demo
+$ grep -E "pgmajfault|pgminfault" /proc/vmstat
+</code></pre>
+<p>两次采样相减，<code>pgminfault</code> 会增加几十（每个新碰的页一次缺页，加上程序本身的加载缺页），而 <code>pgmajfault</code> 通常不变——因为这些页都是匿名页，不需要读磁盘。如果换成读一个刚创建的大文件，<code>pgmajfault</code> 就会明显跳上去。</p>
+
+<h3>5.6 在 qemu 里看缺页打点（可选）</h3>
+<pre><code># 用 qemu 启动内核，加 earlyprintk 以便看到缺页相关日志
+$ qemu-system-x86_64 -kernel bzImage -append "console=ttyS0 earlyprintk" -nographic
+# 在内核里打开缺页统计
+$ echo 1 &gt; /proc/sys/kernel/print-fatal-signals
+$ cat /proc/vmstat | grep fault
+</code></pre>
+<p>如果需要更细的粒度，可以在 gdb 里对 <code>handle_mm_fault</code> 下断点，统计命中次数；或用 <code>ftrace</code> 的 <code>exceptions:page_fault_user</code> 事件：<code>echo 1 &gt; /sys/kernel/tracing/events/exceptions/page_fault_user/enable</code>。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 为什么虚拟地址要设计成"多级页表"，而不是一张平铺的大表？</b>因为地址空间巨大（x86-64 用户空间 128 TB）。平铺表需要为每个虚拟页都准备一个表项，哪怕你只用了一个字节，也要按整个地址空间分配合页表内存。多级表把地址分段，每一级只对"真正用到的区间"分配下级表：PTE 那一级是按需分配的（没碰过的页连 PTE 都没有），上几级也只在需要时才建立。结果是：映射 1 GB 内存的页表开销大约是几 MB 量级，而不是几百 GB。</div>
+<div class="qa"><b>Q2. 缺页处理完成后，为什么是"返回用户态重试指令"，而不是在内核里把这次访存做完？</b>因为缺页处理的职责只是"把路修通"——补上缺失的页表项。它并不知道这条指令后续要怎么用数据、要不要跨页、要不要处理对齐。如果内核替用户态执行完这条指令，就得在用户地址空间里模拟访存的全部语义（字节序、原子性、信号、可被观测的时序），复杂且易错。返回用户态重试，硬件会重新走一遍完整的访存流程，语义天然正确。代价是多一次异常往返，这也是"缺页"在性能分析里值得关注的原因。</div>
+<div class="qa"><b>Q3. COW 缺页和匿名缺页有什么区别？两者都会新建一个物理页吗？</b>都会新建物理页，但来源不同。匿名缺页是"这个地址从来没被映射过"，新页的内容由内核清零提供（因为语义上要求新内存是零）。COW 缺页是"这个地址有映射，但页表项是只读的"——只读是因为它被多个进程共享（典型是 fork 出来的父子进程）。内核这时把原页<b>复制</b>一份给当前进程使用，原页保持不变给其他进程用。COW 的关键在于：复制发生在"真的有人要写"的那一刻，而不是 fork 的那一刻，这让 fork 变得非常廉价。</div>
+<div class="qa"><b>Q4. <code>find_vma()</code> 返回的 VMA 一定包含查询的地址吗？</b><b>不一定。</b>它返回的是"第一个满足 <code>vm_end &gt; addr</code> 的 VMA"。如果 <code>addr</code> 落在两个 VMA 之间的空洞里，返回的是后面那个 VMA（它的 <code>vm_start &gt; addr</code>）。所以调用者必须自己判断：x86 的缺页路径里就是先看 <code>vma-&gt;vm_start &lt;= address</code>，成立才算命中；不成立则根据 <code>VM_GROWSDOWN</code> 判断能否扩栈，否则发 SIGSEGV。</div>
+<div class="qa"><b>Q5. 为什么 <code>/proc/meminfo</code> 里的 <code>PageTables</code> 会比"实际用到的页数 × 8 字节"大不少？</b>因为页表是分级的、且每级都固定占 4 KB。映射 4 KB 数据需要：1 个 PTE（4 KB 页）+ 沿途的 PMD/PUD/PGD（如果之前没建，还要各占 4 KB）。所以摊到每个数据页上，页表开销可能是几十字节甚至更多。此外 <code>PageTables</code> 是<b>全系统</b>的统计，包含内核自身页表、每个进程的页表、以及为预留地址空间而建立的空表。内核在 <code>mm-&gt;pgtables_bytes</code> 里单独统计每个进程的页表开销。</div>
+
+<footer>
+  <p>上一篇：<a href="15-slab.html">15-slab 内核对象的对象池</a> · 下一篇：<a href="17-vma.html">17-vma VMA 与进程地址空间布局</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

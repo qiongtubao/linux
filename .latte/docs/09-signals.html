@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 信号</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="10-interrupts.html">下一篇：10 中断 →</a>
+</nav>
+
+<h1>📣 信号：内核敲你门的门铃</h1>
+<p class="subtitle">一条 64 位位图记录"谁还没被处理"，一次栈帧构造让用户态代码在指定地址醒来 · 预计阅读 28 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>你在厨房煮面，水开了，锅开始尖叫。你不需要盯着锅——你只是<strong>听到了一个通知</strong>，然后关火。门铃也是这样：邮递员按一下门铃就走了，他不会等你开门，更不会替你开门。这个"异步通知"的机制就是信号。</p>
+
+<p>操作系统里的问题是：<strong>进程 A 怎么告诉进程 B "出事了"</strong>，而 B 可能正忙着别的事、可能暂时没空处理、可能已经死了？POSIX 给出的方案是信号（<span class="term">signal</span>）。发送方（<code>kill()</code>）只负责"投递"，不关心对方什么时候处理；接收方可以捕获（写处理函数）、可以忽略（<code>SIG_IGN</code>）、可以暂时屏蔽（挂起），也可以干脆用默认动作（终止、停止、转储 core）。</p>
+
+<p>从 OS 视角看，信号是内核提供的<strong>进程间异步通知机制</strong>，它和管道、消息队列这类 IPC 的区别在于：管道是<strong>同步</strong>的——写端必须等读端来收；信号是<strong>异步</strong>的——发完即走，接收方在"下一个方便的时刻"被打断。信号还携带额外信息（<code>struct siginfo</code>），比如"是谁杀的"、"在哪条指令上出的错"、"孩子是怎么死的"。</p>
+
+<p>还有一个关键认知：<strong>信号不是硬件中断</strong>。中断是 CPU 的硬件机制，目标是"打断 CPU 此刻正在执行的东西"；信号是内核的软件机制，目标是"打断某个进程"。二者都会导致"控制流被重定向"，但拦截点、屏蔽方式、上下文保存方式完全不同。本篇讲信号，第 10 篇讲中断。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">信号</td><td>signal</td><td>内核投递给进程的异步通知，编号 1..64</td></tr>
+  <tr><td class="term">信号编号</td><td>signal number</td><td>整数常量，SIGINT=2、SIGKILL=9、SIGCHLD=17，定义在 <code>include/uapi/asm-generic/signal.h</code></td></tr>
+  <tr><td class="term">信号动作</td><td>struct sigaction</td><td>每个信号一份的处理策略：处理函数地址、flags、附加屏蔽字</td></tr>
+  <tr><td class="term">默认动作</td><td>default action</td><td>没设处理函数时内核替你做的事：忽略 / 终止 / 停止 / 转储 core</td></tr>
+  <tr><td class="term">屏蔽字</td><td>blocked mask / <code>task-&gt;blocked</code></td><td>一个位图，置位的信号"先记下、稍后再说"，不会立刻打断你</td></tr>
+  <tr><td class="term">待处理</td><td>pending</td><td>已投递但还没送达的信号集合，同样是位图</td></tr>
+  <tr><td class="term">共享待处理</td><td>shared_pending</td><td>发给整个线程组（进程）的信号存放处，与线程私有 pending 分开</td></tr>
+  <tr><td class="term">实时信号</td><td>real-time signal</td><td>SIGRTMIN(32) 以后的信号，可以排队多个、不会合并</td></tr>
+  <tr><td class="term">传统信号</td><td>legacy signal</td><td>SIGRTMIN 之前的信号，同一个信号重复发只保留一个</td></tr>
+  <tr><td class="term">信号信息</td><td>siginfo</td><td>随信号一起送达的附加信息（发送者 pid/uid、故障地址、退出码）</td></tr>
+  <tr><td class="term">EINTR</td><td>Interrupted system call</td><td>系统调用被信号打断时返回的错误码；带 <code>SA_RESTART</code> 则自动重启，用户态看不见它</td></tr>
+  <tr><td class="term">ERESTARTSYS</td><td>restart system call</td><td>内核内部标记：这次系统调用可以重启，交给 x86 汇编入口决定行为</td></tr>
+  <tr><td class="term">SA_RESTART</td><td>restart flag</td><td><code>sigaction</code> 的一个 flag，让可重启的系统调用在被信号打断后自动重做</td></tr>
+  <tr><td class="term">SIGCHLD</td><td>child changed state</td><td>子进程退出/停止时通知父进程，默认动作是"忽略"，靠 <code>wait()</code> 收割</td></tr>
+  <tr><td class="term">僵尸进程</td><td>zombie</td><td>已退出但还没被父进程 <code>wait()</code> 回收的进程，只剩一条退出状态</td></tr>
+  <tr><td class="term">信号帧</td><td>rt_sigframe</td><td>内核在用户栈上造的一块结构，保存被打断现场的寄存器，供 <code>sigreturn</code> 恢复</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 信号的一生</h3>
+
+<pre><code>kill(2) / tkill(2) / raise(2) / 内核自发（段错误、定时器、子进程退出）
+    │
+    ▼
+send_signal(sig, info, t, type)                    kernel/signal.c
+    │  · 权限与命名空间检查
+    │  · 决定 force（是否强制送达，绕过"忽略"）
+    ▼
+__send_signal(sig, info, t, type, force)             kernel/signal.c
+    ├─ prepare_signal()      处理 SIGCONT 与"停止类"信号的互斥关系
+    ├─ legacy_queue()        传统信号去重：已在 pending 里就直接返回
+    ├─ __sigqueue_alloc()    分配 sigqueue 节点，携带 siginfo
+    └─ sigaddset(&amp;pending-&gt;signal, sig)   ← 置位 pending 位图
+    │
+    │ ……目标进程照常跑用户代码……
+    ▼
+准备从内核返回用户态时：exit_to_user_mode_loop()      kernel/entry/common.c
+    └─ 看到 _TIF_SIGPENDING → arch_do_signal(regs)     arch/x86/kernel/signal.c
+          │
+          ▼
+        get_signal(&amp;ksig)                              kernel/signal.c
+          ├─ dequeue_synchronous_signal()  同步信号（SIGSEGV/SIGFPE…）优先
+          ├─ dequeue_signal(current, &amp;current-&gt;blocked, …)  取第一个未屏蔽的
+          ├─ ka = &amp;sighand-&gt;action[signr-1]
+          ├─ SIG_IGN        → 丢弃，继续循环
+          ├─ 自定义处理函数  → 记住 ka，退出循环（返回 signr &gt; 0）
+          └─ SIG_DFL        → 按默认动作：忽略 / 停止 / core dump / 终止
+          │
+          ▼
+        handle_signal(&amp;ksig, regs)                     arch/x86/kernel/signal.c
+          ├─ 若来自系统调用且错误码是 -ERESTARTSYS：
+          │     有 SA_RESTART → 恢复原调用号、ip-=2 让它重做
+          │     无 SA_RESTART → regs-&gt;ax = -EINTR
+          └─ setup_rt_frame(ksig, regs)  ← 在用户栈上造信号帧
+                ├─ 填 rt_sigframe（ucontext + siginfo + 旧屏蔽字）
+                ├─ regs-&gt;ip = 处理函数地址
+                └─ regs-&gt;sp = &amp;frame
+    │
+    ▼
+用户态处理函数执行完 → 调用 rt_sigreturn → 内核按帧恢复寄存器现场
+</code></pre>
+
+<div class="note">
+  <strong>一句话总结：</strong>发送阶段只做"记账"（置位 pending + 挂队列），投递阶段才决定"这一瞬间要不要打断你"。这两段代码分别住在 <code>kernel/signal.c</code> 的 <code>__send_signal()</code> 和 <code>get_signal()</code> 里。
+</div>
+
+<h3>3.2 三张表 + 一个队列</h3>
+
+<p>每个线程（task）身上挂着三样跟信号有关的东西，都定义在 <code>include/linux/sched/signal.h</code> 与 <code>include/linux/signal_types.h</code>：</p>
+
+<table>
+  <tr><th>结构</th><th>位置</th><th>作用</th></tr>
+  <tr><td><code>task-&gt;blocked</code></td><td>每个线程私有</td><td>屏蔽字：哪些信号暂时不要给我</td></tr>
+  <tr><td><code>task-&gt;pending</code></td><td>每个线程私有</td><td>只发给本线程的待处理信号（位图 + sigqueue 链表）</td></tr>
+  <tr><td><code>task-&gt;signal-&gt;shared_pending</code></td><td>整个线程组共享</td><td>用 <code>kill(-pgid)</code> 之类发给全组的信号</td></tr>
+  <tr><td><code>sighand-&gt;action[_NSIG]</code></td><td>线程组共享</td><td>每个信号一份的 <code>struct k_sigaction</code>：处理函数、flags、附加屏蔽字</td></tr>
+</table>
+
+<p>注意"动作表是线程组共享的，屏蔽字和私有 pending 是每线程独立的"这个不对称——这正是 POSIX 规定的行为，也是多线程程序里最容易踩坑的地方。</p>
+
+<h3>3.3 SIGKILL 与 SIGSTOP 为什么特殊</h3>
+
+<p>内核头文件里写得很直白（<code>include/linux/signal.h:345</code>）：</p>
+
+<pre><code> * SIGKILL and SIGSTOP cannot be caught, blocked, or ignored.
+</code></pre>
+
+<p>原因有三层，代码里都能找到对应：</p>
+
+<ol>
+  <li><strong>不能捕获</strong>：设置动作的入口 <code>do_sigaction()</code> 直接拒绝——如果信号属于 <code>SIG_KERNEL_ONLY_MASK</code>（只有 SIGKILL 和 SIGSTOP），返回 <code>-EINVAL</code>。</li>
+  <li><strong>不能屏蔽</strong>：<code>rt_sigprocmask()</code> 在写入前把这两个位从用户给的掩码里<strong>抠掉</strong>，所以你 <code>sigprocmask(SIG_BLOCK, &amp;{SIGKILL}, NULL)</code> 之后查 <code>SigBlk</code> 会发现 SIGKILL 根本没被设上。</li>
+  <li><strong>不能忽略</strong>：<code>do_sigaction()</code> 同样拒绝对它们设置 <code>SIG_IGN</code>；即便绕过 API 直接改内核数据，<code>get_signal()</code> 里的默认动作分支对它们也只会终止/停止。</li>
+</ol>
+
+<p>为什么要留这两个"后门"？因为它们是<strong>管理员和内核的救命绳</strong>：进程陷入死循环、内存彻底损坏、连 <code>SIGTERM</code> 都不理的守护进程，<code>kill -9</code> 是唯一能把它从内核里拽出来的办法。而 <code>SIGSTOP</code> 保证调试器（gdb）随时能把失控的进程按在原地。</p>
+
+<h3>3.4 信号 vs 中断</h3>
+
+<table>
+  <tr><th>维度</th><th>信号 signal</th><th>硬件中断 interrupt</th></tr>
+  <tr><td>触发源</td><td>内核软件（另一个进程、系统调用出错、定时器）</td><td>外设硬件（网卡、磁盘、键盘、时钟）</td></tr>
+  <tr><td>目标</td><td>一个进程</td><td>CPU 本身</td></tr>
+  <tr><td>能否屏蔽</td><td>能（<code>blocked</code> 位图）</td><td>能，但只有开关两态（<code>local_irq_disable</code>）</td></tr>
+  <tr><td>能否捕获</td><td>能（用户态处理函数）</td><td>不能，只能由内核注册的 handler 处理</td></tr>
+  <tr><td>现场保存</td><td>用户栈上的 <code>rt_sigframe</code></td><td>CPU 压栈（内核栈）或专用中断栈</td></tr>
+  <tr><td>能否带信息</td><td>能（<code>siginfo</code>：谁发的、什么错）</td><td>不能，只能读设备寄存器</td></tr>
+  <tr><td>处理者</td><td>用户态代码</td><td>内核态代码</td></tr>
+</table>
+
+<h3>3.5 SIGCHLD 与 wait</h3>
+
+<p>子进程退出时，内核在 <code>exit_notify()</code> 里调用 <code>do_notify_parent(tsk, SIGCHLD)</code> 给父进程发一个 SIGCHLD。<strong>SIGCHLD 的默认动作是"忽略"</strong>——它纯粹是个"你该来收尸了"的提醒，真正取走退出状态的是 <code>wait()</code>/<code>waitpid()</code> 系统调用。</p>
+
+<p>如果父进程一直不 <code>wait()</code>，子进程就会变成<strong>僵尸</strong>：进程表里的条目还在（为了让父进程知道它的退出码），但已经不算占内存了。僵尸堆积会耗尽 PID 空间，这是服务器上"进程数爆了"的一个经典原因。</p>
+
+<div class="tip">
+  <strong>常见坑：</strong>把 SIGCHLD 设成 <code>SIG_IGN</code> 后，子进程<strong>不会</strong>留下僵尸——内核会直接自动回收。这条规则在 POSIX 里是明确的，Linux 在 <code>do_notify_parent()</code> 里实现：<code>psig-&gt;action[SIGCHLD-1].sa.sa_handler == SIG_IGN</code> 时设置 <code>autoreap = true</code>。
+</div>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 <code>struct sigaction</code>：用户态 ABI 与内核态</h3>
+
+<p>用户态看到的结构定义在 <code>arch/x86/include/uapi/asm/signal.h</code>（x86_64 分支）：</p>
+
+<p class="srcline">arch/x86/include/uapi/asm/signal.h:118-123  struct sigaction (x86_64)</p>
+<pre><code>struct sigaction {
+	__sighandler_t sa_handler;
+	unsigned long sa_flags;
+	__sigrestore_t sa_restorer;
+	sigset_t sa_mask;		/* mask last for extensibility */
+};
+</code></pre>
+
+<ul>
+  <li><code>sa_handler</code>：处理函数地址。两个特殊值：<code>SIG_DFL</code>(0) 表示用默认动作，<code>SIG_IGN</code>(1) 表示彻底忽略。</li>
+  <li><code>sa_flags</code>：行为开关，常用的有 <code>SA_SIGINFO</code>（处理函数多收两个参数）、<code>SA_RESTART</code>（系统调用自动重启）、<code>SA_ONESHOT</code>（执行一次后恢复默认）、<code>SA_NODEFER</code>（处理期间不自动屏蔽自己）。</li>
+  <li><code>sa_restorer</code>：<strong>用户态代码</strong>里的一小段 trampoline，作用是执行 <code>rt_sigreturn</code> 把控制权交还内核。这字段是 x86_64 ABI 强制的，内核在 <code>__setup_rt_frame()</code> 里会检查 <code>SA_RESTORER</code> 标志，缺了就直接返回 <code>-EFAULT</code>。</li>
+  <li><code>sa_mask</code>：执行处理函数期间额外屏蔽哪些信号。内核在 <code>do_sigaction()</code> 里会强制把 SIGKILL/SIGSTOP 从这里面抠掉。</li>
+</ul>
+
+<p>内核内部另有一份 <code>struct sigaction</code>（<code>include/linux/signal_types.h:35-47</code>），字段顺序按架构可调，并额外包了一层 <code>struct k_sigaction</code>：</p>
+
+<p class="srcline">include/linux/signal_types.h:35-54  struct sigaction / struct k_sigaction</p>
+<pre><code>struct sigaction {
+#ifndef __ARCH_HAS_IRIX_SIGACTION
+	__sighandler_t	sa_handler;
+	unsigned long	sa_flags;
+#else
+	unsigned int	sa_flags;
+	__sighandler_t	sa_handler;
+#endif
+#ifdef __ARCH_HAS_SA_RESTORER
+	__sigrestore_t sa_restorer;
+#endif
+	sigset_t	sa_mask;	/* mask last for extensibility */
+};
+
+struct k_sigaction {
+	struct sigaction sa;
+#ifdef __ARCH_HAS_KA_RESTORER
+	__sigrestore_t ka_restorer;
+#endif
+};
+</code></pre>
+
+<p>为什么要两层？因为某些架构（如 mips、alpha、sparc）历史上把 <code>sa_flags</code> 放在 <code>sa_handler</code> 前面，<code>__ARCH_HAS_IRIX_SIGACTION</code> 就是这个开关。<code>struct k_sigaction</code> 则是给那些"用户态的 sa_restorer"和"内核自己记的 restorer"分开放的内核包装。</p>
+
+<h3>4.2 <code>send_signal()</code>：入口与"强制"语义</h3>
+
+<p>这是对外的一层包装，负责决定这次信号是不是"强制的"（<code>force</code>）。强制的意思是：即使目标是内核线程、或者目标来自更外层的 PID 命名空间，也必须送达。</p>
+
+<p class="srcline">kernel/signal.c:1405-1439  send_signal</p>
+<pre><code>static int send_signal(int sig, struct kernel_siginfo *info, struct task_struct *t,
+			enum pid_type type)
+{
+	/* Should SIGKILL or SIGSTOP be received by a pid namespace init? */
+	bool force = false;
+
+	if (info == SEND_SIG_NOINFO) {
+		/* Force if sent from an ancestor pid namespace */
+		force = !task_pid_nr_ns(current, task_active_pid_ns(t));
+	} else if (info == SEND_SIG_PRIV) {
+		/* Don't ignore kernel generated signals */
+		force = true;
+	} else if (has_si_pid_and_uid(info)) {
+		/* SIGKILL and SIGSTOP is special or has ids */
+		struct user_namespace *t_user_ns;
+
+		rcu_read_lock();
+		t_user_ns = task_cred_xxx(t, user_ns);
+		if (current_user_ns() != t_user_ns) {
+			kuid_t uid = make_kuid(current_user_ns(), info-&gt;si_uid);
+			info-&gt;si_uid = from_kuid_munged(t_user_ns, uid);
+		}
+		rcu_read_unlock();
+
+		/* A kernel generated signal? */
+		force = (info-&gt;si_code == SI_KERNEL);
+
+		/* From an ancestor pid namespace? */
+		if (!task_pid_nr_ns(current, task_active_pid_ns(t))) {
+			info-&gt;si_pid = 0;
+			force = true;
+		}
+	}
+	return __send_signal(sig, info, t, type, force);
+}
+</code></pre>
+
+<ul>
+  <li><code>SEND_SIG_NOINFO</code> / <code>SEND_SIG_PRIV</code> 是两个"魔法指针值"，用来表示"没有额外信息"或"内核私有信号"，省掉一次 <code>kernel_siginfo</code> 的拷贝。</li>
+  <li>跨越 PID 命名空间发信号时，<code>force</code> 会被置真：容器里的进程不能靠"忽略信号"来抗住外层发来的 SIGKILL。</li>
+  <li><code>info-&gt;si_uid</code> 会被翻译到目标进程的用户命名空间去，避免容器内看到外层的 uid。</li>
+</ul>
+
+<h3>4.3 <code>__send_signal()</code>：真正的"记账"</h3>
+
+<p>核心工作只有四步：预处理 → 去重 → 分配队列节点 → 置位 pending。</p>
+
+<p class="srcline">kernel/signal.c:1259-1373  __send_signal</p>
+<pre><code>static int __send_signal(int sig, struct kernel_siginfo *info, struct task_struct *t,
+			enum pid_type type, bool force)
+{
+	struct sigpending *pending;
+	struct sigqueue *q;
+	int override_rlimit;
+	int ret = 0, result;
+
+	assert_spin_locked(&amp;t-&gt;sighand-&gt;siglock);
+
+	result = TRACE_SIGNAL_IGNORED;
+	if (!prepare_signal(sig, t, force))
+		goto ret;
+
+	pending = (type != PIDTYPE_PID) ? &amp;t-&gt;signal-&gt;shared_pending : &amp;t-&gt;pending;
+	/*
+	 * Short-circuit ignored signals and support queuing
+	 * exactly one non-rt signal, so that we can get more
+	 * detailed information about the cause of the signal.
+	 */
+	result = TRACE_SIGNAL_ALREADY_PENDING;
+	if (legacy_queue(pending, sig))
+		goto ret;
+
+	result = TRACE_SIGNAL_DELIVERED;
+	/*
+	 * Skip useless siginfo allocation for SIGKILL and kernel threads.
+	 */
+	if ((sig == SIGKILL) || (t-&gt;flags &amp; PF_KTHREAD))
+		goto out_set;
+	// ... （此处约 70 行：__sigqueue_alloc() 分配节点、填充 siginfo、按 RLIMIT_SIGPENDING 判定是否丢弃）
+out_set:
+	signalfd_notify(t, sig);
+	sigaddset(&amp;pending-&gt;signal, sig);
+	// ... （此处约 30 行：处理多进程信号的延迟投递、complete_signal()）
+ret:
+	trace_signal_generate(sig, info, t, type != PIDTYPE_PID, result);
+	return ret;
+}
+</code></pre>
+
+<ul>
+  <li><code>pending</code> 的选择：发给单个线程（<code>PIDTYPE_PID</code>）放私有 pending，发给进程组/会话放共享 pending。</li>
+  <li><code>legacy_queue()</code> 只做一件事：<code>return (sig &lt; SIGRTMIN) &amp;&amp; sigismember(&amp;signals-&gt;signal, sig);</code>——传统信号重复投递会被合并，实时信号则会排队。</li>
+  <li>SIGKILL 跳过 <code>sigqueue</code> 分配：它没有"原因"要说，直接置位就行。</li>
+  <li>最后 <code>sigaddset(&amp;pending-&gt;signal, sig)</code> 才是"记账"本身——它置的是位图，不是链表。</li>
+  <li>整个函数都在 <code>t-&gt;sighand-&gt;siglock</code> 自旋锁保护下（第一行的 <code>assert_spin_locked</code> 就是自检）。</li>
+</ul>
+
+<h3>4.4 <code>get_signal()</code>：取出一个该处理的信号</h3>
+
+<p>投递阶段的主角。它反复从 pending 里"挑一个未被屏蔽的信号"，然后按它的动作分派。</p>
+
+<p class="srcline">kernel/signal.c:3124-3158  get_signal（核心分派循环）</p>
+<pre><code>		/*
+		 * Signals generated by the execution of an instruction
+		 * need to be delivered before any other pending signals
+		 * so that the instruction pointer in the signal stack
+		 * frame points to the faulting instruction.
+		 */
+		signr = dequeue_synchronous_signal(&amp;ksig-&gt;info);  // 优先处理同步信号(如SIGSEGV、SIGFPE等)
+		if (!signr)
+			signr = dequeue_signal(current, &amp;current-&gt;blocked, &amp;ksig-&gt;info);  // 从信号队列取出下一个未被阻塞的信号
+
+		if (!signr)
+			break; /* will return 0 */  // 没有信号需要处理，退出循环
+
+		if (unlikely(current-&gt;ptrace) &amp;&amp; signr != SIGKILL) {  // 被调试进程的信号需要特殊处理
+			signr = ptrace_signal(signr, &amp;ksig-&gt;info);  // 通知调试器，可能修改或阻止信号
+			if (!signr)
+				continue;  // 调试器阻止了信号，继续处理下一个
+		}
+
+		ka = &amp;sighand-&gt;action[signr-1];  // 获取该信号的处理动作结构体
+
+		/* Trace actually delivered signals. */
+		trace_signal_deliver(signr, &amp;ksig-&gt;info, ka);  // 追踪信号传递事件
+
+		if (ka-&gt;sa.sa_handler == SIG_IGN) /* Do nothing.  */  // 信号被设置为忽略
+			continue;
+		if (ka-&gt;sa.sa_handler != SIG_DFL) {  // 有自定义信号处理器
+			/* Run the handler.  */
+			ksig-&gt;ka = *ka;  // 保存信号动作，准备执行用户处理器
+
+			if (ka-&gt;sa.sa_flags &amp; SA_ONESHOT)  // SA_ONESHOT标志：执行一次后恢复默认
+				ka-&gt;sa.sa_handler = SIG_DFL;
+
+			break; /* will return non-zero "signr" value */  // 跳出循环，返回给用户态执行处理器
+		}
+</code></pre>
+
+<ul>
+  <li><strong>同步信号优先</strong>：<code>dequeue_synchronous_signal()</code> 先取 SIGSEGV/SIGFPE/SIGILL 这类"由当前指令引起"的信号，因为只有它才能保证栈帧里的 IP 指向出错的那条指令。</li>
+  <li><code>dequeue_signal(current, &amp;current-&gt;blocked, ...)</code> 的第二个参数就是屏蔽字：被屏蔽的信号留在 pending 里不动，函数返回 0。</li>
+  <li><code>ka = &amp;sighand-&gt;action[signr-1]</code>——注意下标是 <code>signr-1</code>，因为信号编号从 1 开始，数组下标从 0 开始。</li>
+  <li><code>SIG_IGN</code> → 丢弃并继续；自定义 handler → 拷贝一份 <code>ksig-&gt;ka</code> 后跳出循环；<code>SIG_DFL</code> → 落到后面的默认动作分支。</li>
+  <li>循环结束还没取到信号时，<code>get_signal()</code> 返回 false，<code>arch_do_signal()</code> 就直接返回用户态。</li>
+</ul>
+
+<p class="srcline">kernel/signal.c:3245-3249  get_signal（收尾）</p>
+<pre><code>	spin_unlock_irq(&amp;sighand-&gt;siglock);
+
+	ksig-&gt;sig = signr;
+	return ksig-&gt;sig &gt; 0;
+}
+</code></pre>
+
+<p>返回 <code>true</code> 表示"有一个信号要投递"，调用者据此去造栈帧。</p>
+
+<h3>4.5 <code>setup_rt_frame()</code>：在用户栈上造一个"返回现场"</h3>
+
+<p>这是信号能"像函数调用一样"跑起来的关键：内核在用户栈上写出一个 <code>struct rt_sigframe</code>，里面保存了被打断时的全部寄存器，然后把 <code>rip</code> 改成处理函数地址、<code>rsp</code> 改成帧地址。处理函数返回时执行 <code>rt_sigreturn</code>，内核再按帧把寄存器原样恢复。</p>
+
+<p class="srcline">arch/x86/kernel/signal.c:683-704  setup_rt_frame</p>
+<pre><code>static int
+setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
+{
+	int usig = ksig-&gt;sig;
+	sigset_t *set = sigmask_to_save();
+	compat_sigset_t *cset = (compat_sigset_t *) set;
+
+	/* Perform fixup for the pre-signal frame. */
+	rseq_signal_deliver(ksig, regs);
+
+	/* Set up the stack frame */
+	if (is_ia32_frame(ksig)) {
+		if (ksig-&gt;ka.sa.sa_flags &amp; SA_SIGINFO)
+			return ia32_setup_rt_frame(usig, ksig, cset, regs);
+		else
+			return ia32_setup_frame(usig, ksig, cset, regs);
+	} else if (is_x32_frame(ksig)) {
+		return x32_setup_rt_frame(ksig, cset, regs);
+	} else {
+		return __setup_rt_frame(ksig-&gt;sig, ksig, set, regs);
+	}
+}
+</code></pre>
+
+<p>原生 x86_64 走 <code>__setup_rt_frame()</code>：</p>
+
+<p class="srcline">arch/x86/kernel/signal.c:439-513  __setup_rt_frame（x86_64 版本）</p>
+<pre><code>static int __setup_rt_frame(int sig, struct ksignal *ksig,
+			    sigset_t *set, struct pt_regs *regs)
+{
+	struct rt_sigframe __user *frame;
+	void __user *fp = NULL;
+	unsigned long uc_flags;
+
+	/* x86-64 should always use SA_RESTORER. */
+	if (!(ksig-&gt;ka.sa.sa_flags &amp; SA_RESTORER))
+		return -EFAULT;
+
+	frame = get_sigframe(&amp;ksig-&gt;ka, regs, sizeof(struct rt_sigframe), &amp;fp);
+	uc_flags = frame_uc_flags(regs);
+
+	if (!user_access_begin(frame, sizeof(*frame)))
+		return -EFAULT;
+
+	/* Create the ucontext.  */
+	unsafe_put_user(uc_flags, &amp;frame-&gt;uc.uc_flags, Efault);
+	unsafe_put_user(0, &amp;frame-&gt;uc.uc_link, Efault);
+	unsafe_save_altstack(&amp;frame-&gt;uc.uc_stack, regs-&gt;sp, Efault);
+
+	/* Set up to return from userspace.  If provided, use a stub
+	   already in userspace.  */
+	unsafe_put_user(ksig-&gt;ka.sa.sa_restorer, &amp;frame-&gt;pretcode, Efault);
+	unsafe_put_sigcontext(&amp;frame-&gt;uc.uc_mcontext, fp, regs, set, Efault);
+	unsafe_put_sigmask(set, frame, Efault);
+	user_access_end();
+	// ... （此处约 40 行：填 siginfo、按 SA_SIGINFO 决定处理函数签名）
+	/* Set up registers for signal handler */
+	regs-&gt;di = sig;
+	/* In case the signal handler was declared without prototypes */
+	regs-&gt;ax = 0;
+
+	/* This also works for non SA_SIGINFO handlers because they expect the
+	   next argument after the signal number on the stack. */
+	regs-&gt;si = (unsigned long)&amp;frame-&gt;info;
+	regs-&gt;dx = (unsigned long)&amp;frame-&gt;uc;
+	regs-&gt;ip = (unsigned long) ksig-&gt;ka.sa.sa_handler;
+
+	regs-&gt;sp = (unsigned long)frame;
+	// ... （此处约 15 行：设置 CS/SS 为用户态段寄存器）
+	return 0;
+
+Efault:
+	user_access_end();
+	return -EFAULT;
+}
+</code></pre>
+
+<ul>
+  <li><code>SA_RESTORER</code> 检查：x86_64 ABI 要求用户态必须提供 <code>sa_restorer</code>，内核把它写进帧的 <code>pretcode</code> 字段。处理函数"返回"到那里就等于执行了 <code>rt_sigreturn</code>。</li>
+  <li><code>get_sigframe()</code> 决定帧放在哪：默认在当前用户栈往下长（红区之外），如果设过 <code>sigaltstack</code>（<code>SA_ONSTACK</code>）就放在备用栈上。</li>
+  <li>寄存器约定：<code>rdi</code>=信号号，<code>rsi</code>=&amp;siginfo，<code>rdx</code>=&amp;ucontext——这正好是 <code>SA_SIGINFO</code> 处理函数 <code>void handler(int, siginfo_t*, void*)</code> 的三个参数。没开 <code>SA_SIGINFO</code> 时只有 <code>rdi</code> 有效，另两个参数靠栈传递。</li>
+  <li><code>regs-&gt;ip = sa_handler</code> 与 <code>regs-&gt;sp = frame</code> 就是"跳转"的两步——内核返回用户态时，CPU 就从处理函数开始执行了。</li>
+  <li><code>unsafe_put_sigcontext()</code> 保存通用寄存器；<code>unsafe_put_sigmask()</code> 保存"进入处理函数时的屏蔽字"，供 <code>sigreturn</code> 恢复。</li>
+</ul>
+
+<div class="note">
+  <strong>关于 <code>do_signal()</code>：</strong>在 5.10 之前的内核里有个统一的 <code>do_signal()</code> 负责整个投递过程。它在 5.10 被拆成了两半：通用部分留在 <code>kernel/signal.c</code> 的 <code>get_signal()</code>（返回"有信号要投递"），架构相关部分下沉到 <code>arch/x86/kernel/signal.c</code> 的 <code>arch_do_signal()</code>。所以在本仓库里搜 <code>do_signal</code> 只能搜到 5.10 之前的写法——现在对应的是下面这两个函数。
+</div>
+
+<p class="srcline">arch/x86/kernel/signal.c:807-833  arch_do_signal</p>
+<pre><code>void arch_do_signal(struct pt_regs *regs)
+{
+	struct ksignal ksig;
+
+	if (get_signal(&amp;ksig)) {
+		/* Whee! Actually deliver the signal.  */
+		handle_signal(&amp;ksig, regs);
+		return;
+	}
+
+	/* Did we come from a system call? */
+	if (syscall_get_nr(current, regs) &gt;= 0) {
+		/* Restart the system call - no handlers present */
+		switch (syscall_get_error(current, regs)) {
+		case -ERESTARTNOHAND:
+		case -ERESTARTSYS:
+		case -ERESTARTNOINTR:
+			regs-&gt;ax = regs-&gt;orig_ax;
+			regs-&gt;ip -= 2;
+			break;
+
+		case -ERESTART_RESTARTBLOCK:
+			regs-&gt;ax = get_nr_restart_syscall(regs);
+			regs-&gt;ip -= 2;
+			break;
+		}
+	}
+	// ...
+}
+</code></pre>
+
+<p><code>regs-&gt;ip -= 2</code> 就是"回退到 <code>syscall</code> 指令重新执行"——x86_64 的 <code>syscall</code> 指令正好 2 字节，这样重新执行一次就等于把系统调用重做一遍。</p>
+
+<h3>4.6 SA_RESTART：系统调用到底重启不重启</h3>
+
+<p>上面 <code>arch_do_signal()</code> 里那套 <code>-ERESTARTSYS</code> 逻辑，处理的是"没有处理函数、信号被默认动作消化掉"的情况。真正有处理函数时，逻辑在 <code>handle_signal()</code> 里：</p>
+
+<p class="srcline">arch/x86/kernel/signal.c:715-735  handle_signal（系统调用重启判定）</p>
+<pre><code>	/* Are we from a system call? */
+	if (syscall_get_nr(current, regs) &gt;= 0) {
+		/* If so, check system call restarting.. */
+		switch (syscall_get_error(current, regs)) {
+		case -ERESTART_RESTARTBLOCK:
+		case -ERESTARTNOHAND:
+			regs-&gt;ax = -EINTR;
+			break;
+
+		case -ERESTARTSYS:
+			if (!(ksig-&gt;ka.sa.sa_flags &amp; SA_RESTART)) {
+				regs-&gt;ax = -EINTR;
+				break;
+			}
+			fallthrough;
+		case -ERESTARTNOINTR:
+			regs-&gt;ax = regs-&gt;orig_ax;
+			regs-&gt;ip -= 2;
+			break;
+		}
+	}
+</code></pre>
+
+<ul>
+  <li><code>-ERESTARTSYS</code>：这个系统调用可以重启。<strong>有 <code>SA_RESTART</code></strong> → 走 fallthrough，恢复原调用号并 <code>ip -= 2</code>，重新执行 <code>syscall</code> 指令（用户态根本感觉不到中断过）；<strong>没有</strong> → <code>regs-&gt;ax = -EINTR</code>，用户态的 <code>read()</code> 返回 -1 并置 <code>errno=EINTR</code>。</li>
+  <li><code>-ERESTARTNOHAND</code>：不可重启（典型是 <code>execve</code>），只能返回 EINTR。</li>
+  <li><code>-ERESTARTNOINTR</code>：无条件重启（典型是 <code>poll</code>/<code>select</code>），不看 SA_RESTART。</li>
+</ul>
+
+<h3>4.7 屏蔽字：<code>sigprocmask()</code> 与 SIGKILL/SIGSTOP 的剥离</h3>
+
+<p class="srcline">kernel/signal.c:3484-3509  sigprocmask</p>
+<pre><code>int sigprocmask(int how, sigset_t *set, sigset_t *oldset)
+{
+	struct task_struct *tsk = current;
+	sigset_t newset;
+
+	/* Lockless, only current can change -&gt;blocked, never from irq */
+	if (oldset)
+		*oldset = tsk-&gt;blocked;
+
+	switch (how) {
+	case SIG_BLOCK:
+		sigorsets(&amp;newset, &amp;tsk-&gt;blocked, set);  // 阻塞新信号：newset = blocked ∪ set
+		break;
+	case SIG_UNBLOCK:
+		sigandnsets(&amp;newset, &amp;tsk-&gt;blocked, set);  // 解除阻塞：newset = blocked ∩ ~set
+		break;
+	case SIG_SETMASK:
+		newset = *set;  // 直接设置新的信号掩码
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	__set_current_blocked(&amp;newset);
+	return 0;
+}
+</code></pre>
+
+<p>这是内核内部版本，可以屏蔽 SIGKILL（注释里明说了）。真正给用户态用的是 <code>rt_sigprocmask()</code>，它多做一步"消毒"：</p>
+
+<p class="srcline">kernel/signal.c:3585-3613  sys_rt_sigprocmask</p>
+<pre><code>SYSCALL_DEFINE4(rt_sigprocmask, int, how, sigset_t __user *, nset,
+		sigset_t __user *, oset, size_t, sigsetsize)
+{
+	sigset_t old_set, new_set;
+	int error;
+
+	/* XXX: Don't preclude handling different sized sigset_t's.  */
+	if (sigsetsize != sizeof(sigset_t))
+		return -EINVAL;
+
+	old_set = current-&gt;blocked;
+
+	if (nset) {
+		if (copy_from_user(&amp;new_set, nset, sizeof(sigset_t)))
+			return -EFAULT;
+		sigdelsetmask(&amp;new_set, sigmask(SIGKILL)|sigmask(SIGSTOP));
+
+		error = sigprocmask(how, &amp;new_set, NULL);
+		if (error)
+			return error;
+	}
+
+	if (oset) {
+		if (copy_to_user(oset, &amp;old_set, sizeof(sigset_t)))
+			return -EFAULT;
+	}
+
+	return 0;
+}
+</code></pre>
+
+<p><code>sigdelsetmask(&amp;new_set, sigmask(SIGKILL)|sigmask(SIGSTOP))</code> 这一行就是"SIGKILL/SIGSTOP 不可屏蔽"的实现：用户传给内核的掩码里这两个位会被强行清零，所以 <code>/proc/&lt;pid&gt;/status</code> 的 <code>SigBlk</code> 里永远看不到它们。</p>
+
+<h3>4.8 <code>/proc/&lt;pid&gt;/status</code> 里的五张位图</h3>
+
+<p>内核把这几张表直接暴露给用户态：</p>
+
+<p class="srcline">fs/proc/array.c:250-263  collect_sigign_sigcatch</p>
+<pre><code>static void collect_sigign_sigcatch(struct task_struct *p, sigset_t *sigign,
+				    sigset_t *sigcatch)
+{
+	struct k_sigaction *k;
+	int i;
+
+	k = p-&gt;sighand-&gt;action;
+	for (i = 1; i &lt;= _NSIG; ++i, ++k) {
+		if (k-&gt;sa.sa_handler == SIG_IGN)
+			sigaddset(sigign, i);
+		else if (k-&gt;sa.sa_handler != SIG_DFL)
+			sigaddset(sigcatch, i);
+	}
+}
+</code></pre>
+
+<p class="srcline">fs/proc/array.c:279-301  task_sig（打印五张表）</p>
+<pre><code>	if (lock_task_sighand(p, &amp;flags)) {
+		pending = p-&gt;pending.signal;
+		shpending = p-&gt;signal-&gt;shared_pending.signal;
+		blocked = p-&gt;blocked;
+		collect_sigign_sigcatch(p, &amp;ignored, &amp;caught);
+		num_threads = get_nr_threads(p);
+		// ...
+		unlock_task_sighand(p, &amp;flags);
+	}
+
+	seq_put_decimal_ull(m, "Threads:\t", num_threads);
+	seq_put_decimal_ull(m, "\nSigQ:\t", qsize);
+	seq_put_decimal_ull(m, "/", qlim);
+
+	/* render them all */
+	render_sigset_t(m, "\nSigPnd:\t", &amp;pending);
+	render_sigset_t(m, "ShdPnd:\t", &amp;shpending);
+	render_sigset_t(m, "SigBlk:\t", &amp;blocked);
+	render_sigset_t(m, "SigIgn:\t", &amp;ignored);
+	render_sigset_t(m, "SigCgt:\t", &amp;caught);
+</code></pre>
+
+<table>
+  <tr><th>字段</th><th>来源</th><th>含义</th></tr>
+  <tr><td><code>SigPnd</code></td><td><code>p-&gt;pending.signal</code></td><td>本线程私有的待处理信号（已投递、还没送达）</td></tr>
+  <tr><td><code>ShdPnd</code></td><td><code>p-&gt;signal-&gt;shared_pending.signal</code></td><td>整个线程组共享的待处理信号</td></tr>
+  <tr><td><code>SigBlk</code></td><td><code>p-&gt;blocked</code></td><td>屏蔽字：被暂时挂起的信号</td></tr>
+  <tr><td><code>SigIgn</code></td><td>遍历 <code>action[]</code></td><td>被显式设为 <code>SIG_IGN</code> 的信号</td></tr>
+  <tr><td><code>SigCgt</code></td><td>遍历 <code>action[]</code></td><td>被设为自定义处理函数的信号</td></tr>
+</table>
+
+<p>这五个字段是 16 进制的位图，第 N 位对应信号 N。位序是<strong>从低位往高位</strong>排的：<code>SigCgt</code> 的最低位是 SIGHUP(1)，第二个位是 SIGINT(2)。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看一眼内核认识哪些信号</h3>
+
+<pre><code># 列出本机支持的所有信号名与编号
+$ kill -l
+HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS
+
+# 只看 SIGINT 是第几个（1 起算）
+$ kill -l | tr ' ' '\n' | grep -n '^INT$'
+2
+</code></pre>
+
+<p><code>kill -l</code> 输出里第 1 个是 SIGHUP，第 2 个是 SIGINT，第 9 个是 SIGKILL，第 17 个是 SIGCHLD——正好对应头文件 <code>include/uapi/asm-generic/signal.h</code> 里的编号。</p>
+
+<h3>5.2 观察一个正在睡觉的进程被信号打断</h3>
+
+<pre><code>$ sleep 300 &amp;
+$ echo $!          # 记住 PID
+$ cat /proc/$!/status | grep -E 'SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt'
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000001
+SigCgt:	0000000000000000
+
+$ kill -STOP $!   # 试试屏蔽 SIGKILL 会怎样
+$ kill -TERM $!   # 默认动作是终止
+$ ps -o pid,stat,cmd -p $!
+</code></pre>
+
+<p>解读：</p>
+<ul>
+  <li><code>SigIgn: 0000000000000001</code> 的最低位是 1，对应信号 1 = SIGHUP。默认情况下 SIGHUP 就是被忽略的（终端断开时进程要能继续跑），所以它出现在 <code>SigIgn</code> 里。</li>
+  <li><code>SigBlk</code> 全 0：<code>sleep</code> 没屏蔽任何信号。注意里面也<strong>看不到 SIGKILL/SIGSTOP</strong>——就算你 <code>kill -9</code> 也没用，屏蔽不了。</li>
+  <li><code>SigPnd</code> 全 0：没有待处理的信号。</li>
+</ul>
+
+<h3>5.3 写一个用 <code>sigaction</code> 捕获 SIGINT、并正确重启被打断系统调用的程序</h3>
+
+<p>下面是完整可编译的程序。它演示了两件事：<code>SA_RESTART</code> 让阻塞的 <code>read()</code> 自动重启（用户态看不见 EINTR），以及不带 <code>SA_RESTART</code> 时 <code>read()</code> 会返回 -1/EINTR。</p>
+
+<pre><code>/* sigint_demo.c - 演示用 sigaction 捕获 SIGINT，以及 SA_RESTART 如何
+ *                 让被信号打断的阻塞系统调用自动重启
+ * 编译: gcc -O2 -o sigint_demo sigint_demo.c
+ * 用法: ./sigint_demo            (带 SA_RESTART)
+ *       ./sigint_demo norestart   (不带 SA_RESTART)
+ */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/types.h&gt;
+
+static volatile sig_atomic_t hits = 0;
+static int pipefd[2];
+
+static void on_sigint(int signo)
+{
+	char c = 'X';
+	(void)signo;
+	hits++;
+	write(pipefd[1], &amp;c, 1);   /* write() 是 async-signal-safe 的 */
+}
+
+int main(int argc, char **argv)
+{
+	struct sigaction sa;
+	char buf[64];
+	int use_restart = (argc &lt; 2 || strcmp(argv[1], "norestart") != 0);
+	ssize_t n;
+
+	if (pipe(pipefd) == -1) { perror("pipe"); return 1; }
+
+	memset(&amp;sa, 0, sizeof(sa));
+	sa.sa_handler = on_sigint;
+	sigemptyset(&amp;sa.sa_mask);
+	sa.sa_flags = use_restart ? SA_RESTART : 0;
+	if (sigaction(SIGINT, &amp;sa, NULL) == -1) { perror("sigaction"); return 1; }
+
+	printf("pid=%d  SA_RESTART=%s\n", (int)getpid(), use_restart ? "开" : "关");
+	printf("主线程即将阻塞在 read() 上；1 秒后子进程发 SIGINT\n");
+	printf("你也可以在另一个终端手动执行: kill -INT %d\n", (int)getpid());
+	fflush(stdout);
+
+	/* 造一个"外部事件"：子进程 1 秒后给父进程发 SIGINT */
+	if (fork() == 0) {
+		sleep(1);
+		kill(getppid(), SIGINT);
+		_exit(0);
+	}
+
+	for (;;) {
+		n = read(pipefd[0], buf, sizeof(buf));   /* 没有数据 → 阻塞 */
+		if (n &lt; 0 &amp;&amp; errno == EINTR) {
+			printf("[main] read() 返回 -1，errno=EINTR（系统调用被打断）\n");
+			if (!use_restart)
+				printf("[main] 没有 SA_RESTART，需要自己重试 read()\n");
+			continue;
+		}
+		printf("[main] read() 返回 %zd，buf[0]='%c'（系统调用被自动重启后拿到数据）\n",
+		       n, n &gt; 0 ? buf[0] : '?');
+		break;
+	}
+	printf("[main] 退出，handler 被调用 %d 次\n", (int)hits);
+	return 0;
+}
+</code></pre>
+
+<p>运行与预期输出（带 <code>SA_RESTART</code>）：</p>
+
+<pre><code>$ ./sigint_demo
+pid=12345  SA_RESTART=开
+主线程即将阻塞在 read() 上；1 秒后子进程发 SIGINT
+你也可以在另一个终端手动执行: kill -INT 12345
+[main] read() 返回 1，buf[0]='X'（系统调用被自动重启后拿到数据）
+[main] 退出，handler 被调用 1 次
+</code></pre>
+
+<p>不带 <code>SA_RESTART</code> 时：</p>
+
+<pre><code>$ ./sigint_demo norestart
+pid=12346  SA_RESTART=关
+主线程即将阻塞在 read() 上；1 秒后子进程发 SIGINT
+你也可以在另一个终端手动执行: kill -INT 12346
+[main] read() 返回 -1，errno=EINTR（系统调用被打断）
+[main] 没有 SA_RESTART，需要自己重试 read()
+[main] read() 返回 1，buf[0]='X'（系统调用被自动重启后拿到数据）
+[main] 退出，handler 被调用 1 次
+</code></pre>
+
+<div class="tip">
+  <strong>两段输出的差别就是 <code>SA_RESTART</code> 的全部意义。</strong>带 <code>SA_RESTART</code> 时，用户态<strong>看不到 EINTR</strong>——内核把 <code>syscall</code> 指令重做了一遍，<code>read()</code> 直接返回了 handler 写进管道的那 1 个字节。不带时，用户态必须自己写 <code>if (errno == EINTR) continue;</code> 重试。写生产代码时，如果用的是可重启的系统调用（<code>read</code>/<code>write</code>/<code>accept</code>），加上 <code>SA_RESTART</code> 可以省掉大量样板代码。
+</div>
+
+<div class="note">
+  <strong>注意 handler 里只能调用 async-signal-safe 函数。</strong>处理函数运行在"被中断的那个上下文"上，随时可能被再次打断。本例中 handler 只用了 <code>write()</code>（内核保证安全）和给 <code>volatile sig_atomic_t</code> 赋值——这两类操作在信号处理函数里是安全的。<code>printf()</code>、<code>malloc()</code> 都不是。
+</div>
+
+<h3>5.4 用 <code>strace</code> 看清系统调用被重启</h3>
+
+<pre><code>$ strace -f -e trace=read,rt_sigaction ./sigint_demo 2&gt;&amp;1 | head -20
+</code></pre>
+
+<p>你会看到 <code>rt_sigaction(SIGALRM, ...)</code>，以及 <code>read(3, ...)</code> 被中断后<strong>再次出现</strong>（重启），而不是返回 <code>-1 ERESTART</code>。这正是 <code>handle_signal()</code> 里 <code>regs-&gt;ip -= 2</code> 的效果。</p>
+
+<h3>5.5 SIGCHLD 与 <code>wait()</code>：观察僵尸进程</h3>
+
+<pre><code># 终端 1：父进程 fork 一个子进程后不 wait
+$ cat &gt; zombie.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/wait.h&gt;
+int main(void) {
+	if (fork() == 0) { _exit(42); }     /* 子进程立刻退出 */
+	sleep(30);                          /* 父进程不 wait，30 秒后退出 */
+	return 0;
+}
+EOF
+$ gcc -o zombie zombie.c &amp;&amp; ./zombie &amp;
+
+# 终端 2：
+$ ps -o pid,ppid,stat,cmd | grep zombie
+    PID    PPID STAT CMD
+   12346   12345 Z    ./zombie      ← Z 就是僵尸
+</code></pre>
+
+<p><code>STAT</code> 列的 <code>Z</code> 表示僵尸：子进程已退出，但父进程没调 <code>wait()</code>，内核只好留着它的退出码（42）。等父进程退出后，僵尸被 init 收养并回收。</p>
+
+<p>用 <code>wait()</code> 就能立刻收尸：</p>
+
+<pre><code># 终端 1
+$ cat &gt; reaper.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/wait.h&gt;
+int main(void) {
+	pid_t p = fork();
+	if (p == 0) { _exit(42); }
+	int st = 0;
+	pid_t r = waitpid(p, &amp;st, 0);      /* 阻塞等待子进程 */
+	printf("reaped pid=%d, exited=%d code=%d\n", r, WIFEXITED(st), WEXITSTATUS(st));
+	return 0;
+}
+EOF
+$ gcc -o reaper reaper.c &amp;&amp; ./reaper
+reaped pid=12378, exited=1 code=42
+</code></pre>
+
+<p><code>waitpid()</code> 返回时，<code>st</code> 里打包了退出状态：<code>WIFEXITED(st)</code> 判断是不是正常退出，<code>WEXITSTATUS(st)</code> 取退出码。这些宏和 <code>do_wait()</code> 里的 <code>wait_task_zombie()</code> 是配套的。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. 为什么 <code>kill -9</code> 一定能杀掉进程，而 <code>kill -TERM</code> 可能不行？</b>因为 SIGKILL 属于 <code>SIG_KERNEL_ONLY_MASK</code>（<code>include/linux/signal.h:416</code>）。<code>do_sigaction()</code> 拒绝为它设置处理函数，<code>rt_sigprocmask()</code> 也会把它的位从屏蔽字里抠掉，<code>get_signal()</code> 里它只有"终止"一种结局。所以进程没有任何机会拦截它——这正是内核保留的"不可抗力"后门。</div>
+
+<div class="qa"><b>Q2. <code>sigprocmask(SIG_BLOCK, ...)</code> 之后，进程还会不会收到被屏蔽的信号？</b>会收到，只是不会<strong>投递</strong>。信号照样进 pending 位图（<code>SigPnd</code> 会显示它），只是 <code>get_signal()</code> 里的 <code>dequeue_signal(current, &amp;current-&gt;blocked, ...)</code> 会跳过被屏蔽的位。等你 <code>sigprocmask(SIG_UNBLOCK, ...)</code> 后，它会立刻被投递——所以"屏蔽"不是"丢弃"。</div>
+
+<div class="qa"><b>Q3. <code>SA_RESTART</code> 到底是谁在起作用，内核还是 libc？</b>内核。<code>handle_signal()</code>（<code>arch/x86/kernel/signal.c:724-733</code>）检查 <code>sa_flags</code> 里的 <code>SA_RESTART</code>：有就把 <code>regs-&gt;ax</code> 恢复成原调用号、<code>regs-&gt;ip -= 2</code> 让 CPU 重新执行 <code>syscall</code> 指令；没有就设 <code>regs-&gt;ax = -EINTR</code>。libc 只是把内核给的 errno 转成 <code>-1</code> 返回。</div>
+
+<div class="qa"><b>Q4. 多线程程序里，一个线程 <code>fork()</code> 出来的子进程，收到 SIGINT 会怎样？</b>子进程只继承<strong>调用 fork 的那个线程</strong>的屏蔽字（其他线程的屏蔽字不继承），并且执行 <code>execve</code> 时会重置为默认。另一个容易忽略的点：<code>fork()</code> 出来的子进程里，<code>pthread_create()</code> 创建的线程并不存在，只剩调用 fork 的那个线程。</div>
+
+<div class="qa"><b>Q5. 为什么 <code>/proc/&lt;pid&gt;/status</code> 里的 <code>SigBlk</code> 永远看不到 SIGKILL 和 SIGSTOP？</b>因为 <code>sys_rt_sigprocmask()</code>（<code>kernel/signal.c:3600</code>）在写入前执行了 <code>sigdelsetmask(&amp;new_set, sigmask(SIGKILL)|sigmask(SIGSTOP))</code>，用户给的掩码里这两位被强制清零。内核内部版 <code>sigprocmask()</code> 才允许屏蔽它们（给内核线程用），用户态的 <code>rt_sigprocmask()</code> 是它的"消毒版"。</div>
+
+<div class="qa"><b>Q6. 把 SIGCHLD 设成 <code>SIG_IGN</code> 之后，子进程还会不会变成僵尸？</b>不会。内核在 <code>do_notify_parent()</code>（<code>kernel/signal.c:2424-2448</code>）里检测到父进程把 SIGCHLD 设成 <code>SIG_IGN</code>（或设了 <code>SA_NOCLDWAIT</code>）时，会把 <code>autoreap</code> 置真，子进程直接被回收而不留僵尸。这条规则是 POSIX 要求的。</div>
+
+<footer>
+  <p>上一篇：<a href="08-syscall.html">08 系统调用</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="10-interrupts.html">10 中断</a></p>
+</footer>
+
+</body>
+</html>

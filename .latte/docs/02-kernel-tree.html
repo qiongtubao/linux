@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 内核源码树导读</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="03-boot.html">下一篇：03 启动流程 →</a>
+</nav>
+
+<h1>🗺️ 02 · 内核源码树：3 万个文件怎么找你要的那一个</h1>
+<p class="subtitle">把 23 个顶层目录当成一座城市的行政区划——先会看地图，再动手挖路 · 预计阅读 22 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>假设你被骗到一座陌生的巨型城市，没有导航，只知道"我要找到供水公司的一个阀门"。你会怎么办？先看城市总图（有哪些行政区），再看区的职能（哪个区管供水），再看那个区里的街道门牌。内核源码也是这个道理：<strong>Linux 5.10 的源码树里约有 7 万个文件、3 万个 C 文件</strong>，谁也不可能记住每个文件在哪。你唯一能依靠的，是一套稳定的"空间组织逻辑"。</p>
+
+<p>这套逻辑其实极其朴素：<span class="term">按"功能模块"划顶层目录</span>，比如内存管理全在 <code>mm/</code>、文件系统全在 <code>fs/</code>、驱动全在 <code>drivers/</code>。然后在每个目录内部，再按"子系统—子系统内再分"递归切分。这就是操作系统视角下的"模块化内核"：内核不是一坨代码，而是几十个半独立子系统用少量公共接口缝合起来的整体。</p>
+
+<p>学会这棵树有三个直接收益：① 看到一个函数名，能<strong>猜</strong>它大概在哪个目录（<code>kmalloc</code> 一定在 <code>mm/</code>，<code>tcp_sendmsg</code> 一定在 <code>net/</code>）；② 遇到 bug 时能找到"该看谁"（网络问题不看 <code>fs/</code>）；③ 知道该向谁提交补丁——这直接对应 <code>MAINTAINERS</code> 里的维护者机制。</p>
+
+<p>本篇还会解决一个新手最常见的困惑：<code>include/linux/</code> 和 <code>include/uapi/</code> 到底有什么区别？搞错这一层，你会在写驱动时遇到"结构体字段对不上"的诡异问题。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">源码树</td><td>source tree / srctree</td><td>解压出来的内核源码目录，Kbuild 里的 <code>$(srctree)</code> 就指它。</td></tr>
+  <tr><td class="term">顶层目录</td><td>top-level directory</td><td>源码树根下的一级目录，共 23 个左右，每个对应一个功能域。</td></tr>
+  <tr><td class="term">子架构</td><td>SRCARCH</td><td>Kbuild 内部归一化后的架构名，<code>arch/x86/</code> 就是 <code>SRCARCH=x86</code>。</td></tr>
+  <tr><td class="term">uapi</td><td>user-space API headers</td><td>给用户态程序看的头文件（<code>include/uapi/</code>），会被 <code>make headers_install</code> 导出到 <code>/usr/include</code>。</td></tr>
+  <tr><td class="term">内部头</td><td>internal headers</td><td><code>include/linux/</code> 里的头文件，只能内核代码用，包含 <code>struct task_struct</code> 这种用户态不该知道的结构。</td></tr>
+  <tr><td class="term">MAINTAINERS</td><td>maintainers file</td><td>源码根目录的 5.7 万行文本，记录"哪个子系统归谁管、改哪条路径该抄送谁"。</td></tr>
+  <tr><td class="term">get_maintainer</td><td>scripts/get_maintainer.pl</td><td>根据你改的文件路径，自动查 MAINTAINERS 输出该抄送的维护者邮箱。</td></tr>
+  <tr><td class="term">cscope</td><td>cscope</td><td>老牌源码交叉引用工具，能查"谁调用了这个函数"、"这个符号在哪定义"。</td></tr>
+  <tr><td class="term">ctags</td><td>ctags / etags</td><td>生成符号索引文件（<code>tags</code>/<code>TAGS</code>），让 vim/emacs 能按名字跳转。</td></tr>
+  <tr><td class="term">LKML</td><td>Linux Kernel Mailing List</td><td>内核主邮件列表，一切补丁的最终归宿，<code>lkml.org</code> 有归档。</td></tr>
+  <tr><td class="term">子系统</td><td>subsystem</td><td>一组相关目录 + 一个维护者 + 一个邮件列表，比如 "netdev" 管整个网络栈。</td></tr>
+  <tr><td class="term">Documentation</td><td>Documentation/</td><td>内核自带文档（reStructuredText 格式），可 <code>make htmldocs</code> 生成本地网站。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 一张"行政区划图"</h3>
+<pre><code>linux/  (源码根)
+├── arch/         CPU 架构相关：x86、arm64、riscv…（每个架构一套启动代码、中断、页表）
+├── block/        块设备层：把"读写扇区"抽象成 bio 请求，供 ext4/NVMe 使用
+├── certs/        内核签名用的证书（模块签名、安全启动）
+├── crypto/       加密算法实现（AES、SHA、ChaCha20）与 crypto API
+├── Documentation/ 文档（80+ 子目录，见 3.3）
+├── drivers/      所有硬件驱动（2.87 万个文件，占源码树的 1/3）
+├── fs/           文件系统：vfs 抽象层 + ext4/xfs/btrfs/overlayfs…
+├── include/      头文件：linux/(内部) + uapi/(用户态) + asm-generic/…
+├── init/         启动入口：main.c（start_kernel）、do_mounts.c
+├── ipc/          进程间通信：信号量、共享内存、消息队列
+├── kernel/       核心：调度器、中断管理、时间、锁、模块加载、trace
+├── lib/          通用库函数：字符串、位图、红黑树、排序、CRC
+├── mm/           内存管理：页分配器、slab、页表、回收、swap
+├── net/          网络协议栈：socket 层、TCP/IP、netfilter、各种协议族
+├── samples/      示例代码（kobject、kprobes、bpf、seccomp 的小 demo）
+├── scripts/      构建/辅助脚本：Kbuild 规则、kconfig、checkpatch、dtc
+├── security/     安全框架：LSM、SELinux、AppArmor、seccomp
+├── sound/        音频子系统（ALSA 核心 + 各种声卡驱动）
+├── tools/        用户态工具源码：perf、bpftool、selftests（不编进内核）
+├── usr/          initramfs 的生成与打包（usr/initramfs_data.cpio）
+└── virt/         虚拟化：KVM 的架构无关部分
+    （另有 Kconfig / Makefile / MAINTAINERS / README / COPYING 等根文件）
+</code></pre>
+
+<p>这个划分有一个贯穿全局的隐喻：<strong>越靠上的目录越"抽象"，越靠下的越"具体"</strong>。<code>fs/</code> 的 VFS 层不知道底下是 ext4 还是 xfs；<code>mm/</code> 不知道调用它的是进程还是内核线程；<code>block/</code> 不知道底下是 NVMe 还是 U 盘。这种"抽象层 + 具体实现"的分层，是内核能在 30 年里换掉无数硬件实现而接口不崩的根本原因。</p>
+
+<h3>3.2 每个顶层目录干什么（附文件数）</h3>
+<table>
+  <tr><th>目录</th><th>文件数</th><th>职责</th><th>你会因为什么进来</th></tr>
+  <tr><td class="term">arch/</td><td>15947</td><td>架构相关代码。<code>arch/x86/</code> 管 x86（含 32/64 位），<code>arch/arm64/</code> 管 ARM 64 位。启动汇编、页表布局、中断控制器、SMP 启动都在这。</td><td>看 <code>head_64.S</code>、查某个寄存器的定义、写架构相关驱动。</td></tr>
+  <tr><td class="term">block/</td><td>93</td><td>块层：bio、请求队列、调度器（mq-deadline/kyber）、分区表解析。</td><td>研究 IO 路径、调 IO 调度器、写"块设备驱动"。</td></tr>
+  <tr><td class="term">certs/</td><td>9</td><td>内核内置的公钥/证书，用于验证模块签名。</td><td>开 secure boot、给模块签名。</td></tr>
+  <tr><td class="term">crypto/</td><td>181</td><td>加密算法与 crypto API，含软件实现与硬件加速调度。</td><td>看 AES/SHA 实现、dm-crypt、IPsec。</td></tr>
+  <tr><td class="term">Documentation/</td><td>7486</td><td>全部内核文档（rst 为主），<code>make htmldocs</code> 可渲染。</td><td>查 API 用法、学 CodingStyle、看子系统设计文档。</td></tr>
+  <tr><td class="term">drivers/</td><td>28700</td><td>所有硬件驱动：net/、gpu/、usb/、nvme/、char/、tty/…，以及驱动模型核心 <code>drivers/base/</code>。</td><td>写驱动、查某个设备的初始化、看设备树绑定。</td></tr>
+  <tr><td class="term">fs/</td><td>1994</td><td>文件系统：<code>fs/open.c</code> 是 open 系统调用实现，<code>fs/ext4/</code> 是 ext4 全部实现，<code>fs/proc/</code> 是 /proc。</td><td>调文件系统 bug、理解 path walk、写新 FS。</td></tr>
+  <tr><td class="term">include/</td><td>5417</td><td>头文件：<code>linux/</code>（1357 个内部头）、<code>uapi/</code>（544 个用户态头）、<code>asm-generic/</code>、<code>net/</code>、<code>trace/</code> 等。</td><td>找结构体定义、找函数声明、写模块时 include。</td></tr>
+  <tr><td class="term">init/</td><td>12</td><td>启动：<code>main.c</code>（start_kernel）、<code>do_mounts.c</code>（挂根）、<code>initramfs.c</code>（解包 initramfs）。</td><td>追启动流程、改 initcall、看 rootfs 挂载。</td></tr>
+  <tr><td class="term">ipc/</td><td>13</td><td>老式 IPC：System V 信号量/共享内存/消息队列，以及 POSIX mqueue。</td><td>查 shmget/msgget 实现。</td></tr>
+  <tr><td class="term">kernel/</td><td>492</td><td>核心子系统：<code>sched/</code> 调度、<code>irq/</code> 中断、<code>time/</code> 时钟、<code>locking/</code> 锁、<code>trace/</code> 追踪、<code>events/</code> perf、<code>bpf/</code>。</td><td>理解调度/中断/锁、ftrace、perf、kprobe。</td></tr>
+  <tr><td class="term">lib/</td><td>448</td><td>通用库：字符串、位图、rbtree、排序、<code>lib/Kconfig.debug</code>（调试选项都在这定义）。</td><td>看某个 helper 实现、开 debug 选项。</td></tr>
+  <tr><td class="term">mm/</td><td>127</td><td>内存管理：<code>page_alloc.c</code> 伙伴系统、<code>slab.c/slub.c</code>、<code>mmap.c</code>、<code>vmscan.c</code> 回收、<code>swap</code>。</td><td>调 OOM、看内存分配路径、理解 page cache。</td></tr>
+  <tr><td class="term">net/</td><td>1859</td><td>网络：<code>socket.c</code> 是 socket 系统调用、<code>ipv4/</code>、<code>ipv6/</code>、<code>netfilter/</code>、<code>wireless/</code>。</td><td>排查网络问题、看 TCP 状态机、写 netfilter 规则。</td></tr>
+  <tr><td class="term">samples/</td><td>248</td><td>可编译的示例模块（kobject/kprobes/bpf/seccomp/ftrace 等），是学写模块最好的起点。</td><td>照抄模板、做实验。</td></tr>
+  <tr><td class="term">scripts/</td><td>426</td><td>构建脚本：Kbuild 规则本体、<code>kconfig/</code> 配置工具、<code>checkpatch.pl</code>、<code>get_maintainer.pl</code>、<code>dtc/</code> 设备树编译器。</td><td>看编译规则、提交补丁前自查。</td></tr>
+  <tr><td class="term">security/</td><td>226</td><td>安全框架：<code>security.c</code> 是 LSM 钩子总入口，<code>selinux/</code>、<code>apparmor/</code>、<code>keys/</code>、<code>integrity/</code>。</td><td>研究权限模型、写 LSM 模块。</td></tr>
+  <tr><td class="term">sound/</td><td>2279</td><td>ALSA 核心（<code>sound/core/</code>）+ 各声卡驱动（<code>sound/pci/</code>、<code>sound/usb/</code>、<code>sound/soc/</code>）。</td><td>调音频驱动、理解 PCM 通路。</td></tr>
+  <tr><td class="term">tools/</td><td>4582</td><td>用户态工具源码：<code>tools/perf</code>、<code>tools/bpf</code>、<code>tools/testing/selftests</code>、<code>tools/power</code>。默认不参与内核编译。</td><td>编 perf、跑 selftest、写自己的测试工具。</td></tr>
+  <tr><td class="term">usr/</td><td>9</td><td>把 initramfs 打包成 <code>.cpio.gz</code> 并编进内核镜像的那段逻辑。</td><td>做最小化嵌入式镜像。</td></tr>
+  <tr><td class="term">virt/</td><td>14</td><td>KVM 的架构无关部分：<code>kvm_main.c</code>、<code>kvm/</code> 子目录。</td><td>看虚拟化实现。</td></tr>
+</table>
+
+<p>注意 <code>drivers/</code> 一个目录就占了 2.87 万个文件、<strong>接近全部源码的 40%</strong>，而 <code>ipc/</code> 只有 13 个文件。这个比例本身就是一堂课：内核的主体是驱动，核心机制其实相当紧凑。如果你刚开始学，<strong>不要从 drivers/ 开始读</strong>——先读 <code>init/</code>、<code>kernel/</code>、<code>mm/</code>、<code>fs/</code> 这四块。</p>
+
+<h3>3.3 include/linux 与 include/uapi 的分界线</h3>
+<p>这条线是内核代码里最重要的"海关"：</p>
+<pre><code>                    内核内部                         用户态
+   ┌──────────────────────────────┐   ┌──────────────────────────┐
+   │ include/linux/  (1357 个)     │   │ include/uapi/ (544 个)   │
+   │  - struct task_struct        │   │  - struct sockaddr       │
+   │  - struct file               │   │  - struct ifreq          │
+   │  - 内核函数声明               │   │  - #define SIOCGIFHWADDR │
+   │  - 依赖 __user / spinlock_t   │   │  - 只用基本类型 __u32     │
+   └───────────┬──────────────────┘   └────────────┬─────────────┘
+               │  内核代码同时看到两边               │
+               │  include &lt;linux/socket.h&gt;          │
+               │      └─ 第 11 行 #include &lt;uapi/linux/socket.h&gt;
+               ▼                                    ▼
+   编译内核（用内核头）                 make headers_install 导出到 /usr/include
+</code></pre>
+
+<p class="srcline">include/linux/socket.h:1-11  内部头是如何"包含" uapi 头的</p>
+<pre><code>/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_SOCKET_H
+#define _LINUX_SOCKET_H
+
+
+#include &lt;asm/socket.h&gt;			/* arch-dependent defines	*/
+#include &lt;linux/sockios.h&gt;		/* the SIOCxxx I/O controls	*/
+#include &lt;linux/uio.h&gt;			/* iovec support		*/
+#include &lt;linux/types.h&gt;		/* pid_t			*/
+#include &lt;linux/compiler.h&gt;		/* __user			*/
+#include &lt;uapi/linux/socket.h&gt;</code></pre>
+<p>这就是标准模式：<strong>uapi 头是"干净"的那一半</strong>，只放用户态能看懂的东西（<code>struct sockaddr</code>、常量定义、ioctl 号）；内部头在最后 include 它，再加内核专有的东西（<code>struct socket</code>、<code>struct file</code> 指针、<code>spinlock_t</code>）。</p>
+
+<p class="srcline">include/uapi/linux/if_link.h:1-11  uapi 头长什么样</p>
+<pre><code>/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+#ifndef _UAPI_LINUX_IF_LINK_H
+#define _UAPI_LINUX_IF_LINK_H
+
+#include &lt;linux/types.h&gt;
+#include &lt;linux/netlink.h&gt;
+
+/* This struct should be in sync with struct rtnl_link_stats64 */
+struct rtnl_link_stats {
+	__u32	rx_packets;
+	__u32	tx_packets;</code></pre>
+<p>三个特征：① SPDX 是 <code>GPL-2.0 WITH Linux-syscall-note</code>——这一行让用户态程序可以自由使用这些头文件而<strong>不被 GPL 传染</strong>；② 文件名前缀 <code>_UAPI_</code> 防重复包含；③ 类型只用 <code>__u32</code>/<code>__s64</code> 这类固定宽度类型，绝不用 <code>unsigned long</code>（32/64 位宽度不同）。</p>
+<p>第 8 行的注释 "should be in sync with struct rtnl_link_stats64" 揭示了一个痛苦现实：同一个网卡统计结构在 uapi（<code>rtnl_link_stats</code>）和内部（<code>rtnl_link_stats64</code>）各有一份，必须手工保持一致。<strong>改 uapi 结构 = 改 ABI = 不能随便改</strong>，这是内核"永不破坏用户态"承诺的代价。</p>
+
+<p><code>make headers_install</code> 的作用就是把 uapi 目录按 <code>include/uapi/Kbuild</code> 的规则导出成 <code>usr/include/linux/</code>，供 glibc 和你的 C 程序 include。所以 <code>#include &lt;linux/if_link.h&gt;</code> 在用户态程序里能编过，是因为那个头来自 uapi；而 <code>#include &lt;linux/sched.h&gt;</code> 在用户态会失败，因为它不在 uapi 里（内部头）。</p>
+
+<h3>3.4 Documentation/ 怎么用</h3>
+<p>7.5 千个文件的文档库，新手会觉得无从下手。按"你要解决什么问题"导航：</p>
+<table>
+  <tr><th>你需要…</th><th>去这里</th><th>典型文件</th></tr>
+  <tr><td>装内核、调内核参数、看启动参数含义</td><td><code>Documentation/admin-guide/</code>（85 个文件）</td><td><code>README.rst</code>、<code>kernel-parameters.rst</code>、<code>init.rst</code>、<code>bootconfig.rst</code></td></tr>
+  <tr><td>学怎么提交补丁、CodingStyle、邮件礼仪</td><td><code>Documentation/process/</code></td><td><code>1.Intro.rst</code> … <code>8.Conclusion.rst</code>、<code>coding-style.rst</code>、<code>submitting-patches.rst</code></td></tr>
+  <tr><td>查某个内核 API 的用法（kmalloc、workqueue…）</td><td><code>Documentation/core-api/</code></td><td><code>kernel-api.rst</code>、<code>workqueue.rst</code>、<code>mm-api.rst</code></td></tr>
+  <tr><td>理解 RCU</td><td><code>Documentation/RCU/</code></td><td><code>whatisRCU.rst</code>、<code>checklist.rst</code>、<code>Design/</code></td></tr>
+  <tr><td>查某个文件系统的行为/参数</td><td><code>Documentation/filesystems/</code></td><td><code>ext4.rst</code>、<code>vfs.rst</code>、<code>path-lookup.rst</code>、<code>caching/</code></td></tr>
+  <tr><td>网络协议/驱动调参</td><td><code>Documentation/networking/</code></td><td><code>netdev-FAQ.rst</code>、<code>tcp.txt</code>、<code>scaling.rst</code></td></tr>
+  <tr><td>调试工具（ftrace、kprobes、gdb）</td><td><code>Documentation/dev-tools/</code> + <code>Documentation/trace/</code></td><td><code>gdb-kernel-debugging.rst</code>、<code>ftrace.rst</code>、<code>kprobetrace.rst</code></td></tr>
+  <tr><td>中文文档（只有部分翻译）</td><td><code>Documentation/translations/zh_CN/</code></td><td><code>index.rst</code>、<code>admin-guide/</code>、<code>process/</code>、<code>arm64/</code>、<code>filesystems/</code></td></tr>
+</table>
+
+<p class="srcline">Documentation/translations/zh_CN/index.rst:6-22  中文翻译入口</p>
+<pre><code>中文翻译
+========
+
+这些手册包含有关如何开发内核的整体信息。内核社区非常庞大，一年下来有数千名开发
+人员做出贡献。 与任何大型社区一样，知道如何完成任务将使得更改合并的过程变得更
+加容易。
+
+翻译计划:
+内核中文文档欢迎任何翻译投稿，特别是关于内核用户和管理员指南部分。
+
+.. toctree::
+   :maxdepth: 2
+
+   admin-guide/index
+   process/index
+   filesystems/index
+   arm64/index</code></pre>
+<p>这套中文文档只有 39 个 <code>.rst</code> 文件（全部 Documentation 有 7000+），是<a href="https://github.com/torvalds/linux/tree/master/Documentation/translations/zh_CN">社区志愿者翻译</a>，覆盖率不高但质量好。<code>toctree</code> 是 Sphinx 的目录指令，决定文档站的层级结构。</p>
+<p>想看渲染后的效果：<code>make htmldocs</code> 会调用 Sphinx，输出在 <code>Documentation/output/</code>（需要 <code>pip install sphinx sphinx-rtd-theme</code>）。对新手更实用的是直接用编辑器读 <code>.rst</code>——格式几乎就是纯文本。</p>
+
+<h3>3.5 MAINTAINERS 与"该找谁"</h3>
+<p>改了一个文件，不知道发给谁？看 <code>MAINTAINERS</code>。它是一份<strong>结构化文本</strong>，每个子系统一段：</p>
+
+<p class="srcline">MAINTAINERS:6619-6627  EXT4 文件系统条目</p>
+<pre><code>EXT4 FILE SYSTEM
+M:	"Theodore Ts'o" &lt;tytso@mit.edu&gt;
+M:	Andreas Dilger &lt;adilger.kernel@dilger.ca&gt;
+L:	linux-ext4@vger.kernel.org
+S:	Maintained
+W:	http://ext4.wiki.kernel.org
+Q:	http://patchwork.ozlabs.org/project/linux-ext4/list/
+T:	git git://git.kernel.org/pub/scm/linux/kernel/git/tytso/ext4.git
+F:	Documentation/filesystems/ext4/</code></pre>
+<p>字段含义（<code>MAINTAINERS:83-119</code> 有官方解释）：</p>
+<ul>
+  <li><code>M:</code> maintainer，补丁要发给的人（可以有多个）。</li>
+  <li><code>L:</code> mailing list，邮件列表。</li>
+  <li><code>S:</code> status，<code>Maintained</code>（有人管）/ <code>Supported</code>（有人专职管）/ <code>Odd Fixes</code>（偶尔修）/ <code>Orphan</code>（没人管）。</li>
+  <li><code>T:</code> SCM tree，维护者的 git 仓库 url，补丁基于谁的分支。</li>
+  <li><code>F:</code> file pattern，文件通配模式，<code>F: drivers/net/</code> 表示该目录及子目录全部归他。</li>
+  <li><code>X:</code> 排除模式（<code>F: net/</code> + <code>X: net/ipv6/</code> 表示除了 ipv6 都归他）。</li>
+</ul>
+<p>文件末尾（<code>MAINTAINERS:19480-19487</code>）有一条 <code>THE REST</code>，<code>M:</code> 是 Linus，<code>F: *</code>——意思是"没被任何条目匹配的文件，最终归 Linus（不是真的找他，而是会掉进黑洞，所以要尽量匹配到具体子系统）"。</p>
+
+<p class="srcline">MAINTAINERS:80-116  字段说明（节选）</p>
+<pre><code>Descriptions of section entries and preferred order
+---------------------------------------------------
+
+	M: *Mail* patches to: FullName &lt;address@domain&gt;
+	R: Designated *Reviewer*: FullName &lt;address@domain&gt;
+	   These reviewers should be CCed on patches.
+	L: *Mailing list* that is relevant to this area
+	S: *Status*, one of the following:
+	   Supported:	Someone is actually paid to look after this.
+	   Maintained:	Someone actually looks after it.
+	// ... 省略 Odd Fixes / Orphan / Obsolete 三行
+	W: *Web-page* with status/info
+	Q: *Patchwork* web based patch tracking system site
+	// ... 省略 B/C/P 三个字段
+	T: *SCM* tree type and location.
+	   Type is one of: git, hg, quilt, stgit, topgit
+	F: *Files* and directories wildcard patterns.</code></pre>
+<p>这份"字段字典"就在文件里，忘了含义随时看。<code>scripts/get_maintainer.pl</code> 会解析它：给它一个文件路径，它输出所有匹配的维护者 + 邮件列表。</p>
+
+<p class="srcline">MAINTAINERS:19480-19487  THE REST 兜底条目</p>
+<pre><code>THE REST
+M:	Linus Torvalds &lt;torvalds@linux-foundation.org&gt;
+L:	linux-kernel@vger.kernel.org
+S:	Buried alive in reporters
+Q:	http://patchwork.kernel.org/project/LKML/list/
+T:	git git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+F:	*
+F:	*/</code></pre>
+<p><code>S: Buried alive in reporters</code> 是 Linus 自己写的玩笑状态。两个 <code>F:</code> 通配符保证"没有任何文件能逃出匹配"。</p>
+
+<h3>3.6 建索引：让 3 万个文件可搜索</h3>
+<p>光有目录结构不够，你需要"按符号跳转"的能力。内核自带三个目标：</p>
+
+<p class="srcline">Makefile:1836-1837  tags / cscope 目标</p>
+<pre><code>tags TAGS cscope gtags: FORCE
+	$(call cmd,tags)</code></pre>
+<p><code>$(call cmd,tags)</code> 会调用 <code>scripts/tags.sh</code>，根据目标名决定跑 ctags 还是 cscope。三个命令的区别：</p>
+<ul>
+  <li><code>make cscope</code>：生成 <code>cscope.out</code>（约 100-300 MB），能在 vim 里 <code>:cs find c func</code> 查"谁调用了它"。</li>
+  <li><code>make tags</code>：生成 <code>tags</code>（约 30-60 MB），vim 里 <code>Ctrl-]</code> 跳到定义。</li>
+  <li><code>make TAGS</code>：emacs 用。</li>
+</ul>
+
+<p class="srcline">scripts/tags.sh:123-126  cscope 的生成方式</p>
+<pre><code>docscope()
+{
+	(echo \-k; echo \-q; all_target_sources) &gt; cscope.files
+	cscope -b -f cscope.out
+}</code></pre>
+<p><code>all_target_sources</code> 函数（脚本前面定义）根据 <code>arch/</code> 和配置筛选出所有真正会被编译的源文件——<strong>不是全树</strong>。<code>-k</code> 关闭默认的 <code>/usr/include</code> 索引（内核自带 include 就够），<code>-q</code> 生成反向索引加速查询，<code>-b</code> 只建库不启动交互界面。</p>
+<p>对新手更现代的选择：<strong>clangd / ccls + compile_commands.json</strong>。<code>make compile_commands.json</code>（内核脚本 <code>scripts/clang-tools/gen_compile_commands.py</code> 会用到）能生成供 LSP 使用的编译数据库，VS Code + clangd 就有了完整的跳转与补全。</p>
+
+<h3>3.7 git log：把"谁改的、为什么改"当成第二份文档</h3>
+<p>源码树是 <code>.git</code> 仓库（本仓库确实是）。注释只解释"现在是什么"，<code>git log</code> 解释"<strong>为什么变成这样</strong>"。常用姿势：</p>
+<pre><code>git log --oneline -20 fs/open.c                 # 这个文件最近 20 次改动
+git log -p --follow mm/mmap.c | less            # 带 diff 的历史，跟改名
+git log -S 'kvmalloc' --oneline | head          # 搜索"哪个提交引入了这个字符串"
+git log --author='Linus' --since=2020-01-01     # 按作者/时间过滤
+git blame -L 1316,1320 fs/open.c                # 这 5 行分别是谁何时改的
+git show HEAD~3 --stat                          # 看某个提交改了哪些文件</code></pre>
+<p>精髓是 <code>git log -S</code>（俗称 "pickaxe"）：它不看 diff 文本，而是统计"某字符串出现次数变了"的提交。想找"某个函数是什么时候被删的"，这是唯一靠谱的办法。<code>git blame</code> 加上 <code>-C</code> 参数还能跨文件追踪代码搬移。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 fs/Makefile：VFS 核心文件一览</h3>
+<p>想知道"文件系统抽象层"有哪些核心组件？看一个 Makefile 就够了——<code>obj-y</code> 的清单就是<strong>该目录直接参与 vmlinux 的组件名单</strong>。</p>
+
+<p class="srcline">fs/Makefile:9-14  VFS 核心对象</p>
+<pre><code>obj-y :=	open.o read_write.o file_table.o super.o \
+		char_dev.o stat.o exec.o pipe.o namei.o fcntl.o \
+		ioctl.o readdir.o select.o dcache.o inode.o \
+		attr.o bad_inode.o file.o filesystems.o namespace.o \
+		seq_file.o xattr.o libfs.o fs-writeback.o \
+		pnode.o splice.o sync.o utimes.o d_path.o</code></pre>
+<p>逐个数一遍就是 VFS 的全家福：<code>open.o</code>（open 系统调用）、<code>read_write.o</code>（read/write）、<code>namei.o</code>（路径解析，即"name to inode"）、<code>dcache.o</code>（目录项缓存）、<code>inode.o</code>（inode 缓存）、<code>super.o</code>（superblock 管理）、<code>exec.o</code>（execve 加载 ELF）、<code>pipe.o</code>（管道）、<code>select.o</code>（select/poll）、<code>fs-writeback.o</code>（脏页回写）。</p>
+<p>这些是<strong>所有</strong>文件系统共享的代码，没有一行与 ext4 有关。这就是"抽象层"的具体体现：ext4 只提供 <code>file_operations</code> 和 <code>inode_operations</code> 的具体实现，其余的通用流程都在这里。</p>
+
+<h3>4.2 block/Makefile：块层的 10 个核心文件</h3>
+<p class="srcline">block/Makefile:6-11  块层对象清单</p>
+<pre><code>obj-$(CONFIG_BLOCK) := bio.o elevator.o blk-core.o blk-sysfs.o \
+			blk-flush.o blk-settings.o blk-ioc.o blk-map.o \
+			blk-exec.o blk-merge.o blk-timeout.o \
+			blk-lib.o blk-mq.o blk-mq-tag.o blk-stat.o \
+			blk-mq-sysfs.o blk-mq-cpumap.o blk-mq-sched.o ioctl.o \
+			genhd.o ioprio.o badblocks.o partitions/ blk-rq-qos.o</code></pre>
+<p>读法：<code>bio.o</code> 是 IO 的最小单位（bio = block IO），<code>blk-core.o</code> 是请求队列主逻辑，<code>blk-merge.o</code> 把相邻读写合并，<code>blk-mq.o</code> 是多队列实现（NVMe 必备），<code>genhd.o</code> 管"通用磁盘"（<code>/dev/sda</code> 这种设备节点），<code>partitions/</code> 是分区表解析（DOS/GPT）。</p>
+<p>注意这里用 <code>obj-$(CONFIG_BLOCK) :=</code> 而不是 <code>+=</code>，因为这是<strong>第一条赋值</strong>，后面还有 <code>block/Makefile:13</code> 起的其它 <code>+=</code> 追加。<code>obj-y :=</code> 与 <code>obj-y +=</code> 的区分，是读 Makefile 的基本功。</p>
+
+<h3>4.3 顶层 Kconfig 的目录装载顺序</h3>
+<p class="srcline">Kconfig:6-30  顶层配置的 source 顺序（完整）</p>
+<pre><code>mainmenu "Linux/$(ARCH) $(KERNELVERSION) Kernel Configuration"
+
+source "scripts/Kconfig.include"
+
+source "init/Kconfig"
+
+source "kernel/Kconfig.freezer"
+
+source "fs/Kconfig.binfmt"
+
+source "mm/Kconfig"
+
+source "net/Kconfig"
+
+source "drivers/Kconfig"
+
+source "fs/Kconfig"
+
+source "security/Kconfig"
+
+source "crypto/Kconfig"
+
+source "lib/Kconfig"
+
+source "lib/Kconfig.debug"</code></pre>
+<p>这个顺序是<strong>刻意的</strong>：<code>init/Kconfig</code> 里有 <code>menuconfig MODULES</code>，所以它必须排在最前（后面所有 <code>depends on MODULES</code> 的选项才能被求值）；<code>lib/Kconfig.debug</code> 最后，因为调试选项依赖前面所有子系统定义的符号。<code>scripts/Kconfig.include</code> 提供 <code>$(success)</code>、<code>$(cc-option)</code> 这类宏，让 Kconfig 能检测编译器能力。</p>
+
+<h3>4.4 目录与配置的联动：drivers/ 如何按配置裁剪</h3>
+<p class="srcline">drivers/Kconfig:1-9  menu "Device Drivers" 下的 source 清单</p>
+<pre><code># SPDX-License-Identifier: GPL-2.0
+#
+# For a description of the syntax of this configuration file,
+// ... 省略 1 行指向 Documentation 的注释
+menu "Device Drivers"
+
+source "drivers/accessibility/Kconfig"
+source "drivers/block/Kconfig"
+source "drivers/char/Kconfig"
+// ... 省略大量 drivers/*/Kconfig 的 source 行</code></pre>
+<p>每一行 <code>source</code> 对应一个子目录的 Kconfig，而每个子目录的 Makefile 里又有 <code>obj-$(CONFIG_X) += ...</code>。于是"你要的驱动"在<strong>三个地方</strong>同时登记：Kconfig（选项）、Makefile（编译规则）、C 文件（实现）。如果只动了后两者而没加 Kconfig 项，用户就永远选不到它。</p>
+
+<h3>4.5 samples/Kconfig + samples/Makefile：最小三元组</h3>
+<p class="srcline">samples/Kconfig:1-7  samples 总开关</p>
+<pre><code># SPDX-License-Identifier: GPL-2.0-only
+menuconfig SAMPLES
+	bool "Sample kernel code"
+	help
+	  You can build and test sample kernel code here.
+
+if SAMPLES
+
+config SAMPLE_AUXDISPLAY</code></pre>
+<p><code>menuconfig</code> 是"带菜单的 config"：在 menuconfig 界面里它是一行可展开的菜单标题，而不是叶子选项。<code>if SAMPLES ... endif</code> 包住整个文件，意味着关掉 SAMPLES 后，里面的所有子选项都不可见。</p>
+
+<p class="srcline">samples/Makefile:4-24  子目录与 samples 的登记</p>
+<pre><code>subdir-$(CONFIG_SAMPLE_AUXDISPLAY)	+= auxdisplay
+subdir-$(CONFIG_SAMPLE_ANDROID_BINDERFS) += binderfs
+obj-$(CONFIG_SAMPLE_CONFIGFS)		+= configfs/
+obj-$(CONFIG_SAMPLE_CONNECTOR)		+= connector/
+subdir-$(CONFIG_SAMPLE_HIDRAW)		+= hidraw
+obj-$(CONFIG_SAMPLE_HW_BREAKPOINT)	+= hw_breakpoint/
+obj-$(CONFIG_SAMPLE_KDB)		+= kdb/
+obj-$(CONFIG_SAMPLE_KFIFO)		+= kfifo/
+obj-$(CONFIG_SAMPLE_KOBJECT)		+= kobject/
+obj-$(CONFIG_SAMPLE_KPROBES)		+= kprobes/
+obj-$(CONFIG_SAMPLE_LIVEPATCH)		+= livepatch/
+subdir-$(CONFIG_SAMPLE_PIDFD)		+= pidfd
+obj-$(CONFIG_SAMPLE_QMI_CLIENT)		+= qmi/
+obj-$(CONFIG_SAMPLE_RPMSG_CLIENT)	+= rpmsg/
+subdir-$(CONFIG_SAMPLE_SECCOMP)		+= seccomp
+subdir-$(CONFIG_SAMPLE_TIMER)		+= timers
+obj-$(CONFIG_SAMPLE_TRACE_EVENTS)	+= trace_events/
+obj-$(CONFIG_SAMPLE_TRACE_PRINTK)	+= trace_printk/
+obj-$(CONFIG_SAMPLE_FTRACE_DIRECT)	+= ftrace/
+obj-$(CONFIG_SAMPLE_TRACE_ARRAY)	+= ftrace/
+subdir-$(CONFIG_SAMPLE_UHID)		+= uhid
+obj-$(CONFIG_VIDEO_PCI_SKELETON)	+= v4l/</code></pre>
+<p><code>obj-$(CONFIG_X) += foo/</code>（带斜杠）与 <code>subdir-$(CONFIG_X) += foo</code>（不带斜杠）有什么区别？前者表示"foo 是个 kbuild 子目录，递归进去取 built-in.a"，后者表示"只是下钻，不取产物"（用于 host program / 只做测试的目录）。<code>Documentation/kbuild/makefiles.rst</code> 有完整解释，新手记一条：<strong>要产物就用 obj-，只是去子目录干活用 subdir-</strong>。</p>
+<p>注意 <code>samples/Makefile:9</code> 那行 <code>FTRACE_DIRECT</code> 与 <code>TRACE_ARRAY</code> 都指向 <code>ftrace/</code>，因为两个配置项控制同一目录下的不同目标，允许的重复没有人会去合并它。</p>
+
+<h3>4.6 一个目录的内部结构：drivers/char 与 fs/ext4</h3>
+<pre><code>drivers/char/                 fs/ext4/
+├── Makefile   (obj-y/obj-m)  ├── Makefile   (ext4-y := ...)
+├── Kconfig    (选项定义)      ├── Kconfig    (CONFIG_EXT4_FS)
+├── mem.c      (/dev/mem)     ├── inode.c    (inode 操作)
+├── random.c   (/dev/random)   ├── super.c    (挂载/卸载)
+├── misc.c     (杂项设备注册)   ├── file.c     (读写路径)
+├── ttyprintk.c                ├── ext4.h      (内部头)
+└── ...                        └── ...
+</code></pre>
+<p>规律清晰：<strong>每个"设备/文件系统"一组文件</strong>，文件名按"主题"切分（<code>inode.c</code> 管 inode，<code>super.c</code> 管 superblock）。想找 ext4 的写路径？<code>fs/ext4/file.c</code> → <code>fs/ext4/inode.c</code>（页映射）。想找 ttyprintk 怎么注册？<code>drivers/char/ttyprintk.c</code> 里搜 <code>register_</code>。</p>
+
+<h3>4.7 arch/x86 的布局：一个架构目录怎么组织</h3>
+<p class="srcline">arch/x86/Makefile:225-233  架构 Makefile 注入全局变量</p>
+<pre><code>head-y := arch/x86/kernel/head_$(BITS).o
+head-y += arch/x86/kernel/head$(BITS).o
+head-y += arch/x86/kernel/ebda.o
+head-y += arch/x86/kernel/platform-quirks.o
+
+libs-y  += arch/x86/lib/
+
+# drivers-y are linked after core-y
+core-y += arch/x86/</code></pre>
+<p>这三行把 arch/x86 的代码"注入"到顶层 vmlinux 的链接清单里。注意拼装方式：<code>head-y</code> 是 vmlinux 的第一段（内核入口）、<code>libs-y</code> 是库（<code>memcpy</code> 等）、<code>core-y</code> 是其余。这个顺序决定了内核二进制文件里"哪段代码在最前面"，<strong>启动时的 <code>_text</code> 符号地址就由它决定</strong>。</p>
+<p><code>$(BITS)</code> 是 32 或 64，由配置的 <code>CONFIG_64BIT</code> 决定。所以 x86 用同一个目录同时支撑 32/64 位，文件名里带位数后缀是常见惯例（<code>head_32.S</code>、<code>head_64.S</code>）。</p>
+
+<h3>4.8 Documentation 文档如何编译成网页</h3>
+<p class="srcline">Makefile:1615-1616  help 把文档目标委托出去 · Documentation/Makefile:89-91,134-136</p>
+<pre><code>    # 顶层 Makefile：只负责转发
+    'Documentation targets:'
+    $(MAKE) -f $(srctree)/Documentation/Makefile dochelp
+
+    # Documentation/Makefile：真正的实现
+    htmldocs:
+          @$(srctree)/scripts/sphinx-pre-install --version-check
+          @+$(foreach var,$(SPHINXDIRS),$(call loop_cmd,sphinx,html,$(var),,$(var)))
+
+    cleandocs:
+          $(Q)rm -rf $(BUILDDIR)
+          $(Q)$(MAKE) BUILDDIR=$(abspath $(BUILDDIR)) $(build)=Documentation/userspace-api/media clean
+</code></pre>
+<p>所以 <code>make htmldocs</code> 的实质是：先跑脚本检查 Sphinx 依赖是否齐全，再对每个列在 <code>SPHINXDIRS</code> 里的文档子目录分别调一次 <code>sphinx-build</code>，产物落在 <code>Documentation/output/</code>。<code>make pdfdocs</code> 走 <code>latexdocs</code> 目标生成 LaTeX，再调用 <code>pdflatex</code>。</p>
+<p>Sphinx 读 <code>Documentation/conf.py</code>（Python 配置）和各个 <code>index.rst</code> 的 <code>toctree</code> 来组织页面。每个 <code>.rst</code> 文件都能独立阅读，<code>toctree</code> 只是决定"在网站上谁挂在谁下面"。对新手，<strong>直接 grep .rst 比看网页快</strong>：<code>grep -rn "kmalloc" Documentation/core-api/ | head</code>。</p>
+
+<h3>4.9 本仓库的 git 状态：学会区分"上游代码"和"本地改动"</h3>
+<p>本仓库是 Linux 5.10 加上少量本地修改（<code>git diff --stat</code> 显示 26 个文件被改）。这是一个真实的"读源码"场景：你看到的代码可能不是 Linus 的原始版本。<strong>任何时候怀疑某个行为，先跑 <code>git log -1 --format=%H</code> 确认基线提交，再 <code>git diff -- 某文件</code> 看本地改了啥</strong>。这是读源码树的基本纪律。</p>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+git log --oneline -3          # 最近 3 个提交，最上面是本地的 [cc][note]
+git status --porcelain | wc -l   # 有多少本地修改
+git diff --stat | tail -3     # 改了哪些文件
+git diff -- fs/open.c         # 看具体某文件的差异（如果有）</code></pre>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 数一数这棵树的形状</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+# 顶层目录清单（本仓库就是 23 个左右）
+ls -d */ | tr -d '/' | tr '\n' ' '; echo
+# 每个顶层目录的文件数（按大小排序）
+for d in */; do printf "%-16s %6s\n" "${d%/}" "$(find "$d" -type f | wc -l | tr -d ' ')"; done | sort -k2 -rn | head -10
+# 全树 C 文件总数、头文件总数
+find . -name '*.c' | wc -l; find . -name '*.h' | wc -l</code></pre>
+<p>预期：<code>drivers/</code> 约 28700 个文件排第一，<code>arch/</code> 约 15947 第二，<code>Documentation/</code> 约 7486 第三。<code>*.c</code> 约 2.9 万个，<code>*.h</code> 约 3.4 万个。</p>
+
+<h3>5.2 验证 uapi 与内部头的边界</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+# uapi 里有、内部 linux/ 里没有的经典用户态头
+ls include/uapi/linux/if_link.h include/uapi/linux/sockios.h
+# 内部头里 include uapi 头的证据
+grep -rn 'include &lt;uapi/' include/linux/*.h | head -8
+# 反例：用户态不该看到的内部头
+head -20 include/linux/sched.h     # 里面有 struct task_struct 声明
+
+# 真的导出一次（需要 gcc，会写 /tmp/hdrs）
+make headers_install INSTALL_HDR_PATH=/tmp/hdrs 2&gt;/dev/null
+ls /tmp/hdrs/include/linux/ | head
+# 检查导出的头里没有内核专属类型
+grep -l 'struct task_struct' /tmp/hdrs/include/linux/*.h || echo 'no internal structs exported'</code></pre>
+<p>预期：<code>make headers_install</code> 后 <code>/tmp/hdrs/include/linux/</code> 里有一堆头文件，但<strong>找不到</strong> <code>task_struct</code>、<code>struct file</code> 这种内部结构。这正是"内核可以随时改内部结构而不破坏用户程序"的保证。</p>
+
+<h3>5.3 用 get_maintainer 查"我该发给谁"</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+# 查 ext4 目录
+scripts/get_maintainer.pl fs/ext4/inode.c
+# 预期输出：Theodore Ts'o &lt;tytso@mit.edu&gt; (maintainer:EXT4 FILE SYSTEM)
+#           Andreas Dilger &lt;...&gt;
+#           linux-ext4@vger.kernel.org (open list)
+# 查一个驱动
+scripts/get_maintainer.pl drivers/char/ttyprintk.c
+# 查"没有专门维护者"的（会落到 THE REST，只给 LKML）
+scripts/get_maintainer.pl fs/pnode.c | head -3
+scripts/get_maintainer.pl --no-git -f fs/ext4/inode.c | head -5</code></pre>
+<p>预期：get_maintainer 的输出里带 <code>(maintainer:XXX)</code> 后缀说明匹配到哪条记录。<strong>不加 <code>--no-git</code> 时，它还会查 git log，把"最近改过这个文件的人"也列出来作为 <code>REVIEWER</code></strong>——这是内核社区非常实用的惯例（找熟悉该文件的人）。</p>
+
+<h3>5.4 建索引并体验"跳转"</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+# 需要先有 .config（否则 tags 脚本不知道哪些文件会参与编译）
+make defconfig
+make cscope                                    # 约 1-3 分钟，产出 200+MB
+ls -lh cscope.out cscope.files
+# 用 cscope 命令行查"谁调用了 do_sys_open"
+cscope -d -f cscope.out -L -0 do_sys_open | head
+# -L 表示命令行模式，-0 表示查"调用者"（cscope 助记：0=caller,1=callee,2=text,3=file,4=definition）
+
+make tags                                      # 生成 tags 文件
+grep -w do_sys_open tags | head -3             # tags 就是"符号+文件+行号+正则"的行集合</code></pre>
+<p>预期：<code>cscope -L -0 do_sys_open</code> 会列出 <code>fs/open.c</code> 里 <code>SYSCALL_DEFINE3(open)</code> 与 <code>SYSCALL_DEFINE3(openat)</code> 附近的调用点。<code>tags</code> 文件每行形如 <code>do_sys_open	fs/open.c	/^long do_sys_open(int dfd...$/;"	f</code>。<strong>注意 cscope 只索引"会被编译的源文件"</strong>——所以未配置的驱动（没有 <code>CONFIG_X=y</code>）不在索引里，这是特性不是 bug。</p>
+
+<h3>5.5 从 git 考古</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+git log --oneline -5 -- mm/mmap.c
+git log -S 'kvmalloc' --oneline -- mm/ | head -5
+git blame -L 1316,1320 fs/open.c
+git show 2c85ebc57b3e --stat | head -15   # 本仓库的 5.10 发布提交
+git log --format='%h %an %ad %s' --date=short -3</code></pre>
+<p>预期：<code>git blame</code> 输出每行的提交哈希、作者、日期。<code>git show 2c85ebc57b3e</code> 会展示"Linux 5.10"这个 tag 的提交信息（本仓库 <code>git log</code> 第二行就是它）。如果 <code>git blame</code> 的输出里出现 <code>876b36f71061</code>（本仓库的最新提交），说明这些行被本地改过。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 为什么 <code>include/linux/socket.h</code> 要 include <code>include/uapi/linux/socket.h</code>，而不是反过来？</b>因为 uapi 头是"用户态也能看"的净版，只能依赖基本类型和别的 uapi 头；内部头包含内核专属类型（<code>struct socket</code>、<code>spinlock_t</code>），用户态根本编译不了。所以依赖方向必须是"内部 → uapi"，反过来会把内核内部结构泄漏给用户态，破坏 ABI 稳定性。</div>
+<div class="qa"><b>Q2. 我看到一个函数 <code>tcp_sendmsg</code>，去哪个目录找它的定义？为什么不是 <code>fs/</code>？</b><code>net/ipv4/tcp.c</code>。命名约定：<code>tcp_</code> 前缀 → TCP 协议 → <code>net/ipv4/</code>；<code>ext4_</code> → <code>fs/ext4/</code>；<code>kvm_</code> → <code>virt/kvm/</code> 或 <code>arch/x86/kvm/</code>；<code>kmalloc</code> → <code>mm/slab_common.c</code>。函数前缀就是最好的"目录提示"。</div>
+<div class="qa"><b>Q3. MAINTAINERS 的 <code>F:</code> 匹配了某个文件，但同一路径也被另一条 <code>F:</code> 匹配，会怎样？</b><code>get_maintainer.pl</code> 会把所有匹配条目的维护者都列出来（可能有多组）。<code>X:</code>（排除）优先级高于 <code>F:</code>，所以可以用 <code>F: net/</code> + <code>X: net/ipv6/</code> 把某子目录从某位维护者名下摘掉。实际提交补丁时，"发给谁"以输出的 <code>(maintainer:XXX)</code> 标注为准，不要自己猜。</div>
+<div class="qa"><b>Q4. 为什么 <code>make cscope</code> 要先有 <code>.config</code>？</b>因为 <code>scripts/tags.sh</code> 的 <code>all_target_sources</code> 只收集"当前配置下真正会被编译的源文件"，这样索引更小、更精确。没有 <code>.config</code> 时脚本要么报错要么退回全树扫描。<strong>代价</strong>：索引里不会有你未启用的驱动代码。</div>
+<div class="qa"><b>Q5. 想读一个陌生的子系统，你的前 3 步是什么？</b>① 读该目录的 <code>Makefile</code>（看清有哪些组件）；② 读该目录的 <code>Kconfig</code>（看清它和哪些子系统互相依赖）；③ 读 <code>Documentation/</code> 下对应的 <code>rst</code>（比如 <code>Documentation/filesystems/vfs.rst</code>、<code>Documentation/networking/netdev-FAQ.rst</code>）；最后才 <code>git log</code> 看最近改了什么、为什么改。</div>
+
+<footer>
+  <p>上一篇：<a href="01-kbuild.html">01 Kbuild 编译系统</a> · 下一篇：<a href="03-boot.html">03 启动流程</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

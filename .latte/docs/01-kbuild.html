@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · Kbuild 编译系统：Makefile、Kconfig 与内核构建</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="02-kernel-tree.html">下一篇：02 内核源码树导读 →</a>
+</nav>
+
+<h1>🔨 01 · Kbuild：一套 Makefile 怎么编译两千多万行代码</h1>
+<p class="subtitle">从 <code>make menuconfig</code> 到 <code>insmod</code>——内核的"工厂流水线"是怎么设计和运转的 · 预计阅读 25 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>想象你要盖一栋有 <strong>3 万个房间</strong>的房子，但每个房间要不要盖、盖成什么样，都取决于一张可以随时改动的"需求清单"：今天要 100 个卧室、明天改要 2 个厨房。而且你不可能每次都推倒重建——你只想动那几间改过的房间。这就是 Linux 内核编译要面对的问题：源码有 2.8 万个文件、约 2000 万行 C 代码，可配置项（<span class="term">CONFIG 开关</span>）有 <strong>上万种组合</strong>，而绝大多数用户只需要其中很小一部分。</p>
+
+<p>如果做一个"所有文件全部编译"的傻瓜脚本，会有三个致命问题：① 编译时间从 10 分钟涨到数小时；② 每个驱动都被塞进内核镜像，一块 10 MB 的内核变成 300 MB，手机放不下；③ 一堆互斥的代码（比如同时给 Intel 和 ARM 编同一段汇编）根本编不过。所以内核必须有一套"<strong>先选、再编、只编选中的</strong>"的系统。</p>
+
+<p>从操作系统视角看，这套系统叫 <span class="term">Kbuild</span>，它由三个部件拼成：<strong>Kconfig</strong>（需求清单的描述语言，决定"要什么"）、<strong>Makefile 体系</strong>（施工队，决定"怎么盖"）、<strong>scripts/ 下的辅助工具</strong>（图纸校验、打包、生成头文件）。三者分工明确：Kconfig 只产出数据（<code>.config</code>），Makefile 只读数据做决策（要不要编某个 <code>.o</code>），绝不互相越界。理解这条边界，你就理解了 Kbuild 的一半。</p>
+
+<p>对本篇的读者还有一个实际好处：<strong>写完一个内核模块，你得知道它该放哪、怎么让它被编出来、怎么单独编译它而不重编整个内核</strong>。这些都直接由 obj-y / obj-m 这几行决定。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">Kbuild</td><td>Kernel Build System</td><td>内核官方编译系统的总称，一套越用越深的 Makefile 规则 + 配置工具。</td></tr>
+  <tr><td class="term">Kconfig</td><td>Kernel Configuration language</td><td>描述"有哪些配置项、它们互相依赖什么"的语言，写在各级目录的 <code>Kconfig</code> 文件里。</td></tr>
+  <tr><td class="term">.config</td><td>dot config</td><td>用户最终选择的结果文件，放在源码树根目录，内容形如 <code>CONFIG_XXX=y</code>。</td></tr>
+  <tr><td class="term">menuconfig</td><td>menu config</td><td>基于 ncurses 的终端图形菜单程序（<code>scripts/kconfig/mconf</code>），让你点选配置。</td></tr>
+  <tr><td class="term">auto.conf</td><td>include/config/auto.conf</td><td>由 <code>.config</code> 转换来的"Makefile 可 include 版本"，把 <code>=y</code> 变成 <code>CONFIG_XXX=y</code> 供 <code>obj-$(CONFIG_XXX)</code> 使用。</td></tr>
+  <tr><td class="term">obj-y</td><td>obj-y</td><td>Makefile 变量：列在这里的目标文件被编进 vmlinux（内置，built-in）。</td></tr>
+  <tr><td class="term">obj-m</td><td>obj-m</td><td>Makefile 变量：列在这里的目标文件被编成独立 <code>.ko</code> 模块文件。</td></tr>
+  <tr><td class="term">tristate</td><td>tri-state</td><td>Kconfig 里的三态类型：<code>y</code>（编进内核）、<code>m</code>（编成模块）、<code>n</code>（不编）。</td></tr>
+  <tr><td class="term">vmlinux</td><td>vmlinux</td><td>链接完成的、未压缩的内核 ELF 可执行文件，是所有 <code>built-in.a</code> 拼起来的最终产物。</td></tr>
+  <tr><td class="term">bzImage</td><td>boot zImage</td><td>x86 上 <code>vmlinux</code> 经压缩 + 加 bootloader 头后得到的、真正能启动的镜像 <code>arch/x86/boot/bzImage</code>。</td></tr>
+  <tr><td class="term">built-in.a</td><td>built-in archive</td><td>每个目录把自己的 <code>.o</code> 用 <code>ar</code> 打包成的静态库（不含符号表），层层向上合并，最终喂给链接器。</td></tr>
+  <tr><td class="term">.ko</td><td>kernel object</td><td>可加载内核模块文件，内部是一个特殊构造的 ELF，<code>insmod</code>/<code>modprobe</code> 加载它。</td></tr>
+  <tr><td class="term">System.map</td><td>System map</td><td>由 <code>nm</code> 导出的"符号 → 地址"对照表，调试、<code>dmesg</code> 里的函数名解析、模块加载都靠它。</td></tr>
+  <tr><td class="term">MODVERSIONS</td><td>module versions</td><td>给导出的符号打 CRC 校验值，防止模块和不匹配的内核混用。</td></tr>
+  <tr><td class="term">O=</td><td>output dir</td><td><code>make O=/tmp/build</code>，把全部生成物（含 .config）放到源码树外的目录，源码树保持干净。</td></tr>
+  <tr><td class="term">M=</td><td>module dir</td><td><code>make M=path</code>，只编译某个外部模块目录，不碰内置部分。</td></tr>
+  <tr><td class="term">CROSS_COMPILE</td><td>cross compiler prefix</td><td>交叉编译器前缀，如 <code>aarch64-linux-gnu-</code>，让 x86 机器能编出 ARM 内核。</td></tr>
+  <tr><td class="term">ARCH</td><td>architecture</td><td>目标架构，<code>ARCH=arm64</code>；内核里还有个别名 <code>SRCARCH</code>（x86 的 <code>ARCH=x86_64</code> 会被归一成 <code>SRCARCH=x86</code>）。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 三层 Makefile：递归下降</h3>
+<p>内核<strong>不是</strong>一个巨型 Makefile，而是每层目录一个 Makefile，逐层向下"串门"。一共三层的角色非常清楚：</p>
+<pre><code>第 1 层  顶层 Makefile（源码树根）
+          职责：解析 ARCH/CROSS_COMPILE、检查 .config、决定要进哪些子目录
+              （core-y / drivers-y / libs-y / head-y），最终调用
+              scripts/link-vmlinux.sh 把各目录的 built-in.a 链成 vmlinux
+              │
+第 2 层  scripts/Makefile.build（每个目录都会被执行一次）
+          职责：读取本目录的 Makefile/Kbuild，把它声明的 obj-y 编成 .o，
+              打包成本目录 built-in.a；把 obj-m 变成 .mod 中间文件
+              │
+第 3 层  各级目录自己的 Makefile（如 fs/Makefile、drivers/char/Makefile）
+          职责：只写本目录的 obj-y / obj-m / 子目录，不关心别人
+</code></pre>
+<p>顶层 Makefile 用一条"万能规则"下钻到所有子目录，子目录又用 <code>scripts/Makefile.build</code> 当成自己的"执行器"。这就是 Kbuild 被称为 <strong>recursive build（递归构建）</strong> 的原因。递归的好处是：每个目录只改自己的文件，别人不受影响，增量编译天然成立。</p>
+
+<h3>3.2 Kconfig：配置语言如何变成 .config</h3>
+<p>Kconfig 文件是一棵"菜单树"。顶层 <code>Kconfig</code> 只做一件事——<code>source</code> 各子系统的 Kconfig：</p>
+<p class="srcline">Kconfig:1-30  顶层配置入口</p>
+<pre><code># SPDX-License-Identifier: GPL-2.0
+#
+# For a description of the syntax of this configuration file,
+# see Documentation/kbuild/kconfig-language.rst.
+#
+mainmenu "Linux/$(ARCH) $(KERNELVERSION) Kernel Configuration"
+
+source "scripts/Kconfig.include"
+
+source "init/Kconfig"
+
+source "kernel/Kconfig.freezer"
+
+source "fs/Kconfig.binfmt"
+
+source "mm/Kconfig"
+
+source "net/Kconfig"
+
+source "drivers/Kconfig"
+// ... 省略 fs/Kconfig、security/Kconfig、crypto/Kconfig、lib/Kconfig 等
+source "lib/Kconfig.debug"</code></pre>
+<ul>
+  <li><code>mainmenu</code>：菜单标题，编译时 <code>$(ARCH)</code>、<code>$(KERNELVERSION)</code> 由 Makefile 环境变量替换。</li>
+  <li><code>source</code>：把另一个 Kconfig 文件的内容"内联"进来，没有 <code>#include</code> 那种物理拼接的坑，但效果一样。</li>
+  <li>顺序有意义：先 <code>init/Kconfig</code>（里面有 <code>MODULES</code>），后面 <code>fs/Kconfig</code> 才能写 <code>depends on MODULES</code>。</li>
+</ul>
+
+<p>一条配置项的标准写法（<code>drivers/char/Kconfig</code> 里的真实条目）：</p>
+<p class="srcline">drivers/char/Kconfig:10-23  TTY_PRINTK 的三态选项</p>
+<pre><code>config TTY_PRINTK
+	tristate "TTY driver to output user messages via printk"
+	depends on EXPERT &amp;&amp; TTY
+	default n
+	help
+	  If you say Y here, the support for writing user messages (i.e.
+	  console messages) via printk is available.
+
+	  // ... 省略中间 2 段说明文字
+
+	  If unsure, say N.</code></pre>
+<ul>
+  <li><code>config TTY_PRINTK</code>：定义符号名，最终变成 <code>CONFIG_TTY_PRINTK</code>。</li>
+  <li><code>tristate</code>：三态；如果是 <code>bool</code> 就只有 y/n。</li>
+  <li><code>depends on EXPERT &amp;&amp; TTY</code>：只有 <code>EXPERT</code> 和 <code>TTY</code> 都开着，这个选项才会出现在菜单里。</li>
+  <li><code>help</code>：后面缩进的一段是帮助文本，menuconfig 里按 <code>h</code>/<code>?</code> 显示。</li>
+  <li>答 <code>m</code> 时，符号值变成 <code>CONFIG_TTY_PRINTK=m</code>，Makefile 里的 <code>obj-$(CONFIG_TTY_PRINTK)</code> 就成了 <code>obj-m += ttyprintk.o</code>。</li>
+</ul>
+
+<h3>3.3 make menuconfig 到底写了什么文件</h3>
+<pre><code>                你按键选择
+                     │
+                     ▼
+   scripts/kconfig/mconf  （ncurses 前端，读写 Kconfig 符号树）
+                     │  退出时保存
+                     ▼
+                  .config          ← 人可读的答案清单，例如 CONFIG_TTY_PRINTK=y
+                     │  下一步 make 检测到 .config 比 auto.conf 新
+                     ▼
+   顶层 Makefile 的 syncconfig 规则
+                     │  实际执行：make -f Makefile syncconfig
+                     ▼
+   scripts/kconfig/conf --syncconfig
+            │                    │
+            ▼                    ▼
+ include/config/auto.conf   include/generated/autoconf.h
+ （给 Makefile 用）          （给 C 代码里的 #ifdef CONFIG_X 用）
+            + 每个符号一个空文件 include/config/CONFIG_XXX（供依赖追踪）
+</code></pre>
+<p>关键点是：<strong>Makefile 从不直接读 <code>.config</code></strong>。它读的是 <code>include/config/auto.conf</code>。这两份文件格式不同——<code>.config</code> 里有 <code># CONFIG_FOO is not set</code> 这种注释，<code>auto.conf</code> 只保留等号形式，并且写进 Makefile 的语法域（<code>CONFIG_X=y</code> 就像 <code>X=y</code>）。</p>
+
+<p class="srcline">scripts/kconfig/confdata.c:220-232  配置文件名与 auto.conf 名</p>
+<pre><code>const char *conf_get_configname(void)
+{
+	char *name = getenv("KCONFIG_CONFIG");
+
+	return name ? name : ".config";
+}
+
+static const char *conf_get_autoconfig_name(void)
+{
+	char *name = getenv("KCONFIG_AUTOCONFIG");
+
+	return name ? name : "include/config/auto.conf";
+}</code></pre>
+<p>两段代码一眼看懂：配置文件默认是 <code>.config</code>，但允许用环境变量 <code>KCONFIG_CONFIG</code> 改名（内核构建系统用这个机制做 <code>O=</code> 输出目录和多套配置）。<code>auto.conf</code> 同理，默认 <code>include/config/auto.conf</code>。这使得 <code>O=</code> 构建时所有路径都被"前缀化"，源码树零写入。</p>
+
+<h3>3.4 顶层 Makefile 与 scripts/Makefile.build 的分工</h3>
+<p class="srcline">Makefile:648-654  顶层决定要下钻的目录</p>
+<pre><code># Objects we will link into vmlinux / subdirs we need to visit
+core-y		:= init/ usr/
+drivers-y	:= drivers/ sound/
+drivers-$(CONFIG_SAMPLES) += samples/
+drivers-y	+= net/ virt/
+libs-y		:= lib/
+endif # KBUILD_EXTMOD</code></pre>
+<p>这 5 行是"总图"：<code>core-y</code>/<code>drivers-y</code>/<code>libs-y</code> 只有目录名和结尾斜杠。<code>drivers-$(CONFIG_SAMPLES)</code> 说明 CONFIG_SAMPLES 为 y 时才把 <code>samples/</code> 加进来——这就是"配置驱动的目录裁剪"。注意 <code>arch/</code> 不在这里，它由第 681 行 <code>include arch/$(SRCARCH)/Makefile</code> 注入，因为每个架构的下钻清单不同。</p>
+
+<p class="srcline">Makefile:1119-1127  把目录清单翻译成 built-in.a 清单</p>
+<pre><code>build-dirs	:= $(vmlinux-dirs)
+clean-dirs	:= $(vmlinux-alldirs)
+
+# Externally visible symbols (used by link-vmlinux.sh)
+KBUILD_VMLINUX_OBJS := $(head-y) $(patsubst %/,%/built-in.a, $(core-y))
+KBUILD_VMLINUX_OBJS += $(addsuffix built-in.a, $(filter %/, $(libs-y)))
+ifdef CONFIG_MODULES
+KBUILD_VMLINUX_OBJS += $(patsubst %/, %/lib.a, $(filter %/, $(libs-y)))
+KBUILD_VMLINUX_LIBS := $(filter-out %/, $(libs-y))</code></pre>
+<p><code>$(patsubst %/,%/built-in.a, ...)</code> 把 <code>init/</code> 变成 <code>init/built-in.a</code>。<code>head-y</code> 来自 <code>arch/x86/Makefile:225</code> 的 <code>head-y := arch/x86/kernel/head_$(BITS).o</code>——它是 vmlinux 的"第一段代码"，必须排在最前面，因为它定义了内核入口地址。这就是为什么 <code>head-y</code> 单独列出来而不是混进 core-y。</p>
+
+<h3>3.5 obj-y / obj-m 的真实含义</h3>
+<p>先看 Kconfig 里 <code>tristate</code> 的取值如何流到 Makefile：</p>
+<pre><code>.config 里          auto.conf 里            Makefile 里
+CONFIG_TTY_PRINTK=y   CONFIG_TTY_PRINTK=y   obj-y += ttyprintk.o
+CONFIG_TTY_PRINTK=m   CONFIG_TTY_PRINTK=m   obj-m += ttyprintk.o
+# CONFIG_TTY_PRINTK   （该行不存在）        （空，这一行整行变成 "obj-" 丢掉内容）
+                                            → 结果：obj-  := ，不影响任何目标
+</code></pre>
+<p>第三行的技巧叫"变量名拼接"：<code>obj-$(CONFIG_TTY_PRINTK)</code> 在值为空时展开成 <code>obj- += ttyprintk.o</code>，GNU Make 里 <code>obj-</code> 是个合法（但没人用）的变量名，所以这一行什么也不做。这是 Kbuild 最经典的一招：<strong>不写 if，靠变量名拼接实现条件编译</strong>。</p>
+
+<p class="srcline">drivers/char/Makefile:6-11  真实的 obj-y/obj-$(CONFIG_X)</p>
+<pre><code>obj-y				+= mem.o random.o
+obj-$(CONFIG_TTY_PRINTK)	+= ttyprintk.o
+obj-y				+= misc.o
+obj-$(CONFIG_ATARI_DSP56K)	+= dsp56k.o
+obj-$(CONFIG_VIRTIO_CONSOLE)	+= virtio_console.o
+obj-$(CONFIG_RAW_DRIVER)	+= raw.o</code></pre>
+<ul>
+  <li><code>+=</code> 而不是 <code>:=</code>：因为 <code>scripts/Makefile.build</code> 第 14-15 行先做了 <code>obj-y := ; obj-m := </code> 清空，子 Makefile 必须用 <code>+=</code> 追加，否则会覆盖之前的内容。</li>
+  <li><code>obj-y</code> 与 <code>obj-$(CONFIG_X)</code> 可以混写，最终都汇集到同一个 <code>obj-y</code>。</li>
+  <li><code>agp/</code> 这种带斜杠的条目在第 39 行（<code>obj-y += agp/</code>）出现，会被 <code>scripts/Makefile.lib</code> 改写成 <code>agp/built-in.a</code>，并触发向下递归。</li>
+</ul>
+
+<h3>3.6 编译任意一个 .o 的规则只有一条</h3>
+<p class="srcline">scripts/Makefile.build:153-154  唯一的编译命令</p>
+<pre><code>quiet_cmd_cc_o_c = CC $(quiet_modtag)  $@
+      cmd_cc_o_c = $(CC) $(c_flags) -c -o $@ $&lt;</code></pre>
+<p>所有 <code>.c → .o</code> 都走这条命令。<code>$(c_flags)</code> 是聚合了 <code>KBUILD_CFLAGS</code>、本目录的 <code>ccflags-y</code>、架构特有 flag 的"全家桶"；<code>quiet_cmd_*</code> 与 <code>cmd_*</code> 的成对约定是 Kbuild 的日志风格——正常只打 <code>CC  init/main.o</code>，加 <code>V=1</code> 时打完整命令行。<code>if_changed</code> 会比对命令行与依赖文件的时间戳，只有真变了才重编。</p>
+
+<p class="srcline">scripts/Makefile.build:395-399  打包 built-in.a</p>
+<pre><code>quiet_cmd_ar_builtin = AR      $@
+      cmd_ar_builtin = rm -f $@; $(AR) cDPrST $@ $(real-prereqs)
+
+$(obj)/built-in.a: $(real-obj-y) FORCE
+	$(call if_changed,ar_builtin)</code></pre>
+<p><code>$(AR) cDPrST</code> 的 <code>D</code> 表示"不打符号表"（deterministic），<code>P</code> 用完整路径名——这是为了让 <code>built-in.a</code> 可以确定性地合并，不同机器编出同样的字节。</p>
+
+<h3>3.7 一次 make 的完整产物链</h3>
+<pre><code>make menuconfig
+   └─ .config
+make -j$(nproc)
+   ├─ 各目录 .c → .o
+   │     └─ 各目录 .o → built-in.a（用 ar 打包，无符号表）
+   ├─ scripts/link-vmlinux.sh 把 core-y/drivers-y/libs-y/head-y 的 .a 链起来
+   │     ├─ vmlinux               （ELF，未压缩，带符号）
+   │     └─ System.map            （nm 导出的符号表）
+   └─ arch/x86/boot/compressed → vmlinux.bin → 加 boot 头 → bzImage
+make modules
+   └─ 各目录 .o → .mod（中间） → modpost 检查 → .ko
+make modules_install
+   └─ depmod -a 生成 /lib/modules/$(uname -r)/modules.dep
+</code></pre>
+
+<p class="srcline">Makefile:1169-1170  vmlinux 由脚本链接</p>
+<pre><code>vmlinux: scripts/link-vmlinux.sh autoksyms_recursive $(vmlinux-deps) FORCE
+	+$(call if_changed,link-vmlinux)</code></pre>
+<p>为什么链接要交给 shell 脚本而不是 Makefile？因为 kallsyms（内核内符号表）需要"链接 → 生成表 → 重新链接"两遍以上迭代，Makefile 的表达能力不够。脚本的 <code>vmlinux_link()</code> 会调用 <code>ld</code> 或 <code>gcc</code> 做最终链接。</p>
+
+<p class="srcline">scripts/link-vmlinux.sh:357-368  生成并校验 System.map</p>
+<pre><code>info SYSMAP System.map
+mksysmap vmlinux System.map
+
+# step a (see comment above)
+if [ -n "${CONFIG_KALLSYMS}" ]; then
+	mksysmap ${kallsyms_vmlinux} .tmp_System.map
+
+	if ! cmp -s System.map .tmp_System.map; then
+		echo &gt;&amp;2 Inconsistent kallsyms data
+		echo &gt;&amp;2 Try "make KALLSYMS_EXTRA_PASS=1" as a workaround
+		exit 1
+	fi
+fi</code></pre>
+<p>第一次 <code>mksysmap</code> 给调试工具用（<code>System.map</code>）；然后用带 kallsyms 的 vmlinux 再导出一份，如果两份地址不一致就报错——因为 kallsyms 表的大小会影响段布局，可能导致地址漂移。<code>cmp -s</code> 是"两次链接必须完全收敛"的判定。</p>
+
+<h3>3.8 模块：内置与可加载的区别</h3>
+<p><code>obj-m</code> 的 <code>.o</code> 不走 <code>built-in.a</code>，走 <code>.mod</code> 中间文件（记录 <code>.o</code> 的路径），再经过 <code>scripts/Makefile.modpost</code> 与 <code>modpost</code> 工具生成 <code>.ko</code>。<code>modpost</code> 做两件事：① 检查模块是否用了内核未导出的符号（链接时才发现会太晚）；② 生成 <code>__ksymtab</code>/<code>__kcrctab</code> 相关内容。</p>
+
+<p class="srcline">Makefile:1690-1709  M= 外部模块的构建路径</p>
+<pre><code>// ... 省略上方注释（"only valid targets when building external modules"）
+KBUILD_BUILTIN :=
+KBUILD_MODULES := 1
+
+build-dirs := $(KBUILD_EXTMOD)
+PHONY += modules
+modules: $(MODORDER)
+	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.modpost</code></pre>
+<p><code>KBUILD_BUILTIN := </code> 清空意味着"这次不编 vmlinux"；<code>build-dirs</code> 被替换成外部目录，递归只在那一个目录里发生。这就是 <code>make M=path</code> 能只编模块、秒级完成的原理。</p>
+
+<h3>3.9 initcall 与 module_init 在编译期的落点</h3>
+<p>模块的 <code>module_init(fn)</code> 在编译期被宏展开成一个指向函数指针、被放进特殊 section 的常量。当它是内置代码时，section 名叫 <code>.initcall6.init</code>（device 级），由链接脚本收集、启动时遍历。</p>
+<p class="srcline">include/linux/module.h:80-89  内置模块时的 module_init</p>
+<pre><code>#ifndef MODULE
+/**
+ * module_init() - driver initialization entry point
+ * @x: function to be run at kernel boot time or module insertion
+ *
+ * module_init() will either be called during do_initcalls() (if
+ * builtin) or at module insertion time (if a module).  There can only
+ * be one per module.
+ */
+#define module_init(x)	__initcall(x);</code></pre>
+<p>注释把奥妙讲明了：<strong>同一个宏，在编进 vmlinux 时是 <code>do_initcalls()</code> 走一遍；在编成 <code>.ko</code> 时是 <code>insmod</code> 触发</strong>。这个分支由编译器的 <code>-DMODULE</code> 决定，而不是运行时。所以 <code>samples/kobject/kobject-example.c:141</code> 那一行 <code>module_init(example_init)</code> 在两种构建方式下都能正常工作。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 顶层 Makefile 的"身份证"</h3>
+<p class="srcline">Makefile:1-19  版本与默认目标</p>
+<pre><code># SPDX-License-Identifier: GPL-2.0
+VERSION = 5
+PATCHLEVEL = 10
+SUBLEVEL = 0
+EXTRAVERSION =
+NAME = Kleptomaniac Octopus
+
+# *DOCUMENTATION*
+// ... 省略 3 行注释（make help / README 指引）
+$(if $(filter __%, $(MAKECMDGOALS)), \
+	$(error targets prefixed with '__' are only for internal use))
+
+# That's our default target when none is given on the command line
+PHONY := __all
+__all:</code></pre>
+<ul>
+  <li>讲内核版本号放在这里：<code>make kernelversion</code> 就是读这 4 个变量拼出来。</li>
+  <li><code>$(error ...)</code> 那两行防止用户误跑 <code>make __build_one</code> 这种内部目标。以 <code>__</code> 开头的目标是 Kbuild 内部控制流用的，不是给用户的。</li>
+  <li><code>PHONY := __all</code> 与 <code>__all:</code> 定义默认目标；真正的 <code>all: vmlinux</code> 在 <code>Makefile:660</code>，因为要等架构 Makefile include 进来才确定。</li>
+</ul>
+
+<h3>4.2 架构与交叉编译入口</h3>
+<p class="srcline">Makefile:369-375  ARCH 的默认值与归一化</p>
+<pre><code>ARCH		?= $(SUBARCH)
+
+# Architecture as present in compile.h
+UTS_MACHINE 	:= $(ARCH)
+SRCARCH 	:= $(ARCH)</code></pre>
+<ul>
+  <li><code>?=</code>：如果环境或命令行没给 <code>ARCH</code>，就用 <code>$(SUBARCH)</code>（Makefile 早先用 <code>uname -m</code> 算出来的值）。</li>
+  <li>紧接着 375 行以后有一堆 <code>ifeq ($(ARCH),i386)</code> / <code>x86_64</code> 分支，把两者都归一成 <code>SRCARCH := x86</code>，因为 <code>arch/x86/</code> 一个目录管两种位宽。</li>
+  <li><code>UTS_MACHINE</code> 保留原始 <code>ARCH</code> 值，最终写进 <code>utsrelease.h</code>，<code>uname -m</code> 会显示它。</li>
+</ul>
+
+<p class="srcline">Makefile:351-369  交叉编译的官方说明</p>
+<pre><code># Cross compiling and selecting different set of gcc/bin-utils
+# ---------------------------------------------------------------------------
+#
+// ... 省略 3 行
+ARCH can be set during invocation of make:
+# make ARCH=ia64
+# Another way is to have ARCH set in the environment.
+# The default ARCH is the host where make is executed.
+
+# CROSS_COMPILE specify the prefix used for all executables used
+// ... 省略 4 行
+ARCH		?= $(SUBARCH)</code></pre>
+<p>这段注释是官方"手册"：<code>ARCH=arm64</code> + <code>CROSS_COMPILE=aarch64-linux-gnu-</code> 就是交叉编译的标准姿势。前缀会拼到 <code>CC</code>/<code>LD</code>/<code>AR</code>/<code>NM</code> 前面，Makefile 不做别的事——它只是"传话筒"。</p>
+
+<h3>4.3 scripts/Makefile.build：每个目录的执行器</h3>
+<p class="srcline">scripts/Makefile.build:36-44  读配置、找本目录 Kbuild</p>
+<pre><code># Read auto.conf if it exists, otherwise ignore
+-include include/config/auto.conf
+
+include scripts/Kbuild.include
+
+# The filename Kbuild has precedence over Makefile
+kbuild-dir := $(if $(filter /%,$(src)),$(src),$(srctree)/$(src))
+kbuild-file := $(if $(wildcard $(kbuild-dir)/Kbuild),$(kbuild-dir)/Kbuild,$(kbuild-dir)/Makefile)
+include $(kbuild-file)</code></pre>
+<ul>
+  <li><code>-include</code>（减号前缀）：文件不存在也不报错。第一次构建时 <code>auto.conf</code> 可能还没生成。</li>
+  <li><code>$(wildcard .../Kbuild)</code> 优先：如果目录里同时有 <code>Kbuild</code> 和 <code>Makefile</code>，用 <code>Kbuild</code>。所以纯 kbuild 项目可以只放 <code>Kbuild</code>。</li>
+  <li><code>$(src)</code> 与 <code>$(obj)</code> 在全篇交替出现：<code>src</code> 是源文件所在目录，<code>obj</code> 是产物目录。用 <code>O=</code> 时两者不同，这是 <code>O=</code> 构建的核心机制。</li>
+</ul>
+
+<p class="srcline">scripts/Makefile.build:14-23  先把变量清空</p>
+<pre><code># Init all relevant variables used in kbuild files so
+# 1) they have correct type
+# 2) they do not inherit any value from the environment
+obj-y :=
+obj-m :=
+lib-y :=
+// ... 省略 lib-m、always、always-y、always-m、targets、subdir-y/m 等</code></pre>
+<p>清空是必须的：否则 <code>obj-y</code> 会被父目录的值污染（GNU Make 变量默认向下继承），导致 <code>drivers/char</code> 的 <code>obj-y</code> 里混着 <code>drivers/net</code> 的东西。清空之后再 <code>include $(kbuild-file)</code>，就只包含本目录自己写的。</p>
+
+<h3>4.4 obj-y 如何变成 built-in.a：递归拼接</h3>
+<p class="srcline">scripts/Makefile.lib:27-56  子目录与 built-in.a 的改写</p>
+<pre><code># When an object is listed to be built compiled-in and modular,
+# only build the compiled-in version
+obj-m := $(filter-out $(obj-y),$(obj-m))
+// ... 省略 lib-y / subdir-ym 计算（第 31-37 行）
+ifdef need-modorder
+obj-m := $(patsubst %/,%/modules.order, $(filter %/, $(obj-y)) $(obj-m))
+else
+obj-m := $(filter-out %/, $(obj-m))
+endif
+
+ifdef need-builtin
+obj-y		:= $(patsubst %/, %/built-in.a, $(obj-y))
+else
+obj-y		:= $(filter-out %/, $(obj-y))</code></pre>
+<ul>
+  <li>第 29 行：同一个目标不能既内置又模块，优先内置。</li>
+  <li>第 43-48 行：<code>foo/</code> 在 <code>obj-y</code> 里时变成 <code>foo/built-in.a</code>（下拉目录并取回它的库）；在 <code>obj-m</code> 里时变成 <code>foo/modules.order</code>（只收集模块顺序，不取库）。</li>
+  <li>这解释了为什么 <code>drivers/char/Makefile</code> 里能直接写 <code>obj-y += agp/</code>：Makefile.lib 会替你把斜杠翻译成库文件。</li>
+</ul>
+
+<h3>4.5 menuconfig 的实现：一个被编译出来的程序</h3>
+<p class="srcline">scripts/kconfig/Makefile:28-29  menuconfig 只是跑 mconf</p>
+<pre><code>menuconfig: $(obj)/mconf
+	$(Q)$&lt; $(silent) $(Kconfig)</code></pre>
+<p><code>$(obj)/mconf</code> 是 <code>scripts/kconfig/mconf.c</code> + <code>lxdialog/</code> 编译出来的二进制。<code>$(Kconfig)</code> 是顶层 Kconfig 的路径（<code>KBUILD_KCONFIG</code> 可覆盖）。所以 menuconfig 的本质就是"编译并运行一个小工具"，跟 Makefile 体系没有别的耦合。</p>
+
+<p class="srcline">scripts/kconfig/Makefile:64-71  所有非交互式配置目标共享一条规则</p>
+<pre><code>simple-targets := oldconfig allnoconfig allyesconfig allmodconfig \
+	alldefconfig randconfig listnewconfig olddefconfig syncconfig \
+	helpnewconfig yes2modconfig mod2yesconfig
+
+PHONY += $(simple-targets)
+
+$(simple-targets): $(obj)/conf
+	$(Q)$&lt; $(silent) --$@ $(Kconfig)</code></pre>
+<p><code>--$@</code> 把目标名当参数名传给 <code>conf</code>，例如 <code>make olddefconfig</code> 执行 <code>conf --olddefconfig Kconfig</code>。一条规则覆盖十几种行为，<code>conf.c</code> 里再按 <code>input_mode</code> 枚举分派。</p>
+
+<p class="srcline">scripts/kconfig/conf.c:516-523  syncconfig 模式</p>
+<pre><code>		case syncconfig:
+			/*
+			 * syncconfig is invoked during the build stage.
+			 * Suppress distracting "configuration written to ..."
+			 */
+			conf_set_message_callback(NULL);
+			sync_kconfig = 1;
+			break;</code></pre>
+<p><code>conf_set_message_callback(NULL)</code> 关闭"配置已写入 xxx"的提示——因为构建阶段每次 <code>make</code> 都可能触发 syncconfig，吵人。<code>sync_kconfig=1</code> 后面会强制写 <code>auto.conf</code>。</p>
+
+<p class="srcline">scripts/kconfig/conf.c:705-724  写完 .config 再写 auto.conf</p>
+<pre><code>	} else if (input_mode != listnewconfig && input_mode != helpnewconfig) {
+		if (!no_conf_write && conf_write(NULL)) {
+			fprintf(stderr, "\n*** Error during writing of the configuration.\n\n");
+			exit(1);
+		}
+
+		/*
+		 * Create auto.conf if it does not exist.
+		 // ... 省略 4 行注释
+		 */
+		if (conf_write_autoconf(sync_kconfig) && sync_kconfig) {
+			fprintf(stderr,
+				"\n*** Error during sync of the configuration.\n\n");
+			return 1;
+		}
+	}</code></pre>
+<p>这是"两次写盘"：<code>conf_write()</code> 写 <code>.config</code>（人看的）；<code>conf_write_autoconf()</code> 写 <code>auto.conf</code> + <code>autoconf.h</code>（机器看的）。<code>sync_kconfig</code> 为 0 时若 auto.conf 已存在就跳过，这样 <code>make menuconfig</code> 之后普通 <code>make</code> 才不会重写。</p>
+
+<p class="srcline">scripts/kconfig/confdata.c:1041-1055  auto.conf 的生成</p>
+<pre><code>int conf_write_autoconf(int overwrite)
+{
+	struct symbol *sym;
+	const char *name;
+	const char *autoconf_name = conf_get_autoconfig_name();
+	FILE *out, *out_h;
+	int i;
+
+	if (!overwrite && is_present(autoconf_name))
+		return 0;
+
+	conf_write_dep("include/config/auto.conf.cmd");
+
+	if (conf_touch_deps())
+		return 1;
+
+	out = fopen(".tmpconfig", "w");</code></pre>
+<ul>
+  <li><code>conf_write_dep("include/config/auto.conf.cmd")</code>：写一份"auto.conf 依赖了哪些 Kconfig 文件"的 makefile 片段。这样改了某个 Kconfig，make 会自动重跑 syncconfig。</li>
+  <li><code>conf_touch_deps()</code>：为每个 <code>CONFIG_X=y</code> 触碰一个空文件 <code>include/config/X</code>，让"某个头文件变了"能精确追踪到是哪个配置项导致的。</li>
+</ul>
+
+<h3>4.6 hello 模块：最小的可加载内核代码</h3>
+<p>仓库里没有 <code>samples/hello/</code>，但有更典型的 <code>samples/kobject/</code>——它既是一个模块，也演示了 init/exit 配对。我们节选其中真正决定"能不能加载"的部分：</p>
+
+<p class="srcline">samples/kobject/kobject-example.c:111-134  example_init</p>
+<pre><code>static int __init example_init(void)
+{
+	int retval;
+
+	/*
+	 * Create a simple kobject with the name of "kobject_example",
+	 * located under /sys/kernel/
+	//
+	// ... 省略中间 5 行注释（说明为何不适合动态 kobject）
+	 */
+	example_kobj = kobject_create_and_add("kobject_example", kernel_kobj);
+	if (!example_kobj)
+		return -ENOMEM;
+
+	/* Create the files associated with this kobject */
+	retval = sysfs_create_group(example_kobj, &attr_group);
+	if (retval)
+		kobject_put(example_kobj);
+
+	return retval;
+}</code></pre>
+<ul>
+  <li><code>__init</code>：函数被放进 <code>.init.text</code> 段，启动完成后这段内存被释放——节省几百 KB 到几 MB 的常驻内存。</li>
+  <li>返回 0 表示成功；返回负错误码（<code>-ENOMEM</code>）时，<code>insmod</code> 会打印 "insmod: ERROR: could not insert module ...: Cannot allocate memory"。</li>
+  <li>失败路径里 <code>kobject_put</code> 是必须的，否则 sysfs 目录残留，再次 <code>insmod</code> 会因重名失败。</li>
+</ul>
+
+<p class="srcline">samples/kobject/kobject-example.c:136-143  exit 与注册</p>
+<pre><code>static void __exit example_exit(void)
+{
+	kobject_put(example_kobj);
+}
+
+module_init(example_init);
+module_exit(example_exit);
+MODULE_LICENSE("GPL v2");</code></pre>
+<ul>
+  <li><code>__exit</code>：放进 <code>.exit.text</code>；内置编译时这段会被丢弃（因为内置代码永不卸载），只有 <code>CONFIG_MODULE_UNLOAD</code> 且作为模块时才保留。</li>
+  <li><code>MODULE_LICENSE("GPL v2")</code> 不是装饰：不写它，内核会打 "module verification failed: signature and/or required key missing - tainting kernel" 并标记内核被污染，而且拿不到 EXPORT_SYMBOL_GPL 的符号。</li>
+</ul>
+
+<p class="srcline">samples/kobject/Makefile:1-2  两行 Makefile 就够</p>
+<pre><code># SPDX-License-Identifier: GPL-2.0-only
+obj-$(CONFIG_SAMPLE_KOBJECT) += kobject-example.o kset-example.o</code></pre>
+<p>再配合 <code>samples/Makefile:12</code> 的 <code>obj-$(CONFIG_SAMPLE_KOBJECT) += kobject/</code> 与 <code>samples/Kconfig:41</code> 的 <code>config SAMPLE_KOBJECT / tristate "Build kobject examples"</code>，一个目录的"配置—构建—产物"三元组就闭环了。答 <code>m</code> 得到 <code>.ko</code>，答 <code>y</code> 直接进 vmlinux。</p>
+
+<p>如果你要写自己的最小模块，按同样的三元组做：</p>
+<pre><code>/* hello.c —— 不依赖 kobject，最小可加载模块 */
+#include &lt;linux/module.h&gt;
+#include &lt;linux/kernel.h&gt;
+
+static int __init hello_init(void)
+{
+	pr_info("hello: loaded, jiffies=%lu\n", jiffies);
+	return 0;
+}
+
+static void __exit hello_exit(void)
+{
+	pr_info("hello: unloaded\n");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("minimal hello module");</code></pre>
+<p>外部模块的 Makefile 必须写成"双人格"（源码里有官方范例，见 <code>Documentation/kbuild/modules.rst:198-208</code>）：</p>
+<pre><code>ifneq ($(KERNELRELEASE),)
+# 被内核构建系统 include 时走这里
+obj-m := hello.o
+else
+# 用户直接 make 时走这里
+KDIR ?= /lib/modules/`uname -r`/build
+default:
+	$(MAKE) -C $(KDIR) M=$(PWD)
+endif</code></pre>
+<p><code>KERNELRELEASE</code> 是内核构建系统注入的环境变量。有这个变量说明"我被 Kbuild 调用了"，走 kbuild 语法；没有说明"我是用户在源码树外敲 make"，于是把自己转发给 <code>M=$(PWD)</code>。<code>Documentation/kbuild/modules.rst:215-216</code> 解释了这个检查的意义：同一个 Makefile 兼容两种入口。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看配置系统，不编译</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+make help | head -30            # 会列出所有配置目标与说明
+make defconfig                  # x86_64 默认配置，生成 .config
+grep -E 'CONFIG_MODULES|CONFIG_SAMPLE_KOBJECT|CONFIG_DEBUG_INFO' .config
+make olddefconfig               # 补齐新增符号的默认值
+du -sh .config; head -12 .config</code></pre>
+<p>预期：<code>make help</code> 里能看到 <code>menuconfig / oldconfig / defconfig / localmodconfig</code>；<code>.config</code> 大小约 130 KB、约 4000 行，开头是 <code># Automatically generated file; DO NOT EDIT.</code>。改 <code>.config</code> 后必须跑 <code>make olddefconfig</code>（或重新 menuconfig），否则依赖变化不会被校验。</p>
+
+<h3>5.2 观察 obj-y 与 obj-m 的差异（不真编内核）</h3>
+<pre><code>cd /Users/zhouguodong/Documents/latte/linux_diff
+# 用 make 的 -p 打印数据库，过滤出某个目录的 obj-y / obj-m
+make -s -f scripts/Makefile.build obj=drivers/char -p 2&gt;/dev/null \
+  | grep -E '^obj-(y|m|$(CONFIG_TTY_PRINTK)) ' | head
+# 或者更直接：手动展开变量名拼接的效果
+printf 'CONFIG_TTY_PRINTK=y\nobj-$(CONFIG_TTY_PRINTK) += ttyprintk.o\nall:; @echo [$(obj-y)]\n' &gt; /tmp/kb.mk
+make -s -f /tmp/kb.mk
+printf 'CONFIG_TTY_PRINTK=m\nobj-$(CONFIG_TTY_PRINTK) += ttyprintk.o\nall:; @echo [$(obj-m)]\n' &gt; /tmp/kb2.mk
+make -s -f /tmp/kb2.mk</code></pre>
+<p>预期：第一个实验（<code>make -p</code>）会打印出本目录被 include 后的 <code>obj-y</code> 变量值，能看到 <code>mem.o random.o misc.o agp/built-in.a</code> 等条目；<code>CONFIG_TTY_PRINTK</code> 未设置时该行消失。后两个小实验分别输出 <code>[ttyprintk.o]</code>（但变量名是 obj-y）和 <code>[]</code>——注意第二例里 <code>obj-y</code> 是空的，若改 echo <code>$(obj-m)</code> 才能看到 <code>ttyprintk.o</code>。这亲手演示了"变量名拼接"而不是条件判断。</p>
+
+<h3>5.3 只编一个文件，看 CC 命令行</h3>
+<pre><code>make defconfig
+make V=1 drivers/char/mem.o     # 单目标构建，V=1 打印完整命令行
+# 典型输出（节选）：
+#   gcc -Wp,-MMD,drivers/char/.mem.o.d -nostdinc -isystem ... \
+#       -I./arch/x86/include -I./include ... -c -o drivers/char/mem.o drivers/char/mem.c</code></pre>
+<p>预期：你会看到一条极长的 <code>gcc -c</code> 命令，里面没有 <code>-O2</code> 之外的惊喜——<code>c_flags</code> 就是这样堆起来的。<code>make clean</code> 会删掉 <code>.o</code> 与 <code>built-in.a</code>。<code>make mrproper</code> 连 <code>.config</code> 一起删。<code>make distclean</code> 更彻底（等于 <code>mrproper</code> + 清理编辑器备份等）。</p>
+
+<h3>5.4 用 <code>O=</code> 做"源码树干净"的构建</h3>
+<pre><code>mkdir -p /tmp/kbuild-x86 &amp;&amp; cd /Users/zhouguodong/Documents/latte/linux_diff
+make O=/tmp/kbuild-x86 defconfig
+make O=/tmp/kbuild-x86 -j$(sysctl -n hw.ncpu 2&gt;/dev/null || nproc) bzImage
+ls -lh /tmp/kbuild-x86/arch/x86/boot/bzImage
+ls -lh /tmp/kbuild-x86/vmlinux /tmp/kbuild-x86/System.map</code></pre>
+<p>预期：源码树里除 <code>.latte/</code> 和各种 txt 之外不该新增文件；所有产物都在 <code>/tmp/kbuild-x86</code>。<code>bzImage</code> 通常 8-12 MB，<code>vmlinux</code> 几十到上百 MB（带调试信息时更大），<code>System.map</code> 约 3-6 MB。这就是"内核镜像不是普通 ELF"的直观感受。</p>
+<div class="warn">在 macOS 上直接编 x86 Linux 内核通常不可行（内核对 glibc、binutils、gcc 版本有强依赖）。本节在 Linux x86_64 上即可全流程跑通；本地 macOS 建议只做 5.1/5.2 那种"看配置、看变量"的实验，或者用容器/虚拟机编。</div>
+
+<h3>5.5 加载自写 hello 模块</h3>
+<pre><code># 在 Linux 机器上，准备一个装了对应内核头文件的系统
+mkdir -p ~/hello &amp;&amp; cd ~/hello
+# 把上面的 hello.c 和双人格 Makefile 放进来
+make -C /lib/modules/$(uname -r)/build M=$PWD modules
+file hello.ko           # 应显示 "ELF 64-bit LSB relocatable, x86-64"
+modinfo hello.ko        # 显示 license / description / vermagic
+sudo insmod hello.ko
+dmesg | tail -3
+# 预期：hello: loaded, jiffies=4294xxxxxx
+lsmod | grep hello
+sudo rmmod hello
+dmesg | tail -1         # 预期：hello: unloaded</code></pre>
+<p>三个观察点：① <code>modinfo</code> 里的 <code>vermagic</code> 形如 <code>5.10.0 SMP mod_unload modversions</code>，它必须与内核的 <code>vermagic</code> 一致，否则 <code>insmod</code> 报 "Invalid module format"；② <code>dmesg</code> 里消息前会多出 <code>hello: </code> 前缀，因为 <code>scripts/Makefile.lib</code> 自动给模块加了 <code>-DKBUILD_MODNAME='"hello"'</code>，而 <code>pr_fmt</code> 默认含 <code>KBUILD_MODNAME ": "</code>；③ <code>lsmod</code> 的"Used by"列为 0 说明没有别的模块依赖它。</p>
+
+<h3>5.6 交叉编译（可选）</h3>
+<pre><code># Ubuntu 上装交叉工具链
+sudo apt install gcc-aarch64-linux-gnu
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
+file arch/arm64/boot/Image        # 预期：ARM aarch64 Linux kernel Image
+# 注意产物名是 Image 不是 bzImage；每个架构的镜像名不同
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- mrproper</code></pre>
+<p>关键在于：<code>ARCH</code> 决定 include 哪个 <span class="term">arch/$(SRCARCH)/Makefile</span>，<code>CROSS_COMPILE</code> 只是给工具名加前缀。两者都不改代码，只改"用哪把工具、看哪份架构规则"。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. <code>obj-y</code> 和 <code>obj-m</code> 最本质的区别是什么？</b><code>obj-y</code> 的目标文件被打进 <code>built-in.a</code>，最终链接进 vmlinux，代码常驻内核镜像，启动时就存在；<code>obj-m</code> 的目标文件走 <code>.mod</code> → <code>modpost</code> → <code>.ko</code>，运行时用 <code>insmod</code>/<code>modprobe</code> 才进内核，可卸载。同一个目标不允许同时在两者里（<code>scripts/Makefile.lib:29</code> 会用 filter-out 让 obj-y 获胜）。</div>
+<div class="qa"><b>Q2. 为什么 Makefile 里能写 <code>obj-$(CONFIG_XXX)</code> 而不写 if？</b>因为 GNU Make 的变量名是"文本拼接"的：<code>CONFIG_XXX</code> 为空时整行变成 <code>obj- += ...</code>，而 <code>obj-</code> 是个没人用的变量名，追加进去也没人读，等价于"该行无效"。这是 Kbuild 最省事的条件编译手法。</div>
+<div class="qa"><b>Q3. 改了 <code>.config</code> 之后为什么必须重新 syncconfig？如果不做会怎样？</b>因为 Makefile 读的不是 <code>.config</code> 而是 <code>include/config/auto.conf</code> 与 <code>include/generated/autoconf.h</code>。顶层 Makefile 第 709 行有"auto.conf 依赖 .config"的规则，<code>make</code> 会自动检测时间戳并触发 syncconfig；但如果你只改了 <code>.config</code> 又不跑 make，或者手工写错符号名，Kconfig 的依赖校验（<code>depends on</code>）不会被执行，可能编出"看起来成功但配置自相矛盾"的内核。</div>
+<div class="qa"><b>Q4. <code>make M=dir</code> 为什么快？</b>因为 <code>Makefile:1703-1708</code> 在外部模块构建时把 <code>KBUILD_BUILTIN</code> 清空、把 <code>build-dirs</code> 换成 <code>KBUILD_EXTMOD</code>，于是递归只在你指定的目录发生，不产生 vmlinux，不遍历 drivers/。</div>
+<div class="qa"><b>Q5. 为什么要有 System.map，它和 vmlinux 里的符号表不是重复了吗？</b>vmlinux 是带符号的 ELF，但很多符号地址在 KASLR（内核地址随机化）后会变化；<code>System.map</code> 是构建时生成的"链接期地址"快照，用于 <code>nm</code>/<code>perf</code>/崩溃解析工具在没有 vmlinux 的现场做符号化。而且 <code>scripts/link-vmlinux.sh:364</code> 的 <code>cmp</code> 校验保证 kallsyms 收敛，这是内核内自带的符号表能正确解码的前提。</div>
+
+<footer>
+  <p>上一篇：<a href="index.html">返回主题目录</a> · 下一篇：<a href="02-kernel-tree.html">02 内核源码树导读</a></p>
+</footer>
+
+</body>
+</html>

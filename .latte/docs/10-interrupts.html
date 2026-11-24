@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · 中断</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="11-locking.html">下一篇：11 锁 →</a>
+</nav>
+
+<h1>⚡ 中断：硬件按门铃与内核的分层处理</h1>
+<p class="subtitle">一个中断号找到一张表，一个向量找到一段汇编，处理工作被切成硬中断、软中断、tasklet、工作队列四层 · 预计阅读 30 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>你正在专心读一本书，突然有人敲门。你有两个选择：立刻放下书去开门（打断当前工作），或者在门边放张纸条写"我在忙，稍后"，先把手头这事做完再去。</p>
+
+<p>计算机里的中断就是这件事。网卡收到一个包、磁盘读完了、键盘按了键、定时器到点了——这些硬件事件必须让 CPU 知道。但 CPU 此刻可能正在跑一个很长的计算，如果每次事件都立刻停下所有工作去处理，系统效率会崩掉。所以内核用了<strong>分层</strong>的办法：</p>
+
+<ul>
+  <li><strong>上半部（hardirq）</strong>：硬件事件刚到时的"接待工作"。必须极快——不能睡眠、不能加阻塞锁、不能做耗时的操作。通常就是读一下设备寄存器、ack 一下硬件、把数据放进环形缓冲区，然后立刻返回。</li>
+  <li><strong>下半部（bottom half）</strong>：真正的"正事"。可以耗时、可以睡眠、可以排队。由软中断（softirq）、tasklet、工作队列（workqueue）三种机制承载。</li>
+</ul>
+
+<p>从 OS 视角看，中断机制要解决三个问题：<strong>①</strong> 硬件事件怎么变成 CPU 能识别的"向量"；<strong>②</strong> CPU 怎么知道这个向量对应哪段处理代码；<strong>③</strong> 处理代码怎么在"极短时间 + 禁止睡眠"的约束下把工作分发出去。三个问题分别对应本文的三块内容：APIC/IDT、<code>request_irq()</code>、下半部三种机制。</p>
+
+<p>还要记住一个约束：<strong>中断上下文里不能睡眠</strong>。因为一旦在中断处理里睡眠，CPU 就得切换到别的进程，而中断处理还没做完——那个进程可能在操作同一份数据。这是内核里最常见的"不能这么做"的原因，后面 <code>in_interrupt()</code> 这个函数就是用来做这种检查的。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">中断</td><td>interrupt / IRQ</td><td>硬件事件通知 CPU，打断当前执行流</td></tr>
+  <tr><td class="term">中断请求线</td><td>IRQ line</td><td>设备与中断控制器之间的物理信号线，一个编号就是一个 IRQ 号</td></tr>
+  <tr><td class="term">中断向量</td><td>vector</td><td>x86 上 CPU 内部的中断编号（0..255），用来查 IDT</td></tr>
+  <tr><td class="term">中断描述符表</td><td>IDT (Interrupt Descriptor Table)</td><td>CPU 里的 256 项跳转表：向量 → 处理程序地址</td></tr>
+  <tr><td class="term">门</td><td>gate</td><td>IDT 表项的类型；中断门在处理期间自动关中断</td></tr>
+  <tr><td class="term">中断控制器</td><td>interrupt controller</td><td>管理所有 IRQ 线的芯片；x86 上是 APIC（Advanced Programmable Interrupt Controller）</td></tr>
+  <tr><td class="term">本地 APIC</td><td>Local APIC / LAPIC</td><td>每个 CPU 内部的那一片，负责接收并投递到本 CPU 的中断</td></tr>
+  <tr><td class="term">IO APIC</td><td>IO-APIC</td><td>主板上那片外设中断控制器，把 PCI/ISA 设备的 IRQ 转发给 LAPIC</td></tr>
+  <tr><td class="term">中断描述符</td><td>struct irq_desc</td><td>内核为每个 IRQ 号维护的对象，装着处理函数链、状态、亲和性</td></tr>
+  <tr><td class="term">中断动作</td><td>struct irqaction</td><td>驱动注册的一份处理函数 + 名字 + dev_id cookie</td></tr>
+  <tr><td class="term">上半部</td><td>top half / hardirq</td><td>中断上下文里立刻执行的那部分，必须极快、不可睡眠</td></tr>
+  <tr><td class="term">下半部</td><td>bottom half</td><td>被推迟执行的处理部分，可以耗时、可睡眠</td></tr>
+  <tr><td class="term">软中断</td><td>softirq</td><td>内核自己产生的"软性中断"，共 10 个向量</td></tr>
+  <tr><td class="term">tasklet</td><td>tasklet</td><td>跑在软中断上下文的轻量级延迟任务，不能睡眠</td></tr>
+  <tr><td class="term">工作队列</td><td>workqueue</td><td>跑在内核线程上下文里的延迟任务，可以睡眠、可并行</td></tr>
+  <tr><td class="term">in_interrupt()</td><td>in_interrupt</td><td>判断当前是否处于中断/软中断上下文；为真时禁止睡眠</td></tr>
+  <tr><td class="term">local_bh_disable()</td><td>local_bh_disable</td><td>关掉本 CPU 的软中断（BH），防止当前代码被下半部抢占</td></tr>
+  <tr><td class="term">IRQ_NONE / IRQ_HANDLED</td><td>irqreturn_t</td><td>处理函数的返回值：这个中断不是我的 / 我处理好了</td></tr>
+  <tr><td class="term">IRQ_WAKE_THREAD</td><td>IRQ_WAKE_THREAD</td><td>上半部发现活太多，交给专门的中断线程去做</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 从硬件事件到内核代码</h3>
+
+<pre><code>设备产生事件（如网卡收到包）
+    │  拉低 IRQ 引脚
+    ▼
+IO-APIC 芯片：记录"哪个 IRQ 线有事件"，决定送给哪个 CPU
+    │  通过 APIC 总线发消息
+    ▼
+Local APIC（LAPIC）：把消息变成一个"中断向量号"，写进 APIC 的 ISR 寄存器
+    │  通知 CPU
+    ▼
+CPU：保存当前上下文 → 查 IDT[vector] → 跳到对应的汇编入口
+    │  （栈切换到中断栈 / 内核栈，关闭中断）
+    ▼
+asm_common_interrupt → common_interrupt()      arch/x86/kernel/irq.c
+    │  desc = __this_cpu_read(vector_irq[vector])
+    ▼
+handle_irq(desc, regs) → handle_irq_event(desc)   kernel/irq/handle.c
+    │  遍历 desc-&gt;action 链，逐个调用 action-&gt;handler(irq, dev_id)
+    ▼
+驱动注册的 handler（硬中断上下文）
+    │  · 读设备寄存器取数据
+    │  · ack 硬件
+    │  · 把数据放进 ring buffer
+    │  · 启动下半部：tasklet_schedule() / queue_work() / raise_softirq()
+    ▼
+返回 → 恢复上下文 → 回到被打断的地方
+    │
+    ▼
+稍后（在退出中断上下文时，或由 ksoftirqd 线程）：
+    __do_softirq()  →  依次执行待处理的 softirq
+        TASKLET_SOFTIRQ → 跑 tasklet 队列
+    或
+    kworker/0:1 线程 → 跑 workqueue 里的 work
+</code></pre>
+
+<h3>3.2 上半部 vs 下半部</h3>
+
+<table>
+  <tr><th>维度</th><th>上半部（hardirq handler）</th><th>下半部（softirq / tasklet / workqueue）</th></tr>
+  <tr><td>执行上下文</td><td>中断上下文（关中断、不可抢占调度）</td><td>softirq：关 BH 的软中断上下文<br>workqueue：普通内核线程上下文</td></tr>
+  <tr><td>能否睡眠</td><td><strong>绝对不能</strong></td><td>softirq/tasklet 不能；workqueue 可以</td></tr>
+  <tr><td>能用的锁</td><td>只能用自旋锁（不能关中断地拿）</td><td>softirq 同上；workqueue 可用互斥锁、可睡眠</td></tr>
+  <tr><td>并发性</td><td>同一 CPU 上不重入；不同 CPU 上同一 IRQ 默认串行</td><td>tasklet 在同一 CPU 上串行；workqueue 可多线程并行</td></tr>
+  <tr><td>典型耗时</td><td>微秒级，必须 &lt; 整个系统能容忍的延迟</td><td>不限</td></tr>
+  <tr><td>典型用途</td><td>读寄存器、ack 硬件、填环形缓冲</td><td>协议栈处理、磁盘 I/O 提交、文件系统操作</td></tr>
+</table>
+
+<div class="warn">
+  <strong>为什么上半部不能睡眠？</strong>中断处理期间 CPU 的 <code>IF</code> 标志（中断使能）通常是关的。如果此时调用 <code>schedule()</code> 切走，等于"在一个还没做完的半截操作中间把 CPU 让给别人"。更糟的是，被唤醒的进程可能正在操作同一份数据——比如网卡驱动的 ring buffer——于是出现难以复现的竞态。
+</div>
+
+<h3>3.3 三种下半部机制怎么选</h3>
+
+<pre><code>硬中断 handler 里发生了什么
+    │
+    ├─ 只是"标记一下有待办事项"（置个标志位）？
+    │     └─→ raise_softirq(NET_RX_SOFTIRQ)  → 软中断机制
+    │
+    ├─ 要做点收尾工作，但很快、不能睡眠？
+    │     └─→ tasklet_schedule()             → tasklet 机制
+    │
+    └─ 工作量大 / 要睡眠 / 要并行？
+          └─→ queue_work()                    → 工作队列机制
+</code></pre>
+
+<table>
+  <tr><th>机制</th><th>执行者</th><th>能否睡眠</th><th>并行度</th><th>适用</th></tr>
+  <tr><td>softirq</td><td>退出中断时由当前 CPU 跑，或 <code>ksoftirqd</code></td><td>否</td><td>各 CPU 独立</td><td>网络收包等高频路径</td></tr>
+  <tr><td>tasklet</td><td>跑在 <code>TASKLET_SOFTIRQ</code> 里</td><td>否</td><td>同一 CPU 串行</td><td>轻量收尾，常配合 <code>spin_lock</code></td></tr>
+  <tr><td>workqueue</td><td>内核线程 <code>kworker/N:M</code></td><td><strong>能</strong></td><td>可多线程</td><td>耗时、需要睡眠、需要并行的活</td></tr>
+</table>
+
+<h3>3.4 IDT：CPU 的"中断跳转表"</h3>
+
+<p>IDT（Interrupt Descriptor Table）是 CPU 内部的一张 256 项的表，每项 16 字节，存着"这个向量对应哪个处理程序、什么类型的门、什么特权级"。CPU 收到中断后，用向量号直接查表跳转——这是一次硬件查表，非常快。</p>
+
+<p>门类型（<code>GATE_INTERRUPT</code> / <code>GATE_TRAP</code>）决定了两件事：处理期间中断是否自动关闭，以及返回时用 <code>iret</code> 还是别的指令。Linux 的普通中断和异常几乎都用<strong>中断门</strong>（处理期间 IF 自动清零，避免中断嵌套带来的复杂度）。</p>
+
+<h3>3.5 十个软中断向量</h3>
+
+<p>软中断不是硬件概念，是内核自己"记账"的一套机制。内核定义了 10 个软中断编号，每个对应一类工作：</p>
+
+<pre><code>enum
+{
+	HI_SOFTIRQ=0,       /* 高优先级推迟任务 */
+	TIMER_SOFTIRQ,      /* 定时器 */
+	NET_TX_SOFTIRQ,     /* 网络发送 */
+	NET_RX_SOFTIRQ,     /* 网络接收 */
+	BLOCK_SOFTIRQ,      /* 块设备 */
+	IRQ_POLL_SOFTIRQ,   /* 轮询 */
+	TASKLET_SOFTIRQ,    /* tasklet 队列 */
+	SCHED_SOFTIRQ,      /* 调度器 */
+	HRTIMER_SOFTIRQ,    /* 高精度定时器 */
+	RCU_SOFTIRQ,        /* RCU（读侧无锁） */
+	NR_SOFTIRQS
+};
+</code></pre>
+
+<p>每个 CPU 有一份"待处理软中断位图"，置位表示"这个软中断有事要做"。<code>__do_softirq()</code> 在退出中断上下文时逐个检查并执行。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 IDT 的搭建：<code>arch/x86/kernel/idt.c</code></h3>
+
+<p>IDT 表项用几个宏来声明。核心的 <code>G()</code> 宏把"向量号、门类型、特权级、处理程序地址"塞进一个 <code>struct idt_data</code>：</p>
+
+<p class="srcline">arch/x86/kernel/idt.c:19-43  IDT 表项宏</p>
+<pre><code>#define G(_vector, _addr, _ist, _type, _dpl, _segment)	\
+	{						\
+		.vector		= _vector,		\
+		.bits.ist	= _ist,			\
+		.bits.type	= _type,		\
+		.bits.dpl	= _dpl,		\
+		.bits.p		= 1,		\
+		.addr		= _addr,		\
+		.segment	= _segment,		\
+	}
+
+/* Interrupt gate */
+#define INTG(_vector, _addr)				\
+	G(_vector, _addr, DEFAULT_STACK, GATE_INTERRUPT, DPL0, __KERNEL_CS)
+
+/* System interrupt gate */
+#define SYSG(_vector, _addr)				\
+	G(_vector, _addr, DEFAULT_STACK, GATE_INTERRUPT, DPL3, __KERNEL_CS)
+
+/*
+ * Interrupt gate with interrupt stack. The _ist index is the index in
+ * the tss.ist[] array, but for the descriptor it needs to start at 1.
+ */
+#define ISTG(_vector, _addr, _ist)			\
+	G(_vector, _addr, _ist + 1, GATE_INTERRUPT, DPL0, __KERNEL_CS)
+</code></pre>
+
+<ul>
+  <li><code>INTG</code>：普通中断门，DPL0（只能内核态触发）、用默认栈（当前内核栈）。</li>
+  <li><code>SYSG</code>：系统中断门，DPL3——用户态也能触发，比如 <code>int 0x80</code>（老式系统调用入口）。</li>
+  <li><code>ISTG</code>：带专用中断栈（IST）的门。用于那些"处理时绝不能用当前栈"的场合，比如双重故障（#DF）——如果连栈都坏了，得换一条备用栈来跑处理程序。</li>
+</ul>
+
+<p>真正的表项内容在这里：</p>
+
+<p class="srcline">arch/x86/kernel/idt.c:75-108  def_idts（默认异常表）</p>
+<pre><code>static const __initconst struct idt_data def_idts[] = {
+	INTG(X86_TRAP_DE,		asm_exc_divide_error),
+	INTG(X86_TRAP_NMI,		asm_exc_nmi),
+	INTG(X86_TRAP_BR,		asm_exc_bounds),
+	INTG(X86_TRAP_UD,		asm_exc_invalid_op),
+	INTG(X86_TRAP_NM,		asm_exc_device_not_available),
+	INTG(X86_TRAP_OLD_MF,		asm_exc_coproc_segment_overrun),
+	INTG(X86_TRAP_TS,		asm_exc_invalid_tss),
+	INTG(X86_TRAP_NP,		asm_exc_segment_not_present),
+	INTG(X86_TRAP_SS,		asm_exc_stack_segment),
+	INTG(X86_TRAP_GP,		asm_exc_general_protection),
+	INTG(X86_TRAP_SPURIOUS,		asm_exc_spurious_interrupt_bug),
+	INTG(X86_TRAP_MF,		asm_exc_coprocessor_error),
+	INTG(X86_TRAP_AC,		asm_exc_alignment_check),
+	INTG(X86_TRAP_XF,		asm_exc_simd_coprocessor_error),
+
+#ifdef CONFIG_X86_32
+	TSKG(X86_TRAP_DF,		GDT_ENTRY_DOUBLEFAULT_TSS),
+#else
+	INTG(X86_TRAP_DF,		asm_exc_double_fault),
+#endif
+	INTG(X86_TRAP_DB,		asm_exc_debug),
+
+#ifdef CONFIG_X86_MCE
+	INTG(X86_TRAP_MC,		asm_exc_machine_check),
+#endif
+
+	SYSG(X86_TRAP_OF,		asm_exc_overflow),
+#if defined(CONFIG_IA32_EMULATION)
+	SYSG(IA32_SYSCALL_VECTOR,	entry_INT80_compat),
+#elif defined(CONFIG_X86_32)
+	SYSG(IA32_SYSCALL_VECTOR,	entry_INT80_32),
+#endif
+};
+</code></pre>
+
+<p>可以看到：除零（#DE）、非法指令（#UD）、通用保护异常（#GP）等都是固定向量；而普通外设中断的向量是动态分配的，装在 <code>apic_idts[]</code> 之后由 <code>idt_setup_apic_and_irq_gates()</code> 批量装填：</p>
+
+<p class="srcline">arch/x86/kernel/idt.c:283-314  idt_setup_apic_and_irq_gates</p>
+<pre><code>void __init idt_setup_apic_and_irq_gates(void)
+{
+	int i = FIRST_EXTERNAL_VECTOR;
+	void *entry;
+
+	idt_setup_from_table(idt_table, apic_idts, ARRAY_SIZE(apic_idts), true);
+
+	for_each_clear_bit_from(i, system_vectors, FIRST_SYSTEM_VECTOR) {
+		entry = irq_entries_start + 8 * (i - FIRST_EXTERNAL_VECTOR);
+		set_intr_gate(i, entry);
+	}
+
+#ifdef CONFIG_X86_LOCAL_APIC
+	for_each_clear_bit_from(i, system_vectors, NR_VECTORS) {
+		/*
+		 * Don't set the non assigned system vectors in the
+		 * system_vectors bitmap. Otherwise they show up in
+		 * /proc/interrupts.
+		 */
+		entry = spurious_entries_start + 8 * (i - FIRST_SYSTEM_VECTOR);
+		set_intr_gate(i, entry);
+	}
+#endif
+	/* Map IDT into CPU entry area and reload it. */
+	idt_map_in_cea();
+	load_idt(&amp;idt_descr);
+
+	/* Make the IDT table read only */
+	set_memory_ro((unsigned long)&amp;idt_table, 1);
+
+	idt_setup_done = true;
+}
+</code></pre>
+
+<p>几个关键点：</p>
+<ul>
+  <li>外设中断向量对应的是一段<strong>汇编模板</strong>（<code>irq_entries_start</code> 处的 <code>common_interrupt</code> 汇编），不是一个 C 函数。CPU 跳过去的是汇编，汇编负责保存现场后调用 C 代码。</li>
+  <li><code>set_memory_ro()</code> 把 IDT 设成<strong>只读</strong>，防止攻击者通过任意写把 IDT 表项改掉（那等于给自己造一个任意代码执行的后门）。</li>
+  <li><code>idt_map_in_cea()</code> 把 IDT 映射到 CPU Entry Area 的固定地址，<code>sidt</code> 指令读不到真实地址——这是内核硬化措施（KASLR 的一部分）。</li>
+</ul>
+
+<h3>4.2 从向量找到处理函数：<code>common_interrupt()</code></h3>
+
+<p>CPU 跳进汇编入口后，最终会走到这个 C 函数：</p>
+
+<p class="srcline">arch/x86/kernel/irq.c:235-263  common_interrupt</p>
+<pre><code>/*
+ * common_interrupt() handles all normal device IRQ's (the special SMP
+ * cross-CPU interrupts have their own entry points).
+ */
+DEFINE_IDTENTRY_IRQ(common_interrupt)
+{
+	struct pt_regs *old_regs = set_irq_regs(regs);
+	struct irq_desc *desc;
+
+	/* entry code tells RCU that we're not quiescent.  Check it. */
+	RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
+
+	desc = __this_cpu_read(vector_irq[vector]);
+	if (likely(!IS_ERR_OR_NULL(desc))) {
+		handle_irq(desc, regs);
+	} else {
+		ack_APIC_irq();
+
+		if (desc == VECTOR_UNUSED) {
+			pr_emerg_ratelimited("%s: %d.%u No irq handler for vector\n",
+					     __func__, smp_processor_id(),
+					     vector);
+		} else {
+			__this_cpu_write(vector_irq[vector], VECTOR_UNUSED);
+		}
+	}
+
+	set_irq_regs(old_regs);
+}
+</code></pre>
+
+<ul>
+  <li><code>vector_irq[vector]</code>：一张 per-CPU 数组，把"向量号"映射到 <code>struct irq_desc</code>。这是从硬件世界（向量）到内核世界（irq_desc）的转换点。</li>
+  <li><code>handle_irq(desc, regs)</code>：最终会走到 <code>handle_irq_event()</code>，遍历该 IRQ 上的所有 <code>irqaction</code> 逐个调用。</li>
+  <li>找不到 handler 时要 <code>ack_APIC_irq()</code>——不然这个中断会不断重发，形成"中断风暴"。</li>
+  <li><code>VECTOR_UNUSED</code> 与 <code>ERR_VECTOR</code> 是两个特殊值，分别表示"这个向量空着"和"收到了伪中断/spurious 中断"。</li>
+</ul>
+
+<h3>4.3 注册中断：<code>request_irq()</code></h3>
+
+<p>用户态 API 是 <code>request_irq()</code>，内核里的原型和文档在 <code>include/linux/interrupt.h</code>：</p>
+
+<p class="srcline">include/linux/interrupt.h:143-161  request_irq</p>
+<pre><code>/**
+ * request_irq - Add a handler for an interrupt line
+ * @irq:	The interrupt line to allocate
+ * @handler:	Function to be called when the IRQ occurs.
+ *		Primary handler for threaded interrupts
+ *		If NULL, the default primary handler is installed
+ * @flags:	Handling flags
+ * @name:	Name of the device generating this interrupt
+ * @dev:	A cookie passed to the handler function
+ *
+ * This call allocates an interrupt and establishes a handler; see
+ * the documentation for request_threaded_irq() for details.
+ */
+static inline int __must_check
+request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
+	    const char *name, void *dev)
+{
+	return request_threaded_irq(irq, handler, NULL, flags, name, dev);
+}
+</code></pre>
+
+<p><code>request_irq()</code> 只是 <code>request_threaded_irq()</code> 的薄封装（不建线程）。真正的实现：</p>
+
+<p class="srcline">kernel/irq/manage.c:2002-2086  request_threaded_irq</p>
+<pre><code>int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+			 irq_handler_t thread_fn, unsigned long irqflags,
+			 const char *devname, void *dev_id)
+{
+	struct irqaction *action;
+	struct irq_desc *desc;
+	int retval;
+
+	if (irq == IRQ_NOTCONNECTED)
+		return -ENOTCONN;
+
+	/*
+	 * Sanity-check: shared interrupts must pass in a real dev-ID,
+	 * otherwise we'll have trouble later trying to figure out
+	 * which interrupt is which (messes up the interrupt freeing
+	 * logic etc).
+	 *
+	 * Also IRQF_COND_SUSPEND only makes sense for shared interrupts and
+	 * it cannot be set along with IRQF_NO_SUSPEND.
+	 */
+	if (((irqflags &amp; IRQF_SHARED) &amp;&amp; !dev_id) ||
+	    (!(irqflags &amp; IRQF_SHARED) &amp;&amp; (irqflags &amp; IRQF_COND_SUSPEND)) ||
+	    ((irqflags &amp; IRQF_NO_SUSPEND) &amp;&amp; (irqflags &amp; IRQF_COND_SUSPEND)))
+		return -EINVAL;
+
+	desc = irq_to_desc(irq);
+	if (!desc)
+		return -EINVAL;
+
+	if (!irq_settings_can_request(desc) ||
+	    WARN_ON(irq_settings_is_per_cpu_devid(desc)))
+		return -EINVAL;
+
+	if (!handler) {
+		if (!thread_fn)
+			return -EINVAL;
+		handler = irq_default_primary_handler;
+	}
+
+	action = kzalloc(sizeof(struct irqaction), GFP_KERNEL);
+	if (!action)
+		return -ENOMEM;
+
+	action-&gt;handler = handler;
+	action-&gt;thread_fn = thread_fn;
+	action-&gt;flags = irqflags;
+	action-&gt;name = devname;
+	action-&gt;dev_id = dev_id;
+
+	retval = irq_chip_pm_get(&amp;desc-&gt;irq_data);
+	if (retval &lt; 0) {
+		kfree(action);
+		return retval;
+	}
+
+	retval = __setup_irq(irq, desc, action);
+	// ... （此处约 35 行：失败时清理，DEBUG_SHIRQ_FIXME 下还要试跑一次 handler）
+	return retval;
+}
+EXPORT_SYMBOL(request_threaded_irq);
+</code></pre>
+
+<ul>
+  <li><code>IRQ_NOTCONNECTED</code>（<code>1U &lt;&lt; 31</code>）是个特殊标记，表示"这个设备的 IRQ 没接上"，返回 <code>-ENOTCONN</code> 区别于其他错误。</li>
+  <li><strong>共享中断必须传非空 <code>dev_id</code></strong>：因为一条 IRQ 上可能挂着多个设备，<code>free_irq()</code> 时靠 <code>dev_id</code> 区分要卸哪一个。返回 <code>-EINVAL</code> 就是这个检查。</li>
+  <li><code>action-&gt;name</code> 就是你在 <code>/proc/interrupts</code> 里看到的那串设备名。</li>
+  <li><code>__setup_irq()</code> 才是真正把 action 挂到 <code>desc-&gt;action</code> 链表上、配置硬件（enable/mask 中断线）的地方。</li>
+</ul>
+
+<p>注销用 <code>free_irq()</code>：</p>
+
+<p class="srcline">kernel/irq/manage.c:1866-1905  free_irq</p>
+<pre><code>/**
+ *	free_irq - free an interrupt allocated with request_irq
+ *	@irq: Interrupt line to free
+ *	@dev_id: Device identity to free
+ *
+ *	Remove an interrupt handler. The handler is removed and if the
+ *	interrupt line is no longer in use by any driver it is disabled.
+ *	On a shared IRQ the caller must ensure the interrupt is disabled
+ *	on the card it drives before calling this function. The function
+ *	does not return until any executing interrupts for this IRQ
+ *	have completed.
+ *
+ *	This function must not be called from interrupt context.
+ *
+ *	Returns the devname argument passed to request_irq.
+ */
+const void *free_irq(unsigned int irq, void *dev_id)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	struct irqaction *action;
+	const char *devname;
+
+	if (!desc || WARN_ON(irq_settings_is_per_cpu_devid(desc)))
+		return NULL;
+
+#ifdef CONFIG_SMP
+	if (WARN_ON(desc-&gt;affinity_notify))
+		desc-&gt;affinity_notify = NULL;
+#endif
+
+	action = __free_irq(desc, dev_id);
+
+	if (!action)
+		return NULL;
+
+	devname = action-&gt;name;
+	kfree(action);
+	return devname;
+}
+EXPORT_SYMBOL(free_irq);</code></pre>
+
+<p>注意两点：<strong>①</strong> 它返回的是之前 <code>request_irq()</code> 传的 <code>devname</code>（不是 <code>name</code> 字段），方便驱动做校验；<strong>②</strong> 注释明确说了"<strong>不能</strong>在中断上下文里调用"——它要拿 <code>desc-&gt;request_mutex</code> 并等待正在执行的中断结束。</p>
+
+<h3>4.4 上半部的分发：<code>handle_irq_event()</code></h3>
+
+<p>驱动注册的 handler 最终在这里被调用：</p>
+
+<p class="srcline">kernel/irq/handle.c:137-183  __handle_irq_event_percpu</p>
+<pre><code>irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc, unsigned int *flags)
+{
+	irqreturn_t retval = IRQ_NONE;
+	unsigned int irq = desc-&gt;irq_data.irq;
+	struct irqaction *action;
+
+	record_irq_time(desc);
+
+	for_each_action_of_desc(desc, action) {
+		irqreturn_t res;
+
+		/*
+		 * If this IRQ would be threaded under force_irqthreads, mark it so.
+		 */
+		if (irq_settings_can_thread(desc) &amp;&amp;
+		    !(action-&gt;flags &amp; (IRQF_NO_THREAD | IRQF_PERCPU | IRQF_ONESHOT)))
+			lockdep_hardirq_threaded();
+
+		trace_irq_handler_entry(irq, action);
+		res = action-&gt;handler(irq, action-&gt;dev_id);
+		trace_irq_handler_exit(irq, action, res);
+
+		if (WARN_ONCE(!irqs_disabled(),"irq %u handler %pS enabled interrupts\n",
+			      irq, action-&gt;handler))
+			local_irq_disable();
+
+		switch (res) {
+		case IRQ_WAKE_THREAD:
+			/*
+			 * Catch drivers which return WAKE_THREAD but
+			 * did not set up a thread function
+			 */
+			if (unlikely(!action-&gt;thread_fn)) {
+				warn_no_thread(irq, action);
+				break;
+			}
+
+			__irq_wake_thread(desc, action);
+
+			fallthrough;	/* to add to randomness */
+		case IRQ_HANDLED:
+			*flags |= action-&gt;flags;
+			break;
+
+		default:
+			break;
+		}
+		// ... （此处约 15 行：累加 retval、统计中断次数）
+	}
+	// ...
+}
+</code></pre>
+
+<ul>
+  <li><code>for_each_action_of_desc()</code> 遍历 <code>desc-&gt;action</code> 链表——<strong>共享中断</strong>时链上有多份 <code>irqaction</code>，逐个问"是不是你的设备"。</li>
+  <li><code>action->handler(irq, action->dev_id)</code> 就是驱动注册的函数。</li>
+  <li>返回 <code>IRQ_HANDLED</code> 表示"确实是我的，处理完了"；<code>IRQ_NONE</code> 表示"不是我的"（共享中断时用来告诉控制器别再重发）。</li>
+  <li>返回 <code>IRQ_WAKE_THREAD</code> 时，内核唤醒该 IRQ 专属的中断线程，由它去执行 <code>action->thread_fn</code>——这就是"线程化中断"：把耗时的活挪出硬中断上下文。</li>
+  <li>那个 <code>WARN_ONCE(!irqs_disabled(), ...)</code> 是护栏：驱动 handler 里如果错误地开了中断，lockdep 会报警。</li>
+</ul>
+
+<h3>4.5 软中断：十个向量与调度</h3>
+
+<p>软中断向量定义在 <code>include/linux/interrupt.h</code>：</p>
+
+<p class="srcline">include/linux/interrupt.h:528-544  软中断向量枚举</p>
+<pre><code>enum
+{
+	HI_SOFTIRQ=0,
+	TIMER_SOFTIRQ,
+	NET_TX_SOFTIRQ,
+	NET_RX_SOFTIRQ,
+	BLOCK_SOFTIRQ,
+	IRQ_POLL_SOFTIRQ,
+	TASKLET_SOFTIRQ,
+	SCHED_SOFTIRQ,
+	HRTIMER_SOFTIRQ,
+	RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+
+	NR_SOFTIRQS
+};
+
+#define SOFTIRQ_STOP_IDLE_MASK (~(1 &lt;&lt; RCU_SOFTIRQ))
+</code></pre>
+
+<p>名字表在 <code>kernel/softirq.c</code>，与枚举顺序严格对应：</p>
+
+<p class="srcline">kernel/softirq.c:59-62  softirq_to_name</p>
+<pre><code>const char * const softirq_to_name[NR_SOFTIRQS] = {
+	"HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL",
+	"TASKLET", "SCHED", "HRTIMER", "RCU"
+};
+</code></pre>
+
+<p>置位与执行：</p>
+
+<p class="srcline">kernel/softirq.c:456-487  raise_softirq_irqoff / __raise_softirq_irqoff</p>
+<pre><code>inline void raise_softirq_irqoff(unsigned int nr)
+{
+	__raise_softirq_irqoff(nr);
+
+	/*
+	 * If we're in an interrupt or softirq, we're done
+	 * (this also catches softirq-disabled code). We will
+	 * actually run the softirq once we return from
+	 * the irq or softirq.
+	 *
+	 * Otherwise we wake up ksoftirqd to make sure we
+	 * schedule the softirq soon.
+	 */
+	if (!in_interrupt())
+		wakeup_softirqd();
+}
+
+void raise_softirq(unsigned int nr)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	raise_softirq_irqoff(nr);
+	local_irq_restore(flags);
+}
+
+void __raise_softirq_irqoff(unsigned int nr)
+{
+	lockdep_assert_irqs_disabled();
+	trace_softirq_raise(nr);
+	or_softirq_pending(1UL &lt;&lt; nr);
+}
+</code></pre>
+
+<ul>
+  <li><code>or_softirq_pending(1UL &lt;&lt; nr)</code>：把本 CPU 的软中断待处理位图置位。<strong>是"记账"，不是执行</strong>。位图本体是 per-CPU 的 <code>irq_stat.__softirq_pending</code>（<code>include/linux/interrupt.h:503</code>），声明在 <code>arch/x86/include/asm/hardirq.h:8</code>。</li>
+  <li>如果在中断上下文里，就靠 <code>__do_softirq()</code> 在退出时统一执行；否则唤醒 <code>ksoftirqd</code> 线程，让它去执行。</li>
+  <li>为什么要 <code>ksoftirqd</code>？因为软中断是"可选的延迟"——如果当前进程一直没退出中断上下文，软中断可能饿死。专门有个线程兜底。</li>
+</ul>
+
+<h3>4.6 tasklet：<code>__tasklet_schedule()</code></h3>
+
+<p>tasklet 跑在 <code>TASKLET_SOFTIRQ</code> 里。它的调度就是把 tasklet 挂到本 CPU 的链表，再置起 <code>TASKLET_SOFTIRQ</code>：</p>
+
+<p class="srcline">kernel/softirq.c:505-533  __tasklet_schedule_common / __tasklet_schedule</p>
+<pre><code>static void __tasklet_schedule_common(struct tasklet_struct *t,
+				      struct tasklet_head __percpu *headp,
+				      unsigned int softirq_nr)
+{
+	struct tasklet_head *head;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	head = this_cpu_ptr(headp);
+	t-&gt;next = NULL;
+	*head-&gt;tail = t;
+	head-&gt;tail = &amp;(t-&gt;next);
+	raise_softirq_irqoff(softirq_nr);
+	local_irq_restore(flags);
+}
+
+void __tasklet_schedule(struct tasklet_struct *t)
+{
+	__tasklet_schedule_common(t, &amp;tasklet_vec,
+				  TASKLET_SOFTIRQ);
+}
+EXPORT_SYMBOL(__tasklet_schedule);
+
+void __tasklet_hi_schedule(struct tasklet_struct *t)
+{
+	__tasklet_schedule_common(t, &amp;tasklet_hi_vec,
+				  HI_SOFTIRQ);
+}
+EXPORT_SYMBOL(__tasklet_hi_schedule);
+</code></pre>
+
+<ul>
+  <li><code>local_irq_save(flags)</code>：关中断保护链表操作。因为 <code>tasklet_vec</code> 是 per-CPU 的，中断可能在任意时刻来抢占并调度另一个 tasklet。</li>
+  <li><code>raise_softirq_irqoff(TASKLET_SOFTIRQ)</code>：置位软中断，稍后由 <code>__do_softirq()</code> 执行。</li>
+  <li><code>__tasklet_hi_schedule()</code> 挂到 <code>tasklet_hi_vec</code> 并置 <code>HI_SOFTIRQ</code>——优先级更高的那一条队列。软中断执行时 <code>HI_SOFTIRQ</code> 序号最小，先被处理。</li>
+  <li><code>tasklet_schedule()</code>（<code>include/linux/interrupt.h:681-685</code>）是用户态 API：它先用 <code>test_and_set_bit(TASKLET_STATE_SCHED)</code> 判重，确保同一个 tasklet 不会重复入队。</li>
+</ul>
+
+<h3>4.7 工作队列：<code>queue_work()</code> 与 <code>worker_thread()</code></h3>
+
+<p>工作队列是"能睡觉"的下半部。它由若干内核线程（<code>kworker/N:M</code>）执行任务。</p>
+
+<p class="srcline">include/linux/workqueue.h:504-508  queue_work</p>
+<pre><code>static inline bool queue_work(struct workqueue_struct *wq,
+			      struct work_struct *work)
+{
+	return queue_work_on(WORK_CPU_UNBOUND, wq, work);
+}
+</code></pre>
+
+<p>真正干活的是 <code>queue_work_on()</code>：</p>
+
+<p class="srcline">kernel/workqueue.c:1830-1846  queue_work_on</p>
+<pre><code>bool queue_work_on(int cpu, struct workqueue_struct *wq,
+		   struct work_struct *work)
+{
+	bool ret = false;
+	unsigned long flags;
+
+	local_irq_save(flags);
+
+	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+		__queue_work(cpu, wq, work);
+		ret = true;
+	}
+
+	local_irq_restore(flags);
+	return ret;
+}
+EXPORT_SYMBOL(queue_work_on);
+</code></pre>
+
+<ul>
+  <li><code>WORK_STRUCT_PENDING_BIT</code> 判重：同一个 work 已经在队列里就返回 false，不会重复执行。</li>
+  <li><code>local_irq_save()</code> 是为了保证"判重 + 入队"这两步的原子性——否则两个 CPU 同时 queue 同一个 work 就会执行两次。</li>
+  <li>返回 <code>true</code> 表示"成功排队"。</li>
+</ul>
+
+<p>执行者是内核线程：</p>
+
+<p class="srcline">kernel/workqueue.c:2857-2925  worker_thread</p>
+<pre><code>static int worker_thread(void *__worker)
+{
+	struct worker *worker = __worker;
+	struct worker_pool *pool = worker-&gt;pool;
+
+	/* tell the scheduler that this is a workqueue worker */
+	set_pf_worker(true);
+woke_up:
+	raw_spin_lock_irq(&amp;pool-&gt;lock);
+
+	/* am I supposed to die? */
+	if (unlikely(worker-&gt;flags &amp; WORKER_DIE)) {
+		raw_spin_unlock_irq(&amp;pool-&gt;lock);
+		WARN_ON_ONCE(!list_empty(&amp;worker-&gt;entry));
+		set_pf_worker(false);
+
+		set_task_comm(worker-&gt;task, "kworker/dying");
+		ida_simple_remove(&amp;pool-&gt;worker_ida, worker-&gt;id);
+		worker_detach_from_pool(worker);
+		kfree(worker);
+		return 0;
+	}
+
+	worker_leave_idle(worker);
+recheck:
+	/* no more worker necessary? */
+	if (!need_more_worker(pool))
+		goto sleep;
+
+	/* do we need to manage? */
+	if (unlikely(!may_start_working(pool)) &amp;&amp; manage_workers(worker))
+		goto recheck;
+	// ... （此处约 20 行注释：说明 scheduled 列表的并发约定）
+	do {
+		struct work_struct *work =
+			list_first_entry(&amp;pool-&gt;worklist,
+					 struct work_struct, entry);
+
+		pool-&gt;watchdog_ts = jiffies;
+
+		if (likely(!(*work_data_bits(work) &amp; WORK_STRUCT_LINKED))) {
+			/* optimization path, not strictly necessary */
+			process_one_work(worker, work);
+			if (unlikely(!list_empty(&amp;worker-&gt;scheduled)))
+				process_scheduled_works(worker);
+		} else {
+			move_linked_works(work, &amp;worker-&gt;scheduled, NULL);
+			process_scheduled_works(worker);
+		}
+	} while (keep_working(pool));
+
+	worker_set_flags(worker, WORKER_PREP);
+sleep:
+	// ... （此处约 20 行：进入空闲、挂到等待队列、睡眠等待唤醒）
+}
+</code></pre>
+
+<ul>
+  <li><code>set_pf_worker(true)</code>：告诉调度器"我是工作线程"，这样 <code>schedule()</code> 的行为和普通进程区分开。</li>
+  <li>主循环就是：从 <code>pool-&gt;worklist</code> 取第一个 work，<code>process_one_work()</code> 执行它。</li>
+  <li>没活干时 <code>need_more_worker()</code> 为假 → <code>goto sleep</code>，线程睡在等待队列上，有新 work 时被唤醒。</li>
+  <li><code>manage_workers()</code> 是动态并发管理：<code>WQ_UNBOUND</code> 队列在系统繁忙时会自动增加线程数，闲时再缩回去。</li>
+</ul>
+
+<h3>4.8 判断上下文：<code>in_interrupt()</code> 与 <code>local_bh_disable()</code></h3>
+
+<p>这两个宏是写内核代码时的"安全带"。</p>
+
+<p class="srcline">include/linux/preempt.h:80-104  上下文判定宏</p>
+<pre><code>#define hardirq_count()	(preempt_count() &amp; HARDIRQ_MASK)
+#define softirq_count()	(preempt_count() &amp; SOFTIRQ_MASK)
+#define irq_count()	(preempt_count() &amp; (HARDIRQ_MASK | SOFTIRQ_MASK \
+				 | NMI_MASK))
+
+/*
+ * Are we doing bottom half or hardware interrupt processing?
+ *
+ * in_irq()       - We're in (hard) IRQ context
+ * in_softirq()   - We have BH disabled, or are processing softirqs
+ * in_interrupt() - We're in NMI,IRQ,SoftIRQ context or have BH disabled
+ * in_serving_softirq() - We're in softirq context
+ * in_nmi()       - We're in NMI context
+ * in_task()	  - We're in task context
+ *
+ * Note: due to the BH disabled confusion: in_softirq(),in_interrupt() really
+ *       should not be used in new code.
+ */
+#define in_irq()		(hardirq_count())
+#define in_softirq()		(softirq_count())
+#define in_interrupt()		(irq_count())
+#define in_serving_softirq()	(softirq_count() &amp; SOFTIRQ_OFFSET)
+#define in_nmi()		(preempt_count() &amp; NMI_MASK)
+#define in_task()		(!(preempt_count() &amp; \
+				   (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
+</code></pre>
+
+<p>实现原理很朴素：<code>preempt_count()</code> 这个 per-CPU 变量用不同的位段记录"当前嵌套了几层中断"。进硬中断时硬件/汇编把 HARDIRQ 位加上，进软中断时加 SOFTIRQ 位，关 BH 时加 SOFTIRQ_DISABLE 位。所以 <code>in_interrupt()</code> 就是一次位与运算，代价接近于零。</p>
+
+<p><code>local_bh_disable()</code> 则是"我这个小临界区里别来软中断插队"：</p>
+
+<p class="srcline">include/linux/bottom_half.h:1-35  local_bh_disable</p>
+<pre><code>/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_BH_H
+#define _LINUX_BH_H
+
+#include &lt;linux/preempt.h&gt;
+
+#ifdef CONFIG_TRACE_IRQFLAGS
+extern void __local_bh_disable_ip(unsigned long ip, unsigned int cnt);
+#else
+static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+{
+	preempt_count_add(cnt);
+	barrier();
+}
+#endif
+
+static inline void local_bh_disable(void)
+{
+	__local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+}
+
+extern void _local_bh_enable(void);
+extern void __local_bh_enable_ip(unsigned long ip, unsigned int cnt);
+
+static inline void local_bh_enable_ip(unsigned long ip)
+{
+	__local_bh_enable_ip(ip, SOFTIRQ_DISABLE_OFFSET);
+}
+
+static inline void local_bh_enable(void)
+{
+	__local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+}
+
+#endif /* _LINUX_BH_H */
+</code></pre>
+
+<p><code>SOFTIRQ_DISABLE_OFFSET</code> 定义在 <code>include/linux/preempt.h:54</code>：<code>#define SOFTIRQ_DISABLE_OFFSET (2 * SOFTIRQ_OFFSET)</code>。它不是真的关硬件中断，而是把 preempt_count 里"软中断禁用"的计数加上去，让 <code>__do_softirq()</code> 知道自己现在不该跑。</p>
+
+<div class="warn">
+  <strong>软禁用 vs 硬禁用：</strong><code>local_bh_disable()</code> 只挡住软中断，硬中断照样能打断你；<code>local_irq_disable()</code> 才是真的关 CPU 的中断使能位。前者便宜得多（不碰硬件寄存器），是绝大多数内核代码保护短临界区的首选。
+</div>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 读懂 <code>/proc/interrupts</code> 的每一列</h3>
+
+<pre><code>$ cat /proc/interrupts
+           CPU0       CPU1       CPU2       CPU3
+  0:         38          0          0          0   IO-APIC    2-edge      timer
+  1:          2          0          0          0   IO-APIC    1-edge      i8042
+  8:          1          0          0          0   IO-APIC    8-edge      rtc0
+  9:          0          0          0          0   IO-APIC    1-fasteoi   acpi
+ 12:      18642       19221       19355       19002   IO-APIC   12-fasteoi   ehci_hcd:usb1
+ 14:       3912          0          0          0   IO-APIC   14-fasteoi   ata_piix
+ 16:      51033      50871      51204      50988   IO-APIC   16-fasteoi   ata_piix
+ 24:      22841      22903      22775      22956   IO-APIC   24-fasteoi   ata_piix
+ 25:         37          0          0          0   IO-APIC   25-fasteoi   eth0
+ 26:          0          0          0          0   IO-APIC   26-fasteoi   ehci_hcd:usb1
+ 34:          0          0          0          0   IO-APIC   34-edge      virtio0
+  NMI:      1082        917        994        951   Non-maskable interrupts
+  LOC:      3182       3101       3229       3155   Local timer interrupts
+  RES:      1204       1188       1211       1195   Rescheduling interrupts
+  TLB:        77         71         80         74   TLB shootdowns
+  ERR:          0          0          0          0   Error
+  MIS:          0          0          0          0   Misalignment
+</code></pre>
+
+<p>列的含义（对应 <code>kernel/irq/proc.c:460-533</code> 的 <code>show_interrupts()</code>）：</p>
+
+<table>
+  <tr><th>列</th><th>含义</th><th>代码来源</th></tr>
+  <tr><td><code>CPU0 CPU1 ...</code></td><td>每个 CPU 各自处理了多少次该中断</td><td><code>desc-&gt;kstat_irqs</code>（per-CPU 计数器）</td></tr>
+  <tr><td>中断号</td><td>IRQ 号（不是向量号）</td><td><code>seq_printf(p, "%*d: ", prec, i)</code></td></tr>
+  <tr><td>控制器</td><td>中断控制器名：<code>IO-APIC</code> / <code>APIC</code> / <code>None</code></td><td><code>desc-&gt;irq_data.chip-&gt;name</code></td></tr>
+  <tr><td>硬件号</td><td>控制器内部的编号</td><td><code>desc-&gt;irq_data.hwirq</code></td></tr>
+  <tr><td>触发方式</td><td><code>edge</code>（边沿）/ <code>level</code>（电平）</td><td><code>irqd_is_level_type()</code></td></tr>
+  <tr><td>描述名</td><td>驱动名（<code>desc-&gt;name</code>）</td><td>PCI 设备的 <code>name</code> 字段</td></tr>
+  <tr><td>处理程序名</td><td><code>request_irq()</code> 传的 name</td><td><code>action-&gt;name</code>，共享中断会有多个逗号分隔</td></tr>
+</table>
+
+<p>底部的 <code>NMI</code> / <code>LOC</code> / <code>RES</code> / <code>TLB</code> / <code>ERR</code> / <code>MIS</code> 不是普通 IRQ，而是各架构自己上报的统计项，由 <code>arch_show_interrupts()</code> 输出。</p>
+
+<p><strong>实用技巧：</strong>如果某个 IRQ 的某个 CPU 计数远高于其他 CPU，说明中断没有做亲和性均衡，可以考虑用 <code>/proc/irq/&lt;N&gt;/smp_affinity</code> 调整。</p>
+
+<pre><code>$ cat /proc/irq/12/smp_affinity_list
+0-3
+
+$ cat /proc/irq/12/effective_affinity_list
+0-3
+
+# 把它绑到 CPU0 和 CPU1
+$ echo 0,1 | sudo tee /proc/irq/12/smp_affinity_list
+</code></pre>
+
+<h3>5.2 观察软中断的分布</h3>
+
+<pre><code>$ cat /proc/softirqs
+                    CPU0       CPU1       CPU2       CPU3
+          HI:          0          0          0          0
+       TIMER:     382910     379884     381201     380115
+      NET_TX:        117        104         98        121
+      NET_RX:       8841       8766       8902       8790
+       BLOCK:       3201       2988       3345       3102
+    IRQ_POLL:          0          0          0          0
+      TASKLET:      4521       4390       4612       4488
+        SCHED:     91204      90877      91330      91042
+      HRTIMER:     12043      11987      12098      11976
+         RCU:     120433     119876     120554     120011
+</code></pre>
+
+<p>这张表来自 <code>fs/proc/softirqs.c</code>，行名就是那 10 个软中断（<code>softirq_to_name</code>），数值是各 CPU 的执行次数。</p>
+
+<p>解读：</p>
+<ul>
+  <li><code>TIMER</code> 数量最大——每次时钟中断都会处理定时器，这是正常的。</li>
+  <li><code>RCU</code> 数量也很高，因为 RCU 的回调经常需要在 softirq 上下文里执行。</li>
+  <li><code>NET_RX</code> 明显高于 <code>NET_TX</code>，说明这台机器收包比发包多（典型的服务器）。</li>
+  <li>如果某个软中断在某个 CPU 上特别高，说明那个 CPU 是"网络收包热点"，<code>ksoftirqd</code> 可能被它拖累。</li>
+</ul>
+
+<h3>5.3 看系统总览</h3>
+
+<pre><code>$ grep -E '^cpu[0-9]|^intr' /proc/stat
+cpu0  1234567 8901 234567 4567890 12345 0 6789 0 0 0
+intr 12345678 100 200 300 400 500 600 700 800 900 ...
+</code></pre>
+
+<p><code>/proc/stat</code> 的 <code>intr</code> 行是所有中断的累计计数（第一列是总数，后面按向量号排列）。<code>cpu0</code> 那行的第 7 个字段（<code>softirq</code>）是软中断累计时间。</p>
+
+<pre><code># 各 CPU 的 idle 时间占比（越低说明越忙）
+$ top -1 | head -4
+%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.0 wa,  0.0 hi,  0.1 si
+</code></pre>
+
+<p><code>si</code> 是 softirq 时间，<code>hi</code> 是 hardirq 时间。生产环境里如果 <code>hi</code> 很高，说明上半部太重，需要往下半部挪。</p>
+
+<h3>5.4 追踪中断来源（需要 root）</h3>
+
+<pre><code># 动态探测：读 /proc/interrupts 前后对比
+$ watch -n1 'cat /proc/interrupts | head -5'
+
+# 内核里有专门的 tracepoint
+$ cat /sys/kernel/tracing/available_events | grep irq
+irq/irq_handler_entry
+irq/irq_handler_exit
+irq/softirq_entry
+irq/softirq_exit
+</code></pre>
+
+<p>用 ftrace 追踪一次中断的完整生命周期：</p>
+
+<pre><code>$ sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/irq/irq_handler_entry/enable'
+$ sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/irq/irq_handler_exit/enable'
+$ sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/tracing_on'
+$ sudo cat /sys/kernel/tracing/trace_pipe | head -20
+</code></pre>
+
+<p>输出里能看到 <code>irq_handler_entry: irq=12 name=ata_piix dev_id=... handler=...</code>，正好对应 <code>/proc/interrupts</code> 里的那一行。</p>
+
+<h3>5.5 在 QEMU 里跑一个最小内核（可选）</h3>
+
+<p>如果想亲眼看到中断计数从 0 开始涨，可以编译一个最小内核在 QEMU 里跑：</p>
+
+<pre><code># 在内核源码树根目录
+$ make defconfig
+$ make menuconfig
+#   → Device Drivers → Network device support → Ethernet driver support → e1000
+$ make -j$(nproc)
+
+# 编译一个 busybox
+$ cd ~/busybox &amp;&amp; make defconfig &amp;&amp; make -j$(nproc)
+
+# 打包成 initramfs
+$ cd .. &amp;&amp; find busybox -print0 | cpio --null -ov --format=newc | gzip -9 &gt; initramfs.gz
+
+# 启动 Qemu
+$ qemu-system-x86_64 -kernel arch/x86/boot/bzImage \
+    -initrd initramfs.gz -append "console=ttyS0" -nographic
+</code></pre>
+
+<p>进去之后：</p>
+
+<pre><code>/ # cat /proc/interrupts | head -8
+           CPU0
+  0:         14          IO-APIC    2-edge      timer
+  1:          1          IO-APIC    1-edge      i8042
+  8:          2          IO-APIC    8-edge      rtc0
+  9:          0          IO-APIC    1-fasteoi   acpi
+ 12:          0          IO-APIC  12-fasteoi   ahci
+</code></pre>
+
+<p>此时 <code>0:</code> 那一行（timer）的计数在持续增长，因为时钟中断一直在发生；而 <code>12:</code>（ahci）在没有磁盘 I/O 时保持为 0。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. <code>request_irq()</code> 和 <code>free_irq()</code> 必须成对吗？</b>必须。<code>free_irq()</code> 内部要拿 <code>desc-&gt;request_mutex</code> 并等待该 IRQ 上正在执行的中断结束（<code>kernel/irq/manage.c:1882</code>），所以它<strong>不能在中断上下文里调用</strong>。而且如果 <code>request_irq()</code> 失败（比如 <code>-ENOMEM</code>），驱动必须自己清理已申请的硬件资源。</div>
+
+<div class="qa"><b>Q2. 共享中断（<code>IRQF_SHARED</code>）时，多个 handler 都会被调用吗？</b>都会调用。<code>__handle_irq_event_percpu()</code> 遍历 <code>desc-&gt;action</code> 链表，把每个 <code>action-&gt;handler</code> 都调一遍。每个 handler 要通过检查 <code>dev_id</code> 判断"这个中断是不是我的"，不是就返回 <code>IRQ_NONE</code>。这就是为什么共享中断必须传非空 <code>dev_id</code>——内核没法靠返回值区分设备。</div>
+
+<div class="qa"><b>Q3. tasklet 和 workqueue 到底怎么选？</b>看<strong>要不要睡眠</strong>和<strong>要不要并行</strong>。要睡眠或要并行（同一份工作拆给多个线程）→ workqueue。仅仅是"收个尾"、很快、不睡 → tasklet。而且注意：tasklet 跑在软中断上下文，<strong>不能</strong>调 <code>sleep()</code>、不能拿互斥锁（可睡眠的锁），只能拿自旋锁。</div>
+
+<div class="qa"><b>Q4. <code>in_interrupt()</code> 返回真时，为什么不能调用 <code>mutex_lock()</code>？</b>因为可睡眠的互斥锁在拿不到锁时会调用 <code>schedule()</code> 把自己挂起。而中断处理还没做完，CPU 一旦切走，另一个进程可能正在操作同一份数据（比如驱动的 ring buffer），造成数据竞争。正确做法是用 <code>spinlock_t</code>（不可睡眠的锁）。</div>
+
+<div class="qa"><b>Q5. <code>local_bh_disable()</code> 和 <code>local_irq_disable()</code> 有什么区别？</b><code>local_bh_disable()</code> 只禁止<strong>软中断</strong>在本 CPU 上运行——它只是给 <code>preempt_count</code> 加一个偏移量，不碰硬件；硬中断依然能打断你。<code>local_irq_disable()</code> 才是真的关掉 CPU 的中断使能标志（IF），代价更大（要写硬件寄存器）。前者用来保护短小的临界区，后者用来做整个中断上下文的切换。</div>
+
+<div class="qa"><b>Q6. 为什么 <code>/proc/interrupts</code> 里同一个中断在不同 CPU 上的计数差那么多？</b>因为中断亲和性（<code>irq_set_affinity</code>）决定了该 IRQ 由哪些 CPU 处理。内核默认会把中断负载均衡，但如果你的进程绑在特定 CPU 上，或者手动改过 <code>/proc/irq/&lt;N&gt;/smp_affinity_list</code>，就会出现倾斜。计数严重不均是负载不均的信号。</div>
+
+<div class="qa"><b>Q7. 十个软中断里为什么 <code>RCU_SOFTIRQ</code> 要放在最后？</b>因为 RCU 的回调可能需要执行较重的操作，如果放在高位就总是被推迟。放在最后（序号最大）意味着它优先级最低、最晚被处理；<code>SOFTIRQ_STOP_IDLE_MASK</code> 就是专门为它定义的——在 CPU 即将进入 idle 时，RCU 软中断仍然会被执行以保证 grace period 能推进。</div>
+
+<footer>
+  <p>上一篇：<a href="09-signals.html">09 信号</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="11-locking.html">11 锁</a></p>
+</footer>
+
+</body>
+</html>

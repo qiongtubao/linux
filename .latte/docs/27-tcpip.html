@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>27-tcpip TCP/IP 协议栈</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="28-netfilter.html">下一篇：28-netfilter →</a>
+</nav>
+
+<h1>🌐 27-tcpip TCP/IP 协议栈</h1>
+<p class="subtitle">一个字节如何从网卡爬到应用、又如何从应用掉回网卡；讲清 sk_buff 的指针戏法、TCP 握手状态机与拥塞控制 · 约 14 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>寄一封信，你不会只写正文就把它塞进邮筒。真实流程是：<b>写信（应用数据）→ 装信封（TCP 段）→ 写收件地址（IP 包）→ 贴邮票、分拣、装车（以太网帧）→ 干线运输（网卡）</b>。每一层只关心自己那层头的信息，下层把整包当"载荷"往上交，上层把载荷剥掉继续往上送。TCP/IP 协议栈干的就是这件事，只不过它不是比喻，而是真的在内存里一层层套头。</p>
+<p>关键难点在<b>效率</b>。如果每加一层头就把整个包复制一遍，10 Gbps 网卡上每秒钟要做上亿次 memcpy，内核直接被拖垮。所以 Linux 用一个结构体 <code>struct sk_buff</code> 代表"一个包"，把整包数据放在<b>一段连续的线性内存</b>里，头部不是插进去的，而是<b>在前面预留空地、各层用指针标记自己那份头的起点</b>。剥头就是把 <code>data</code> 指针往后挪，插头就是把 <code>data</code> 指针往前挪——数据一个字节都不复制。</p>
+<p>第二个难点是<b>收包不能被慢速处理拖死</b>。网卡每秒能收上百万帧，若每帧都同步走完整个协议栈，CPU 会被瞬间打满。Linux 的答案是 NAPI：中断只负责"打个招呼说我这儿有货"，真正的收包循环交给软中断（softirq）批量执行，还带一个预算（budget），一轮最多处理 N 个包，剩下的一半再排下一轮。这样即使某个包处理慢，也不会饿死其它 CPU。</p>
+<p>第三个难点是<b>TCP 是个状态机</b>。同一段字节，在"连接还没建起来"和"连接已经建立"两种状态下含义完全不同：前者要拿来完成三次握手，后者是纯粹的数据。所以内核必须把收到的每个段先按状态分派（<code>tcp_rcv_state_process</code>），再走不同的处理逻辑。拥塞控制（cubic）则管的是"我该发多快"——发太快网络会堵死，发太慢带宽浪费。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">包对象</td><td>struct sk_buff</td><td>内核里"一个包"的化身，指向一段线性内存并记录各层头的偏移。</td></tr>
+  <tr><td class="term">线性区</td><td>head / data / tail / end</td><td>四个指针划出一块连续内存：head 是起点，data 是当前层数据起点，tail 是数据末尾，end 是内存末尾。</td></tr>
+  <tr><td class="term">协议栈</td><td>protocol stack</td><td>把网络功能拆成链路层/IP/TCP/应用层，每层只做自己的事。</td></tr>
+  <tr><td class="term">封装</td><td>encapsulation</td><td>上层数据被当作下层载荷，加上自己的头再往下传。</td></tr>
+  <tr><td class="term">解封装</td><td>de-encapsulation</td><td>收到包后逐层剥掉头，每层把自己的头交给上一层。</td></tr>
+  <tr><td class="term">NAPI</td><td>Net API</td><td>网卡收包的调度机制：中断只登记，softirq 批量取包，带预算限流。</td></tr>
+  <tr><td class="term">软中断</td><td>softirq</td><td>在硬中断退出后、进程上下文恢复前执行的半上下文，通常在同一个 CPU 上跑。</td></tr>
+  <tr><td class="term">GRO</td><td>Generic Receive Offload</td><td>把连续多个同流小包合并成一个大包再交给协议栈，省 CPU。</td></tr>
+  <tr><td class="term">GSO</td><td>Generic Segmentation Offload</td><td>发送时把大 skb 交给网卡，由网卡拆成 MTU 大小的多个包。</td></tr>
+  <tr><td class="term">三次握手</td><td>three-way handshake</td><td>SYN → SYN+ACK → ACK，双方确认彼此的收发能力并同步初始序号。</td></tr>
+  <tr><td class="term">初始序号</td><td>ISN</td><td>TCP 连接双方各自随机挑选的起始字节编号，防止旧连接的报文混入新连接。</td></tr>
+  <tr><td class="term">确认号</td><td>ACK / rcv_nxt</td><td>发送方告诉对端"我期望收到的下一个字节序号"。</td></tr>
+  <tr><td class="term">窗口</td><td>window</td><td>接收方通告"我还能收多少字节"，发送方据此限制在途数据量。</td></tr>
+  <tr><td class="term">拥塞窗口</td><td>cwnd</td><td>发送方根据网络拥塞状况自行估算的额外限速，与对端窗口取小者。</td></tr>
+  <tr><td class="term">拥塞控制算法</td><td>congestion control</td><td>决定 cwnd 怎么涨怎么跌，Linux 默认是 CUBIC。</td></tr>
+  <tr><td class="term">慢启动</td><td>slow start</td><td>连接初期 cwnd 从 1 个 MSS 开始快速翻倍，不是真的"慢"。</td></tr>
+  <tr><td class="term">重传</td><td>retransmission</td><td>超时或收到重复 ACK 时重发未确认的段。</td></tr>
+  <tr><td class="term">队列规则</td><td>qdisc</td><td>网卡发送侧的"排队 disciplines"，决定包先发谁、限速、整形。</td></tr>
+  <tr><td class="term">MTU</td><td>Maximum Transmission Unit</td><td>链路层一帧能装的最大字节数，IPv4 常见 1500。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 报文头的嵌套</h3>
+<p>发送时一层层套头，接收时一层层剥头。以一个 HTTP 请求为例，最终上线的以太网帧长这样：</p>
+<pre><code>以太网帧 (Ethernet)
+┌──────────────────────────────────────────────────────┐
+│ 以太网头 (14B) │ IP 头 (20B) │ TCP 头 (20B) │ HTTP 数据 │
+└──────────────────────────────────────────────────────┘
+                    └────── IP 头 ──────┘
+                            └──── TCP 头 ─────┘
+
+内核里的内存布局（发送方向，data 指针在动）：
+
+  head                data                 tail        end
+   │                   │                    │          │
+   ▼                   ▼                    ▼          ▼
+   ┌───────────────────────────────────────────────────┐
+   │ 预留区 │ 以太网头 │ IP头 │ TCP头 │ 负载数据      │  ← 一块连续内存
+   └───────────────────────────────────────────────────┘
+              ▲             ▲         ▲
+              │             │         └── TCP 层数据起点（写入时）
+              │             └──────────── IP 层认为的包起点
+              └────────────────────────── 以太网层包起点</code></pre>
+<p>接收方向完全相反：网卡交付的 skb 里 <code>data</code> 指向以太网卡头，IP 层用 <code>skb_pull</code> 剥掉 14 字节以太头后 <code>data</code> 指向 IP 头；TCP 层再剥 20 字节 TCP 头，<code>data</code> 最终指向应用数据。<b>剥头 = data 指针右移；插头 = data 指针左移</b>，全程零拷贝。</p>
+
+<h3>3.2 接收路径</h3>
+<pre><code>  网卡 DMA 写入内存 → 驱动填 skb → 中断里 napi_schedule()
+        │
+        ▼
+  软中断 net_rx_action()  ── 预算 netdev_budget 控制每轮处理量
+        │
+        ▼
+  napi_poll() → 驱动 poll() 逐个取包
+        │
+        ▼
+  napi_gro_receive() → GRO 合并相邻同流包
+        │
+        ▼
+  netif_receive_skb()  → 按 ethertype 找协议处理器
+        │
+        ▼
+  ip_rcv()  ── 校验和、解析 IP 头、路由查找
+        │
+        ▼
+  ip_local_deliver() / ip_forward()  ── 本机还是转发？
+        │
+        ▼
+  tcp_v4_rcv()  ── 按四元组查 socket、算校验和
+        │
+        ▼
+  tcp_v4_do_rcv()
+        ├── ESTABLISHED → tcp_rcv_established()   【快路径】
+        └── 其它状态   → tcp_rcv_state_process()   【握手/关闭路径】
+                                │
+                                ▼
+                       tcp_rcv_established() → 拷进接收队列 → 唤醒 read()</code></pre>
+<p><b>为什么要分快慢两条路？</b>ESTABLISHED 是绝大多数包的去处，那条路上只做必要校验、找 socket、入队；握手和拆除连接是罕见事件，逻辑复杂得多。走慢路径不影响快路径的吞吐。</p>
+
+<h3>3.3 发送路径</h3>
+<pre><code>  应用 write(fd, buf, n)
+        │
+        ▼
+  inet_sendmsg → tcp_sendmsg → tcp_sendmsg_locked
+        │                        （数据拷进发送队列 sk_write_queue）
+        ▼
+  tcp_push_pending_frames → tcp_write_xmit → tcp_transmit_skb
+        │                     （组 TCP 头、算序号、塞进新 skb）
+        ▼
+  __tcp_transmit_skb → icsk_af_ops-&gt;queue_xmit  (= ip_queue_xmit)
+        │
+        ▼
+  __ip_queue_xmit  ── 查路由、填 IP 头、算 IP 校验和
+        │
+        ▼
+  ip_local_out → NF_HOOK(LOCAL_OUT) → dev_queue_xmit
+        │
+        ▼
+  __dev_queue_xmit  ── 交给 qdisc 排队（限速/整形）
+        │
+        ▼
+  驱动 xmit → 网卡 DMA → 上线</code></pre>
+<p>注意这条链是<b>自上而下</b>、和接收完全相反。发送方向的头部是<b>先申请空间再填内容</b>（<code>skb_push</code>），接收方向是<b>剥头</b>（<code>skb_pull</code>），这就是"只挪指针不拷贝"的具体落地。</p>
+
+<h3>3.4 TCP 状态机与三次握手</h3>
+<pre><code>  被动方（server）                主动方（client）
+  ────────────────                ────────────────
+  CLOSED ──listen()──► LISTEN
+                          │                  CLOSED ──connect()──► SYN_SENT
+                          │  ◄───── SYN ────────────────┐  发 SYN，seq=x
+                          │                              │
+                          │  ────── SYN+ACK ────────────►│  回 SYN+ACK，seq=y, ack=x+1
+                          │        ack=x+1               │
+                          │  ◄───── ACK ─────────────────┘  发 ACK，ack=y+1
+                          ▼                              ▼
+                      SYN_RECV                       ESTABLISHED
+                          │  收到 ACK 后                 │
+                          ▼                              ▼
+                     ESTABLISHED ◄───────────────── ESTABLISHED
+                       （收到第三次 ACK 后转正）</code></pre>
+<p>三次而不是两次，是为了让<b>双方都确认对方的收发能力</b>，同时交换初始序号（ISN）。服务端回 SYN+ACK 时其实已经把"我收到了你的 SYN"编码进了 ACK 号里，所以第三次 ACK 是客户端确认"我收到了你的 SYN+ACK"。ISN 随机化则防止旧连接的迟到报文污染新连接。</p>
+
+<h3>3.5 拥塞控制的位置</h3>
+<p>TCP 有两个独立的限速阀：<b>接收窗口</b>（对端告诉我能收多少，是<b>被动</b>的，由 TCP 协议栈自动通告）和<b>拥塞窗口 cwnd</b>（我自己判断网络能承受多少，是<b>主动</b>的，由拥塞控制算法维护）。实际在途字节数受两者较小值限制。Linux 默认的拥塞控制算法是 <b>CUBIC</b>（<code>net/ipv4/tcp_cubic.c</code>），它用一条三次方曲线代替 Reno 的线性增长，在高带宽时能更快铺满链路。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 sk_buff：四个指针划出整块内存</h3>
+<p>这是全篇最重要的结构。sk_buff 本身不装数据，它只是一串"元数据 + 四个指针"，真正的数据在别处的内存里。</p>
+<p class="srcline">include/linux/skbuff.h:911-917</p>
+<pre><code>	/* These elements must be at the end, see alloc_skb() for details.  */
+	sk_buff_data_t		tail;
+	sk_buff_data_t		end;
+	unsigned char		*head,
+				*data;
+	unsigned int		truesize;
+	refcount_t		users;</code></pre>
+<p><code>head</code> 是这块线性内存的<b>最开头</b>，<code>end</code> 是<b>最末尾</b>；<code>tail</code> 指向有效数据的最后一个字节的下一位，<code>data</code> 指向"当前协议层认为的数据起点"。发送时 data 往左跑（预留头部空间），接收时 data 往右跑（剥掉已处理的头）。<code>truesize</code> 是真实占用（含 slab 头等开销），用于内存统计；<code>users</code> 是引用计数，多个 skb 可能共享同一块数据（如 GSO 分割、<code>skb_clone</code>）。</p>
+<p>这两个宏就是"零拷贝"的全部秘密：</p>
+<p class="srcline">include/linux/skbuff.h:2285-2299</p>
+<pre><code>void *skb_push(struct sk_buff *skb, unsigned int len);
+static inline void *__skb_push(struct sk_buff *skb, unsigned int len)
+{
+	skb-&gt;data -= len;
+	skb-&gt;len  += len;
+	return skb-&gt;data;
+}
+
+void *skb_pull(struct sk_buff *skb, unsigned int len);
+static inline void *__skb_pull(struct sk_buff *skb, unsigned int len)
+{
+	skb-&gt;len -= len;
+	BUG_ON(skb-&gt;len &lt; skb-&gt;data_len);
+	return skb-&gt;data += len;
+}</code></pre>
+<p><code>__skb_push</code> 把 data 指针<b>左移</b> len 字节（腾出头部空间），<code>__skb_pull</code> 把 data 指针<b>右移</b>（吃掉已解析的头）。两者都只改指针和长度计数，一个字节的数据都没动。<code>BUG_ON(skb->len &lt; skb->data_len)</code> 是防呆：<code>data_len</code> 是分片到非线性区的部分，剥过头会让长度算错。</p>
+
+<h3>4.2 收包入口：NAPI 与 netif_receive_skb</h3>
+<p>网卡收包不是每个包一次中断。驱动在中断里只做"登记"，真正的批量取包在软中断里做。</p>
+<p class="srcline">net/core/dev.c:5583-5593</p>
+<pre><code>int netif_receive_skb(struct sk_buff *skb)
+{
+	int ret;
+
+	trace_netif_receive_skb_entry(skb);
+
+	ret = netif_receive_skb_internal(skb);
+	trace_netif_receive_skb_exit(ret);
+
+	return ret;
+}</code></pre>
+<p>这是个薄壳，实质工作在 <code>netif_receive_skb_internal</code>（dev.c:5508）：先做时间戳处理，然后在 RCU 读侧临界区里调 <code>__netif_receive_skb</code>。RCU 的作用是让"当前挂在这个 hook 上的协议处理器列表"在遍历期间不会被释放——挂载/卸载 netfilter hook 时可以并发进行。</p>
+<p>真正决定"这个包交给谁"的地方在 <code>__netif_receive_skb_core</code>：它遍历 <code>ptype_all</code> 链表，按 <code>skb-&gt;protocol</code>（以太网头里的 EtherType，0x0800 表示 IPv4）找到对应协议的处理函数。IPv4 对应的就是 <code>ip_rcv</code>。</p>
+<p class="srcline">net/core/dev.c:6740-6768</p>
+<pre><code>static int napi_poll(struct napi_struct *n, struct list_head *repoll)
+{
+	void *have;
+	int work, weight;
+
+	list_del_init(&amp;n-&gt;poll_list);
+
+	have = netpoll_poll_lock(n);
+
+	weight = n-&gt;weight;
+
+	work = 0;
+	if (test_bit(NAPI_STATE_SCHED, &amp;n-&gt;state)) {
+		work = n-&gt;poll(n, weight);
+		trace_napi_poll(n, work, weight);
+	}
+
+	if (unlikely(work &gt; weight))
+		pr_err_once("NAPI poll function %pS returned %d, exceeding its budget of %d.\n",
+			    n-&gt;poll, work, weight);
+
+	if (likely(work &lt; weight))
+		goto out_unlock;</code></pre>
+<p><code>n-&gt;weight</code> 就是 NAPI 的<b>预算</b>：驱动一次 poll 最多交出 weight 个包。交满了说明网络很忙，NAPI 实例被放回 <code>repoll</code> 队列下一轮继续；没交满说明网络闲，可以歇着。这就是"用一半 CPU 处理千兆流量"的老办法。</p>
+
+<h3>4.3 IP 层入口：ip_rcv</h3>
+<p class="srcline">net/ipv4/ip_input.c:527-542</p>
+<pre><code>/*
+ * IP receive entry point
+ */
+int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
+	   struct net_device *orig_dev)
+{
+	struct net *net = dev_net(dev);
+
+	skb = ip_rcv_core(skb, net);
+	if (skb == NULL)
+		return NET_RX_DROP;
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
+		       net, NULL, skb, dev, NULL,
+		       ip_rcv_finish);
+}</code></pre>
+<p><code>ip_rcv_core</code>（ip_input.c:435 起）干的是脏活：验证版本号和头长 <code>ihl</code>、做 IP 头校验和（<code>ip_fast_csum</code>）、按 <code>tot_len</code> 裁掉链路层填充、检查分片。校验和错了直接丢包并记 <code>IPSTATS_MIB_CSUMERRORS</code>。</p>
+<p><code>NF_HOOK</code> 是 netfilter 的第一个挂载点（<code>NF_INET_PRE_ROUTING</code>），包在这里会经过 iptables 的 mangle/raw 表再继续。防火墙细节见第 28 篇。</p>
+
+<h3>4.4 TCP 层入口：tcp_v4_rcv</h3>
+<p class="srcline">net/ipv4/tcp_ipv4.c:1915-1957</p>
+<pre><code>int tcp_v4_rcv(struct sk_buff *skb)
+{
+	struct net *net = dev_net(skb-&gt;dev);
+	struct sk_buff *skb_to_free;
+	int sdif = inet_sdif(skb);
+	int dif = inet_iif(skb);
+	const struct iphdr *iph;
+	const struct tcphdr *th;
+	bool refcounted;
+	struct sock *sk;
+	int ret;
+
+	if (skb-&gt;pkt_type != PACKET_HOST)
+		goto discard_it;
+
+	/* Count it even if it's bad */
+	__TCP_INC_STATS(net, TCP_MIB_INSEGS);
+
+	if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
+		goto discard_it;
+
+	th = (const struct tcphdr *)skb-&gt;data;
+
+	if (unlikely(th-&gt;doff &lt; sizeof(struct tcphdr) / 4))
+		goto bad_packet;
+	if (!pskb_may_pull(skb, th-&gt;doff * 4))
+		goto discard_it;
+
+	/* An explanation is required here, I think.
+	 * Packet length and doff are validated by header prediction,
+	 * provided case of th-&gt;doff==0 is eliminated.
+	 * So, we defer the checks. */
+
+	if (skb_checksum_init(skb, IPPROTO_TCP, inet_compute_pseudo))
+		goto csum_error;
+
+	th = (const struct tcphdr *)skb-&gt;data;
+	iph = ip_hdr(skb);
+lookup:
+	sk = __inet_lookup_skb(&amp;tcp_hashinfo, skb, __tcp_hdrlen(th), th-&gt;source,
+			       th-&gt;dest, sdif, &amp;refcounted);
+	if (!sk)
+		goto no_tcp_socket;</code></pre>
+<p>几个关键动作：<code>pskb_may_pull</code> 保证 TCP 头已经在线性区（否则得先把分片搬过来）；<code>skb_checksum_init</code> 校验 TCP 校验和（伪首部含 IP 地址，所以函数名带 <code>inet_compute_pseudo</code>）；<code>__inet_lookup_skb</code> 用<b>四元组</b>（源 IP、源端口、目的 IP、目的端口）在哈希表里找对应的 socket。找不到就是 <code>no_tcp_socket</code>，通常回 RST。</p>
+<p><code>__inet_lookup_skb</code> 是这条路径上最贵的一步，所以内核专门为它做了<b>头部预测</b>（header prediction）：常见情况下（比如连接数不多）能直接猜出 socket 指针，省掉哈希计算。</p>
+
+<h3>4.5 状态分派：tcp_rcv_state_process</h3>
+<p>这是三次握手真正发生的地方。</p>
+<p class="srcline">net/ipv4/tcp_input.c:6303-6345</p>
+<pre><code>int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	const struct tcphdr *th = tcp_hdr(skb);
+	struct request_sock *req;
+	int queued = 0;
+	bool acceptable;
+
+	switch (sk-&gt;sk_state) {
+	case TCP_CLOSE:
+		goto discard;
+
+	case TCP_LISTEN:
+		if (th-&gt;ack)
+			return 1;
+
+		if (th-&gt;rst)
+			goto discard;
+
+		if (th-&gt;syn) {
+			if (th-&gt;fin)
+				goto discard;
+			/* It is possible that we process SYN packets from backlog,
+			 * so we need to make sure to disable BH and RCU right there.
+			 */
+			rcu_read_lock();
+			local_bh_disable();
+			acceptable = icsk-&gt;icsk_af_ops-&gt;conn_request(sk, skb) &gt;= 0;
+			local_bh_enable();
+			rcu_read_unlock();
+
+			if (!acceptable)
+				return 1;
+			consume_skb(skb);
+			return 0;
+		}
+		goto discard;
+
+	case TCP_SYN_SENT:
+		tp-&gt;rx_opt.saw_tstamp = 0;
+		tcp_mstamp_refresh(tp);
+		queued = tcp_rcv_synsent_state_process(sk, skb, th);</code></pre>
+<p>三个分支正好对应三次握手的三个角色：</p>
+<ul>
+<li><b>TCP_LISTEN</b>（被动方）：收到 SYN 就调 <code>conn_request</code>，即 <code>tcp_conn_request</code>（tcp_input.c:6743）。它会创建 <code>request_sock</code>（半连接对象）、协商 MSS/时间戳选项、算好 ISN，然后回 SYN+ACK。</li>
+<li><b>TCP_SYN_SENT</b>（主动方）：收到 SYN+ACK 时进 <code>tcp_rcv_synsent_state_process</code>（tcp_input.c:6032），校验 ACK 号合法性后转 ESTABLISHED，并回第三个 ACK。</li>
+<li><b>TCP_SYN_RECV</b>：服务端收到第三次 ACK 后转 ESTABLISHED，代码在 tcp_input.c:6388 起的 <code>case TCP_SYN_RECV:</code> 分支，末尾执行 <code>tcp_set_state(sk, TCP_ESTABLISHED)</code>。</li>
+</ul>
+<p>注意 <code>local_bh_disable()</code>：<code>conn_request</code> 可能做路由查找等能睡眠的操作，而此时可能处在软中断上下文，必须显式禁止下半部抢占以免死锁。</p>
+
+<h3>4.6 发送路径：tcp_sendmsg → ip_queue_xmit → dev_queue_xmit</h3>
+<p class="srcline">net/ipv4/tcp.c:1529-1539</p>
+<pre><code>int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+{
+	int ret;
+
+	lock_sock(sk);				/* 获取socket锁，防止软中断和其他进程并发访问 */
+	ret = tcp_sendmsg_locked(sk, msg, size);	/* 调用核心发送函数 */
+	release_sock(sk);			/* 释放socket锁 */
+
+	return ret;
+}</code></pre>
+<p><code>lock_sock</code> 拿的是 socket 的<b>自旋锁</b>，保护 socket 状态机不被软中断并发修改。注意它不是互斥锁——发送路径不允许睡眠。</p>
+<p class="srcline">net/ipv4/ip_output.c:651-655</p>
+<pre><code>int ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
+{
+	return __ip_queue_xmit(sk, skb, fl, inet_sk(sk)-&gt;tos);
+}
+EXPORT_SYMBOL(ip_queue_xmit);</code></pre>
+<p><code>__ip_queue_xmit</code>（ip_output.c:546）做三件事：<b>查路由</b>（<code>ip_route_output_ports</code>，决定从哪个网卡出去）、<b>填 IP 头</b>（<code>skb_push(skb, sizeof(struct iphdr))</code> 后写版本、TTL、协议号、地址）、<b>交给 netfilter</b>（<code>ip_local_out</code>）。</p>
+<p class="srcline">net/ipv4/ip_output.c:605-619</p>
+<pre><code>	/* OK, we know where to send it, allocate and build IP header. */
+	/* 在skb头部预留IP头部空间（20字节基本头部+可选IP选项） */
+	skb_push(skb, sizeof(struct iphdr) + (inet_opt ? inet_opt-&gt;opt.optlen : 0));
+	skb_reset_network_header(skb); /* 重置网络层头部指针 */
+	iph = ip_hdr(skb);
+	/* 设置IP头部：版本号(4) + 头部长度(5*4=20字节) + TOS字段 */
+	*((__be16 *)iph) = htons((4 &lt;&lt; 12) | (5 &lt;&lt; 8) | (tos &amp; 0xff));
+	/* 设置分片标志：DF位禁止中间路由器分片（用于PMTU发现） */
+	if (ip_dont_fragment(sk, &amp;rt-&gt;dst) &amp;&amp; !skb-&gt;ignore_df)
+		iph-&gt;frag_off = htons(IP_DF);
+	else
+		iph-&gt;frag_off = 0;
+	iph-&gt;ttl      = ip_select_ttl(inet, &amp;rt-&gt;dst); /* TTL生存时间 */
+	iph-&gt;protocol = sk-&gt;sk_protocol; /* 上层协议号（TCP=6, UDP=17） */
+	ip_copy_addrs(iph, fl4); /* 拷贝源地址和目标地址 */</code></pre>
+<p><code>skb_push</code> 把 data 指针左移 20 字节，腾出 IP 头的位置——数据本身一个字节没动。<code>*((__be16 *)iph) = htons(...)</code> 一行写了三个字段：版本号 4（高 4 位）、头长度 5（以 4 字节为单位，即 20 字节）、TOS。</p>
+<p class="srcline">net/core/dev.c:4171-4175</p>
+<pre><code>int dev_queue_xmit(struct sk_buff *skb)
+{
+	return __dev_queue_xmit(skb, NULL);
+}
+EXPORT_SYMBOL(dev_queue_xmit);</code></pre>
+<p><code>__dev_queue_xmit</code>（dev.c:4064）是发送的最后一站，它取出网卡对应的 qdisc 并把 skb 交给它排队：</p>
+<p class="srcline">net/core/dev.c:4103-4110</p>
+<pre><code>	txq = netdev_core_pick_tx(dev, skb, sb_dev);
+	q = rcu_dereference_bh(txq-&gt;qdisc);
+
+	trace_net_dev_queue(skb);
+	if (q-&gt;enqueue) {
+		rc = __dev_xmit_skb(skb, q, dev, txq);
+		goto out;
+	}</code></pre>
+<p>qdisc（队列规则）是发送侧的交通管制器：<code>pfifo_fast</code> 是默认的简单 FIFO；<code>sfq</code> 做公平排队；<code>htb</code>/<code>netem</code> 能限速和模拟丢包。<code>__dev_xmit_skb</code>（dev.c:3742）里如果 qdisc 标记了 <code>TCQ_F_CAN_BYPASS</code> 且队列为空，就<b>跳过排队直接发</b>（work-conserving 直通），省一次入队出队。Linux 的 qdisc 全部在 <code>net/sched/</code>，注册表是 <code>struct Qdisc_ops</code>（net/sched/sch_api.c:130 的 <code>register_qdisc</code>）。</p>
+
+<h3>4.7 拥塞控制：cubic 是怎么被选中的</h3>
+<p class="srcline">net/ipv4/tcp_cong.c:156-175</p>
+<pre><code>/* Assign choice of congestion control. */
+void tcp_assign_congestion_control(struct sock *sk)
+{
+	struct net *net = sock_net(sk);
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	const struct tcp_congestion_ops *ca;
+
+	rcu_read_lock();
+	ca = rcu_dereference(net-&gt;ipv4.tcp_congestion_control);
+	if (unlikely(!bpf_try_module_get(ca, ca-&gt;owner)))
+		ca = &amp;tcp_reno;
+	icsk-&gt;icsk_ca_ops = ca;
+	rcu_read_unlock();
+
+	memset(icsk-&gt;icsk_ca_priv, 0, sizeof(icsk-&gt;icsk_ca_priv));
+	if (ca-&gt;flags &amp; TCP_CONG_NEEDS_ECN)
+		INET_ECN_xmit(sk);
+	else
+		INET_ECN_dontxmit(sk);
+}</code></pre>
+<p>每个 socket 在创建时通过 <code>tcp_assign_congestion_control</code> 选定自己的拥塞控制算法，存进 <code>icsk_ca_ops</code>。选中的那个是<b>网络命名空间级别</b>的（<code>net-&gt;ipv4.tcp_congestion_control</code>），可以用 <code>sysctl net.ipv4.tcp_congestion_control</code> 改。找不到模块时降级到 <code>tcp_reno</code>。</p>
+<p>算法本体是一张函数表：</p>
+<p class="srcline">net/ipv4/tcp_cubic.c:482-492</p>
+<pre><code>static struct tcp_congestion_ops cubictcp __read_mostly = {
+	.init		= bictcp_init,
+	.ssthresh	= bictcp_recalc_ssthresh,
+	.cong_avoid	= bictcp_cong_avoid,
+	.set_state	= bictcp_state,
+	.undo_cwnd	= tcp_reno_undo_cwnd,
+	.cwnd_event	= bictcp_cwnd_event,
+	.pkts_acked     = bictcp_acked,
+	.owner		= THIS_MODULE,
+	.name		= "cubic",
+};</code></pre>
+<p><code>.cong_avoid</code> 是核心：每次收到 ACK 时被调用，按 CUBIC 公式算出新的 cwnd。<code>.ssthresh</code> 在检测到丢包时计算新的慢启动门限。编译期默认值由 Kconfig 决定（<code>net/ipv4/Kconfig:733</code> 是 <code>default "cubic"</code>）。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 抓一次真实的三次握手</h3>
+<pre><code># 开一个终端抓包（需要 root）
+tcpdump -i lo -n 'tcp port 9000' -c 4 -vv
+
+# 另一个终端
+python3 -c "
+import socket,time
+s=socket.socket(); s.connect(('127.0.0.1',9000)); s.send(b'hello'); print(s.recv(100)); time.sleep(2)"
+# 但要先有服务端：
+python3 -c "
+import socket
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',9000)); s.listen(1)
+c,_=s.accept(); print(c.recv(100)); c.send(b'world'); c.close()" </code></pre>
+<p>预期输出能看到三个包：<code>SYN</code>（seq=相对值）、<code>SYN,ACK</code>（ack 指向对端 seq+1）、<code>ACK</code>，然后是数据。<b>第三个包不带 SYN 也不带 ACK 数据</b>，只有纯 ACK——这就是握手完成标志。</p>
+
+<h3>5.2 看内核里的连接状态与拥塞窗口</h3>
+<pre><code>ss -ti '( sport = :9000 or dport = :9000 )'
+# ESTAB  Recv-Q 0  Send-Q 0  local 127.0.0.1:9000  peer 127.0.0.1:52344
+#   cubic wscale:7,7 rto:204 rtt:0.375/0.062 ato:40 mss:1448 ...
+#   cwnd:10 bytes_sent:1234 bytes_acked:1234 bytes_received:0
+#   delivery_rate 12Mbps delivery_rate_limited:no
+#   busy:0 rcv_nxt:5 snd_una:5 snd_wnd:65535 rcv_mss:1448 ... unacked:0</code></pre>
+<p>逐项解释：<code>cubic</code> 是当前拥塞控制算法；<code>cwnd:10</code> 是拥塞窗口（10 个 MSS）；<code>rto:204</code> 是重传超时 204 毫秒；<code>rtt:0.375/0.062</code> 是平滑 RTT 及偏差；<code>snd_una:5</code>/<code>rcv_nxt:5</code> 是已确认序号和期望接收序号；<code>unacked:0</code> 表示没有未确认数据。<code>ss -ti</code> 读的是内核的 <code>inet_diag</code> 接口，展示的是<b>内核真实状态</b>，比抓包更全面。</p>
+
+<h3>5.3 观察 GRO/GSO 卸载</h3>
+<pre><code>ethtool -k lo | grep -E 'generic-receive-offload|generic-segmentation-offload'
+# lo: rx-checksumming: on
+#    tx-checksumming: on
+#    generic-receive-offload: on
+#    generic-segmentation-offload: on
+
+# 关闭后抓包能看到每个小包，关闭前只看到一个合并包
+sudo ethtool -K lo gro off gso off
+tcpdump -i lo -n 'tcp port 9000' -c 3
+sudo ethtool -K lo gro on gso on</code></pre>
+<p>这是最直观的"零拷贝 + 卸载"体验：开着 GRO 时，<code>tcpdump</code> 看到的是合并后的大包；关掉就恢复成一帧一包。内核源码里对应的就是 <code>gro_normal_one</code>（net/core/dev.c:5726）把多个 skb 挂进 <code>napi-&gt;rx_list</code>，凑够 <code>gro_normal_batch</code> 再一次性上交。</p>
+
+<h3>5.4 用 tracepoint 看真实路径</h3>
+<pre><code>sudo mount -t debugfs none /sys/kernel/debug 2&gt;/dev/null
+cd /sys/kernel/debug/tracing
+echo 1 &gt; events/net/net_dev_queue/enable
+echo 1 &gt; events/net/ip4/ip4_local_delivery/enable
+cat trace_pipe 
+# 然后 curl 一次 http://127.0.0.1:8000</code></pre>
+<p>trace_pipe 会打印出 <code>net_dev_queue</code>（进 qdisc）和 <code>ip4_local_delivery</code>（IP 层投递）两类事件，带时间戳和 CPU 号，能直接看到本篇 3.3 那条发送链是真的被走了一遍。</p>
+
+<h3>5.5 qemu + busybox 最小实验（需要编译内核时）</h3>
+<pre><code># 1. 编译带 debug 选项的内核
+make defconfig
+scripts/config --enable DEBUG_INFO --enable KPROBES
+make -j$(nproc)
+
+# 2. 准备 busybox 根文件系统
+wget https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox
+chmod +x busybox &amp;&amp; ./busybox --install -h initramfs
+
+# 3. 用 qemu 启动，串口控制台
+qemu-system-x86_64 -kernel arch/x86/boot/bzImage \
+  -initrd initramfs -append "console=ttyS0" -nographic
+
+# 4. 在控制台里
+ip addr          # 看到 lo 和 eth0
+ping -c 2 127.0.0.1
+ip route         # 看路由表
+cat /proc/net/tcp   # 看 TCP 连接状态（十六进制端口号）</code></pre>
+<p><code>/proc/net/tcp</code> 里每行是一个 TCP 连接：本地地址、远端地址、状态（<code>01</code> = ESTABLISHED，<code>0A</code> = LISTEN）、队列长度。状态码定义在 <code>include/net/tcp_states.h</code>，正好和本篇 3.4 的状态机一一对应。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. sk_buff 的 head/data/tail/end 四个指针分别指什么？</b>head 是线性内存块的起点，end 是终点；data 是当前协议层认为的数据起点（发送时左移预留头，接收时右移剥头），tail 是有效数据末尾的下一位。</div>
+<div class="qa"><b>Q2. 为什么剥协议头不需要 memcpy？</b>因为整个包的数据在一段连续内存里，各层头都靠 data 指针的位置来界定。<code>__skb_pull</code> 只做 <code>skb-&gt;data += len</code> 和长度计数，<code>__skb_push</code> 只做 <code>skb-&gt;data -= len</code>，一个字节的数据都不复制。</div>
+<div class="qa"><b>Q3. NAPI 的 weight 是什么概念？</b>是单次 poll 的处理预算，驱动最多交出 weight 个包。交满说明网络忙，NAPI 实例被放回复处理队列下一轮继续；没交满说明空闲。这让内核能"用一半 CPU 处理千兆流量"。</div>
+<div class="qa"><b>Q4. tcp_v4_rcv 里为什么要先做 pskb_may_pull？</b>保证 TCP 头完整落在 skb 的线性区内。若头部分散在分片区，必须先把数据搬过来才能安全读取头字段，否则会读到无效内存。</div>
+<div class="qa"><b>Q5. tcp_rcv_state_process 的 TCP_LISTEN 分支做了什么？</b>收到 SYN 后调用 <code>conn_request</code>（tcp_conn_request），创建半连接 request_sock、协商选项、计算 ISN，并回发 SYN+ACK。整个过程在 <code>local_bh_disable()</code> 保护下进行，因为路由查找可能睡眠而此时可能处于软中断上下文。</div>
+<div class="qa"><b>Q6. cwnd 和接收窗口有什么区别？</b>接收窗口是<b>对端</b>通告的，反映接收方缓冲能力，TCP 协议栈自动维护；cwnd 是<b>本地</b>拥塞控制算法根据网络拥塞状况估算的。实际在途数据受两者较小值限制。</div>
+<div class="qa"><b>Q7. __ip_queue_xmit 里 skb_push 的作用是什么？</b>把 data 指针左移 20 字节（加上可选 IP 选项长度）在内存前方腾出空间，然后就地填写 IP 头。既不拷贝数据，也不需要预先精确分配每个头部的空间。</div>
+<div class="qa"><b>Q8. qdisc 位于发送路径的哪一步？</b>在 IP 层填完头之后、驱动真正发包之前。<code>__dev_queue_xmit</code> 把 skb 交给网卡的 qdisc 排队，qdisc 决定排队顺序、限速、整形；队列为空且允许直通时会跳过排队直接发送。</div>
+
+<footer>
+  <p>上一篇：<a href="26-socket.html">26-socket 套接字层</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="28-netfilter.html">28-netfilter 防火墙框架</a></p>
+</footer>
+
+</body>
+</html>

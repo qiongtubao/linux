@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>29-lsm 安全模块框架</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="30-seccomp.html">下一篇：30-seccomp →</a>
+</nav>
+
+<h1>🛡️ 29-lsm 安全模块框架</h1>
+<p class="subtitle">当"属主可读写"不足以描述安全时，用 LSM 钩子把 SELinux/AppArmor 插进内核的每个关键决策点 · 约 13 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>先看一个真实场景。公司给每个员工一个共享目录，权限是 <code>rw</code>。按传统的 DAC（Discretionary Access Control，自主访问控制）模型，任何属主都能改任何文件——因为权限位就写在那儿。这套模型的隐含假设是：<b>文件属主值得信任</b>。</p>
+<p>但在真实的企业环境里这个假设常常不成立。财务部希望：只有财务应用能读 <code>salary.db</code>，即便是属主本人用文本编辑器打开也要被拒绝；日志进程可以追加日志但不能删除；nginx 可以读静态目录但不能读配置里的私钥。SELinux 的做法是给每个进程和每个文件打一个<b>安全标签</b>（比如 <code>system_u:system_r:httpd_t</code> 和 <code>unconfined_t</code>），然后用策略表规定"哪种标签的进程，对哪种标签的文件，能做什么操作"。</p>
+<p>问题来了：内核的权限检查散落在几百个地方——打开文件、读目录、创建进程、发信号、绑定端口……如果每加一种安全策略就往内核里塞一次判断，代码会烂掉。LSM 的解法是<b>先在所有关键决策点埋一个"钩子"，再让外部模块往钩子上挂函数</b>。协议栈/文件系统完全不知道自己被检查了，它们只是调用 <code>security_xxx()</code> 这个壳，壳内部遍历一串模块的回调，任一模块说"不行"就整体拒绝。</p>
+<p>这本质上是第 28 篇 netfilter 的同一套思想在"安全"领域的翻版：<b>把策略与机制分离</b>。netfilter 管网络包，LSM 管系统对象。</p>
+<p>第二个问题是<b>能力（capability）</b>。传统 UNIX 里只有 root 和非 root 两档，root 能干的事太多了。Linux 把 root 的权力拆成 40 多项能力（CAP_NET_ADMIN、CAP_SYS_ADMIN、CAP_KILL……），可以按需授予某个子进程。这就是 <code>capability</code> 这个 LSM 干的事——它其实不"管"，只是提供了这个机制的挂载点。</p>
+<p>第三个问题是<b>多个 LSM 同时存在</b>。SELinux 和 AppArmor 是两种风格迥异的策略系统，都可能装在同一台机器上。LSM 框架的答案是：<b>所有已注册的模块按顺序依次被询问，第一个给出非默认返回的说了算</b>。同时提供 <code>lsm=...</code> 启动参数和 <code>/sys/kernel/security/lsm</code> 文件来选择启用哪些、什么顺序。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">自主访问控制</td><td>DAC</td><td>传统 UNIX 权限模型：属主/属组/其他 × 读/写/执行，靠权限位判断。</td></tr>
+  <tr><td class="term">强制访问控制</td><td>MAC</td><td>由安全策略决定，绕不开；SELinux/AppArmor 属于此类。</td></tr>
+  <tr><td class="term">安全模块</td><td>LSM</td><td>一个可插拔的安全策略实现，如 selinux、apparmor、smack、capability。</td></tr>
+  <tr><td class="term">钩子</td><td>hook</td><td>内核里的一个安全检查点，如 file_open、inode_permission。</td></tr>
+  <tr><td class="term">钩子表</td><td>security_hook_heads</td><td>每个钩子一个链表头，装载所有注册在该钩子上的模块回调。</td></tr>
+  <tr><td class="term">回调项</td><td>security_hook_list</td><td>一个模块为某个钩子提供的函数及其元信息。</td></tr>
+  <tr><td class="term">调用宏</td><td>call_int_hook</td><td>遍历钩子链执行所有回调，遇到非零返回就停止并返回该值。</td></tr>
+  <tr><td class="term">返回值约定</td><td>0 表示放行</td><td>回调返回 0 表示"我不反对"，非 0 表示拒绝（负 errno）。</td></tr>
+  <tr><td class="term">默认返回值</td><td>LSM_RET_DEFAULT</td><td>某些钩子用特殊返回值表示"未表态"，让后面的模块继续判断。</td></tr>
+  <tr><td class="term">能力</td><td>capability</td><td>把 root 权力拆成的细粒度能力位，如 CAP_NET_ADMIN。</td></tr>
+  <tr><td class="term">SELinux</td><td>Mandatory Access Control</td><td>基于标签和策略的强制访问控制，Red Hat 系默认。</td></tr>
+  <tr><td class="term">AppArmor</td><td>Application Armor</td><td>基于路径的强制访问控制，Debian/Ubuntu 系默认。</td></tr>
+  <tr><td class="term">Smack</td><td>Simplified MAC</td><td>极简 MAC，只有几个级别，用于嵌入式设备。</td></tr>
+  <tr><td class="term">安全上下文</td><td>security blob</td><td>挂在 cred/file/inode 等对象上的私有数据，供各模块存放自己的标签。</td></tr>
+  <tr><td class="term">安全标记</td><td>label / SID</td><td>SELinux 给进程和文件贴的标签，决定访问是否被允许。</td></tr>
+  <tr><td class="term">强制模式</td><td>enforcing</td><td>SELinux 严格执行策略并拒绝违规操作；permissive 只记录不拒绝。</td></tr>
+  <tr><td class="term">审计</td><td>audit / AVC</td><td>记录安全决策的日志，便于排查被拒的操作。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 钩子表的组织方式</h3>
+<pre><code>  内核代码（fs/open.c 等）
+        │
+        ▼
+  security_file_open(file)
+        │
+        ▼
+  call_int_hook(file_open, 0, file)
+        │
+        ├──► security_hook_heads.file_open  (链表头)
+        │        │
+        │        ├─► [capability]  （若实现了该钩子）
+        │        ├─► [selinux]     selinux_file_open
+        │        └─► [apparmor]    apparmor_file_open
+        │
+        ▼
+   任一回调返回非 0 → 整体拒绝，错误码上抛
+   全部返回 0     → 放行</code></pre>
+
+<h3>3.2 LSM 之间的优先级</h3>
+<pre><code>  内核启动参数：lsm=capability,selinux,yama,apparmor
+       ↓
+  ordered_lsms[] = [capability, selinux, yama, apparmor]
+       ↓
+  每个钩子的链表按这个顺序排列
+       ↓
+  call_int_hook 遍历时，先问 capability，再问 selinux……
+
+  特殊规则：
+   · capability 永远排第一（LSM_ORDER_FIRST）
+   · 某些 LSM 标了 LSM_FLAG_EXCLUSIVE（如 SELinux），
+     它一旦启用，其它 LSM 就都不启用了
+   · "security=selinux" 这种老写法只影响 Legacy Major 类 LSM</code></pre>
+<p>为什么要给 LSM 排序？因为它们的语义会互相影响。SELinux 的 <code>capable</code> 钩子会检查进程是否被策略允许使用某项能力；capability 模块则只回答"能力位有没有"。顺序不同结果可能不同。</p>
+
+<h3>3.3 三大安全模块的对比</h3>
+<table>
+  <tr><th>维度</th><th>SELinux</th><th>AppArmor</th><th>Smack</th></tr>
+  <tr><td>标签方式</td><td>给进程和文件都打安全上下文</td><td>只给进程打 profile，路径写在 profile 里</td><td>给进程打级别</td></tr>
+  <tr><td>策略语言</td><td>type enforcement 规则（TE）</td><td>类 DBUS 风格的路径规则</td><td>极简单，几行配置</td></tr>
+  <tr><td>配置文件</td><td>/etc/selinux/&lt;policy&gt;/policy/</td><td>/etc/apparmor.d/</td><td>/etc/smack/</td></tr>
+  <tr><td>状态查询</td><td><code>getenforce</code> / <code>sestatus</code></td><td><code>aa-status</code></td><td><code>cat /sys/kernel/security/smack</code></td></tr>
+  <tr><td>典型发行版</td><td>RHEL / CentOS / Fedora</td><td>Ubuntu / Debian / openSUSE</td><td>嵌入式 / Android 早期</td></tr>
+</table>
+
+<h3>3.4 LSM 与其它安全机制的分工</h3>
+<pre><code>┌──────────────────────────────────────────────────────────┐
+│  用户态策略引擎                                          │
+│    SELinux policy  /  AppArmor profile                    │
+└──────────────┬───────────────────────────────────────────┘
+               │ 决策
+┌──────────────▼───────────────────────────────────────────┐
+│  LSM 框架（security/security.c）                          │
+│    call_int_hook → 遍历各模块回调                        │
+└──────────────┬───────────────────────────────────────────┘
+               │ 询问
+┌──────────────▼───────────────────────────────────────────┐
+│  内核机制                                                │
+│    DAC 权限位 → capability → namespace 隔离 → seccomp    │
+└──────────────────────────────────────────────────────────┘</code></pre>
+<p>它们是<b>叠加</b>而非替代关系：DAC 先看（文件权限位），LSM 再看（策略），seccomp 最后看（能不能发起这个系统调用）。任何一层拒绝就整体拒绝。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 钩子定义：一个头文件生成三份清单</h3>
+<p>LSM 最巧妙的设计在 <code>include/linux/lsm_hook_defs.h</code>：<b>整个文件只是一串 <code>LSM_HOOK(...)</code> 声明</b>，不同代码 include 它时用不同的 <code>LSM_HOOK</code> 宏展开成完全不同的东西。</p>
+<p class="srcline">include/linux/lsm_hook_defs.h:166-176</p>
+<pre><code>LSM_HOOK(int, 0, file_lock, struct file *file, unsigned int cmd)
+LSM_HOOK(int, 0, file_fcntl, struct file *file, unsigned int cmd,
+	 unsigned long arg)
+LSM_HOOK(void, LSM_RET_VOID, file_set_fowner, struct file *file)
+LSM_HOOK(int, 0, file_send_sigiotask, struct task_struct *tsk,
+	 struct fown_struct *fown, int sig)
+LSM_HOOK(int, 0, file_receive, struct file *file)
+LSM_HOOK(int, 0, file_open, struct file *file)
+LSM_HOOK(int, 0, task_alloc, struct task_struct *task,
+	 unsigned long clone_flags)
+LSM_HOOK(void, LSM_RET_VOID, task_free, struct task_struct *task)</code></pre>
+<p>每行的格式是 <code>LSM_HOOK(返回值类型, 默认值, 钩子名, 参数...)</code>。这个文件被 include 三次，每次得到不同结果：</p>
+<p class="srcline">include/linux/lsm_hooks.h:1536-1546</p>
+<pre><code>union security_list_options {
+	#define LSM_HOOK(RET, DEFAULT, NAME, ...) RET (*NAME)(__VA_ARGS__);
+	#include "lsm_hook_defs.h"
+	#undef LSM_HOOK
+};
+
+struct security_hook_heads {
+	#define LSM_HOOK(RET, DEFAULT, NAME, ...) struct hlist_head NAME;
+	#include "lsm_hook_defs.h"
+	#undef LSM_HOOK
+} __randomize_layout;</code></pre>
+<p>第一次展开得到一个<b>函数指针联合体</b>：每个钩子对应一个函数指针成员，模块的回调表就长这样。第二次展开得到<b>钩子链表头数组</b>：每个钩子对应一个 <code>hlist_head</code>，用来挂所有模块的回调。</p>
+<p>第三次展开在 <code>security/security.c</code> 里，生成每个钩子的默认值常量：</p>
+<p class="srcline">security/security.c:672-689</p>
+<pre><code>/*
+ * The default value of the LSM hook is defined in linux/lsm_hook_defs.h and
+ * can be accessed with:
+ *
+ *	LSM_RET_DEFAULT(&lt;hook_name&gt;)
+ *
+ * The macros below define static constants for the default value of each
+ * LSM hook.
+ */
+#define LSM_RET_DEFAULT(NAME) (NAME##_default)
+#define DECLARE_LSM_RET_DEFAULT_void(DEFAULT, NAME)
+#define DECLARE_LSM_RET_DEFAULT_int(DEFAULT, NAME) \
+	static const int LSM_RET_DEFAULT(NAME) = (DEFAULT);
+#define LSM_HOOK(RET, DEFAULT, NAME, ...) \
+	DECLARE_LSM_RET_DEFAULT_##RET(DEFAULT, NAME)
+
+#include &lt;linux/lsm_hook_defs.h&gt;
+#undef LSM_HOOK</code></pre>
+<p>所以 <code>LSM_RET_DEFAULT(file_open)</code> 就是 0。这种"单一定义、多处生成"的做法，让新增一个钩子只需要改一行声明，三处代码自动跟上——<b>避免了内核里几百个钩子各写一遍的维护噩梦</b>。</p>
+<p>钩子链表项本身：</p>
+<p class="srcline">include/linux/lsm_hooks.h:1550-1584</p>
+<pre><code>/*
+ * Security module hook list structure.
+ * For use with generic list macros for common operations.
+ */
+struct security_hook_list {
+	struct hlist_node		list;
+	struct hlist_head		*head;
+	union security_list_options	hook;
+	char				*lsm;
+} __randomize_layout;
+
+/*
+ * LSM_RET_VOID is used as the default value in LSM_HOOK definitions for void
+ * LSM hooks (in include/linux/lsm_hook_defs.h).
+ */
+#define LSM_RET_VOID ((void) 0)
+
+/*
+ * Initializing a security_hook_list structure takes
+ * up a lot of space in a source file. This macro takes
+ * care of the common case and reduces the amount of
+ * text involved.
+ */
+#define LSM_HOOK_INIT(HEAD, HOOK) \
+	{ .head = &amp;security_hook_heads.HEAD, .hook = { .HEAD = HOOK } }</code></pre>
+<p><code>LSM_HOOK_INIT</code> 是给模块用的初始化宏：<code>LSM_HOOK_INIT(file_open, selinux_file_open)</code> 展开成 <code>{ .head = &amp;security_hook_heads.file_open, .hook = { .file_open = selinux_file_open } }</code>——一行搞定"我注册在哪个钩子上、我提供哪个函数"。</p>
+
+<h3>4.2 模块注册：security_add_hooks</h3>
+<p class="srcline">security/security.c:468-494</p>
+<pre><code>/**
+ * security_add_hooks - Add a modules hooks to the hook lists.
+ * @hooks: the hooks to add
+ * @count: the number of hooks to add
+ * @lsm: the name of the security module
+ *
+ * Each LSM has to register its hooks with the infrastructure.
+ */
+void __init security_add_hooks(struct security_hook_list *hooks, int count,
+				char *lsm)
+{
+	int i;
+
+	for (i = 0; i &lt; count; i++) {
+		hooks[i].lsm = lsm;
+		hlist_add_tail_rcu(&amp;hooks[i].list, hooks[i].head);
+	}
+
+	/*
+	 * Don't try to append during early_security_init(), we'll come back
+	 * and fix this up afterwards.
+	 */
+	if (slab_is_available()) {
+		if (lsm_append(lsm, &amp;lsm_names) &lt; 0)
+			panic("%s - Cannot get early memory.\n", __func__);
+	}
+}</code></pre>
+<p><code>hlist_add_tail_rcu</code> 把回调插到链表<b>尾部</b>——这保证了执行顺序就是模块的注册顺序，而注册顺序由启动时的 <code>ordered_lsm[]</code> 决定（不是编译进内核的顺序）。用 RCU 版本是因为遍历侧（<code>call_int_hook</code>）在 RCU 读侧临界区里，不能被阻塞。</p>
+<p><code>lsm_append(lsm, &amp;lsm_names)</code> 把模块名字追加到全局字符串 <code>lsm_names</code>，这正是 <code>/sys/kernel/security/lsm</code> 显示的内容。</p>
+
+<h3>4.3 调用侧：call_int_hook</h3>
+<p class="srcline">security/security.c:701-721</p>
+<pre><code>#define call_void_hook(FUNC, ...)				\
+	do {							\
+		struct security_hook_list *P;			\
+								\
+		hlist_for_each_entry(P, &amp;security_hook_heads.FUNC, list) \
+			P-&gt;hook.FUNC(__VA_ARGS__);		\
+	} while (0)
+
+#define call_int_hook(FUNC, IRC, ...) ({			\
+	int RC = IRC;						\
+	do {							\
+		struct security_hook_list *P;			\
+								\
+		hlist_for_each_entry(P, &amp;security_hook_heads.FUNC, list) { \
+			RC = P-&gt;hook.FUNC(__VA_ARGS__);		\
+			if (RC != 0)				\
+				break;				\
+		}						\
+	} while (0);						\
+	RC;							\
+})</code></pre>
+<p>关键点在 <code>if (RC != 0) break;</code>：<b>任何一个模块返回非 0，遍历立刻停止，该值就是最终结果</b>。所以 LSM 的返回值约定是"0 = 我不反对，非 0 = 拒绝"。这与 netfilter 的"verdict"风格不同——netfilter 里 ACCEPT 是 1，LSM 里放行是 0。</p>
+<p><code>IRC</code> 参数是"初始返回码"，用于那些默认值不是 0 的钩子（比如 <code>fs_context_parse_param</code> 默认是 <code>-ENOPARAM</code>）。它是 statement expression（<code>({ ... })</code>），整个块的值就是最后一个表达式的值。</p>
+<p><code>call_void_hook</code> 是无返回值版本，遍历完所有模块，没有"否决权"。</p>
+
+<h3>4.4 一个具体钩子：security_file_open</h3>
+<p class="srcline">security/security.c:1571-1580</p>
+<pre><code>int security_file_open(struct file *file)
+{
+	int ret;
+
+	ret = call_int_hook(file_open, 0, file);
+	if (ret)
+		return ret;
+
+	return fsnotify_perm(file, MAY_OPEN);
+}</code></pre>
+<p>两步：先问所有 LSM 能不能开这个文件；通过了再通知文件系统监听器（inotify/fanotify）"有文件被打开了"。这个顺序很重要——被拒绝的操作不应该产生"文件被打开"的审计事件。</p>
+<p>SELinux 的实现：</p>
+<p class="srcline">security/selinux/hooks.c:3850-3875</p>
+<pre><code>static int selinux_file_open(struct file *file)
+{
+	struct file_security_struct *fsec;
+	struct inode_security_struct *isec;
+
+	fsec = selinux_file(file);
+	isec = inode_security(file_inode(file));
+	/*
+	 * Save inode label and policy sequence number
+	 * at open-time so that selinux_file_permission
+	 * can determine whether revalidation is necessary.
+	 * Task label is already saved in the file security
+	 * struct as its SID.
+	 */
+	fsec-&gt;isid = isec-&gt;sid;
+	fsec-&gt;pseqno = avc_policy_seqno(&amp;selinux_state);
+	/*
+	 * Since the inode label or policy seqno may have changed
+	 * between the selinux_inode_permission check and the saving
+	 * of state above, recheck that access is still permitted.
+	 * Otherwise, access might never be revalidated against the
+	 * new inode label or new policy.
+	 * This check is not redundant - do not remove.
+	 */
+	return file_path_has_perm(file-&gt;f_cred, file, open_file_to_av(file));
+}</code></pre>
+<p>这里体现了 SELinux 的一个重要设计：<b>打开文件时保存 inode 的 SID 和策略版本号，后续的权限检查（<code>file_permission</code>）可以据此判断"策略或标签有没有变过"</b>，变了就重新验证（revalidate）。注释还特意强调最后那次检查"不是冗余的，不要删"——因为它防的是 TOCTOU：检查通过之后、真正读之前，标签被换掉了。</p>
+
+<h3>4.5 capability 模块：cap_capable</h3>
+<p>capability 这个 LSM 很特殊——它不做策略，只提供"能力位"这套机制的实现。</p>
+<p class="srcline">security/commoncap.c:65-101</p>
+<pre><code>int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
+		int cap, unsigned int opts)
+{
+	struct user_namespace *ns = targ_ns;
+
+	/* See if cred has the capability in the target user namespace
+	 * by examining the target user namespace and all of the target
+	 * user namespace's parents.
+	 */
+	for (;;) {
+		/* Do we have the necessary capabilities? */
+		if (ns == cred-&gt;user_ns)
+			return cap_raised(cred-&gt;cap_effective, cap) ? 0 : -EPERM;
+
+		/*
+		 * If we're already at a lower level than we're looking for,
+		 * we're done searching.
+		 */
+		if (ns-&gt;level &lt;= cred-&gt;user_ns-&gt;level)
+			return -EPERM;
+
+		/* 
+		 * The owner of the user namespace in the parent of the
+		 * user namespace has all caps.
+		 */
+		if ((ns-&gt;parent == cred-&gt;user_ns) &amp;&amp; uid_eq(ns-&gt;owner, cred-&gt;euid))
+			return 0;
+
+		/*
+		 * If you have a capability in a parent user ns, then you have
+		 * it over all children user namespaces as well.
+		 */
+		ns = ns-&gt;parent;
+	}
+
+	/* We never get here */
+}</code></pre>
+<p>这个循环体现的是 <b>namespace 的层级语义</b>：判断进程是否拥有某能力时，要沿着目标 user namespace 往上走：</p>
+<ul>
+<li>如果目标 ns 就是自己的 ns，看 <code>cap_effective</code> 里有没有这个位；</li>
+<li>如果目标的 ns 层级比自己还低（更"内层"），直接拒绝；</li>
+<li>如果自己是目标 ns 的<b>直接父 namespace 的属主</b>，那么拥有全部能力（这是创建 user namespace 的人天然具备的权限）；</li>
+<li>否则往上一级继续找——在父 namespace 里有该能力，就对所有子 namespace 都有效。</li>
+</ul>
+<p>这就是为什么容器里的进程默认拿不到 <code>CAP_SYS_ADMIN</code>（除非用 <code>--privileged</code> 或 <code>cap_add</code>），而容器里的 root 对<b>它自己那个</b> user namespace 里的操作是有全部能力的。</p>
+<p>capability 模块注册的全部钩子：</p>
+<p class="srcline">security/commoncap.c:1344-1376</p>
+<pre><code>static struct security_hook_list capability_hooks[] __lsm_ro_after_init = {
+	LSM_HOOK_INIT(capable, cap_capable),
+	LSM_HOOK_INIT(settime, cap_settime),
+	LSM_HOOK_INIT(ptrace_access_check, cap_ptrace_access_check),
+	LSM_HOOK_INIT(ptrace_traceme, cap_ptrace_traceme),
+	LSM_HOOK_INIT(capget, cap_capget),
+	LSM_HOOK_INIT(capset, cap_capset),
+	LSM_HOOK_INIT(bprm_creds_from_file, cap_bprm_creds_from_file),
+	LSM_HOOK_INIT(inode_need_killpriv, cap_inode_need_killpriv),
+	LSM_HOOK_INIT(inode_killpriv, cap_inode_killpriv),
+	LSM_HOOK_INIT(inode_getsecurity, cap_inode_getsecurity),
+	LSM_HOOK_INIT(mmap_addr, cap_mmap_addr),
+	LSM_HOOK_INIT(mmap_file, cap_mmap_file),
+	LSM_HOOK_INIT(task_fix_setuid, cap_task_fix_setuid),
+	LSM_HOOK_INIT(task_prctl, cap_task_prctl),
+	LSM_HOOK_INIT(task_setscheduler, cap_task_setscheduler),
+	LSM_HOOK_INIT(task_setioprio, cap_task_setioprio),
+	LSM_HOOK_INIT(task_setnice, cap_task_setnice),
+	LSM_HOOK_INIT(vm_enough_memory, cap_vm_enough_memory),
+};
+
+static int __init capability_init(void)
+{
+	security_add_hooks(capability_hooks, ARRAY_SIZE(capability_hooks),
+				"capability");
+	return 0;
+}</code></pre>
+<p>注意它<b>没有</b> <code>file_open</code> 或 <code>inode_permission</code> 钩子——文件权限检查在 capability 模块里是直接调 <code>capable()</code>，不走 LSM 链。LSM 链上只有那些"需要策略参与"的钩子。</p>
+
+<h3>4.6 怎么知道当前启用了哪些 LSM</h3>
+<p class="srcline">security/inode.c:316-329</p>
+<pre><code>#ifdef CONFIG_SECURITY
+static struct dentry *lsm_dentry;
+static ssize_t lsm_read(struct file *filp, char __user *buf, size_t count,
+			loff_t *ppos)
+{
+	return simple_read_from_buffer(buf, count, ppos, lsm_names,
+		strlen(lsm_names));
+}
+
+static const struct file_operations lsm_ops = {
+	.read = lsm_read,
+	.llseek = generic_file_llseek,
+};
+#endif</code></pre>
+<p><code>lsm_read</code> 只是把全局字符串 <code>lsm_names</code> 原样吐出来。<code>lsm_names</code> 由 <code>security_add_hooks</code> 里的 <code>lsm_append</code> 逐个追加而成，<b>顺序就是模块的启用顺序</b>。这个文件在 securityfs 初始化时创建：</p>
+<p class="srcline">security/inode.c:344-347</p>
+<pre><code>#ifdef CONFIG_SECURITY
+	lsm_dentry = securityfs_create_file("lsm", 0444, NULL, NULL,
+						&amp;lsm_ops);
+#endif</code></pre>
+<p>所以 <code>cat /sys/kernel/security/lsm</code> 的输出（比如 <code>capability,selinux,yama,apparmor</code>）就是内核当前的 LSM 顺序，<b>顺序即优先级</b>。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 查看当前启用的 LSM</h3>
+<pre><code>cat /sys/kernel/security/lsm
+# 典型输出：capability,selinux,yama,apparmor
+#          ^ 第一个永远是 capability（LSM_ORDER_FIRST）
+
+# 如果文件不存在，说明内核没编 CONFIG_SECURITY
+ls -l /sys/kernel/security/</code></pre>
+<p>输出顺序即执行顺序。<code>capability</code> 一定在最前；<code>selinux</code> 若标记为 exclusive，则它之后不会有别的模块。</p>
+
+<h3>5.2 SELinux</h3>
+<pre><code>getenforce
+# Enforcing   ← 严格执行，拒绝违规操作
+# Permissive  ← 只记录日志不拒绝（调试用）
+
+sestatus
+# SELinux status: enabled
+# Current mode:  enforcing
+# Loaded policy name: local
+# ...
+
+# 查看某个进程的标签
+ps -eZ | head -5
+# system_u:system_r:init_t:s0      1 ?        0      0 48 ?        0 0 ?       0 ?        init
+# unconfined_u:unconfined_r:unconfined_t:s0 1000 ?  0 ...
+
+# 查看文件的标签
+ls -Z /etc/passwd
+# system_u:object_r:passwd_file_t:s0 /etc/passwd
+
+# 看审计日志
+sudo ausearch -m avc -ts recent
+# 或
+sudo dmesg | grep -i avc
+
+# 临时切到 permissive
+sudo setenforce 0
+sudo setenforce 1</code></pre>
+<p>标签格式是 <code>user:role:type:level</code>，最重要的是第三段 <b>type</b>（类型）——策略表规定的正是"某 type 的进程对某 type 的对象能做什么"。<code>unconfined_t</code> 表示未受限。</p>
+
+<h3>5.3 AppArmor</h3>
+<pre><code>sudo aa-status
+# apparmor module is loaded.
+# 48 profiles are loaded.
+# AppArmor profiles:
+# /usr/lib/firefox/firefox
+# /usr/bin/man
+# ...
+# /etc/apparmor.d/usr.man
+# /etc/apparmor.d/usr.sshd
+
+# 看某个 profile
+cat /etc/apparmor.d/usr.sshd | head -20
+
+# 某个进程在哪个 profile 里
+cat /proc/$(pgrep -n sshd)/attr/current
+# /usr/sbin/sshd (enforce)
+
+# 临时禁用
+sudo aa-disable /etc/apparmor.d/usr.man
+sudo aa-enforce /etc/apparmor.d/usr.man
+sudo aa-complain /etc/apparmor.d/usr.man
+
+# 审计日志
+sudo journalctl -k | grep apparmor="DENIED"</code></pre>
+<p>AppArmor 只给进程打 profile（路径规则写在 profile 里），不用给文件打标签，所以上手比 SELinux 简单，但表达力弱一些。</p>
+
+<h3>5.4 capability 实操</h3>
+<pre><code># 看当前进程的 capability 位
+capsh --print
+# Current: =, cap_chown, dac_override, fowner, fsetid, kill, setgid, setuid,
+#          setpcap, net_bind_service, net_raw, sys_chroot, mknod, audit_write,
+#          setfcap
+
+# 完整列表
+cat /proc/sys/kernel/cap_last_cap
+# 40   ← 最后一个能力的编号，共 41 项（0~40）
+
+# 给某个二进制文件加能力（这样普通用户也能执行）
+sudo setcap cap_net_bind_service+ep /usr/local/bin/myserver
+getcap /usr/local/bin/myserver
+# /usr/local/bin/myserver cap_net_bind_service=ep
+
+# 在文件里运行
+sudo capsh --drop=cap_sys_admin -- -c 'ls /proc/1/'
+
+# 容器里
+docker run --rm --cap-add=NET_ADMIN ubuntu ip link add dummy0 type dummy
+docker run --rm ubuntu ip link add dummy0 type dummy   # 权限不够</code></pre>
+<p>capability 位共 41 项（<code>cap_last_cap</code> = 40）。<code>setcap ... +ep</code> 的 <code>e</code> 是 effective、<code>p</code> 是 permitted。文件能力让非 root 程序在执行时获得特定能力——这是给服务程序最小权限的常用手法。</p>
+
+<h3>5.5 观察 LSM 钩子被调用</h3>
+<pre><code>cd /sys/kernel/debug/tracing
+# LSM 有专门的 tracepoint
+ls events/lsm/
+# lsm_capable  lsm_file_alloc  lsm_file_open  lsm_inode_permission ...
+
+echo 1 &gt; events/lsm/lsm_file_open/enable
+echo 1 &gt; events/lsm/lsm_inode_permission/enable
+cat trace_pipe
+# 然后 cat /etc/passwd，能看到 lsm_file_open 事件</code></pre>
+<p>每个 LSM 钩子都有对应的 tracepoint，能直接看到"某个钩子被调用了，返回值是多少"。这是验证 LSM 是否生效的最直接手段。</p>
+
+<h3>5.6 qemu + busybox 最小实验</h3>
+<pre><code>make defconfig
+scripts/config --enable CONFIG_SECURITY --enable CONFIG_SECURITYFS \
+               --enable CONFIG_SECURITY_SELINUX
+make -j$(nproc)
+
+wget https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox
+chmod +x busybox &amp;&amp; ./busybox --install -h initramfs
+qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd initramfs \
+  -append "console=ttyS0 lsm=capability,selinux" -nographic
+
+# 客控台里
+mount -t securityfs securityfs /sys/kernel/security   # 挂上 securityfs
+cat /sys/kernel/security/lsm
+# capability,selinux
+grep Cap /proc/self/status
+# CapInh: 0000000000000000
+# CapPrm: 0000003fffffffff
+# CapEff: 0000003fffffffff</code></pre>
+<p>用 <code>lsm=</code> 启动参数指定顺序，串口控制台里挂上 securityfs 后就能看到生效的模块列表和当前进程的 capability 位。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. DAC 和 MAC 有什么区别？</b>DAC（自主访问控制）是传统 UNIX 权限位模型，文件属主可以随意修改权限，隐含假设属主可信；MAC（强制访问控制）由中央安全策略决定，绕不开，SELinux/AppArmor 属于此类。</div>
+<div class="qa"><b>Q2. call_int_hook 里 RC != 0 时会发生什么？</b>立即停止遍历链表，该非零值作为整个钩子的结果返回。LSM 的约定是 0 表示"不反对"，非 0（通常是负 errno）表示拒绝，协议栈据此返回错误。</div>
+<div class="qa"><b>Q3. lsm_hook_defs.h 被 include 三次分别生成什么？</b>第一次生成函数指针联合体 union security_list_options（模块回调表用）；第二次生成钩子链表头数组 struct security_hook_heads；第三次生成每个钩子的默认值常量（LSM_RET_DEFAULT(name)）。</div>
+<div class="qa"><b>Q4. /sys/kernel/security/lsm 里的内容是怎么来的？</b>由 security_add_hooks 里的 lsm_append 按模块注册顺序追加到全局字符串 lsm_names，securityfs 用 lsm_read 原样输出。顺序即执行顺序即优先级。</div>
+<div class="qa"><b>Q5. 为什么 LSM 链表用 hlist_add_tail_rcu？</b>tail 保证执行顺序等于注册顺序（由启动参数 lsm= 决定）；RCU 保证遍历侧（call_int_hook 在 RCU 读侧临界区）不会被注册/卸载操作阻塞。</div>
+<div class="qa"><b>Q6. cap_capable 里的 namespace 遍历逻辑是什么？</b>沿目标 user namespace 逐级向上：目标即自己则看 cap_effective；目标层级比自己低则拒绝；自己是目标直接父 ns 的属主则拥有全部能力；在父 ns 有该能力则对所有子 ns 有效。</div>
+<div class="qa"><b>Q7. 为什么说 LSM 框架是"策略与机制分离"？</b>内核只在固定位置调用 security_xxx() 壳，壳内遍历模块回调；具体的策略判断全在模块里（SELinux 的策略引擎、AppArmor 的路径匹配）。新增策略不需要改内核代码。</div>
+<div class="qa"><b>Q8. SELinux 的 selinux_file_open 为什么要保存策略版本号并做二次检查？</b>防止 TOCTOU：前一次权限检查通过后，inode 的标签或策略本身可能已被修改，保存的 pseqno/isid 让后续检查能判断是否需要重新验证（revalidate），否则被撤销的授权将永远生效。</div>
+
+<footer>
+  <p>上一篇：<a href="28-netfilter.html">28-netfilter 防火墙框架</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="30-seccomp.html">30-seccomp 系统调用过滤</a></p>
+</footer>
+
+</body>
+</html>

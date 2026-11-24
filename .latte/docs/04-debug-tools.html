@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 内核调试与观测工具</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="05-task-struct.html">下一篇：05 进程描述符 task_struct →</a>
+</nav>
+
+<h1>🔧 04 · 内核调试与观测工具：给内核装上仪表盘</h1>
+<p class="subtitle">从"打一行日志"到"单步停在某个函数上"，一整套工具串起内核排障的完整武器库 · 预计阅读 28 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>内核是个"看不见摸不着"的东西：它跑在你看不见的地址空间里，出问题时屏幕上只有一个黑屏或一行 oops。修车师傅有举升机、有诊断仪、有示波器；<strong>内核工程师也需要仪表盘</strong>。这就是本章要讲的东西：<code>printk</code> 是仪表盘上的报警灯，<code>/proc/kallsyms</code> 是全车线路图，ftrace 是行车记录仪，perf 是性能分析仪，而 gdb 让你能把车拆开来逐个螺丝看。</p>
+
+<p>从操作系统视角看，调试的核心矛盾是：<strong>bug 发生在内核态，而你的观察工具在用户态</strong>。内核必须主动"开窗"，把这些内部状态以文件（<code>/proc</code>、<code>/sys</code>、<code>debugfs</code>、<code>tracefs</code>）的形式暴露出来，用户态工具再去读这些"窗口"。<strong>本章讲的每一个工具，本质上都是一对"内核里的文件" + "用户态的读法"。</strong></p>
+
+<p>新手最常见的三个困惑，本章会逐一拆掉：</p>
+<ul>
+  <li><strong>"为什么我改了代码，dmesg 里什么都没变？"</strong>——因为你没重新编译，或者你用的是运行时的日志级别过滤（<code>/proc/sys/kernel/printk</code> 把级别卡住了）。</li>
+  <li><strong>"为什么 <code>/proc/kallsyms</code> 里的地址全是 0？"</strong>——因为 <code>kptr_restrict</code> 出于安全考虑把地址藏起来了，只有 root 能看。</li>
+  <li><strong>"ftrace 和 perf 到底选哪个？"</strong>——ftrace 是"内核自己记录调用轨迹"，perf 是"用 PMU 硬件计数器采样"，两者可以叠加使用。</li>
+</ul>
+
+<p>本章所有命令都可以在<strong>普通 Linux 机器</strong>上直接跑（需要 <code>root</code> 的会标出来）。需要编译内核的部分（gdb + qemu），会给出一套最小可用的步骤。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">printk</td><td>printk</td><td>内核的"打印"函数。输出进内核环形缓冲区，<code>dmesg</code> 就是读它。</td></tr>
+  <tr><td class="term">日志级别</td><td>log level</td><td>0(EMERG) 到 7(DEBUG) 共 8 级，数字越小越严重。级别 &gt; 当前阈值的消息被丢弃。</td></tr>
+  <tr><td class="term">环形缓冲区</td><td>ring buffer</td><td>内核日志的存放地，容量固定，写满就覆盖最老的记录。</td></tr>
+  <tr><td class="term">dmesg</td><td>dmesg</td><td>读内核环形缓冲区的用户态命令，支持按级别过滤（<code>dmesg -l err,warn</code>）。</td></tr>
+  <tr><td class="term">kallsyms</td><td>/proc/kallsyms</td><td>内核符号表：每个函数/变量的名字和地址。地址受 <code>kptr_restrict</code> 控制。</td></tr>
+  <tr><td class="term">debugfs</td><td>debug filesystem</td><td>调试专用伪文件系统，挂在 <code>/sys/kernel/debug/</code>，里面全是内核内部状态。</td></tr>
+  <tr><td class="term">tracefs</td><td>tracing filesystem</td><td>ftrace 的控制台，挂在 <code>/sys/kernel/debug/tracing/</code>（或 <code>/sys/kernel/tracing/</code>）。</td></tr>
+  <tr><td class="term">tracer</td><td>tracer</td><td>一种跟踪策略，如 <code>function</code>（记录调用）、<code>function_graph</code>（记录调用+嵌套+耗时）。</td></tr>
+  <tr><td class="term">ftrace</td><td>Function Tracer</td><td>内核自带的跟踪框架，在函数入口/返回处插桩。动态插桩靠 <code>ftrace_ops</code> + kprobe。</td></tr>
+  <tr><td class="term">perf</td><td>Performance Events</td><td>利用 CPU 性能计数器（PMU）做采样统计的工具集，源码在 <code>tools/perf/</code>。</td></tr>
+  <tr><td class="term">kprobe</td><td>kernel probe</td><td>在任意内核函数上打"探针"（断点），不改代码就能触发回调。</td></tr>
+  <tr><td class="term">bpftrace</td><td>bpftrace</td><td>用类 C 的小脚本语言写探针，基于 eBPF，<code>tools/bpf/bpftrace.c</code> 是它的实现。</td></tr>
+  <tr><td class="term">QEMU gdb stub</td><td>gdbstub</td><td>虚拟机内置的调试服务器，监听 1234 端口，让 gdb 通过 <code>target remote</code> 连进去单步调试。</td></tr>
+  <tr><td class="term">vmlinux</td><td>vmlinux</td><td>未压缩、未剥离符号的内核 ELF 文件，gdb 需要它来解析符号。</td></tr>
+  <tr><td class="term">slabinfo</td><td>/proc/slabinfo</td><td>slab/slub 分配器的详细统计：每种对象的数量、大小、碎片率。</td></tr>
+  <tr><td class="term">中断统计</td><td>/proc/interrupts</td><td>每个 IRQ 号被处理了多少次、各 CPU 分布。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 工具全景图：谁在内核里，谁在内核外</h3>
+<pre><code>┌─────────────────────── 用户态（你在终端敲的东西）───────────────────────┐
+│                                                                          │
+│  dmesg      perf top / record / script     gdb      bpftrace              │
+│    │              │                          │         │                 │
+└────┼──────────────┼──────────────────────────┼─────────┼─────────────────┘
+     │              │                          │         │
+     │  /proc/kallsyms│  /sys/kernel/debug/tracing/   │  /sys/kernel/debug/tracing/
+     ▼              ▼                          ▼         ▼ kprobe_events
+┌──────────────────────── 内核态（数据的真正来源）────────────────────────┐
+│                                                                          │
+│  printk()  ──► 环形缓冲区 ──► /proc/kmsg  /dev/kmsg                      │
+│                                                                          │
+│  kallsyms   ──► 符号表       ──► /proc/kallsyms                          │
+│                                                                          │
+│  debugfs_create_file() ──► /sys/kernel/debug/...   （内核自报的内部状态）  │
+│                                                                          │
+│  ftrace 框架 ──► tracefs ──► /sys/kernel/debug/tracing/                  │
+│      │  │                                                                    │
+│      │  └── kprobe 动态插桩（kernel/kprobes.c）                          │
+│      │                                                                    │
+│      └── perf_event_open() ──► PMU 硬件计数器（硬件级采样）              │
+│                                                                          │
+│  统计计数器 ──► /proc/stat  /proc/interrupts  /proc/slabinfo            │
+└──────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>这张图要记住一句话：<strong>所有用户态工具都不"认识"内核，它们只是读文件</strong>。<code>dmesg</code> 就是 <code>cat /dev/kmsg</code> 的加工版；<code>perf top</code> 就是反复读 <code>/proc/…</code> + <code>perf_event_open()</code> 的结果；ftrace 的配置则是往 <code>/sys/kernel/debug/tracing/current_tracer</code> 里 <code>echo</code> 一个字符串。</p>
+
+<h3>3.2 四种观测粒度：从粗到细</h3>
+<table>
+  <tr><th>粒度</th><th>工具</th><th>回答什么问题</th><th>开销</th></tr>
+  <tr><td>日志（事后）</td><td><code>printk</code> / <code>dmesg</code></td><td>"出事了/发生了某事"——只有你主动打印过才知道</td><td>极低</td></tr>
+  <tr><td>统计（周期）</td><td><code>/proc/stat</code>、<code>/proc/interrupts</code>、<code>/proc/slabinfo</code>、<code>perf stat</code></td><td>"整体健康度如何"——CPU 用了多少、IRQ 打了几次</td><td>低</td></tr>
+  <tr><td>轨迹（实时）</td><td>ftrace（<code>function</code>/<code>function_graph</code>）、<code>perf record</code></td><td>"谁调用了谁、耗时多少、调用栈长什么样"</td><td>中～高（需过滤）</td></tr>
+  <tr><td>断点（交互）</td><td>gdb + qemu、kprobe、kgdb</td><td>"此刻内核的变量到底是什么值"</td><td>极高（会把机器拖停）</td></tr>
+</table>
+<p>排障的<strong>正确顺序是从粗到细</strong>：先用统计确定"问题在 CPU 还是在 IO"，再用轨迹缩小到"哪个函数"，最后才上断点看变量。<strong>一上来就 gdb 单步是最慢的做法</strong>（每一步都可能几毫秒，而内核一次系统调用涉及的指令数以万计）。</p>
+
+<h3>3.3 ftrace 四件套：它们是怎么配合的</h3>
+<pre><code>        /sys/kernel/debug/tracing/
+        │
+        ├── available_tracers        【只读】列出本内核支持的 tracer
+        │       nop  function  function_graph  wakeup  ...
+        │
+        ├── current_tracer           【可写】当前用哪个 tracer
+        │       echo function_graph &gt; current_tracer
+        │
+        ├── set_ftrace_filter         【可写】只跟踪哪些函数
+        │       echo do_sys_open &gt; set_ftrace_filter
+        │       echo 'do_sys_*' &gt; set_ftrace_filter      (支持通配)
+        │       echo '!do_sys_read' &gt; set_ftrace_filter   (排除)
+        │
+        ├── available_filter_functions 【只读】列出所有可被过滤的函数
+        │       grep do_sys_open available_filter_functions
+        │
+        ├── tracing_on                【可写】0/1 开关采集
+        ├── trace                     【只读】采集到的内容（快照）
+        └── trace_pipe                 【只读】流式输出（cat 会阻塞）
+</code></pre>
+<p><strong>四件套的协作关系</strong>：</p>
+<ol>
+  <li>先 <code>cat available_tracers</code> 看看有哪些"镜头"可选（你要的是<strong>拍什么</strong>）。</li>
+  <li>把选中的名字写进 <code>current_tracer</code>（<strong>换镜头</strong>）。</li>
+  <li>用 <code>set_ftrace_filter</code> 限定拍摄范围（<strong>缩小视野</strong>）——不加过滤的话，内核每秒几万次函数调用会把缓冲区瞬间写满。</li>
+  <li><code>echo 1 &gt; tracing_on</code> 开始录制，事后 <code>cat trace</code> 看快照，或 <code>cat trace_pipe</code> 实时跟着看。</li>
+</ol>
+<p><code>available_filter_functions</code> 是"字典"：它告诉你内核里<strong>到底有哪些函数名可以填进 filter</strong>。因为你得知道确切的符号名（还要注意 <code>[module]</code> 后缀表示该函数来自哪个模块）。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 printk 的日志级别：为什么内核消息会"消失"</h3>
+<p>每条 <code>printk()</code> 消息前面都带一个"级别前缀"。老式写法是 <code>printk(KERN_ERR "...")</code>，现代写法是 <code>pr_err("...")</code>。这两者编译出来是同一个东西。</p>
+
+<p class="srcline">include/linux/kern_levels.h:5-17  级别宏定义</p>
+<pre><code>#define KERN_SOH	"\001"		/* ASCII Start Of Header */
+#define KERN_SOH_ASCII	'\001'
+
+#define KERN_EMERG	KERN_SOH "0"	/* system is unusable */
+#define KERN_ALERT	KERN_SOH "1"	/* action must be taken immediately */
+#define KERN_CRIT	KERN_SOH "2"	/* critical conditions */
+#define KERN_ERR	KERN_SOH "3"	/* error conditions */
+#define KERN_WARNING	KERN_SOH "4"	/* warning conditions */
+#define KERN_NOTICE	KERN_SOH "5"	/* normal but significant condition */
+#define KERN_INFO	KERN_SOH "6"	/* informational */
+#define KERN_DEBUG	KERN_SOH "7"	/* debug-level messages */
+
+#define KERN_DEFAULT	""		/* the default kernel loglevel
+</code></pre>
+<p>注意 <code>KERN_SOH</code> 是 ASCII 码 1（<code>\001</code>），后面跟一个数字字符。<strong>这是一个"带前缀的字符串"</strong>：<code>KERN_ERR</code> 展开成 <code>"\0013"</code>。内核靠这个约定在运行时<strong>反解</strong>出这条消息的级别——这样就不需要在消息结构体里额外存一个字段，代价是每条消息前面多两个字节。</p>
+
+<p class="srcline">include/linux/printk.h:19-45  printk_get_level（反解级别）</p>
+<pre><code>static inline int printk_get_level(const char *buffer)
+{
+	if (buffer[0] == KERN_SOH_ASCII &amp;&amp; buffer[1]) {
+		switch (buffer[1]) {
+		case '0' ... '7':
+		case 'c':	/* KERN_CONT */
+			return buffer[1];
+		}
+	}
+	return 0;
+}
+
+static inline const char *printk_skip_level(const char *buffer)
+{
+	if (printk_get_level(buffer))
+		return buffer + 2;
+
+	return buffer;
+}
+
+static inline const char *printk_skip_headers(const char *buffer)
+{
+	while (printk_get_level(buffer))
+		buffer = printk_skip_level(buffer);
+
+	return buffer;
+}
+</code></pre>
+<ul>
+  <li><code>printk_get_level()</code>：看到 <code>\001</code> + 数字就返回那个数字，否则返回 0（表示"没有级别前缀"）。</li>
+  <li>注意 <code>case 'c'</code>：<code>KERN_CONT</code>（<code>\001c</code>）表示"这是一条续行"，不算独立日志级别。</li>
+  <li><code>printk_skip_headers()</code>：连续跳过多层前缀——因为 <code>printk()</code> 可以把多条消息拼成一次调用。</li>
+</ul>
+
+<p class="srcline">include/linux/kern_levels.h:25-36  级别的整数值</p>
+<pre><code>/* integer equivalents of KERN_&lt;LEVEL&gt; */
+#define LOGLEVEL_SCHED		-2	/* Deferred messages from sched code
+					 * are set to this special level */
+#define LOGLEVEL_DEFAULT	-1	/* default (or last) loglevel */
+#define LOGLEVEL_EMERG		0	/* system is unusable */
+#define LOGLEVEL_ALERT		1	/* action must be taken immediately */
+#define LOGLEVEL_CRIT		2	/* critical conditions */
+#define LOGLEVEL_ERR		3	/* error conditions */
+#define LOGLEVEL_WARNING	4	/* warning conditions */
+#define LOGLEVEL_NOTICE		5	/* normal but significant condition */
+#define LOGLEVEL_INFO		6	/* informational */
+#define LOGLEVEL_DEBUG		7	/* debug-level messages */
+</code></pre>
+<p>这套整数定义（<code>LOGLEVEL_ERR</code> 等）是给 C 代码用的，因为 <code>pr_err()</code> 这类宏需要在<strong>编译期</strong>就知道级别数字。</p>
+
+<h3>4.2 /proc/sys/kernel/printk：四个数字控制日志输出</h3>
+<p>你可能见过这个输出：<code>4 4 1 7</code>。这四个数字的含义经常被搞错，搞错了就会"日志怎么不打印"。</p>
+
+<p class="srcline">kernel/printk/printk.c:63-69  console_printk 数组</p>
+<pre><code>int console_printk[4] = {
+	CONSOLE_LOGLEVEL_DEFAULT,	/* console_loglevel */
+	MESSAGE_LOGLEVEL_DEFAULT,	/* default_message_loglevel */
+	CONSOLE_LOGLEVEL_MIN,		/* minimum_console_loglevel */
+	CONSOLE_LOGLEVEL_DEFAULT,	/* default_console_loglevel */
+};
+EXPORT_SYMBOL_GPL(console_printk);
+</code></pre>
+<p>四个槽位的含义：</p>
+<table>
+  <tr><th>位置</th><th>名字</th><th>含义</th></tr>
+  <tr><td>1</td><td><code>console_loglevel</code></td><td><strong>当前控制台阈值</strong>：级别数字 &gt; 它的消息<b>不输出到控制台</b>（但仍进环形缓冲区）。</td></tr>
+  <tr><td>2</td><td><code>default_message_loglevel</code></td><td>没写级别前缀的消息（<code>printk("...")</code>）默认按这个级别处理。</td></tr>
+  <tr><td>3</td><td><code>minimum_console_loglevel</code></td><td><strong>下限</strong>：控制台阈值不能被设得比它更小（防止把关键错误也屏蔽掉）。</td></tr>
+  <tr><td>4</td><td><code>default_console_loglevel</code></td><td>开机时的默认控制台阈值。</td></tr>
+</table>
+
+<p class="srcline">kernel/sysctl.c:2206-2213  /proc/sys/kernel/printk 的注册</p>
+<pre><code>#if defined CONFIG_PRINTK
+	{
+		.procname	= "printk",
+		.data		= &console_loglevel,
+		.maxlen		= 4*sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+</code></pre>
+<p><code>.data = &console_loglevel</code> 指向整个数组的第一个元素，<code>.maxlen = 4*sizeof(int)</code> 说明这是<strong>一个长度为 4 的整型数组</strong>，<code>proc_dointvec</code> 负责读写。所以 <code>echo 4 4 1 7 &gt; /proc/sys/kernel/printk</code> 一次写 4 个数；<strong>只写一个数（如 <code>echo 8</code>）会只改第 1 个</strong>，其余保持不变。</p>
+
+<div class="warn">
+<strong>注意：控制台阈值只影响"输出到屏幕/串口"，不影响环形缓冲区！</strong>你可以把控制台阈值调到 8（只显示 DEBUG），但 <code>dmesg</code> 依然能读出全部消息（受环形缓冲区和 <code>dmesg</code> 自身级别过滤影响）。这解释了那个经典现象：<strong>屏幕上啥也没有，但 <code>dmesg | tail</code> 全是日志</strong>。
+</div>
+
+<h3>4.3 /proc/kallsyms：内核符号表</h3>
+<p>要 gdb/perf 把地址翻译成函数名，靠的就是 kallsyms。</p>
+
+<p class="srcline">kernel/kallsyms.c:681-696  kallsyms_show_value（地址是否可见）</p>
+<pre><code>bool kallsyms_show_value(const struct cred *cred)
+{
+	switch (kptr_restrict) {
+	case 0:
+		if (kallsyms_for_perf())
+			return true;
+		fallthrough;
+	case 1:
+		if (security_capable(cred, &init_user_ns, CAP_SYSLOG,
+				     CAP_OPT_NOAUDIT) == 0)
+			return true;
+		fallthrough;
+	default:
+		return false;
+	}
+}
+</code></pre>
+<p><code>kptr_restrict</code> 的语义：</p>
+<table>
+  <tr><th>值</th><th>谁能看到真实地址</th></tr>
+  <tr><td>0</td><td>所有人</td></tr>
+  <tr><td>1</td><td>有 <code>CAP_SYSLOG</code> 能力的用户（通常 root）</td></tr>
+  <tr><td>2</td><td>没有人（连 root 也只看到 0）</td></tr>
+</table>
+<p><code>fallthrough</code> 是 C 的显式"贯穿"标注——告诉编译器"这里故意不 break，继续往下走"。所以 <code>kptr_restrict=0</code> 时，即使不是 root，只要 perf 被允许（<code>kallsyms_for_perf()</code>）也能看到地址。</p>
+
+<p class="srcline">kernel/kallsyms.c:739-751  /proc/kallsyms 的创建</p>
+<pre><code>static const struct proc_ops kallsyms_proc_ops = {
+	.proc_open	= kallsyms_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= seq_release_private,
+};
+
+static int __init kallsyms_init(void)
+{
+	proc_create("kallsyms", 0444, NULL, &amp;kallsyms_proc_ops);
+	return 0;
+}
+device_initcall(kallsyms_init);
+</code></pre>
+<ul>
+  <li><code>proc_create("kallsyms", 0444, ...)</code>：创建只读文件。注意 0444 权限——<strong>它是只读的</strong>，你不能通过写它来改符号表。</li>
+  <li><code>device_initcall(kallsyms_init)</code>：<strong>用第 6 梯队 initcall 注册</strong>（见上一篇 03 的 3.3 节）。也就是说，<code>/proc/kallsyms</code> 在启动的"设备初始化"阶段就出现了，早于用户态 init。</li>
+  <li>实现用 <code>seq_file</code> 接口（<code>seq_read</code>），这是内核里输出"可能很大"的文本文件的通用套路——分页生成，不会一次性把内容塞进内存。</li>
+</ul>
+
+<h3>4.4 debugfs：内核自报的内部状态</h3>
+<p>debugfs 是专门给调试用的伪文件系统。它的内容<strong>没有稳定性保证</strong>——内核升级后文件名可能就变了（所以它不能被用户态程序依赖）。</p>
+
+<p class="srcline">fs/debugfs/inode.c:447-457  debugfs_create_file</p>
+<pre><code>struct dentry *debugfs_create_file(const char *name, umode_t mode,
+				   struct dentry *parent, void *data,
+				   const struct file_operations *fops)
+{
+
+	return __debugfs_create_file(name, mode, parent, data,
+				fops ? &amp;debugfs_full_proxy_file_operations :
+					&amp;debugfs_noop_file_operations,
+				fops);
+}
+EXPORT_SYMBOL_GPL(debugfs_create_file);
+</code></pre>
+<p>参数含义：</p>
+<ul>
+  <li><code>name</code>：文件名。</li>
+  <li><code>mode</code>：权限位（如 <code>0644</code>）。</li>
+  <li><code>parent</code>：父目录 dentry，<code>NULL</code> 表示根目录。</li>
+  <li><code>data</code>：<strong>内核私有数据指针</strong>。打开文件时它会出现在 <code>file-&gt;private_data</code> 里——这是 debugfs 的核心机制：你把一个结构体指针扔进去，读写回调函数就能拿回它。</li>
+  <li><code>fops</code>：<code>struct file_operations</code>，定义 read/write 的行为。</li>
+</ul>
+<p>如果 <code>fops</code> 为 <code>NULL</code>，内核会用 <code>debugfs_noop_file_operations</code>——<strong>文件能创建、能列出，但读写什么都不干</strong>。这就是为什么有些 debugfs 条目看着"空"：那个驱动只创建了占位文件，还没实现真正的输出。</p>
+
+<div class="note">
+<strong>debugfs 的三个常见 API：</strong><code>debugfs_create_dir()</code> 建目录、<code>debugfs_create_file()</code> 建自定义文件、<code>debugfs_create_u32()</code> 建一个"读写的 32 位整数"快捷方式（实现在 <code>fs/debugfs/file.c:510</code>）。很多驱动还喜欢用 <code>seq_file</code> 自己分页输出。
+</div>
+
+<h3>4.5 tracefs 与 ftrace 四件套的文件是怎么造出来的</h3>
+<p>这些"文件"不是真的磁盘文件，而是内核在启动时用 <code>trace_create_file()</code> 动态创建的虚拟文件。写进去的内容会触发对应的回调函数。</p>
+
+<p class="srcline">kernel/trace/trace.c:8923-8948  init_tracer_tracefs（创建 tracer 控制文件）</p>
+<pre><code>static void
+init_tracer_tracefs(struct trace_array *tr, struct dentry *d_tracer)
+{
+	struct trace_event_file *file;
+	int cpu;
+
+	trace_create_file("available_tracers", 0444, d_tracer,
+			tr, &amp;show_traces_fops);
+
+	trace_create_file("current_tracer", 0644, d_tracer,
+			tr, &amp;set_tracer_fops);
+
+	trace_create_file("tracing_cpumask", 0644, d_tracer,
+			  tr, &amp;tracing_cpumask_fops);
+
+	trace_create_file("trace_options", 0644, d_tracer,
+			  tr, &amp;tracing_iter_fops);
+
+	trace_create_file("trace", 0644, d_tracer,
+			  tr, &amp;tracing_fops);
+
+	trace_create_file("trace_pipe", 0444, d_tracer,
+			  tr, &amp;tracing_pipe_fops);
+
+	trace_create_file("buffer_size_kb", 0644, d_tracer,
+			  tr, &amp;tracing_entries_fops);
+	// ... 省略后续若干 trace_create_file() 调用
+}
+</code></pre>
+<ul>
+  <li><code>available_tracers</code> 用 <strong>0444</strong>（只读）——它是"菜单"，让你看有哪些选择。</li>
+  <li><code>current_tracer</code> 用 <strong>0644</strong>（可写）——<code>echo function_graph &gt; current_tracer</code> 就是"切换镜头"。</li>
+  <li><code>trace</code> 是 <strong>0644</strong>：<strong>它竟然可写</strong>！但注意机制：真正起作用的是<strong>打开方式</strong>——用 <code>&gt; trace</code>（或 <code>: &gt; trace</code>）以截断方式打开它时，<code>tracing_open()</code>（<code>kernel/trace/trace.c:4519</code>）会先清空整个缓冲区；而往里写具体文字是无效的（写回调 <code>tracing_write_stub()</code> 什么也不做）。</li>
+  <li><code>trace_pipe</code> 是 <strong>0444</strong>（只读），且是"流式"的：<code>cat trace_pipe</code> 会一直阻塞着不断输出新内容。</li>
+</ul>
+
+<p class="srcline">kernel/trace/ftrace.c:6073-6112  ftrace 的过滤器文件</p>
+<pre><code>void ftrace_create_filter_files(struct ftrace_ops *ops,
+				struct dentry *parent)
+{
+
+	trace_create_file("set_ftrace_filter", 0644, parent,
+			  ops, &amp;ftrace_filter_fops);
+
+	trace_create_file("set_ftrace_notrace", 0644, parent,
+			  ops, &amp;ftrace_notrace_fops);
+}
+
+// ... 省略 destroy_filter_files() 的说明性注释
+
+static __init int ftrace_init_dyn_tracefs(struct dentry *d_tracer)
+{
+
+	trace_create_file("available_filter_functions", 0444,
+			d_tracer, NULL, &amp;ftrace_avail_fops);
+
+	trace_create_file("enabled_functions", 0444,
+			d_tracer, NULL, &amp;ftrace_enabled_fops);
+
+	ftrace_create_filter_files(&amp;global_ops, d_tracer);
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+	trace_create_file("set_graph_function", 0644, d_tracer,
+				    NULL,
+				    &amp;ftrace_graph_fops);
+	// ... 省略 set_graph_notrace / max_graph_depth 等文件
+#endif
+</code></pre>
+<p><code>set_ftrace_filter</code> 的 <code>ops</code> 参数是 <code>&amp;global_ops</code>——<strong>全局 ftrace_ops</strong>，也就是"所有可被 ftrace 插桩的函数"。这解释了为什么 <code>set_ftrace_filter</code> 能过滤任意函数，而 <code>set_graph_function</code>（<code>NULL</code>）只对 function_graph tracer 生效。</p>
+
+<p class="srcline">kernel/trace/trace_functions_graph.c:1281-1297  function_graph tracer 的定义</p>
+<pre><code>static struct tracer graph_trace __tracer_data = {
+	.name		= "function_graph",
+	.update_thresh	= graph_trace_update_thresh,
+	.open		= graph_trace_open,
+	.pipe_open	= graph_trace_open,
+	.close		= graph_trace_close,
+	.pipe_close	= graph_trace_close,
+	.init		= graph_trace_init,
+	.reset		= graph_trace_reset,
+	.print_line	= print_graph_function,
+	.print_header	= print_graph_headers,
+	.flags		= &amp;tracer_flags,
+	.set_flag	= func_graph_set_flag,
+#ifdef CONFIG_FTRACE_SELFTEST
+	.selftest	= trace_selftest_startup_function_graph,
+#endif
+};
+</code></pre>
+<p>这就是 <code>available_tracers</code> 里 <code>function_graph</code> 那一行的来源：每个 tracer 就是一个 <code>struct tracer</code>，带着名字和一堆回调。<code>register_tracer()</code>（<code>kernel/trace/trace.c:2037</code>）把它们登记到全局列表，<code>current_tracer</code> 的写回调就在这个列表里按名字查找。</p>
+
+<h3>4.6 kprobe：不改代码就能在任意函数上打点</h3>
+
+<p class="srcline">kernel/trace/trace_kprobe.c:1928-1937  kprobe_events 文件</p>
+<pre><code>	entry = tracefs_create_file("kprobe_events", 0644, NULL,
+				    NULL, &amp;kprobe_events_ops);
+
+	/* Event list interface */
+	if (!entry)
+		pr_warn("Could not create tracefs 'kprobe_events' entry\n");
+
+	/* Profile interface */
+	entry = tracefs_create_file("kprobe_profile", 0444, NULL,
+				    NULL, &amp;kprobe_profile_ops);
+</code></pre>
+<p><code>kprobe_events</code> 是<strong>可写</strong>的：往里写一行文本就创建一个探针事件，比如：</p>
+<pre><code># 语法：p[:[GRP/]EVENT] [MOD:]SYM[+offs]|MEMADDR [FETCHARGS]   (p=probe)
+#       r[:[GRP/]EVENT] [MOD:]SYM[+offs]|MEMADDR [FETCHARGS]   (r=retprobe)
+echo 'p:myprobe do_sys_open'   &gt; /sys/kernel/debug/tracing/kprobe_events
+echo 'r:myret  do_sys_open'    &gt; /sys/kernel/debug/tracing/kprobe_events
+echo 1 &gt; /sys/kernel/debug/tracing/events/myprobe/enable
+cat /sys/kernel/debug/tracing/trace</code></pre>
+<p><code>p:</code> 是"进入函数时触发"，<code>r:</code> 是"函数返回时触发"。kprobe 的实现原理是把目标函数的第一条指令临时改成 <code>int3</code>（断点指令），命中后由调试异常处理程序执行回调，再把原指令恢复。<strong>这就是"不用重新编译就能加探针"的原因。</strong></p>
+
+<h3>4.7 /proc/interrupts、/proc/stat、/proc/slabinfo</h3>
+
+<p class="srcline">fs/proc/interrupts.c:12-40  /proc/interrupts 的实现</p>
+<pre><code>static void *int_seq_start(struct seq_file *f, loff_t *pos)
+{
+	return (*pos &lt;= nr_irqs) ? pos : NULL;
+}
+
+static void *int_seq_next(struct seq_file *f, void *v, loff_t *pos)
+{
+	(*pos)++;
+	if (*pos &gt; nr_irqs)
+		return NULL;
+	return pos;
+}
+
+static void *int_seq_stop(struct seq_file *f, void *v)
+{
+	/* Nothing to do */
+}
+
+static const struct seq_operations int_seq_ops = {
+	.start = int_seq_start,
+	.next  = int_seq_next,
+	.stop  = int_seq_stop,
+	.show  = show_interrupts
+};
+
+static int __init proc_interrupts_init(void)
+{
+	proc_create_seq("interrupts", 0, NULL, &amp;int_seq_ops);
+	return 0;
+}
+fs_initcall(proc_interrupts_init);
+</code></pre>
+<p>它遍历 <code>nr_irqs</code> 个中断号，对每个号调用 <code>show_interrupts()</code> 输出各 CPU 的计数。<strong>注意 <code>fs_initcall</code></strong>——它在 initcall 第 5 梯队（文件系统级）注册，比 kallsyms 的第 6 梯队早。</p>
+
+<p class="srcline">fs/proc/stat.c:150-160  /proc/stat 的 CPU 行输出</p>
+<pre><code>	seq_put_decimal_ull(p, "cpu  ", nsec_to_clock_t(user));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(nice));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(system));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(idle));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(iowait));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(irq));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(softirq));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(steal));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest));
+	seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest_nice));
+	seq_putc(p, '\n');
+</code></pre>
+<p>这 10 个字段的顺序是固定的（用户态的 <code>top</code>、<code>mpstat</code> 都按这个顺序解析）：<strong>user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice</strong>。单位是 USER_HZ（通常是 100，即百分之一秒）。</p>
+
+<p class="srcline">mm/slab_common.c:1049-1063  /proc/slabinfo 的创建</p>
+<pre><code>static const struct proc_ops slabinfo_proc_ops = {
+	.proc_flags	= PROC_ENTRY_PERMANENT,
+	.proc_open	= slabinfo_open,
+	.proc_read	= seq_read,
+	.proc_write	= slabinfo_write,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= seq_release,
+};
+
+static int __init slab_proc_init(void)
+{
+	proc_create("slabinfo", SLABINFO_RIGHTS, NULL, &amp;slabinfo_proc_ops);
+	return 0;
+}
+module_init(slab_proc_init);
+</code></pre>
+<ul>
+  <li><code>SLABINFO_RIGHTS</code> 在 <code>mm/slab_common.c:908</code> 定义：<code>CONFIG_SLUB_DEBUG</code> 时是 <code>0600</code>（仅 root 可读写），否则 <code>0400</code>（仅 root 可读）。</li>
+  <li><code>module_init(slab_proc_init)</code>：等价于 <code>device_initcall</code>（第 6 梯队）。</li>
+  <li><code>.proc_write = slabinfo_write</code>：<strong>可以往 <code>/proc/slabinfo</code> 里写东西</strong>——比如写 <code>1</code> 会强制回收各 slab 缓存里的空闲对象（用于紧急降内存）。</li>
+</ul>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 printk 级别实验</h3>
+<pre><code># 查看当前的四元组
+cat /proc/sys/kernel/printk
+# 典型输出：4 4 1 7
+#          │ │ │ └── default_console_loglevel（开机默认控制台级别）
+#          │ │ └──── minimum_console_loglevel（下限，不能低于 1）
+#          │ └────── default_message_loglevel（无级别前缀消息的默认级别）
+#          └──────── console_loglevel（当前控制台阈值）
+
+# 临时把所有级别都打到屏幕（只影响控制台，不影响 dmesg）
+sudo sysctl -w kernel.printk="8 4 1 7"
+cat /proc/sys/kernel/printk        # 预期：8 4 1 7
+
+# 恢复
+sudo sysctl -w kernel.printk="4 4 1 7"
+
+# dmesg 按级别过滤（util-linux ≥ 2.30）
+dmesg -l err,warn                # 只看错误和警告
+dmesg -l err,warn --level-prefix
+dmesg --level=err                # 等价写法
+
+# 实时看内核日志
+sudo dmesg -w                    # 像 tail -f 一样跟踪
+
+# 内核命令行里也能定：printk=7 或 quiet / loglevel=7
+cat /proc/cmdline</code></pre>
+<p><strong>验证小技巧</strong>：<code>dmesg | grep -c "your_keyword"</code> 能确认消息是否真的进了环形缓冲区。如果缓冲区里有但屏幕上没有，说明是控制台阈值的问题（改 <code>/proc/sys/kernel/printk</code>）；如果缓冲区里也没有，说明代码根本没执行到。</p>
+
+<h3>5.2 /proc/kallsyms 与 kptr_restrict</h3>
+<pre><code># 普通用户看到的是 0
+grep -w do_sys_open /proc/kallsyms
+# 预期（普通用户）：0000000000000000 T do_sys_open
+# 预期（root）    ：ffffffff81234567 T do_sys_open
+
+# 当前限制值
+cat /proc/sys/kernel/kptr_restrict
+# 0=所有人可见  1=需要CAP_SYSLOG  2=谁都不可见
+
+# 用 root 临时放开
+sudo sysctl -w kernel.kptr_restrict=0
+grep -w do_sys_open /proc/kallsyms | head -3
+sudo sysctl -w kernel.kptr_restrict=1   # 恢复
+
+# 看看某个符号属于哪个模块（模块符号后面带 [模块名]）
+grep -w ' ' /proc/kallsyms | grep '\[' | head -5
+# 例如：ffffffffc04a0000 t nvme_irq [nvme]  0x1234 /sbin/modprobe -R nvme
+
+# 统计符号总数
+wc -l &lt; /proc/kallsyms</code></pre>
+
+<h3>5.3 挂载并探索 debugfs</h3>
+<pre><code># 先看看有没有挂
+mount | grep debugfs
+ls /sys/kernel/debug/ 2&gt;/dev/null | head
+
+# 没挂就挂上（需要 root）
+sudo mount -t debugfs none /sys/kernel/debug/
+# 或者：sudo mount -t debugfs debugfs /sys/kernel/debug/
+
+# 探索：debugfs 的根目录就是"内核内部状态总目录"
+ls /sys/kernel/debug/
+# 常见条目：dri/  iommu/  kprobes/  tracing/  devfreq/  pinctrl/  usb/
+
+# 找找你关心的子系统
+ls /sys/kernel/debug/tracing/ | head -20
+ls /sys/kernel/debug/dri/          # DRM/显卡
+ls /sys/kernel/debug/slab/         # slab 缓存详情（需 CONFIG_SLUB_DEBUG）
+
+# 卸载
+sudo umount /sys/kernel/debug/</code></pre>
+<p><strong>如果 <code>ls /sys/kernel/debug/</code> 是空的</strong>，通常是因为内核没开 <code>CONFIG_DEBUG_FS</code>（用 <code>grep DEBUG_FS /proc/config.gz</code> 或 <code>zcat /proc/config.gz</code> 确认）。</p>
+
+<h3>5.4 ftrace：用 function_graph 跟踪一次 open()</h3>
+<p>这是 ftrace 最经典的用法：<strong>看清一次系统调用的完整调用链和每层耗时</strong>。</p>
+
+<pre><code>sudo mount -t debugfs none /sys/kernel/debug/ 2&gt;/dev/null || true
+cd /sys/kernel/debug/tracing
+
+# ① 有哪些 tracer 可选
+cat available_tracers
+# 典型输出：
+#   nop
+#   function
+#   function_graph
+#   wakeup
+#   wakeup_rt
+#   ...
+
+# ② 换镜头：选中 function_graph
+echo function_graph &gt; current_tracer
+cat current_tracer
+# 预期：function_graph
+
+# ③ 缩小视野：只跟踪 do_sys_open 这一个函数
+echo do_sys_open &gt; set_ftrace_filter
+cat set_ftrace_filter
+# 预期：do_sys_open
+# 也可以用通配符：echo 'do_sys_*' &gt; set_ftrace_filter
+#              echo '!do_sys_read' &gt; set_ftrace_filter   （排除）
+
+# ④ 清空缓冲并开始录制
+echo 0 &gt; tracing_on
+echo &gt; trace                     # 清空旧内容
+echo 1 &gt; tracing_on
+
+# ⑤ 在另一个终端触发一次 open（这里用 cat 读文件）
+cat /etc/passwd &gt; /dev/null
+
+# ⑥ 停止并查看
+echo 0 &gt; tracing_on
+cat trace</code></pre>
+<p><strong>输出格式示例</strong>（<code>function_graph</code> tracer 的真实格式，数值因机器而异）：</p>
+<pre><code># tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 0)               do_sys_open  {
+ 0)   0.823 us               do_sys_openat;
+ 0)               SyS_openat  {
+ 0)   0.128 us               getname_flags;
+ 0)   0.214 us               alloc_empty_file;
+ 0)   0.096 us               security_file_open;
+ 0)   0.301 us               do_dentry_open  {
+ 0)   0.412 us               lookup_fast;
+ 0)   0.088 us               do_open;
+ 0)   0.132 us               vfs_open;
+ 0)   1.203 us             } /* do_dentry_open */
+ 0)   0.221 us               finish_open;
+ 0)   1.842 us             } /* SyS_openat */
+ 0)   1.104 us             } /* do_sys_openat */
+ 0)   2.010 us             } /* do_sys_open */
+</code></pre>
+<p>怎么读这张图：</p>
+<ul>
+  <li>最左边的 <code>0)</code> 是 CPU 编号；<code>0)   0.823 us</code> 是<strong>本函数从进入到返回的耗时</strong>。</li>
+  <li>缩进表示<strong>调用层级</strong>：越往右越深。</li>
+  <li><code>{</code> 表示函数进入，<code>} /* 函数名 */</code> 表示返回。</li>
+  <li>中间那列是<strong>被调用者</strong>的名字。<strong>这一列就是你要找的东西</strong>——哪个子调用最耗时（这里是 <code>do_dentry_open</code>）。</li>
+</ul>
+
+<pre><code># 实时跟踪（流式，不间断输出新事件）
+cat trace_pipe
+# 用 Ctrl-C 退出
+
+# 控制嵌套深度，避免刷屏
+echo 3 &gt; max_graph_depth
+
+# 只跟踪某个函数的"内部嵌套"（function_graph 专属）
+echo do_sys_open &gt; set_graph_function
+
+# 恢复：清空过滤器，切回 nop
+echo &gt; set_ftrace_filter
+echo nop &gt; current_tracer
+echo 0 &gt; tracing_on</code></pre>
+
+<div class="warn">
+<strong>性能警告：</strong>不加 <code>set_ftrace_filter</code> 直接开 ftrace，内核每秒会产生<strong>几万到几十万个</strong>事件，几秒就能写满缓冲区（默认每 CPU 几 MB），而且会显著拖慢系统。缓冲区大小可以调：<code>echo 8192 &gt; buffer_size_kb</code>。
+</div>
+
+<h3>5.5 用 available_filter_functions 查"能跟踪谁"</h3>
+<pre><code>cd /sys/kernel/debug/tracing
+
+# 这个文件列出内核里所有可被 ftrace 插桩的函数
+wc -l available_filter_functions        # 预期：几万行
+
+# 精确查找某个函数
+grep -w do_sys_open available_filter_functions
+# 预期：do_sys_open [kernel]
+#   （[kernel] 表示来自内核本体；如果是模块会显示 [模块名]）
+
+# 按前缀找一批
+grep -w 'do_sys_open' available_filter_functions
+grep 'sys_open' available_filter_functions | head -10
+
+# 找出所有和 ext4 相关的可跟踪函数
+grep 'ext4_' available_filter_functions | head -20
+
+# 找出所有可跟踪的模块函数
+grep '\[' available_filter_functions | grep -v '\[kernel\]' | head -10
+
+# 直接把某个前缀下的函数全部加入过滤器
+grep '^do_sys_open' available_filter_functions | awk '{print $1}' &gt; set_ftrace_filter
+cat set_ftrace_filter</code></pre>
+
+<h3>5.6 perf：采样统计与火焰图</h3>
+<pre><code># 前提：内核要开 CONFIG_PERF_EVENTS，且 perf 工具可用
+perf --version
+
+# ① perf top：实时看谁在烧 CPU（相当于内核版的 top）
+sudo perf top
+# 按 q 退出；按 c 切换调用图；按 f 折叠/展开
+
+# ② perf record：录一段采样
+sudo perf record -a -g -- sleep 10
+#   -a  : 采样所有 CPU
+#   -g  : 同时记录调用栈（做火焰图必须）
+#   -- sleep 10 : 录 10 秒
+
+# ③ perf script：把采样转成文本
+perf script | head -40
+# 典型输出：
+#   perf  1234 [000] 1234.567890: cycles:
+#         ffffffff81000000 do_sys_open+0x40 (/lib/modules/.../vmlinux)
+#         ffffffff81000100 __x64_sys_open+0x20 (/lib/modules/.../vmlinux)
+#         ffffffff81000200 entry_SYSCALL_64_after_hwframe+0x44 (/lib/modules/.../vmlinux)
+
+# ④ perf report：交互式汇总（按函数聚合）
+sudo perf report
+# 提示里按 a-z 排序、q 退出
+
+# ⑤ 火焰图（需要 FlameGraph 脚本，或用 perf 自带的 report）
+sudo perf report --stdio --sort symbol | head -30
+
+# 只统计某个函数的开销
+sudo perf stat -e task-clock,cycles,instructions -- sleep 5
+
+# 统计系统调用次数
+sudo perf stat -e syscalls:sys_enter_open -- sleep 5</code></pre>
+<p><strong>perf 和 ftrace 怎么选？</strong></p>
+<table>
+  <tr><th></th><th>ftrace</th><th>perf</th></tr>
+  <tr><td>原理</td><td>软件插桩（在函数入口插指令）</td><td>硬件 PMU 计数器采样（每 N 个事件中断一次）</td></tr>
+  <tr><td>开销</td><td>较高（每个被跟踪函数都有成本）</td><td>低（可采样的函数数量不受限）</td></tr>
+  <tr><td>能跟踪什么</td><td>只有被 ftrace 插桩的函数</td><td>任何函数（靠采样命中）</td></tr>
+  <tr><td>能看到调用栈</td><td>function_graph 能看到</td><td><code>-g</code> 采样时能记录</td></tr>
+  <tr><td>适合</td><td>"这个调用链长什么样"</td><td>"CPU 时间花在哪了"</td></tr>
+</table>
+
+<h3>5.7 qemu + gdb：最小内核调试流程</h3>
+<p>这是唯一能"停住内核看变量"的手段。原理：QEMU 内置一个 gdb 服务器，gdb 通过串口协议连上去。</p>
+
+<pre><code># ── 准备：编译一份带调试符号的内核 ──
+cd /Users/zhouguodong/Documents/latte/linux_diff
+make defconfig                       # 生成 .config
+# 打开调试符号（内核默认 CONFIG_DEBUG_INFO=y，但检查一下）
+grep -E "CONFIG_DEBUG_INFO=|CONFIG_GDB_SCRIPTS=" .config
+# 期望：CONFIG_DEBUG_INFO=y
+# 关掉 KASLR，否则地址每次都变，断点位置对不上
+#   在 .config 里追加： CONFIG_RANDOMIZE_BASE=n
+# 也可开机参数 nokaslr（但 -kernel 方式加载时更保险的是编进配置）
+
+make -j$(sysctl -n hw.ncpu)          # 编译，产物：
+ls -lh arch/x86/boot/bzImage vmlinux
+# vmlinux 是带符号的 ELF，gdb 要用它
+
+# ── 造一个最小 initramfs ──
+mkdir -p /tmp/rootfs/bin /tmp/rootfs/proc /tmp/rootfs/sys
+busybox --install -s /tmp/rootfs/bin
+cat &gt; /tmp/rootfs/init &lt;&lt;'EOF'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+exec /bin/sh
+EOF
+chmod +x /tmp/rootfs/init
+cd /tmp/rootfs &amp;&amp; find . | cpio -o -H newc 2&gt;/dev/null | gzip &gt; /tmp/initramfs.cpio.gz
+cd -
+
+# ── 启动 qemu，-s 开 gdb stub，-S 让 CPU 停在第一条指令 ──
+qemu-system-x86_64 -m 512M \
+  -kernel arch/x86/boot/bzImage \
+  -initrd /tmp/initramfs.cpio.gz \
+  -append "console=ttyS0 rdinit=/init nokaslr" \
+  -s -S -nographic
+#   -s : 在 :1234 开 gdb 服务器
+#   -S : 启动时冻结 CPU（等 gdb 说"go"才继续）
+#   -nographic : 串口输出到当前终端
+
+# ── 另开一个终端，gdb 连上去 ──
+gdb ./vmlinux
+# (gdb) target remote :1234
+# (gdb) break start_kernel
+# (gdb) continue
+# → 命中！打印出 init/main.c:949 附近的源码和寄存器
+
+# 常用命令：
+# (gdb) bt              打印调用栈
+# (gdb) info registers   打印所有寄存器
+# (gdb) print command_line   打印变量（需要知道类型名）
+# (gdb) p/x $rip         打印指令指针
+# (gdb) x/10i $rip       反汇编当前指令
+# (gdb) step / next / continue
+# (gdb) finish           跑完当前函数
+# (gdb) info threads     查看所有线程
+# (gdb) thread 1 / bt   看某个线程的栈
+
+# 内核自带的 gdb python 脚本（需要 CONFIG_GDB_SCRIPTS=y）
+# (gdb) lx-symbols       加载 vmlinux 和所有模块符号
+# (gdb) lx-dmesg         打印目标机的 dmesg
+# (gdb) p $lx_current().pid   打印当前任务的 pid
+# (gdb) p $lx_current().comm  打印当前任务名
+
+# 退出 gdb 后，qemu 里按 Ctrl-A X 结束</code></pre>
+<p><strong>为什么必须 <code>-S</code>？</strong>因为启动只有零点几秒，等你 gdb 连上去内核早就跑完了。<code>-S</code> 让 CPU 停在第一条指令，等你设好断点再 <code>continue</code>。<code>nokaslr</code> 则保证符号地址稳定，否则 <code>break start_kernel</code> 每次都会失败。</p>
+<p>完整教程在源码树里：<code>Documentation/dev-tools/gdb-kernel-debugging.rst</code>（本仓库自带）。</p>
+
+<h3>5.8 其他一眼就能用的"窗口"</h3>
+<pre><code># ── /proc/interrupts：谁在抢 CPU ──
+column -t -s $'\t' /proc/interrupts | head -12
+# 关注：某行的计数是否远大于其他行（说明该设备在疯狂中断）
+#       计数是否只在某几个 CPU 上增长（说明中断没有亲和性）
+
+# ── /proc/stat：CPU 时间去了哪 ──
+head -1 /proc/stat
+# cpu  user nice system idle iowait irq softirq steal guest guest_nice
+# 用两次采样做差得到"占用率"（用户态的 top 就是这么干的）
+
+# ── /proc/slabinfo：内存都花在哪些对象上 ──
+sudo cat /proc/slabinfo | head -10
+# 注意：需要 CONFIG_SLUB_DEBUG，且权限 0400（root）
+# 输出列：名称 活动对象数 内存大小(字节) 对象大小 碎片率 相关对象列表
+# 找 "活动对象数" 特别大的行 = 内存泄漏线索
+
+# ── kprobe：不用改代码就能挂钩 ──
+sudo mount -t debugfs none /sys/kernel/debug/ 2&gt;/dev/null || true
+cd /sys/kernel/debug/tracing
+echo 'p:myprobe do_sys_open' &gt; kprobe_events
+echo 1 &gt; events/myprobe/enable
+# 触发几次 open 后：
+cat trace | grep myprobe | head
+# 清理：echo 0 &gt; events/myprobe/enable; echo '-:myprobe' &gt; kprobe_events
+
+# ── bpftrace：一行脚本做统计 ──
+sudo bpftrace -e 'kprobe:do_sys_open { @opens = count(); }'
+# 另开终端跑几个 open，然后 Ctrl-C
+# 预期：@opens: N
+
+sudo bpftrace -e 'kprobe:do_sys_open { @[comm] = count(); }'
+# 预期：按进程名分组统计谁在疯狂 open 文件</code></pre>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. <code>cat /proc/sys/kernel/printk</code> 输出 <code>4 4 1 7</code>，四个数分别是什么？我把它第一项改成 8，为什么 <code>dmesg</code> 里还是能看到 <code>KERN_ERR</code> 的消息？</b>① <code>console_loglevel</code>=4：当前控制台阈值，级别 &gt; 4（即 NOTICE/INFO/DEBUG）的消息不输出到屏幕；② <code>default_message_loglevel</code>=4：没写级别前缀的消息按 WARNING 处理；③ <code>minimum_console_loglevel</code>=1：控制台阈值不能被设到比 1 更低（防止屏蔽掉 ALERT）；④ <code>default_console_loglevel</code>=7：开机时的默认控制台级别。<br>改它不改变 <code>dmesg</code> 的内容，因为这四项<strong>只管控制台输出</strong>（屏幕/串口），不管环形缓冲区。<code>dmesg</code> 读的是环形缓冲区，那里按消息自身的级别全部保留（只受缓冲区容量和 <code>dmesg</code> 自己的 <code>-l</code> 过滤影响）。反过来，如果你改了内核代码但 dmesg 里没有新消息，那才是代码根本没执行到。</div>
+<div class="qa"><b>Q2. <code>/proc/kallsyms</code> 里地址全是 0，怎么修？</b>看 <code>/proc/sys/kernel/kptr_restrict</code>：0=所有人可见、1=需要 <code>CAP_SYSLOG</code>（一般 root 即可）、2=谁都不显示。执行 <code>sudo sysctl -w kernel.kptr_restrict=0</code> 临时放开。代码层面由 <code>kallsyms_show_value()</code>（<code>kernel/kallsyms.c:681</code>）根据 <code>kptr_restrict</code> 和调用者的 capability 决定是否显示真实地址。</div>
+<div class="qa"><b>Q3. ftrace 的 <code>current_tracer</code>、<code>set_ftrace_filter</code>、<code>available_filter_functions</code> 三者分别管什么？</b><code>current_tracer</code> 决定"用什么方式记录"（<code>function</code> 只记调用、<code>function_graph</code> 记调用+嵌套+耗时、<code>wakeup</code> 记调度唤醒），对应 <code>kernel/trace/trace.c</code> 里 <code>init_tracer_tracefs()</code> 创建的可写文件；<code>set_ftrace_filter</code> 决定"记录哪些函数"，支持精确名、通配符（<code>do_sys_*</code>）和排除（<code>!func</code>）；<code>available_filter_functions</code> 则是"字典"——只读，列出内核里所有可填进 filter 的函数名（模块函数还带 <code>[模块名]</code> 后缀）。不设过滤就开录，缓冲区会瞬间被刷爆。</div>
+<div class="qa"><b>Q4. <code>function_graph</code> 的输出怎么读？</b>每一行的格式是 <code>CPU号) 耗时 函数名</code>，<strong>缩进表示调用深度</strong>（越靠右越深），<code>{</code> 是进入、<code>} /* 函数名 */</code> 是返回，中间那列是<strong>被调用者</strong>。所以想找"哪里慢"，就看哪一行的耗时数字大——比如 <code>do_dentry_open</code> 那行明显比别的长，说明路径解析是瓶颈。</div>
+<div class="qa"><b>Q5. perf 和 ftrace 什么时候用哪个？</b>问"CPU 时间花在哪了"（要覆盖大量函数、要低开销）用 <code>perf top</code>/<code>perf record</code>；问"这次调用的调用链长什么样、哪一层慢"用 ftrace 的 <code>function_graph</code>（需要精确的嵌套关系时 perf 的采样可能漏掉）。两者可以同时开：ftrace 给你结构，perf 给你全局热点。</div>
+
+<footer>
+  <p>上一篇：<a href="03-boot.html">03 内核启动流程</a> · 下一篇：<a href="05-task-struct.html">05 进程描述符 task_struct</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

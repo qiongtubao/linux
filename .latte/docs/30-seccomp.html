@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>30-seccomp 系统调用过滤</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="31-kvm.html">下一篇：31-kvm →</a>
+</nav>
+
+<h1>🔒 30-seccomp 系统调用过滤</h1>
+<p class="subtitle">给进程套上一个"只能做这几件事"的笼子：BPF 过滤器在每次系统调用入口处做判决 · 约 13 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>上一讲讲的 LSM 是"贴在对象上的标签检查"，这一讲讲的是另一个维度：<b>限制一个进程能发起哪些系统调用</b>。</p>
+<p>想象一个图片处理程序被用户下载运行。它只需要读文件、写文件、退出。但万一这个程序被攻陷（或者本身就是恶意软件），它可能会去 <code>open("/dev/mem")</code> 读物理内存、去 <code>execve("/bin/sh")</code> 起个 shell、外传数据。传统的 UNIX 权限救不了它——因为它本来就有那些文件权限。</p>
+<p>seccomp 的思路是<b>白名单</b>：只列出允许的系统调用，其余一律拒绝或杀死。这叫"默认拒绝"，比"默认允许"安全得多——攻击者必须先突破白名单才能做坏事。</p>
+<p>为什么用 <b>BPF</b>（Berkeley Packet Filter）而不是普通的 C 函数当规则？三个原因：<b>一是无状态</b>——过滤器是一个纯函数式的指令序列，每次系统调用都从头执行一遍，没有"当前处于什么规则中间"的概念，所以不需要加锁、不需要保存上下文，天然线程安全；<b>二是可验证</b>——BPF 指令集只有十来条指令，指令里没有循环（跳转只能向前），所以内核能在加载时静态检查它一定会终止，不会死循环；<b>三是快</b>——解释执行一个几十条指令的小程序，比走一遍复杂策略匹配快得多。</p>
+<p>第三个问题是<b>谁有权设置过滤器</b>。如果任何进程都能随便给自己装过滤器倒还好（限制自己不会更危险），但如果一个低权限进程能给自己装过滤器，然后 fork 出一个高权限子进程——那这个过滤器会"传染"给子进程，反而让子进程权限更受限，这倒不危险。<b>真正危险的是反过来</b>：一个高权限进程 exec 一个低权限程序时，如果低权限程序能预先设置过滤器，就可能阻止高权限程序做某些事（虽然这也不能提权，但会让 setuid 程序行为异常）。</p>
+<p>Linux 的解法是 <b><code>no_new_privs</code></b>：一旦设置了"不允许通过 exec 获得新权限"这个标志，那么后续 exec 出来的程序不会获得任何新权限。因为带 setuid 的程序 exec 后本来会获得 root 权限，现在被禁止获得新权限，就没法利用过滤器做文章。安装过滤器的两条路：<b>要么进程已经设置了 <code>no_new_privs</code>，要么进程拥有 <code>CAP_SYS_ADMIN</code></b>。</p>
+<p>最后是<b>多层过滤器的合成</b>。一个进程可以叠加多个过滤器（每次 <code>seccomp()</code> 调用加一个），内核会<b>全部执行一遍，取最严格的那个结果</b>。这样 Docker 可以加一层全局过滤器，应用自己也可以再加一层，两层取严。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">模式</td><td>mode</td><td>SECCOMP_MODE_DISABLED / STRICT / FILTER 三选一，一旦确定不能改。</td></tr>
+  <tr><td class="term">严格模式</td><td>SECCOMP_MODE_STRICT</td><td>内核硬编码只允许 read、write、exit、rt_sigreturn，其余一律 SIGKILL。</td></tr>
+  <tr><td class="term">过滤器模式</td><td>SECCOMP_MODE_FILTER</td><td>由用户提供的 BPF 程序决定每个系统调用的命运。</td></tr>
+  <tr><td class="term">BPF 指令</td><td>struct sock_filter</td><td>一条 8 字节指令：16 位 opcode + 16 位跳转偏移 + 32 位立即数。</td></tr>
+  <tr><td class="term">过滤器数据</td><td>struct seccomp_data</td><td>BPF 程序能看到的数据：系统调用号、架构、指令指针、6 个参数。</td></tr>
+  <tr><td class="term">判决</td><td>SECCOMP_RET_*</td><td>ALLOW / ERRNO / TRAP / KILL_THREAD / KILL_PROCESS / LOG / TRACE / USER_NOTIF。</td></tr>
+  <tr><td class="term">数据位</td><td>SECCOMP_RET_DATA</td><td>判决值的低 16 位，可以携带 errno 号或传给 tracer 的数据。</td></tr>
+  <tr><td class="term">禁止提权</td><td>no_new_privs</td><td>PR_SET_NO_NEW_PRIVS 设置后，exec 出来的程序不会获得新权限。</td></tr>
+  <tr><td class="term">线程同步</td><td>TSYNC</td><td>安装过滤器时同时给进程的所有线程装上，避免多线程进程有漏网之鱼。</td></tr>
+  <tr><td class="term">系统调用号</td><td>syscall number</td><td>每个系统调用的编号，x86_64 上 read=0、write=1、exit=60。</td></tr>
+  <tr><td class="term">架构</td><td>arch</td><td>BPF 必须先检查 arch 字段，防止 32 位兼容调用绕过规则。</td></tr>
+  <tr><td class="term">陷阱</td><td>SECCOMP_RET_TRAP</td><td>不执行系统调用，而是给进程发 SIGSYS 信号（可装 handler）。</td></tr>
+  <tr><td class="term">用户态通知</td><td>USER_NOTIF</td><td>把系统调用请求转发给用户态守护进程，由它决定是否放行。</td></tr>
+  <tr><td class="term">进程状态字段</td><td>/proc/pid/status</td><td>Seccomp 字段显示模式（0/1/2），Seccomp_filters 显示过滤器个数。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 过滤器在系统调用路径上的位置</h3>
+<pre><code>  用户态：syscall 指令 / libc 包装
+        │
+        ▼
+  架构入口（arch/x86/entry/common.c）
+        │  保存参数到 pt_regs
+        ▼
+  secure_computing()          ← 检查 TIF_SECCOMP 标志
+        │                       没装过滤器 → 直接返回 0，几乎零成本
+        ▼
+  __secure_computing()
+        │
+        ├── mode == STRICT → __secure_computing_strict()
+        │                    只查内核硬编码的四个系统调用白名单
+        │                    不在白名单 → do_exit(SIGKILL)
+        │
+        └── mode == FILTER → __seccomp_filter()
+                              │
+                              ▼
+                        seccomp_run_filters()
+                          遍历当前进程的所有过滤器（从最新到最旧）
+                          每个都执行 bpf_prog_run_pin_on_cpu()
+                          取"动作值最小"的那个作为最终判决
+                              │
+                              ▼
+                        根据判决动作：
+                          ALLOW        → 正常执行系统调用
+                          ERRNO(data)  → 直接返回 -data
+                          TRAP         → 发 SIGSYS
+                          KILL_PROCESS → 整个进程被杀
+                          LOG          → 记录后放行</code></pre>
+
+<h3>3.2 三种模式的对比</h3>
+<table>
+  <tr><th>模式</th><th>值</th><th>允许什么</th><th>用途</th></tr>
+  <tr><td class="term">DISABLED</td><td>0</td><td>什么都不限制</td><td>默认状态</td></tr>
+  <tr><td class="term">STRICT</td><td>1</td><td>只有 read、write、exit、rt_sigreturn</td><td>内核内置的极端沙箱，基本只用于测试</td></tr>
+  <tr><td class="term">FILTER</td><td>2</td><td>由 BPF 程序决定</td><td>实际使用的模式，Docker/systemd 隔离服务都用它</td></tr>
+</table>
+
+<h3>3.3 BPF 过滤器的结构</h3>
+<pre><code>  struct seccomp_data（过滤器唯一能看到的"世界"）
+
+  偏移 0:  nr                 系统调用号
+  偏移 4:  arch               架构（AUDIT_ARCH_X86_64 等）
+  偏移 8:  instruction_pointer 指令指针
+  偏移 16: args[0..5]         6 个 64 位参数
+
+  ┌──────────────────────────────────────────────┐
+  │ 加载 nr:   BPF_LD|BPF_W|BPF_ABS, k=0          │
+  │ 比较:      BPF_JMP|BPF_JEQ|BPF_K, k=1, jt=0   │
+  │            jf=1                                │
+  │ 允许:      BPF_RET|BPF_K, k=SECCOMP_RET_ALLOW  │
+  │ 拒绝:      BPF_RET|BPF_K, k=SECCOMP_RET_ERRNO  │
+  │            | (1&lt;&lt;0)  /* data = EPERM = 1 */   │
+  └──────────────────────────────────────────────┘
+
+  执行流程：从第 0 条指令开始，逐条执行，
+  遇到 BPF_RET 就返回该指令里的 k 值；
+  遇到条件跳转按比较结果跳转到相对偏移处。</code></pre>
+<p>BPF 指令的编码：<code>code</code> 的低 8 位是类别（LD/ST/JMP/ALU/RET/MISC），中间 8 位是操作（ABS/W/H/K 等），高 8 位是跳转偏移的存储方式。<code>jt</code>（真时跳）和 <code>jf</code>（假时跳）各 8 位，<code>k</code> 是 32 位立即数。</p>
+
+<h3>3.4 判决值的编码</h3>
+<pre><code>  高 16 位：动作（action）      低 16 位：数据（data）
+  ┌────────────────┬────────────┐
+  │  action        │   data     │
+  └────────────────┴────────────┘
+
+  动作值大小决定优先级（越小越严格）：
+    0x00000000  KILL_THREAD  ← 最严
+    0x00030000  TRAP
+    0x00050000  ERRNO
+    0x7fc00000  USER_NOTIF
+    0x7ff00000  TRACE
+    0x7ffc0000  LOG
+    0x7fff0000  ALLOW        ← 最宽松
+
+  多过滤器合成时：取 action 最小者</code></pre>
+<p>这个编码很巧妙：<b>把"严格程度"直接编码成数值大小</b>，于是"取最严"就退化成"取最小"，一行比较搞定，不需要额外的优先级表。</p>
+
+<h3>3.5 与其它安全机制的分工</h3>
+<pre><code>  进程要做事
+      │
+      ├─ 能访问这个对象吗？   → LSM（SELinux/AppArmor）+ DAC + capability
+      │
+      ├─ 能发起这个系统调用吗？ → seccomp（本文）
+      │
+      └─ 能看到别人的资源吗？   → namespace（pid/net/mnt/user/ipc/uts/cgroup）
+                                ↑ 与 seccomp 正交：seccomp 管"做什么操作"，
+                                  namespace 管"能看到什么"</code></pre>
+<p>seccomp 与 namespace 的关系：namespace 提供<b>虚拟资源视图</b>（比如 chroot 后看不到外部文件系统，pid namespace 里只看到自己的进程），seccomp 提供<b>操作白名单</b>（哪怕在 chroot 里也不许 execve）。两者互补，容器通常两个都用。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 入口：secure_computing</h3>
+<p>seccomp 的检查点是一个 per-task 的线程标志 <code>TIF_SECCOMP</code>。没装过滤器的进程根本不会走进 seccomp 代码。</p>
+<p class="srcline">include/linux/seccomp.h:42-48</p>
+<pre><code>extern int __secure_computing(const struct seccomp_data *sd);
+static inline int secure_computing(void)
+{
+	if (unlikely(test_thread_flag(TIF_SECCOMP)))
+		return  __secure_computing(NULL);
+	return 0;
+}</code></pre>
+<p><code>unlikely</code> 提示编译器"绝大多数情况不会走进去"，让这条分支预测为不成立。加上 <code>test_thread_flag</code> 是<b>每个线程独立的</b>——多线程程序可以给不同线程装不同的过滤器（只要线程组 leader 装了，其它线程自动继承）。</p>
+<p>真正的分派：</p>
+<p class="srcline">kernel/seccomp.c:1056-1077</p>
+<pre><code>int __secure_computing(const struct seccomp_data *sd)
+{
+	int mode = current-&gt;seccomp.mode;
+	int this_syscall;
+
+	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &amp;&amp;
+	    unlikely(current-&gt;ptrace &amp; PT_SUSPEND_SECCOMP))
+		return 0;
+
+	this_syscall = sd ? sd-&gt;nr :
+		syscall_get_nr(current, current_pt_regs());
+
+	switch (mode) {
+	case SECCOMP_MODE_STRICT:
+		__secure_computing_strict(this_syscall);  /* may call do_exit */
+		return 0;
+	case SECCOMP_MODE_FILTER:
+		return __seccomp_filter(this_syscall, sd, false);
+	default:
+		BUG();
+	}
+}</code></pre>
+<p><code>mode</code> 从 <code>current-&gt;seccomp.mode</code> 读——per-task 字段，不加锁，因为只有自己能改自己的 mode。</p>
+
+<h3>4.2 严格模式：内核硬编码的白名单</h3>
+<p class="srcline">kernel/seccomp.c:783-800</p>
+<pre><code>static void __secure_computing_strict(int this_syscall)
+{
+	const int *allowed_syscalls = mode1_syscalls;
+#ifdef CONFIG_COMPAT
+	if (in_compat_syscall())
+		allowed_syscalls = get_compat_mode1_syscalls();
+#endif
+	do {
+		if (*allowed_syscalls == this_syscall)
+			return;
+	} while (*++allowed_syscalls != -1);
+
+#ifdef SECCOMP_DEBUG
+	dump_stack();
+#endif
+	seccomp_log(this_syscall, SIGKILL, SECCOMP_RET_KILL_THREAD, true);
+	do_exit(SIGKILL);
+}</code></pre>
+<p>白名单 <code>mode1_syscalls</code> 是内核里一张写死的表（seccomp.c:778）：<code>__NR_seccomp_read</code>、<code>__NR_seccomp_write</code>、<code>__NR_seccomp_exit</code>、<code>__NR_seccomp_sigreturn</code>。这些宏在 <code>include/asm-generic/seccomp.h</code> 里定义成 <code>__NR_read</code> / <code>__NR_write</code> / <code>__NR_exit</code> / <code>__NR_rt_sigreturn</code>，即"只允许读写、退出和从信号处理返回"。找不到就 <code>do_exit(SIGKILL)</code>——注意是 SIGKILL，不可捕获。</p>
+<p>严格模式是历史遗留（为 x86 64 移植设计），实际很少用：它连 <code>open</code>、<code>execve</code>、<code>mmap</code> 都不允许，进程几乎什么都干不了。</p>
+
+<h3>4.3 过滤器执行：seccomp_run_filters</h3>
+<p>这是整个 seccomp 的心脏。</p>
+<p class="srcline">kernel/seccomp.c:310-336</p>
+<pre><code>#define ACTION_ONLY(ret) ((s32)((ret) &amp; (SECCOMP_RET_ACTION_FULL)))
+static u32 seccomp_run_filters(const struct seccomp_data *sd,
+			       struct seccomp_filter **match)
+{
+	u32 ret = SECCOMP_RET_ALLOW;
+	/* Make sure cross-thread synced filter points somewhere sane. */
+	struct seccomp_filter *f =
+			READ_ONCE(current-&gt;seccomp.filter);
+
+	/* Ensure unexpected behavior doesn't result in failing open. */
+	if (WARN_ON(f == NULL))
+		return SECCOMP_RET_KILL_PROCESS;
+
+	/*
+	 * All filters in the list are evaluated and the lowest BPF return
+	 * value always takes priority (ignoring the DATA).
+	 */
+	for (; f; f = f-&gt;prev) {
+		u32 cur_ret = bpf_prog_run_pin_on_cpu(f-&gt;prog, sd);
+
+		if (ACTION_ONLY(cur_ret) &lt; ACTION_ONLY(ret)) {
+			ret = cur_ret;
+			*match = f;
+		}
+	}
+	return ret;
+}</code></pre>
+<p>逐点解释：</p>
+<ul>
+<li><code>ret</code> 初值是 <code>SECCOMP_RET_ALLOW</code>（最宽松）。</li>
+<li><code>WARN_ON(f == NULL) → 返回 KILL_PROCESS</code>：<b>fail closed</b>。如果过滤器链表莫名其妙空了，宁可杀掉进程也不能放行——这是安全代码的基本原则。</li>
+<li><code>for (; f; f = f-&gt;prev)</code>：<code>prev</code> 指针指向<b>上一个</b>安装的过滤器。每次安装新过滤器都是头插，所以链表头是<b>最新</b>的。<b>最新装的过滤器先跑</b>——这个顺序很重要，因为最新加的规则通常最具体。</li>
+<li><code>bpf_prog_run_pin_on_cpu(f-&gt;prog, sd)</code>：在当前 CPU 上执行 BPF 程序。返回 32 位判决值。</li>
+<li><code>ACTION_ONLY(cur_ret) &lt; ACTION_ONLY(ret)</code>：<b>只比较动作部分，忽略数据部分</b>。这就是"取最严"的实现——因为动作值编码成越大越宽松（见 3.4），取最小即最严。data 位（errno 号）只在最终选中那个过滤器时生效。</li>
+<li><code>*match = f</code>：记住是哪个过滤器给出的判决，后面 <code>USER_NOTIF</code> 需要用它。</li>
+</ul>
+
+<h3>4.4 判决处理：__seccomp_filter</h3>
+<p class="srcline">kernel/seccomp.c:921-951</p>
+<pre><code>static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
+			    const bool recheck_after_trace)
+{
+	u32 filter_ret, action;
+	struct seccomp_filter *match = NULL;
+	int data;
+	struct seccomp_data sd_local;
+
+	/*
+	 * Make sure that any changes to mode from another thread have
+	 * been seen after TIF_SECCOMP was seen.
+	 */
+	rmb();
+
+	if (!sd) {
+		populate_seccomp_data(&amp;sd_local);
+		sd = &amp;sd_local;
+	}
+
+	filter_ret = seccomp_run_filters(sd, &amp;match);
+	data = filter_ret &amp; SECCOMP_RET_DATA;
+	action = filter_ret &amp; SECCOMP_RET_ACTION_FULL;
+
+	switch (action) {
+	case SECCOMP_RET_ERRNO:
+		/* Set low-order bits as an errno, capped at MAX_ERRNO. */
+		if (data &gt; MAX_ERRNO)
+			data = MAX_ERRNO;
+		syscall_set_return_value(current, current_pt_regs(),
+					 -data, 0);
+		goto skip;</code></pre>
+<p><code>rmb()</code>（读内存屏障）是为了配合安装路径里的 <code>smp_mb__before_atomic()</code>：保证"看到 TIF_SECCOMP 标志"之后，一定能看到已经设置好的 <code>mode</code> 和 <code>filter</code> 指针。这是 seccomp 唯一一处需要内存屏障的地方。</p>
+<p><code>populate_seccomp_data</code> 把当前系统调用的信息填进 <code>seccomp_data</code>：调用号、架构、指令指针、6 个参数。</p>
+<p><code>SECCOMP_RET_ERRNO</code> 的处理很直接：<b>根本不执行这个系统调用</b>，直接把返回值设成 <code>-data</code>（比如 -EPERM）。应用程序会看到一个普通的 errno，而不是知道有 seccomp 存在。</p>
+<p>其它几个动作：</p>
+<ul>
+<li><code>SECCOMP_RET_TRAP</code>：<code>syscall_rollback</code> 恢复寄存器（因为系统调用参数已被破坏），然后 <code>seccomp_send_sigsys</code> 发 SIGSYS 信号。应用可以装 SIGSYS handler 得知"这个系统调用被拒了"。</li>
+<li><code>SECCOMP_RET_TRACE</code>：交给 ptrace tracer（如 gdb、strace）处理。tracer 存在时由它决定；不存在时返回 <code>-ENOSYS</code>（模拟"系统调用不存在"）。</li>
+<li><code>SECCOMP_RET_USER_NOTIF</code>：把请求转发给监听 fd 的用户态进程（用 <code>SECCOMP_IOCTL_NOTIF_RECV</code> 接收，<code>SECCOMP_IOCTL_NOTIF_SEND</code> 回复）。</li>
+<li><code>SECCOMP_RET_LOG</code>：记一条审计日志，但<b>放行</b>。用于"先观察一段时间再收紧"。</li>
+<li><code>SECCOMP_RET_KILL_PROCESS</code>：<b>杀掉整个进程组</b>（不只是调用线程）。这是最狠的动作。</li>
+</ul>
+
+<h3>4.5 BPF 程序的白名单</h3>
+<p>用户提供的 BPF 程序不是随便什么都能干。内核在加载时会检查每一条指令，只允许一小撮安全指令。</p>
+<p class="srcline">kernel/seccomp.c:231-299</p>
+<pre><code>static int seccomp_check_filter(struct sock_filter *filter, unsigned int flen)
+{
+	int pc;
+	for (pc = 0; pc &lt; flen; pc++) {
+		struct sock_filter *ftest = &amp;filter[pc];
+		u16 code = ftest-&gt;code;
+		u32 k = ftest-&gt;k;
+
+		switch (code) {
+		case BPF_LD | BPF_W | BPF_ABS:
+			ftest-&gt;code = BPF_LDX | BPF_W | BPF_ABS;
+			/* 32-bit aligned and not out of bounds. */
+			if (k &gt;= sizeof(struct seccomp_data) || k &amp; 3)
+				return -EINVAL;
+			continue;
+		case BPF_LD | BPF_W | BPF_LEN:
+			ftest-&gt;code = BPF_LD | BPF_IMM;
+			ftest-&gt;k = sizeof(struct seccomp_data);
+			continue;
+		case BPF_LDX | BPF_W | BPF_LEN:
+			ftest-&gt;code = BPF_LDX | BPF_IMM;
+			ftest-&gt;k = sizeof(struct seccomp_data);
+			continue;
+		/* Explicitly include allowed calls. */
+		case BPF_RET | BPF_K:
+		case BPF_RET | BPF_A:
+		case BPF_ALU | BPF_ADD | BPF_K:
+		case BPF_ALU | BPF_ADD | BPF_X:
+		case BPF_ALU | BPF_SUB | BPF_K:
+		case BPF_ALU | BPF_SUB | BPF_X:
+		case BPF_ALU | BPF_MUL | BPF_K:
+		case BPF_ALU | BPF_MUL | BPF_X:
+		case BPF_ALU | BPF_DIV | BPF_K:
+		case BPF_ALU | BPF_DIV | BPF_X:
+		case BPF_ALU | BPF_AND | BPF_K:
+		case BPF_ALU | BPF_AND | BPF_X:
+		case BPF_ALU | BPF_OR | BPF_K:
+		case BPF_ALU | BPF_OR | BPF_X:
+		case BPF_ALU | BPF_XOR | BPF_K:
+		case BPF_ALU | BPF_XOR | BPF_X:
+		case BPF_ALU | BPF_LSH | BPF_K:
+		case BPF_ALU | BPF_LSH | BPF_X:
+		case BPF_ALU | BPF_RSH | BPF_K:
+		case BPF_ALU | BPF_RSH | BPF_X:
+		case BPF_ALU | BPF_NEG:
+		case BPF_LD | BPF_IMM:
+		case BPF_LDX | BPF_IMM:
+		case BPF_MISC | BPF_TAX:
+		case BPF_MISC | BPF_TXA:
+		case BPF_LD | BPF_MEM:
+		case BPF_LDX | BPF_MEM:
+		case BPF_ST:
+		case BPF_STX:
+		case BPF_JMP | BPF_JA:
+		case BPF_JMP | BPF_JEQ | BPF_K:
+		case BPF_JMP | BPF_JEQ | BPF_X:
+		case BPF_JMP | BPF_JGE | BPF_K:
+		case BPF_JMP | BPF_JGE | BPF_X:
+		case BPF_JMP | BPF_JGT | BPF_K:
+		case BPF_JMP | BPF_JGT | BPF_X:
+		case BPF_JMP | BPF_JSET | BPF_K:
+		case BPF_JMP | BPF_JSET | BPF_X:
+			continue;
+		default:
+			return -EINVAL;
+		}
+	}
+	return 0;
+}</code></pre>
+<p>白名单里的指令分三类：<b>加载</b>（从 seccomp_data 里读数据、读立即数、读写 BPF 自己的 16 个暂存寄存器）、<b>算术</b>（加减乘除位运算）、<b>跳转</b>（无条件跳转和条件跳转）、<b>返回</b>。<b>没有任何"写内存到任意地址"的能力</b>——最危险的一类指令被排除了。</p>
+<p>注意 <code>BPF_LD|BPF_W|BPF_ABS</code> 被<b>改写成</b> <code>BPF_LDX|BPF_W|BPF_ABS</code>：强制要求先加载到寄存器 X 而不是 A，这是 cBPF→eBPF 转换的遗留（避免"隐式累加器"带来的状态混淆）。</p>
+
+<h3>4.6 安装过滤器：no_new_privs 检查</h3>
+<p class="srcline">kernel/seccomp.c:543-575</p>
+<pre><code>static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
+{
+	struct seccomp_filter *sfilter;
+	int ret;
+	const bool save_orig = IS_ENABLED(CONFIG_CHECKPOINT_RESTORE);
+
+	if (fprog-&gt;len == 0 || fprog-&gt;len &gt; BPF_MAXINSNS)
+		return ERR_PTR(-EINVAL);
+
+	BUG_ON(INT_MAX / fprog-&gt;len &lt; sizeof(struct sock_filter));
+
+	/*
+	 * Installing a seccomp filter requires that the task has
+	 * CAP_SYS_ADMIN in its namespace or be running with no_new_privs.
+	 * This avoids scenarios where unprivileged tasks can affect the
+	 * behavior of privileged children.
+	 */
+	if (!task_no_new_privs(current) &amp;&amp;
+			!ns_capable_noaudit(current_user_ns(), CAP_SYS_ADMIN))
+		return ERR_PTR(-EACCES);
+
+	/* Allocate a new seccomp_filter */
+	sfilter = kzalloc(sizeof(*sfilter), GFP_KERNEL | __GFP_NOWARN);
+	if (!sfilter)
+		return ERR_PTR(-ENOMEM);
+
+	mutex_init(&amp;sfilter-&gt;notify_lock);
+	ret = bpf_prog_create_from_user(&amp;sfilter-&gt;prog, fprog,
+					seccomp_check_filter, save_orig);
+	if (ret &lt; 0) {
+		kfree(sfilter);
+		return ERR_PTR(ret);
+	}</code></pre>
+<p><code>!task_no_new_privs(current) &amp;&amp; !ns_capable_noaudit(..., CAP_SYS_ADMIN)</code> 是核心的授权判断：<b>两个条件都不满足才拒绝</b>。也就是说，有 <code>CAP_SYS_ADMIN</code> 的进程可以无视 <code>no_new_privs</code> 直接装过滤器（root 就是这样）。</p>
+<p><code>ns_capable_noaudit</code> 用的是 <code>current_user_ns()</code>——在用户命名空间里检查能力，这正是容器里能装 seccomp 的原因（容器内 root 在自己的 user ns 里对 <code>CAP_SYS_ADMIN</code> 有权限）。</p>
+<p><code>bpf_prog_create_from_user</code> 的第三个参数是 <code>seccomp_check_filter</code>——把用户的 BPF 程序交给检查回调逐条验证，不合法的直接拒绝安装。</p>
+
+<h3>4.7 prctl 接口</h3>
+<p class="srcline">kernel/seccomp.c:1717-1743</p>
+<pre><code>long prctl_set_seccomp(unsigned long seccomp_mode, void __user *filter)
+{
+	unsigned int op;
+	void __user *uargs;
+
+	switch (seccomp_mode) {
+	case SECCOMP_MODE_STRICT:
+		op = SECCOMP_SET_MODE_STRICT;
+		/*
+		 * Setting strict mode through prctl always ignored filter,
+		 * so make sure it is always NULL here to pass the internal
+		 * check in do_seccomp().
+		 */
+		uargs = NULL;
+		break;
+	case SECCOMP_MODE_FILTER:
+		op = SECCOMP_SET_MODE_FILTER;
+		uargs = filter;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/* prctl interface doesn't have flags, so they are always zero. */
+	return do_seccomp(op, 0, uargs);
+}</code></pre>
+<p><code>prctl(PR_SET_SECCOMP, ...)</code> 是老接口，<b>没有 flags 参数</b>（所以装不了 TSYNC、NEW_LISTENER）。新接口是 <code>seccomp(SECCOMP_SET_MODE_FILTER, flags, prog)</code> 系统调用。</p>
+<p>而 <code>prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)</code> 设置禁止提权标志，它的实现在 <code>kernel/sys.c:2443</code>：</p>
+<p class="srcline">kernel/sys.c:2443-2448</p>
+<pre><code>	case PR_SET_NO_NEW_PRIVS:
+		if (arg2 != 1 || arg3 || arg4 || arg5)
+			return -EINVAL;
+
+		task_set_no_new_privs(current);
+		break;</code></pre>
+<p><code>arg2</code> 必须严格等于 1，其余参数必须为 0——<b>这个标志一旦设置就永远不能清除</b>，且会继承给子进程。</p>
+
+<h3>4.8 观察状态：/proc/pid/status</h3>
+<p class="srcline">fs/proc/array.c:339-346</p>
+<pre><code>static inline void task_seccomp(struct seq_file *m, struct task_struct *p)
+{
+	seq_put_decimal_ull(m, "NoNewPrivs:\t", task_no_new_privs(p));
+#ifdef CONFIG_SECCOMP
+	seq_put_decimal_ull(m, "\nSeccomp:\t", p-&gt;seccomp.mode);
+	seq_put_decimal_ull(m, "\nSeccomp_filters:\t",
+			    atomic_read(&amp;p-&gt;seccomp.filter_count));
+#endif</code></pre>
+<p><code>Seccomp</code> 字段的值就是 mode：0=未启用，1=STRICT，2=FILTER。<code>Seccomp_filters</code> 是过滤器个数——每调一次 <code>seccomp()</code> 加一个，<b>多层取严</b>的效果就体现在这里。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 写一个只允许 write/exit 的最小程序</h3>
+<p>下面是完整的 C 程序，用 libseccomp 之外的纯 BPF 方式实现，方便在没有额外依赖的环境里跑：</p>
+<pre><code>// seccomp_demo.c —— 只允许 write 和 exit_group
+#include stdio.h
+#include stdlib.h
+#include string.h
+#include unistd.h
+#include linux/filter.h
+#include linux/seccomp.h
+#include linux/audit.h
+#include sys/prctl.h
+#include sys/syscall.h
+#include errno.h
+
+#define SCMP_ACT(x) (x)
+#define SCMP_ALLOW   SCMP_ACT(SECCOMP_RET_ALLOW)
+#define SCMP_ERRNO(x) SCMP_ACT(SECCOMP_RET_ERRNO | (x  SECCOMP_RET_DATA))
+
+int main(void)
+{
+    /* BPF 指令序列：
+     *   0: 加载 seccomp_data.nr（偏移 0）
+     *   1: 如果等于 __NR_write  → 跳到 6（ALLOW）
+     *   2: 如果等于 __NR_exit_group → 跳到 6（ALLOW）
+     *   3: 如果等于 __NR_exit → 跳到 6（ALLOW）
+     *   4: 返回 ERRNO(EPERM)
+     *   6: 返回 ALLOW
+     */
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SCMP_ERRNO(EPERM)),
+        BPF_STMT(BPF_RET | BPF_K, SCMP_ALLOW),
+    };
+    struct sock_fprog prog = {
+        .len = sizeof(filter) / sizeof(filter[0]),
+        .filter = filter,
+    };
+
+    /* 1. 禁止提权，这样不需要 root 也能装过滤器 */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)  0) {
+        perror("prctl(NO_NEW_PRIVS)");
+        return 1;
+    }
+
+    /* 2. 装过滤器 */
+    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, prog)  0) {
+        perror("seccomp");
+        return 1;
+    }
+
+    /* 3. 现在只有 write / exit / exit_group 可用 */
+    write(1, "write 成功\n", 10);
+
+    /* 4. 尝试 open()，应该返回 EPERM */
+    int fd = open("/etc/passwd", 0);
+    printf("open 返回 %d, errno=%d (%s)\n", fd, errno, strerror(errno));
+
+    /* 5. 尝试 fork()，应该返回 EPERM */
+    pid_t p = fork();
+    printf("fork 返回 %d, errno=%d (%s)\n", (int)p, errno, strerror(errno));
+
+    return 0;
+}</code></pre>
+<p>编译运行：</p>
+<pre><code>gcc -O2 -Wall -o seccomp_demo seccomp_demo.c
+./seccomp_demo
+# 预期输出：
+# write 成功
+# open 返回 -1, errno=1 (Operation not permitted)
+# fork 返回 -1, errno=1 (Operation not permitted)</code></pre>
+<p><b>注意</b>：<code>printf</code> 内部可能会调用 <code>write</code>（允许）和 <code>newfstatat</code>（<b>不允许</b>）——glibc 的 printf 会先 fstat 判断是终端还是管道。所以严格来说应该把 <code>newfstatat</code> 也加进白名单，或者用 <code>write</code> 直接输出。上面的代码在多数情况下 printf 仍能工作（因为 stdout 已缓存时不需要 fstat），但更稳妥的写法是全部用 <code>write</code>。</p>
+
+<h3>5.2 用 libseccomp 写同样的东西（更简洁）</h3>
+<pre><code>// 需要 libseccomp-dev
+#include seccomp.h
+#include stdio.h
+#include unistd.h
+#include errno.h
+
+int main(void)
+{
+    scmp_filter_ctx ctx;
+    seccomp_init(ctx);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(open), 0);
+    seccomp_load(ctx);          /* 内部会先 prctl(PR_SET_NO_NEW_PRIVS) */
+    write(1, "OK\n", 3);
+    printf("open=%d errno=%d\n", open("/etc/passwd", 0), errno);
+    return 0;
+}
+# gcc -o demo2 demo2.c -lseccomp &amp;&amp; ./demo2</code></pre>
+
+<h3>5.3 检查状态</h3>
+<pre><code>cat /proc/self/status | grep -i seccomp
+# Seccomp:        2
+# Seccomp_filters: 1
+
+# 看别的进程
+grep -i seccomp /proc/1/status
+grep -i seccomp /proc/$$/status
+
+# NoNewPrivs 也是这里看
+grep NoNewPrivs /proc/self/status
+# NoNewPrivs:   0</code></pre>
+<p><code>Seccomp: 2</code> 表示 FILTER 模式，<code>Seccomp_filters: 1</code> 表示装了一个过滤器。</p>
+
+<h3>5.4 用 strace 观察过滤器的判决</h3>
+<pre><code>strace -f -e trace=openat,write ./seccomp_demo
+# openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = -1 EPERM (Operation not permitted)
+# 注意：不是 SIGSYS，而是普通的 EPERM 返回值</code></pre>
+<p>如果用 <code>SECCOMP_RET_TRAP</code> 代替 <code>ERRNO</code>，strace 会显示进程收到 <code>SIGSYS</code>：</p>
+<pre><code>strace -f ./demo_trap
+# --- SIGSYS ---si_pid=0, si_code=1 (SYS_SECCOMP) ---
+# +++ killed by SIGSYS +++</code></pre>
+
+<h3>5.5 看容器用了什么过滤器</h3>
+<pre><code>docker run --rm alpine sh -c 'grep -i seccomp /proc/self/status'
+# Seccomp:        2
+# Seccomp_filters: 1
+
+# Docker 默认的过滤器可以导出成 JSON
+docker run --rm alpine cat /proc/self/status | grep Seccomp
+# 查看 Docker 的默认 seccomp profile
+cat /etc/docker/seccomp.json 2&gt;/dev/null | head -30
+
+# 对比：关闭 seccomp
+docker run --rm --security-opt seccomp=unconfined alpine \
+  sh -c 'grep -i seccomp /proc/self/status'
+# Seccomp:        0</code></pre>
+
+<h3>5.6 用 strace 直接看内核的过滤器</h3>
+<pre><code># 查看当前进程的 seccomp 过滤器（需要 CONFIG_SECCOMP_FILTER + 权限）
+grep Seccomp /proc/self/status
+# 通过 /proc/PID/seccomp_filters 或者 bpftool 也可以
+bpftool prog list                    # 列出所有 BPF 程序
+bpftool prog dump id 42              # 反汇编过滤器
+bpftool map dump id 43 name seccomp_data
+# 可以看到内核里 seccomp 过滤器被挂在一个 BPF map 上</code></pre>
+
+<h3>5.7 qemu + busybox 最小实验</h3>
+<pre><code>make defconfig
+scripts/config --enable CONFIG_SECCOMP --enable CONFIG_SECCOMP_FILTER
+make -j$(nproc)
+
+wget https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox
+chmod +x busybox &amp;&amp; ./busybox --install -h initramfs
+qemu-system-x86_64 -kernel arch/x86/boot/bzImage -initrd initramfs \
+  -append "console=ttyS0" -nographic
+
+# 客控台里
+cat /proc/self/status | grep -i seccomp
+# Seccomp:        0
+
+# 用 busybox 的 strace 观察（如果编进了）
+strace -e trace=open /bin/ls 21 | head</code></pre>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. seccomp 的三种模式分别是什么？</b>DISABLED(0) 不限制；STRICT(1) 内核硬编码只允许 read、write、exit、rt_sigreturn，其余 SIGKILL；FILTER(2) 由用户提供的 BPF 程序决定每个系统调用的命运。</div>
+<div class="qa"><b>Q2. 多个过滤器同时存在时怎么合成？</b>全部执行一遍，每个过滤器的判决按"动作部分"比较（ACTION_ONLY 掩掉数据位），取动作值最小的那个。因为动作编码成越严越小，所以取最小即取最严。</div>
+<div class="qa"><b>Q3. 为什么安装 seccomp 过滤器需要 no_new_privs 或 CAP_SYS_ADMIN？</b>防止低权限进程给自己装过滤器后 exec 出一个高权限的 setuid 程序，导致那个高权限程序的行为被过滤器限制（甚至被用来规避某些检查）。no_new_privs 保证 exec 不会带来新权限。</div>
+<div class="qa"><b>Q4. seccomp_run_filters 里为什么要用 WARN_ON(f == NULL) 返回 KILL_PROCESS？</b>fail closed 原则。过滤器链表异常为空时若返回 ALLOW 就是"失效即放行"（fail open），是最危险的行为。宁可误杀也不能放行。</div>
+<div class="qa"><b>Q5. BPF 程序为什么不能有向后跳转？</b>向后跳转会形成循环，可能永不终止，导致系统调用 hang 死。BPF 只允许向前跳转，保证一定终止，内核在加载时（seccomp_check_filter）也只放行 BPF_JMP|BPF_JA 和条件跳转这些向前跳的指令。</div>
+<div class="qa"><b>Q6. SECCOMP_RET_ERRNO 和 SECCOMP_RET_TRAP 的区别？</b>ERRNO 直接把系统调用返回值设为 -data（如 -EPERM），系统调用根本不执行，应用看不出有 seccomp；TRAP 会发 SIGSYS 信号，应用可以装 handler 得知被拒的具体系统调用号（SIGSYS 的 si_syscall 字段）。</div>
+<div class="qa"><b>Q7. 怎么知道某个进程装了 seccomp 过滤器？</b>cat /proc/PID/status，看 Seccomp 字段（0/1/2 表示模式）和 Seccomp_filters 字段（过滤器个数）。</div>
+<div class="qa"><b>Q8. seccomp 和 namespace 是什么关系？</b>正交互补。namespace 管"能看到什么"（隔离文件、进程、网络视图），seccomp 管"能做什么操作"（限制系统调用集合）。容器通常两者并用。</div>
+
+<footer>
+  <p>上一篇：<a href="29-lsm.html">29-lsm 安全模块框架</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="31-kvm.html">31-kvm 虚拟化</a></p>
+</footer>
+
+</body>
+</html>

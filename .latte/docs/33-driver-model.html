@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>33 设备模型：bus / device / driver</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="34-char-dev.html">下一篇：34-char-dev 字符设备 →</a>
+</nav>
+
+<h1>🔌 设备模型：bus / device / driver</h1>
+<p class="subtitle">内核怎么「发现」硬件、怎么找到对的驱动、怎么把两者绑起来 · 预计阅读 11 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>搬家时最烦的不是搬东西，而是「这箱东西该放哪个房间」。如果所有箱子都堆在客厅，你每次找锅都要翻一遍全部家当。聪明的做法是：每个房间门口挂一块牌子写「厨房」「书房」，箱子外面贴着用途标签，你只要把标签和门口牌子对上一放——各就各位。</p>
+<p>Linux 内核面对的问题一模一样：机器上可能有 PCI 网卡、USB 键盘、I2C 温度传感器、platform 串口……如果每个驱动都在启动时挨个探测「这个设备是不是我的」，代码会乱到无法维护。于是内核抽象出一个统一的<span class="term">设备模型</span>（device model）：</p>
+<ul>
+  <li><span class="term">bus</span>（总线）是「房间」，负责定义这套设备的匹配规则（<code>match</code>）；</li>
+  <li><span class="term">device</span>（设备）是「箱子」，描述自己是什么（名字、资源、设备树节点）；</li>
+  <li><span class="term">driver</span>（驱动）是「管家」，声明自己能照顾哪类箱子，并提供 <code>probe</code>/<code>remove</code>。</li>
+</ul>
+<p>三者一旦对上，内核就调用驱动的 <code>probe()</code>，把设备的所有权交出去。这个过程叫<span class="term">绑定</span>（bind）。此外这个模型还统一解决了热插拔、电源管理、sysfs 呈现（<code>/sys/bus/pci/devices/...</code>）、驱动延迟探测依赖等横切需求。</p>
+<p>为什么必须有它？因为设备种类与驱动数量是「多对多」：一块网卡芯片可能被两个驱动支持，一个驱动可能服务几十种型号。没有统一的匹配框架，就只能写死判断链，既不能并行探测，也无法在设备热插入时自动找到驱动。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">总线</td><td>bus_type</td><td>设备与驱动的「介绍人」，提供 <code>match</code>/<code>probe</code> 等钩子</td></tr>
+  <tr><td class="term">设备</td><td>struct device</td><td>一个具体硬件的内核表示，包含名字、所属总线、父设备、驱动指针</td></tr>
+  <tr><td class="term">驱动</td><td>struct device_driver</td><td>一段能驱动某类设备的代码，包含匹配表和 probe/remove</td></tr>
+  <tr><td class="term">匹配</td><td>match</td><td>总线提供的函数，判断「这个设备」与「这个驱动」是否是一对</td></tr>
+  <tr><td class="term">探测</td><td>probe</td><td>匹配成功后调用驱动初始化硬件；成功即绑定</td></tr>
+  <tr><td class="term">解绑</td><td>unbind / remove</td><td>驱动停止服务该设备，释放资源</td></tr>
+  <tr><td class="term">延迟探测</td><td>-EPROBE_DEFER</td><td>probe 返回它表示「我依赖的资源还没就绪」，内核稍后重试</td></tr>
+  <tr><td class="term">设备树</td><td>Device Tree / DT</td><td>由 bootloader 传给的硬件描述，节点里有 <code>compatible</code> 属性</td></tr>
+  <tr><td class="term">compatible</td><td>compatible 字符串</td><td>设备树里「我是谁」的标识，如 <code>"arm,sbsa-uart"</code>，用于匹配</td></tr>
+  <tr><td class="term">OF 匹配表</td><td>of_match_table</td><td>驱动里声明的 <code>of_device_id</code> 数组，按 compatible 匹配</td></tr>
+  <tr><td class="term">平台设备</td><td>platform_device</td><td>不挂在真实物理总线上的片上外设（UART、I2C、GPIO 控制器等）</td></tr>
+  <tr><td class="term">平台总线</td><td>platform_bus_type</td><td>虚拟总线，专为「不可枚举的片上设备」提供匹配框架</td></tr>
+  <tr><td class="term">kobject</td><td>kobject</td><td>设备模型的基础引用计数对象，负责在 sysfs 中占据一个目录</td></tr>
+  <tr><td class="term">kset</td><td>kset</td><td>kobject 的集合，对应 sysfs 的一个目录簇（如 <code>/sys/bus/</code>）</td></tr>
+  <tr><td class="term">驱动数据</td><td>driver_data / drvdata</td><td><code>device</code> 里的 <code>void *</code>，驱动私放自己的结构指针</td></tr>
+  <tr><td class="term">supplier/consumer</td><td>device link</td><td>设备间依赖关系，保证「供电/时钟就绪后再 probe」</td></tr>
+  <tr><td class="term">uevent</td><td>kobject_uevent</td><td>向用户态广播「设备来了/走了」，udev 据此创建设备节点</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<h3>3.1 三角关系</h3>
+<pre><code>
+                    ┌──────────────────────────────────────────┐
+                    │            bus_type（总线）              │
+                    │  .name = "platform" / "pci" / "i2c" ...  │
+                    │  .match(dev, drv) → 1 匹配 / 0 不匹配    │
+                    │  .probe / .remove（可选的通用钩子）      │
+                    └───────────┬──────────────────┬───────────┘
+                                │                  │
+          ┌─────────────────────▼──────┐    ┌──────▼─────────────────────┐
+          │ struct device              │    │ struct device_driver       │
+          │  .kobj（sysfs 目录）       │    │  .name                     │
+          │  .bus   ────────────────┐  │    │  .bus  ────────────────┐   │
+          │  .driver ───────────────┼──┼────┼─►  .of_match_table     │   │
+          │  .parent（设备树/总线层次）│  │    │  .probe(dev)           │   │
+          │  .driver_data（私货）    │    │    │  .remove(dev)          │   │
+          └────────────┬───────────┘    │    └────────────────────────┘
+                       │                │
+                       │ device_add()   │ driver_register()
+                       ▼                ▼
+              /sys/devices/...      /sys/bus/&lt;bus&gt;/drivers/&lt;drv&gt;/
+                       │                │
+                       └────── 匹配成功后建立符号链接 ───────┘
+                       /sys/bus/&lt;bus&gt;/devices/&lt;dev&gt; -&gt; driver
+                       /sys/bus/&lt;bus&gt;/drivers/&lt;drv&gt;/&lt;dev&gt; -&gt; device
+</code></pre>
+
+<h3>3.2 匹配与绑定的流程图</h3>
+<pre><code>
+ 设备出现                          驱动加载
+ device_register()                driver_register()
+      │                                  │
+      ▼                                  ▼
+  device_add()                     bus_add_driver()
+      │                                  │
+      └──────────────┬───────────────────┘
+                     ▼
+          driver_match_device(drv, dev)     ← bus-&gt;match()
+                     │
+           ┌─────────┴─────────┐
+     返回 0（不匹配）      返回 &gt;0（匹配）
+           │                   │
+           ▼                   ▼
+        跳过          really_probe(dev, drv)
+                              │
+                              ├─ pinctrl_bind_pins / dma_configure
+                              ├─ driver_sysfs_add（建 sysfs 链接）
+                              ├─ drv-&gt;probe(dev)  ──► 成功？
+                              │        │
+                              │        ├─ 返回 0  → driver_bound() → 绑定完成
+                              │        ├─ -EPROBE_DEFER → 挂到延迟探测链表，稍后重试
+                              │        └─ 其它错误 → 解绑清理，打印 "probe failed"
+                              └─ 失败时 devres_release_all() 释放 devm_* 资源
+</code></pre>
+<p>关键设计：<strong>设备注册和驱动注册是两条独立的路径，任何一方先到都会主动去找对方</strong>。设备先到，<code>device_add</code> 会遍历该总线上的所有驱动；驱动先到，<code>driver_register</code> 会遍历已有设备。这样驱动可以编成模块按需加载，不必关心加载顺序。</p>
+
+<h3>3.3 sysfs 呈现</h3>
+<p>每注册一个对象，就在 <code>/sys</code> 里多出一套目录和符号链接，让用户态能看见「谁绑了谁」：</p>
+<pre><code>
+/sys/bus/platform/
+├── devices/              ← 所有平台设备（含到 /sys/devices/... 的链接）
+├── drivers/              ← 所有平台驱动
+│   ├── sbsa-uart/
+│   │   ├── bind          ← echo 设备名 &gt; bind  可手动绑定
+│   │   ├── unbind        ← 手动解绑
+│   │   └── a0010000.uart -&gt; ../../../../devices/platform/a0010000.uart
+└── drivers_autoprobe     ← 1：注册即自动匹配
+</code></pre>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 三个结构体的骨架</h3>
+<p>总线最重要的字段是 <code>match</code>，驱动最重要的是 <code>of_match_table</code> 与 <code>probe</code>，设备最重要的是 <code>kobj</code>（sysfs 身份）、<code>bus</code>、<code>driver</code> 与 <code>driver_data</code>。</p>
+<p class="srcline">include/linux/device/bus.h:82-95 &amp; include/linux/device/driver.h:95-110</p>
+<pre><code>struct bus_type {
+	const char		*name;
+	const char		*dev_name;
+	struct device		*dev_root;
+	const struct attribute_group **bus_groups;
+	const struct attribute_group **dev_groups;
+	const struct attribute_group **drv_groups;
+
+	int (*match)(struct device *dev, struct device_driver *drv);
+	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
+	int (*probe)(struct device *dev);
+	void (*sync_state)(struct device *dev);
+	int (*remove)(struct device *dev);
+	void (*shutdown)(struct device *dev);
+    // ...（省略：online/offline/suspend/resume、dev_pm_ops、subsys_private *p）</code></pre>
+<p class="srcline">include/linux/device.h:461-479  struct device</p>
+<pre><code>struct device {
+	struct kobject kobj;
+	struct device		*parent;
+
+	struct device_private	*p;
+
+	const char		*init_name; /* initial name of the device */
+	const struct device_type *type;
+
+	struct bus_type	*bus;		/* type of bus device is on */
+	struct device_driver *driver;	/* which driver has allocated this
+					   device */
+	void		*platform_data;	/* Platform specific data, device
+					   core doesn't touch it */
+	void		*driver_data;	/* Driver data, set and get with
+					   dev_set_drvdata/dev_get_drvdata */
+    // ...（省略：mutex、dev_links_info、pm_info、of_node、dma 参数、release 回调等）</code></pre>
+<p>注意第一个成员就是 <code>struct kobject kobj</code>——这是 Linux 内核常见的「嵌入基类」手法，<code>container_of</code> 可以从 kobject 反推回 device。<code>driver_data</code> 是驱动的私货口袋，驱动通常这样用：</p>
+<pre><code>struct my_chip *chip = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*chip), GFP_KERNEL);
+platform_set_drvdata(pdev, chip);   /* 等价于 dev_set_drvdata(&amp;pdev-&gt;dev, chip) */
+/* 之后任何拿到 device 的地方： */
+struct my_chip *chip = dev_get_drvdata(dev);</code></pre>
+
+<h3>4.2 驱动注册：先挂到总线下，再广播</h3>
+<p><code>driver_register</code> 做四件事：检查总线是否已初始化、防止旧式 API 混用、查重名，然后 <code>bus_add_driver</code> 把它挂上总线，最后 <code>kobject_uevent</code> 通知 udev。</p>
+<p class="srcline">drivers/base/driver.c:147-182  driver_register</p>
+<pre><code>int driver_register(struct device_driver *drv)
+{
+	int ret;
+	struct device_driver *other;
+
+	if (!drv-&gt;bus-&gt;p) {
+		pr_err("Driver '%s' was unable to register with bus_type '%s' because the bus was not initialized.\n",
+			   drv-&gt;name, drv-&gt;bus-&gt;name);
+		return -EINVAL;
+	}
+
+	if ((drv-&gt;bus-&gt;probe &amp;&amp; drv-&gt;probe) ||
+	    (drv-&gt;bus-&gt;remove &amp;&amp; drv-&gt;remove) ||
+	    (drv-&gt;bus-&gt;shutdown &amp;&amp; drv-&gt;shutdown))
+		pr_warn("Driver '%s' needs updating - please use "
+			"bus_type methods\n", drv-&gt;name);
+
+	other = driver_find(drv-&gt;name, drv-&gt;bus);
+	if (other) {
+		pr_err("Error: Driver '%s' is already registered, "
+			"aborting...\n", drv-&gt;name);
+		return -EBUSY;
+	}
+
+	ret = bus_add_driver(drv);
+	if (ret)
+		return ret;
+	ret = driver_add_groups(drv, drv-&gt;groups);
+	if (ret) {
+		bus_remove_driver(drv);
+		return ret;
+	}
+	kobject_uevent(&amp;drv-&gt;p-&gt;kobj, KOBJ_ADD);
+
+	return ret;
+}</code></pre>
+<p><code>bus_add_driver</code> 是关键：它把驱动加入 <code>bus-&gt;p-&gt;klist_drivers</code>，若 <code>drivers_autoprobe</code> 为真就立刻调 <code>driver_attach(drv)</code>，遍历该总线所有设备尝试绑定。<code>drv-&gt;bus-&gt;p</code> 为 NULL 的报错非常常见——那通常意味着驱动的 <code>bus</code> 字段没填，或总线本身还没 <code>bus_register</code>。</p>
+
+<h3>4.3 总线注册：sysfs 的目录骨架</h3>
+<p><code>bus_register</code> 先把一个 <code>subsys_private</code> 塞进 <code>bus-&gt;p</code>，再注册 sysfs 的 subsystem 目录，并创建 <code>devices/</code> 与 <code>drivers/</code> 两个子 kset。</p>
+<p class="srcline">drivers/base/bus.c:802-840  bus_register（节选）</p>
+<pre><code>int bus_register(struct bus_type *bus)
+{
+	int retval;
+	struct subsys_private *priv;
+	struct lock_class_key *key = &amp;bus-&gt;lock_key;
+
+	priv = kzalloc(sizeof(struct subsys_private), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv-&gt;bus = bus;
+	bus-&gt;p = priv;
+
+	BLOCKING_INIT_NOTIFIER_HEAD(&amp;priv-&gt;bus_notifier);
+
+	retval = kobject_set_name(&amp;priv-&gt;subsys.kobj, "%s", bus-&gt;name);
+	if (retval)
+		goto out;
+
+	priv-&gt;subsys.kobj.kset = bus_kset;
+	priv-&gt;subsys.kobj.ktype = &amp;bus_ktype;
+	priv-&gt;drivers_autoprobe = 1;
+
+	retval = kset_register(&amp;priv-&gt;subsys);
+	if (retval)
+		goto out;
+    // ...（省略：uevent 属性、devices_kset / drivers_kset 创建、总线属性组）</code></pre>
+<p><code>drivers_autoprobe = 1</code> 就是「注册即匹配」的开关，对应 sysfs 的 <code>drivers_autoprobe</code> 文件。<code>ktype</code> 决定这个 sysfs 目录暴露哪些属性（比如 <code>uevent</code>）。</p>
+
+<h3>4.4 设备注册与 really_probe 的实质</h3>
+<p><code>device_register</code> 只是 <code>device_initialize</code> + <code>device_add</code> 的两步包装（后者做 kobject_add、uevent、属性、symlink，并触发与驱动的匹配）。真正把「设备交给驱动」的是 <code>really_probe</code>：</p>
+<p class="srcline">drivers/base/dd.c:494-562  really_probe（节选）</p>
+<pre><code>static int really_probe(struct device *dev, struct device_driver *drv)
+{
+	int ret = -EPROBE_DEFER;
+	int local_trigger_count = atomic_read(&amp;deferred_trigger_count);
+	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &amp;&amp;
+			   !drv-&gt;suppress_bind_attrs;
+
+	if (defer_all_probes) {
+		/* ...（省略：device_block_probing() 时强制延迟） */
+		dev_dbg(dev, "Driver %s force probe deferral\n", drv-&gt;name);
+		driver_deferred_probe_add(dev);
+		return ret;
+	}
+
+	ret = device_links_check_suppliers(dev);
+	if (ret == -EPROBE_DEFER)
+		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+	if (ret)
+		return ret;
+
+	atomic_inc(&amp;probe_count);
+	pr_debug("bus: '%s': %s: probing driver %s with device %s\n",
+		 drv-&gt;bus-&gt;name, __func__, drv-&gt;name, dev_name(dev));
+	if (!list_empty(&amp;dev-&gt;devres_head)) {
+		dev_crit(dev, "Resources present before probing\n");
+		ret = -EBUSY;
+		goto done;
+	}
+
+re_probe:
+	dev-&gt;driver = drv;
+
+	/* If using pinctrl, bind pins now before probing */
+	ret = pinctrl_bind_pins(dev);
+	if (ret)
+		goto pinctrl_bind_failed;
+    // ...（省略：dma_configure、driver_sysfs_add、pm_domain activate）
+	if (dev-&gt;bus-&gt;probe) {
+		ret = dev-&gt;bus-&gt;probe(dev);
+		if (ret)
+			goto probe_failed;
+	} else if (drv-&gt;probe) {
+		ret = drv-&gt;probe(dev);
+		if (ret)
+			goto probe_failed;
+	}</code></pre>
+<p>几个值得记住的点：</p>
+<ul>
+  <li><code>device_links_check_suppliers</code> 检查「供电/时钟等供应商设备」是否已就绪，未就绪就返回 <code>-EPROBE_DEFER</code>。</li>
+  <li><code>!list_empty(&amp;dev-&gt;devres_head)</code> 的 <code>dev_crit</code>：probe 开始前不该有任何 devm 资源，否则说明上次清理不干净。</li>
+  <li><strong>优先调用 <code>bus-&gt;probe</code>，其次 <code>drv-&gt;probe</code></strong>。新式写法用 bus 层统一包装（例如 platform bus 的 <code>platform_drv_probe</code> 会先做 clk defaults、PM domain），旧式驱动直接给 <code>drv-&gt;probe</code>。</li>
+  <li>失败后统一走 <code>devres_release_all(dev)</code> —— <code>devm_*</code> 分配的资源和 <code>iounmap</code> 等都在此自动撤销，这是「错误路径不必写一堆 goto 清理」的基石。</li>
+</ul>
+<p>probe 成功后 <code>driver_bound(dev)</code> 把设备挂到驱动的设备链表、清掉延迟探测标记，并广播 <code>BUS_NOTIFY_BOUND_DRIVER</code>。</p>
+
+<h3>4.5 匹配：platform bus 的优先级</h3>
+<p>不同总线各有各的匹配算法。平台总线（虚拟总线）的 <code>platform_match</code> 依次尝试四种方式，先命中先绑定：</p>
+<p class="srcline">drivers/base/platform.c:1170-1190  platform_match</p>
+<pre><code>static int platform_match(struct device *dev, struct device_driver *drv)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct platform_driver *pdrv = to_platform_driver(drv);
+
+	/* When driver_override is set, only bind to the matching driver */
+	if (pdev-&gt;driver_override)
+		return !strcmp(pdev-&gt;driver_override, drv-&gt;name);
+
+	/* Attempt an OF style match first */
+	if (of_driver_match_device(dev, drv))
+		return 1;
+
+	/* Then try ACPI style match */
+	if (acpi_driver_match_device(dev, drv))
+		return 1;
+
+	/* Then try to match against the id table */
+	if (pdrv-&gt;id_table)
+		return platform_match_id(pdrv-&gt;id_table, pdev) != NULL;
+
+	/* fall-back to driver name match */
+	return (strcmp(pdev-&gt;name, drv-&gt;name) == 0);
+}</code></pre>
+<p>顺序有意义：设备树/ACPI 是「固件给出的权威描述」，优先于平台 id 表，最后才退化为「名字相同就算匹配」这条兼容旧驱动的兜底规则。<code>driver_override</code> 是给用户态调试用的（<code>echo foo &gt; /sys/bus/platform/devices/X/driver_override</code>）。</p>
+
+<h3>4.6 compatible 匹配的打分机制</h3>
+<p><code>of_driver_match_device</code> 只是一层壳：<code>of_match_device(drv-&gt;of_match_table, dev)</code>，后者取设备的 <code>of_node</code> 后调 <code>of_match_node</code>。真正的比较在 <code>__of_match_node</code>，它不是「第一个相等就返回」，而是<strong>给每个候选打分，取最高分</strong>：</p>
+<p class="srcline">drivers/of/base.c:1082-1100  __of_match_node</p>
+<pre><code>const struct of_device_id *__of_match_node(const struct of_device_id *matches,
+					   const struct device_node *node)
+{
+	const struct of_device_id *best_match = NULL;
+	int score, best_score = 0;
+
+	if (!matches)
+		return NULL;
+
+	for (; matches-&gt;name[0] || matches-&gt;type[0] || matches-&gt;compatible[0]; matches++) {
+		score = __of_device_is_compatible(node, matches-&gt;compatible,
+						  matches-&gt;type, matches-&gt;name);
+		if (score &gt; best_score) {
+			best_match = matches;
+			best_score = score;
+		}
+	}
+
+	return best_match;
+}</code></pre>
+<p>打分规则（来自 <code>__of_device_is_compatible</code>）：compatible 命中得 <code>INT_MAX/2 - (index &lt;&lt; 2)</code>，即<strong>在设备节点 compatible 列表里越靠前，分数越高</strong>；type 命中加 2 分；name 命中加 1 分。这就实现了设备树的「从最具体到最通用」的层次匹配：一个节点可以写 <code>compatible = "vendor,chip-v2", "vendor,chip", "generic-uart";</code>，专为 v2 写的驱动优先胜出。</p>
+
+<h3>4.7 一个真实的平台驱动：SBSA UART</h3>
+<p>看一个架构里真实存在的例子。它挂在 platform 总线上，用 <code>of_match_table</code> 按 compatible 匹配，probe 里取资源、映射寄存器、把上下文存进 drvdata：</p>
+<p class="srcline">drivers/tty/serial/amba-pl011.c:2786-2808  sbsa_uart_of_match / arm_sbsa_uart_platform_driver</p>
+<pre><code>static const struct of_device_id sbsa_uart_of_match[] = {
+	{ .compatible = "arm,sbsa-uart", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, sbsa_uart_of_match);
+
+static struct platform_driver arm_sbsa_uart_platform_driver = {
+	.probe		= sbsa_uart_probe,
+	.remove		= sbsa_uart_remove,
+	.driver	= {
+		.name	= "sbsa-uart",
+		.pm	= &amp;pl011_dev_pm_ops,
+		.of_match_table = of_match_ptr(sbsa_uart_of_match),
+		.acpi_match_table = ACPI_PTR(sbsa_uart_acpi_match),
+		.suppress_bind_attrs = IS_BUILTIN(CONFIG_SERIAL_AMBA_PL011),
+	},
+};</code></pre>
+<p>细节：<code>of_match_table</code> 是嵌在 <code>driver</code> 子结构里的，因为 <code>struct platform_driver</code> 把通用的 <code>struct device_driver driver</code> 当作成员（而非指针），<code>to_platform_driver()</code> 用 <code>container_of</code> 反向转换。末尾的空 <code>{}</code> 是哨兵项，<code>__of_match_node</code> 的循环靠它判断「表结束」。<code>suppress_bind_attrs</code> 在内建时禁用 <code>/sys/.../bind</code> 文件，避免用户把正在用的串口 unbind 掉。</p>
+<p>再看 probe 的主体，注意它怎么把「设备描述」翻译成「驱动私有状态」：</p>
+<p class="srcline">drivers/tty/serial/amba-pl011.c:2715-2775  sbsa_uart_probe</p>
+<pre><code>static int sbsa_uart_probe(struct platform_device *pdev)
+{
+	struct uart_amba_port *uap;
+	struct resource *r;
+	int portnr, ret;
+	int baudrate;
+
+	if (pdev-&gt;dev.of_node) {
+		struct device_node *np = pdev-&gt;dev.of_node;
+
+		ret = of_property_read_u32(np, "current-speed", &amp;baudrate);
+		if (ret)
+			return ret;
+	} else {
+		baudrate = 115200;
+	}
+
+	portnr = pl011_find_free_port();
+	if (portnr &lt; 0)
+		return portnr;
+
+	uap = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(struct uart_amba_port),
+			   GFP_KERNEL);
+	if (!uap)
+		return -ENOMEM;
+
+	ret = platform_get_irq(pdev, 0);
+	if (ret &lt; 0)
+		return ret;
+	uap-&gt;port.irq	= ret;
+    // ...（省略：vendor 选择、fifo/iotype/ops 填充、type 字符串）
+	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+
+	ret = pl011_setup_port(&amp;pdev-&gt;dev, uap, r, portnr);
+	if (ret)
+		return ret;
+
+	platform_set_drvdata(pdev, uap);
+
+	return pl011_register_port(uap);
+}</code></pre>
+<ul>
+  <li><code>pdev-&gt;dev.of_node</code> 就是设备树里那个节点；<code>of_property_read_u32</code> 读取固件写的属性——这是「硬件描述」与「驱动逻辑」分离的典型做法。</li>
+  <li><code>devm_kzalloc</code> 让内核记得这块内存在设备卸载时自动释放，probe 失败也自动回收，不需要手写 <code>kfree</code> 的 goto 链。</li>
+  <li><code>platform_get_irq</code>/<code>platform_get_resource</code> 从 <code>pdev-&gt;resource[]</code> 里取中断号和 MMIO 区间——这些资源由设备树或板级代码在创建设备时填入。</li>
+  <li><code>platform_set_drvdata(pdev, uap)</code> 把 <code>uap</code> 存进 <code>dev.driver_data</code>，<code>sbsa_uart_remove</code> 里 <code>platform_get_drvdata(pdev)</code> 就能取回来——这是 remove 与 probe 之间唯一的约定。</li>
+</ul>
+<div class="note">「probe 成功」的含义不是「初始化函数返回 0」，而是「驱动能把设备当作自己的私有类型操作」。所以每个 probe 几乎都以 <code>set_drvdata</code> + 注册到某个框架（uart、netdev、input）结尾。顺序颠倒会导致中断先来、状态还没准备好。</div>
+
+<h2>5. 动手验证</h2>
+<p><b>(1)</b> 在 <code>/sys/bus</code> 下看清三角关系与符号链接的方向：</p>
+<pre><code>$ ls /sys/bus/
+acpi  amba  clockevents  clocksource  container  cpu  edac  event_source
+gpio  i2c  isa  mdio_bus  mmc  module  nvme  pci  pci_express  platform
+scsi  serio  spi  usb  virtio  ...  workqueue
+
+$ ls /sys/bus/platform/devices/ | head -5
+LNXPWRBN:00  PNP0000:00  PNP0103:00  alarmtimer  efi-framebuffer.0
+
+$ ls -l /sys/bus/platform/devices/serial8250
+... -&gt; ../../../devices/platform/serial8250
+
+$ ls /sys/bus/platform/drivers/
+...  sbsa-uart  serial8250
+
+$ ls -l /sys/bus/platform/drivers/serial8250/
+bind  serial8250 -&gt; ../../../../devices/platform/serial8250  unbind</code></pre>
+<p>设备先出现在 <code>devices/</code>；绑定后 <code>drivers/&lt;drv&gt;/</code> 下多一个指向设备的符号链接。两个目录里的同名项只是链接，真实目录在 <code>/sys/devices/platform/serial8250</code>。</p>
+<p><b>(2)</b> 手动解绑/绑定（在虚拟机或测试机上做，别动真机的根磁盘控制器）：</p>
+<pre><code># 看某设备当前挂的驱动
+$ basename $(readlink -f /sys/bus/platform/devices/serial8250/driver 2&gt;/dev/null)
+serial8250
+
+# 解绑（写入的是设备名，不是驱动名）
+$ echo serial8250 | sudo tee /sys/bus/platform/drivers/serial8250/unbind
+serial8250
+
+# 重新绑定
+$ echo serial8250 | sudo tee /sys/bus/platform/drivers/serial8250/bind
+serial8250</code></pre>
+<p>写入后 <code>dmesg</code> 里能看到 probe/remove 的痕迹；解绑时 <code>/sys/devices/platform/serial8250/driver</code> 目录消失，说明 <code>dev-&gt;driver</code> 已被置空、devm 资源已回收。</p>
+<p><b>(3)</b> 观察 probe 顺序与延迟探测：</p>
+<pre><code>$ dmesg | grep -i 'probe.*defer'
+platform serial8250: Driver serial8250 requests probe deferral
+
+$ cat /sys/bus/platform/drivers_autoprobe   # 1 = 自动匹配
+$ echo 0 | sudo tee /sys/bus/platform/drivers_autoprobe   # 之后注册的驱动不再自动探测</code></pre>
+<p><b>(4)</b> 查看设备的资源与 driver_data 之外的信息（sysfs 属性）：</p>
+<pre><code>$ ls /sys/devices/platform/serial8250/
+driver  driver_override  modalias  power  subsystem  uevent
+$ cat /sys/devices/platform/serial8250/modalias
+platform:serial8250
+$ cat /sys/devices/platform/serial8250/uevent
+DRIVER=serial8250
+MODALIAS=platform:serial8250</code></pre>
+<p><code>modalias</code> 正是 udev 做「模块自动加载」时用来匹配 <code>MODULE_DEVICE_TABLE</code> 的字符串；<code>uevent</code> 是热插拔事件的载荷内容。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 设备和驱动谁先注册会漏匹配吗？</b>不会。两条路径都在自己的末尾主动遍历对方：<code>device_add</code> 里 <code>bus_probe_device(dev)</code> 遍历该总线所有驱动；<code>driver_register</code> 里 <code>bus_add_driver</code> 调 <code>driver_attach</code> 遍历所有设备。只要匹配函数返回正数就会 probe。</div>
+<div class="qa"><b>Q2. probe 返回 <code>-EPROBE_DEFER</code> 后发生了什么？</b>设备被挂在总线延迟探测链表上，每次有新驱动/设备成功绑定，内核会触发重试列表。常用于「我的时钟供应商驱动还没 probe」「我的 regulator 还没就绪」这类顺序依赖。</div>
+<div class="qa"><b>Q3. 驱动为什么要保存 <code>driver_data</code>？</b>因为 probe 与 remove（以及中断处理、sysfs 属性回调）是不同函数、不同时机调用的，需要一个地方存放「这次绑定的私有状态」。<code>dev_set_drvdata</code> 是唯一的官方入口，别自己写全局变量。</div>
+<div class="qa"><b>Q4. 设备树里的 compatible 字符串为什么可以写多个？</b>表示「兼容性从最具体到最通用」。驱动匹配时按分数选最优表项（compatible 在设备节点中越靠前分数越高），从而让专用驱动赢过通用驱动，也让旧驱动能兜底。</div>
+<div class="qa"><b>Q5. <code>/sys/bus/platform/devices/foo</code> 是真目录吗？</b>不是，是指向 <code>/sys/devices/platform/foo</code> 的符号链接。<code>/sys/devices/</code> 是按「设备拓扑」组织的树（父设备下面挂子设备），<code>/sys/bus/&lt;bus&gt;/devices/</code> 是按「总线归属」组织的视图，两者靠链接交叉引用。</div>
+
+<footer>
+  <p>上一篇：<a href="32-bpf.html">32-bpf eBPF</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="34-char-dev.html">34-char-dev 字符设备</a></p>
+</footer>
+
+</body>
+</html>

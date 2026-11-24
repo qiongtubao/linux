@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>24-块层：bio、请求队列与 blk-mq</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75; max-width: 900px; margin: 0 auto;
+    padding: 32px 24px 80px; font-size: 16px; }
+  nav.top { display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border); }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="25-nvme.html">下一篇：NVMe →</a>
+</nav>
+
+<h1>🧱 块层：bio、请求队列与 blk-mq</h1>
+<p class="subtitle">把“读写某个文件的几页”翻译成“往某个设备发哪些扇区”，并排队排得聪明些 · 预计阅读 11 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>文件系统说的是“我要第 100 到 104 页”，却不懂设备说的是“第 2048 到 2051 号扇区、要不要 flush、优先级多少”。中间需要一层翻译与调度，这就是<span class="term">块层</span>。它像快递公司的分拣中心：上游是各家网店（文件系统、swap、raw 设备），下游是各种运输工具（SATA 盘、NVMe、RAID 卡）。分拣中心要做的，是把大小不一的包裹（<span class="term">bio</span>）合并成大件、按目的地装车（<span class="term">request</span>），再交给司机（驱动）。</p>
+<p>“排队排得聪明”就是 <span class="term">IO 调度器</span>：机械盘怕随机寻道，所以要把相邻地址的读写排在一起（deadline、bfq）；SSD/NVMe 不怕寻道但怕队列饿着，所以要把请求尽快发出去（none、kyber）。5.10 已经没有老式单队列 <code>elevator</code>，全部是 <span class="term">blk-mq</span>：每个 CPU 有软件队列，设备有若干硬件队列（<code>hctx</code>），请求在哪个 CPU 上产生就从哪个队列走，天然可扩展。</p>
+<p>还有两个基础概念先分清：<strong>块设备</strong>以固定大小块（通常 512 或 4096 字节）随机访问，有页缓存、有文件系统，如 <code>/dev/nvme0n1</code>；<strong>字符设备</strong>按字节流，无缓存无寻址，如键盘、<code>/dev/tty</code>。本篇只讲块设备这条路。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">基本 IO 单元</td><td>bio</td><td>一次块 IO 的描述：目标设备、起始扇区、长度、页向量、完成回调。</td></tr>
+  <tr><td class="term">请求</td><td>request</td><td>调度单位：由一个或多个相邻 bio 合并而成，带 tag 号供硬件识别。</td></tr>
+  <tr><td class="term">请求队列</td><td>request_queue</td><td>设备的 IO 队列，挂着 <code>mq_ops</code>、hctx 数组、调度器。</td></tr>
+  <tr><td class="term">硬件队列</td><td>hctx</td><td>blk-mq 的每个硬件队列上下文，对应设备的一条提交通道。</td></tr>
+  <tr><td class="term">软件队列</td><td>blk_mq_ctx</td><td>每 CPU 一个，暂存本 CPU 产生的请求，再派到 hctx。</td></tr>
+  <tr><td class="term">标签</td><td>tag</td><td>请求在硬件队列中的槽位编号，队列深度决定最多同时多少请求。</td></tr>
+  <tr><td class="term">plug</td><td>plugging</td><td>“先攒后发”：用 <code>blk_start_plug</code> 期间产生的 bio 先攒着，结束再一起下发，便于合并。</td></tr>
+  <tr><td class="term">调度器</td><td>elevator</td><td>决定请求顺序的策略：<code>mq-deadline</code>、<code>kyber</code>、<code>bfq</code>、<code>none</code>。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<pre><code>文件系统 / swap / raw 读写
+        │ submit_bio(bio)
+        ▼
+submit_bio_noacct：检查、防递归（current-&gt;bio_list）、IO 统计
+        │
+        ├─► __submit_bio_noacct_mq ─► blk_mq_submit_bio
+        │                             │ 合并：plug 合并 / 调度器合并
+        │                             │ 分配 request（tag）
+        │                             ├─ 无调度器 → blk_mq_try_issue_directly
+        │                             └─ 有调度器 → blk_mq_sched_insert_request
+        │                                                     │
+        ▼                                                     ▼
+   驱动 .queue_rq(hctx, bd)  ◄── hctx dispatch ──►  硬件（SATA/NVMe/...）
+        │
+        ▼ 完成中断
+   bio-&gt;bi_end_io → 文件系统回调（标页 Uptodate、end_page_writeback）</code></pre>
+<p>一次读的完整链条：页缓存未命中 → ext4 的 <code>readpage</code> 建 bio → <code>submit_bio</code> → <strong>合并</strong>进已有 request 或新建 → 调度器排序 → 驱动把 request 变成硬件命令（SATA FIS / NVMe 命令）→ 完成中断 → <code>bio_endio</code> → 文件系统标 <code>PageUptodate</code> → 唤醒读线程。</p>
+<p><strong>“块设备 vs 字符设备”</strong>分辨方法：<code>ls -l /dev/xxx</code> 首字符 <code>b</code> 是块、<code>c</code> 是字符；块设备可 <code>mount</code>、能随机读写扇区，字符设备只能按字节流顺序使用。块层只管前者。</p>
+<p><strong>5.10 的调度器</strong>：<code>mq-deadline</code>（读写截止时间 + 排序，机械盘友好）、<code>kyber</code>（按延迟目标限流，快设备友好）、<code>bfq</code>（按进程公平分配带宽，桌面友好）、<code>none</code>（纯 FIFO，NVMe 默认）。多硬件队列时 <code>elevator_get_default</code> 直接返回 <code>NULL</code>（即 none），因为多队列下全局排序意义不大。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 bio 里有什么</h3>
+<p class="srcline">include/linux/blk_types.h:203-236  struct bio（节选）</p>
+<pre><code>struct bio {
+	struct bio		*bi_next;	/* request queue link */
+	struct gendisk		*bi_disk;
+	unsigned int		bi_opf;		/* 低 bits 标志，高 bits REQ_OP */
+	unsigned short		bi_flags;
+	blk_status_t		bi_status;
+	struct bvec_iter	bi_iter;	/* 当前扇区与剩余长度 */
+	bio_end_io_t		*bi_end_io;	/* 完成回调 */
+	void			*bi_private;
+	unsigned short		bi_vcnt;	/* 有几个 bio_vec */
+	unsigned short		bi_max_vecs;
+	struct bio_vec		*bi_io_vec;	/* 页 + 页内偏移 + 长度 数组 */
+	struct bio_set		*bi_pool;
+	struct bio_vec		bi_inline_vecs[];   /* 小 bio 内联，省一次分配 */
+};</code></pre>
+<p>关键在 <code>bi_opf</code>（操作类型读写/丢弃/flush + 标志）、<code>bi_iter</code>（当前处理到哪个扇区）、<code>bi_io_vec</code>（数据分布在哪些内存页）。<code>bi_end_io</code> 是完成时的回调，通常指向按页收尾的函数。</p>
+<p class="srcline">block/bio.c:437-460  bio_alloc_bioset（节选）</p>
+<pre><code>	if (!bs) {
+		if (nr_iovecs &gt; UIO_MAXIOV)
+			return NULL;
+		p = kmalloc(struct_size(bio, bi_inline_vecs, nr_iovecs), gfp_mask);
+		front_pad = 0;  inline_vecs = nr_iovecs;
+	} else {
+		// ... 省略 mempool 分配与 rescuer 防死锁逻辑
+		p = mempool_alloc(&amp;bs-&gt;bio_pool, gfp_mask);
+		front_pad = bs-&gt;front_pad;
+		inline_vecs = BIO_INLINE_VECS;
+	}
+	bio = p + front_pad;</code></pre>
+<p>bio 从 <code>bio_set</code>（预分配的 mempool）里取，避免 IO 路径上因内存紧张失败；<code>bi_inline_vecs</code> 让少量页的 bio 与描述符一起分配，少一次 <code>kmalloc</code>。注释里还提到 rescuer workqueue：当上层在 <code>submit_bio_noacct</code> 之下递归分配 bio 时，防止把 mempool 耗尽而死锁。</p>
+
+<h3>4.2 提交与防递归</h3>
+<p class="srcline">block/blk-core.c:1064-1087  submit_bio_noacct</p>
+<pre><code>	if (!submit_bio_checks(bio))
+		return BLK_QC_T_NONE;
+
+	if (current-&gt;bio_list) {
+		/* 递归保护：已有 submit_bio 在处理，先收进队列 */
+		bio_list_add(&amp;current-&gt;bio_list[0], bio);
+		return BLK_QC_T_NONE;
+	}
+
+	if (!bio-&gt;bi_disk-&gt;fops-&gt;submit_bio)
+		return __submit_bio_noacct_mq(bio);  /* blk-mq 路径 */
+	return __submit_bio_noacct(bio);         /* 传统单队列路径 */</code></pre>
+<p><code>current-&gt;bio_list</code> 是“防递归栈”的替代品：设备栈叠（如 dm、md）时，每层都调 <code>submit_bio</code> 会把内核栈撑爆。做法是把后到的 bio 塞进链表，由最外层循环处理，把递归变成迭代。</p>
+<p class="srcline">block/blk-core.c:1014-1042  __submit_bio_noacct_mq</p>
+<pre><code>	struct bio_list bio_list[2] = { };
+	blk_qc_t ret = BLK_QC_T_NONE;
+
+	current-&gt;bio_list = bio_list;   /* 打开递归防护 */
+	do {
+		struct gendisk *disk = bio-&gt;bi_disk;
+		if (unlikely(bio_queue_enter(bio) != 0))
+			continue;
+		if (!blk_crypto_bio_prep(&amp;bio)) {
+			blk_queue_exit(disk-&gt;queue);
+			ret = BLK_QC_T_NONE;
+			continue;
+		}
+		ret = blk_mq_submit_bio(bio);
+	} while ((bio = bio_list_pop(&amp;bio_list[0])));
+	current-&gt;bio_list = NULL;
+	return ret;</code></pre>
+<p>循环把本次提交期间新塞进来的 bio 也逐个处理。注意 <code>bio_queue_enter</code> 是队列“活跃引用”计数，防止提交途中队列被卸载。</p>
+
+<h3>4.3 blk_mq_submit_bio：合并与分派</h3>
+<p class="srcline">block/blk-mq.c:2174-2245  blk_mq_submit_bio（节选）</p>
+<pre><code>	struct request_queue *q = bio-&gt;bi_disk-&gt;queue;
+	// ...
+	blk_queue_bounce(q, &amp;bio);          /* DMA 地址受限时做 bounce */
+	__blk_queue_split(&amp;bio, &amp;nr_segs);  /* 超过硬件上限就切分 */
+
+	if (!bio_integrity_prep(bio))
+		goto queue_exit;
+
+	if (!is_flush_fua &amp;&amp; !blk_queue_nomerges(q) &amp;&amp;
+	    blk_attempt_plug_merge(q, bio, nr_segs, &amp;same_queue_rq))
+		goto queue_exit;                 /* 并进 plug 里的请求 */
+
+	if (blk_mq_sched_bio_merge(q, bio, nr_segs))
+		goto queue_exit;                 /* 并进调度器里的请求 */
+
+	rq = __blk_mq_alloc_request(&amp;data);  /* 从 tag 池取 request */
+	// ...
+	cookie = request_to_qc_t(data.hctx, rq);
+	blk_mq_bio_to_request(rq, bio, nr_segs);
+	// ... 省略 crypto 初始化</code></pre>
+<p>两条合并路径：<strong>plug 合并</strong>（本 CPU 攒着的请求里有地址相邻的就并进去）、<strong>调度器合并</strong>（已排队的请求里找相邻）。合并成功直接返回，<code>cookie</code> 即完成标识。合并失败才分配 request，分配失败时若带了 <code>REQ_NOWAIT</code> 就报 <code>-EAGAIN</code>，否则可能等待 tag。</p>
+<p class="srcline">block/blk-mq.c:2245-2280  blk_mq_submit_bio 的分派分支（节选）</p>
+<pre><code>	if (unlikely(is_flush_fua)) {
+		blk_insert_flush(rq);              /* flush 直接特殊处理 */
+		blk_mq_run_hw_queue(data.hctx, true);
+	} else if (plug &amp;&amp; (q-&gt;nr_hw_queues == 1 || q-&gt;mq_ops-&gt;commit_rqs ||
+				!blk_queue_nonrot(q))) {
+		// ... 省略：plug 累积，超过 BLK_MAX_REQUEST_COUNT 先 flush
+		blk_add_rq_to_plug(plug, rq);
+	} else if (q-&gt;elevator) {
+		blk_mq_sched_insert_request(rq, false, true, true);   /* 进调度器 */
+	} else if ((q-&gt;nr_hw_queues &gt; 1 &amp;&amp; is_sync) ||
+			!data.hctx-&gt;dispatch_busy) {
+		blk_mq_try_issue_directly(data.hctx, rq, &amp;cookie);   /* 直接下发 */
+	} else {
+		blk_mq_sched_insert_request(rq, false, true, true);
+	}</code></pre>
+<p>分派优先级：<strong>flush 请求</strong>走专门路径（需要等待前序写完成）；<strong>plug</strong> 存在且设备适合攒批（单队列、驱动支持批量提交、或机械盘）则先塞进 plug；有<strong>调度器</strong>就插进调度器；否则多队列同步请求或硬件不忙时<strong>直接下发</strong>给驱动，省一次派发延迟。</p>
+
+<h3>4.4 硬件队列与 CPU 的映射</h3>
+<p class="srcline">block/blk-mq-cpumap.c:35-75  blk_mq_map_queues（节选）</p>
+<pre><code>	unsigned int *map = qmap-&gt;mq_map;
+	unsigned int nr_queues = qmap-&gt;nr_queues;
+	// ...
+	for_each_present_cpu(cpu) {
+		if (q &gt;= nr_queues)
+			break;
+		map[cpu] = queue_index(qmap, nr_queues, q++);
+	}
+	for_each_possible_cpu(cpu) {
+		if (map[cpu] != -1)
+			continue;
+		if (q &lt; nr_queues) {
+			map[cpu] = queue_index(qmap, nr_queues, q++);
+		} else {
+			first_sibling = get_first_sibling(cpu);
+			if (first_sibling == cpu)
+				map[cpu] = queue_index(qmap, nr_queues, q++);
+			else
+				map[cpu] = map[first_sibling];   /* 超线程共享队列 */
+		}
+	}</code></pre>
+<p>先把每个 <strong>present CPU</strong> 依次映射到不同队列，避免“死队列”（只被不可用 CPU 引用）；CPU 数多于队列数时，同一物理核上的超线程兄弟共享一个队列。驱动可提供自己的 <code>map_queues</code>（NVMe 就用 PCIe 的 NUMA 亲和映射），默认实现就是这一套。</p>
+<p>设备的 <code>request_queue</code>（<code>include/linux/blkdev.h:399</code>）持有 <code>queue_ctx</code>（每 CPU 软件队列）、<code>queue_hw_ctx</code>（hctx 数组）、<code>nr_hw_queues</code>、<code>elevator</code> 与 <code>mq_ops</code>。<code>hctx</code>（<code>include/linux/blk-mq.h:16</code>）则持有派发链表、<code>cpumask</code>、<code>sched_data</code>。队列深度决定 tag 数，也就是“最多多少个请求同时在硬件里”。</p>
+
+<h3>4.5 调度器选谁</h3>
+<p class="srcline">block/elevator.c:622-629  elevator_get_default</p>
+<pre><code>static struct elevator_type *elevator_get_default(struct request_queue *q)
+{
+	if (q-&gt;nr_hw_queues != 1)
+		return NULL;                    /* 多硬件队列：默认 none */
+
+	return elevator_get(q, "mq-deadline", false);
+}</code></pre>
+<p>这一行解释了为什么新机器上 <code>/sys/block/nvme0n1/queue/scheduler</code> 常显示 <code>[none]</code>：NVMe 有几十个硬件队列，全局排序变成累赘。只有单队列设备（部分 SATA、virtio 单队列）才默认 <code>mq-deadline</code>。想换：<code>echo bfq &gt; /sys/block/sda/queue/scheduler</code>，立即生效（部分调度器在切换时会重建队列）。</p>
+
+<h2>5. 动手验证</h2>
+<pre><code>lsblk; ls -l /dev/nvme0n1 /dev/sda        # 首字符 b = 块设备
+cat /sys/block/nvme0n1/queue/scheduler    # 形如 [none] mq-deadline kyber bfq
+cat /sys/block/nvme0n1/queue/nr_requests  # 队列深度
+cat /sys/block/nvme0n1/queue/rotational   # 1=机械 0=SSD/NVMe
+ls /sys/block/nvme0n1/mq/                 # 每个 hctx 一个目录，内含 cpu_list</code></pre>
+<p><code>mq/0/cpu_list</code> 显示这个硬件队列负责哪些 CPU 的提交，正是 <code>blk_mq_map_queues</code> 的结果。看 IO 统计：</p>
+<pre><code>iostat -x 1 3 | head -20          # 关注 r/s w/s, rkB/s, await, %util, aqu-sz
+cat /proc/diskstats | grep nvme0n1</code></pre>
+<p><code>diskstats</code> 每行字段依次是：主/次设备号、名字、读完成数、读合并数、读扇区数、读耗时(ms)、写完成数、写合并数、写扇区数、写耗时、IO 进行中、IO 总耗时、加权耗时。<strong>合并数</strong>高说明合并生效；<code>aqu-sz</code>（平均队列长度）接近队列深度说明打满。</p>
+<p>压测并切换调度器：</p>
+<pre><code>sudo fio --name=randrw --filename=/tmp/fio.bin --size=1G --bs=4k \
+  --rw=randread --iodepth=32 --numjobs=4 --runtime=20 --group_reporting
+# 切换后重跑同一命令对比 IOPS
+sudo sh -c 'echo none &gt; /sys/block/&lt;dev&gt;/queue/scheduler'
+grep -E '^nvme|^sda' /proc/diskstats</code></pre>
+<p>预期：NVMe 上 <code>none</code> 与 <code>mq-deadline</code> 差距不大；机械盘上随机读在 <code>bfq</code>/<code>mq-deadline</code> 下明显优于 <code>none</code>（后者会退化成几乎纯寻道）。<code>fio</code> 报告里的 <code>iops</code>、<code>clat</code>（完成延迟）、<code>lat</code> 分布就是调度器效果的量化。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. bio 与 request 的区别？</b>bio 描述“一段数据要读写到哪个设备的哪段扇区”；request 是调度与硬件提交单位，可由多个相邻 bio 合并，带 tag 号。</div>
+<div class="qa"><b>Q2. 为什么 submit_bio_noacct 要用 <code>current-&gt;bio_list</code>？</b>设备栈叠时每层都调 submit_bio 会耗尽内核栈；把后续 bio 收进链表改由外层循环处理，把递归变成迭代。</div>
+<div class="qa"><b>Q3. blk-mq 的两个“队列”是什么关系？</b>每 CPU 一个软件队列（<code>blk_mq_ctx</code>）收集本 CPU 请求，再按 <code>map_queues</code> 映射派发到硬件队列（<code>hctx</code>），每个 hctx 对应设备一条提交通道。</div>
+<div class="qa"><b>Q4. 5.10 中多队列设备为什么默认没有调度器？</b><code>elevator_get_default</code> 在 <code>nr_hw_queues != 1</code> 时返回 NULL（即 none）；多队列并行提交下全局排序收益低于开销。</div>
+<div class="qa"><b>Q5. <code>diskstats</code> 里的“合并数”说明什么？</b>相邻 bio 被合并进同一 request 的次数。它高说明块层合并生效，能以更少的硬件命令传输更多数据。</div>
+
+<footer>
+  <p>上一篇：<a href="23-pseudo-fs.html">23-pseudo-fs 伪文件系统</a> · 下一篇：<a href="25-nvme.html">25-nvme 驱动</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

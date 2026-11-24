@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Linux 内核学习文档 — 主题目录</title>
+<style>
+  :root {
+    --fg: #1a1a2e; --muted: #666; --accent: #2962ff;
+    --border: #e0e0e0; --surface: #f7f8fa;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.6;
+    max-width: 960px; margin: 0 auto; padding: 40px 24px;
+  }
+  h1 { border-bottom: 3px solid var(--accent); padding-bottom: 12px; margin-bottom: 8px; }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 32px; }
+  .topic { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
+  .topic > h2 { padding: 12px 20px; font-size: 1.05rem; background: var(--border); }
+  ul { list-style: none; padding: 8px 20px 12px; }
+  li { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; }
+  li a { font-family: Menlo, monospace; font-size: 0.9rem; color: var(--accent); text-decoration: none; white-space: nowrap; }
+  li a:hover { text-decoration: underline; }
+  li .desc { color: var(--muted); font-size: 0.88rem; }
+</style>
+</head>
+<body>
+
+<h1>📚 Linux 内核学习文档 — 主题目录</h1>
+<p class="meta">
+  文档按<b>主题</b>组织，相互独立，可任意顺序阅读。每篇含名词解释、源码走读与动手验证，适合零基础入口。
+</p>
+<p class="meta">源码基准：Linux 5.10；读者定位：零基础 · 代码与命令可直接照做。</p>
+
+<div class="topic">
+  <h2>🏗️ 构建与基础</h2>
+  <ul>
+    <li><a href="01-kbuild.html">01-kbuild</a><span class="desc">编译系统：Makefile / Kconfig / Kbuild、menuconfig、编译安装内核</span></li>
+    <li><a href="02-kernel-tree.html">02-kernel-tree</a><span class="desc">内核源码树导读、Documentation 结构、各顶层目录职责</span></li>
+    <li><a href="03-boot.html">03-boot</a><span class="desc">启动流程：start_kernel()、initcall、模块加载机制</span></li>
+    <li><a href="04-debug-tools.html">04-debug-tools</a><span class="desc">调试与观测工具：gdb+qemu、printk/dmesg、ftrace、perf</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>⚙️ 进程与调度</h2>
+  <ul>
+    <li><a href="05-task-struct.html">05-task-struct</a><span class="desc">task_struct 结构、进程状态机、命名空间与 credentials</span></li>
+    <li><a href="06-fork-exit.html">06-fork-exit</a><span class="desc">进程创建 fork/clone、退出与僵尸回收（kernel/fork.c, exit.c）</span></li>
+    <li><a href="07-scheduler.html">07-scheduler</a><span class="desc">CFS 调度器、调度类、负载均衡（kernel/sched/）</span></li>
+    <li><a href="08-syscall.html">08-syscall</a><span class="desc">系统调用路径 arch/x86/entry/、一次 write() 的全程跟踪</span></li>
+    <li><a href="09-signals.html">09-signals</a><span class="desc">信号机制：投递、阻塞、处理（kernel/signal.c）</span></li>
+    <li><a href="10-interrupts.html">10-interrupts</a><span class="desc">中断与下半部：硬中断、softirq、tasklet、workqueue</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>🔒 并发与同步</h2>
+  <ul>
+    <li><a href="11-locking.html">11-locking</a><span class="desc">自旋锁、互斥量、信号量、seqlock（kernel/locking/）</span></li>
+    <li><a href="12-rcu.html">12-rcu</a><span class="desc">RCU：原理、宽限期、常见用法（Documentation/RCU/）</span></li>
+    <li><a href="13-atomic.html">13-atomic</a><span class="desc">原子操作、内存屏障、per-CPU 变量</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>🧠 内存管理</h2>
+  <ul>
+    <li><a href="14-buddy.html">14-buddy</a><span class="desc">伙伴系统页分配器（mm/page_alloc.c）</span></li>
+    <li><a href="15-slab.html">15-slab</a><span class="desc">slab/slub 对象分配器（mm/slub.c）</span></li>
+    <li><a href="16-page-table.html">16-page-table</a><span class="desc">页表结构、缺页异常处理、反向映射 rmap（mm/memory.c）</span></li>
+    <li><a href="17-vma.html">17-vma</a><span class="desc">进程地址空间：mmap/brk、VMA 管理（mm/mmap.c）</span></li>
+    <li><a href="18-reclaim.html">18-reclaim</a><span class="desc">页面回收 kswapd、LRU、swap（mm/vmscan.c）</span></li>
+    <li><a href="19-thp.html">19-thp</a><span class="desc">大页 THP 与 khugepaged（mm/huge_memory.c，本树 5.10 无 mm/page-table 目录）</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>💾 文件系统与存储</h2>
+  <ul>
+    <li><a href="20-vfs.html">20-vfs</a><span class="desc">VFS 四大对象：inode/dentry/file/superblock、路径查找</span></li>
+    <li><a href="21-pagecache.html">21-pagecache</a><span class="desc">Page Cache 与读写路径（mm/filemap.c）</span></li>
+    <li><a href="22-ext4.html">22-ext4</a><span class="desc">ext4 样本：日志 jbd2、extent、目录索引（fs/ext4/）</span></li>
+    <li><a href="23-pseudo-fs.html">23-pseudo-fs</a><span class="desc">伪文件系统：procfs、sysfs、debugfs、cgroupfs</span></li>
+    <li><a href="24-block.html">24-block</a><span class="desc">块层：bio、请求队列、blk-mq 多队列、IO 调度器（block/）</span></li>
+    <li><a href="25-nvme.html">25-nvme</a><span class="desc">NVMe 块设备驱动样本（drivers/nvme/）</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>🌐 网络协议栈</h2>
+  <ul>
+    <li><a href="26-socket.html">26-socket</a><span class="desc">套接字层：socket API 到内核对象、inet 通信机制</span></li>
+    <li><a href="27-tcpip.html">27-tcpip</a><span class="desc">TCP/IP 协议栈：收发包路径、TCP 状态机（net/ipv4/）</span></li>
+    <li><a href="28-netfilter.html">28-netfilter</a><span class="desc">netfilter/iptables 框架、nftables</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>🛡️ 安全</h2>
+  <ul>
+    <li><a href="29-lsm.html">29-lsm</a><span class="desc">LSM 框架：SELinux/AppArmor 挂钩机制（security/）</span></li>
+    <li><a href="30-seccomp.html">30-seccomp</a><span class="desc">seccomp-BPF、capabilities、namespace 隔离</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>📐 虚拟化与 eBPF</h2>
+  <ul>
+    <li><a href="31-kvm.html">31-kvm</a><span class="desc">KVM 虚拟化：vcpu、EPT、中断虚拟化（virt/kvm/, arch/x86/kvm/）</span></li>
+    <li><a href="32-bpf.html">32-bpf</a><span class="desc">eBPF：验证器、helper、tracepoint/kprobe 程序（kernel/bpf/）</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>🔌 驱动与设备模型</h2>
+  <ul>
+    <li><a href="33-driver-model.html">33-driver-model</a><span class="desc">设备模型：bus/device/driver 三角、sysfs 绑定</span></li>
+    <li><a href="34-char-dev.html">34-char-dev</a><span class="desc">字符设备：cdev、file_operations、ioctl</span></li>
+    <li><a href="35-platform.html">35-platform</a><span class="desc">platform 驱动、设备树、DMA、自己写一个完整驱动</span></li>
+  </ul>
+</div>
+
+<div class="topic">
+  <h2>⚡ 专项</h2>
+  <ul>
+    <li><a href="36-preempt-rt.html">36-preempt-rt</a><span class="desc">实时性 PREEMPT_RT、抢占模型</span></li>
+    <li><a href="37-power.html">37-power</a><span class="desc">电源管理：cpuidle、cpufreq、suspend/resume</span></li>
+    <li><a href="38-cgroup.html">38-cgroup</a><span class="desc">cgroup v2 资源控制、容器底层机制</span></li>
+  </ul>
+</div>
+
+</body>
+</html>

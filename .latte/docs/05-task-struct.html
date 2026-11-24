@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 进程描述符 task_struct</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="06-fork-exit.html">下一篇：06 fork 与 exit →</a>
+</nav>
+
+<h1>🧬 进程描述符 task_struct</h1>
+<p class="subtitle">内核用一个 C 结构体记住每个进程的一切：它是谁、在等什么、占着哪些内存和文件 · 预计阅读 25 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>想象一家大型酒店。住客有几百上千人，前台需要随时回答：这位客人住哪间房、房卡什么时候到期、他订的早餐送到哪、他欠多少钱、他是不是正在等洗衣机。前台不会把每个客人的信息塞进房卡里，而是在电脑里为每位客人建一条<strong>档案</strong>，房卡上只写一个编号，其余信息一查档案就有。</p>
+
+<p>Linux 内核面对的是同一类问题。CPU 只有几个，可运行的“进程”有几百个，而且每秒要切换上千次。内核必须为每个执行流（一个进程，或者进程里的一个线程）维护一份完整的档案：它在什么状态、它的内核栈在哪、它的地址空间是什么、打开的文件表是哪一份、凭据（uid/gid）是什么、父子关系是谁。这份档案就是 <span class="term">task_struct</span>，中文通常叫“进程描述符”（process descriptor）。</p>
+
+<p>从操作系统视角看，<span class="term">task_struct</span> 是内核里唯一“代表一个执行流”的对象。Linux 并不区分“进程”和“线程”两种数据结构——二者都是 <code>task_struct</code>，区别只在于若干指针是共享还是复制（这正是下一篇 fork 要讲的事）。你看到的 <code>ps</code>、<code>top</code>、<code>/proc</code>、调度器、信号、内存管理，全部围绕这个结构体运转。</p>
+
+<p>理解 <code>task_struct</code> 的关键不是背字段，而是理解三件事：<strong>状态字段如何描述“我在等什么”</strong>、<strong>内核如何用 <code>current</code> 在 O(1) 时间找到“我自己”</strong>、<strong>哪些字段是共享的、哪些是私有的</strong>。这三点决定了后面 fork、调度、信号、内存几篇文章的所有行为。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">进程描述符</td><td>task_struct / process descriptor</td><td>内核为每个执行流维护的结构体，5.10 中约 9KB</td></tr>
+  <tr><td class="term">执行流</td><td>task / thread of execution</td><td>一段可以被调度运行的控制流；进程和线程都是 task</td></tr>
+  <tr><td class="term">进程状态</td><td>state</td><td>一个长整型位掩码，表示“可运行 / 可中断睡眠 / 不可中断睡眠 / 停止 / 僵尸”</td></tr>
+  <tr><td class="term">内核栈</td><td>kernel stack</td><td>每个 task 私有的 16KB 栈，内核代码运行、保存 <code>pt_regs</code> 都用它</td></tr>
+  <tr><td class="term">THREAD_SIZE</td><td>THREAD_SIZE</td><td>内核栈大小常量，x86_64 上是 4 页 = 16KB</td></tr>
+  <tr><td class="term">thread_info</td><td>thread_info</td><td>放在 <code>task_struct</code> 最前面的“低层标志位”小块</td></tr>
+  <tr><td class="term">current</td><td>current</td><td>宏，恒等于“当前 CPU 上正在运行的那个 task_struct 指针”</td></tr>
+  <tr><td class="term">percpu 变量</td><td>per-CPU variable</td><td>每个 CPU 各有一份副本的全局变量，读写无需加锁</td></tr>
+  <tr><td class="term">mm</td><td>mm_struct</td><td>用户态地址空间：页表、VMA 链表、代码段数据段描述</td></tr>
+  <tr><td class="term">active_mm</td><td>active_mm</td><td>“当前 CPU 上实际装着的页表”，内核线程借用别人的 mm</td></tr>
+  <tr><td class="term">凭据</td><td>cred / cred_struct</td><td>uid、gid、capability 集合等权限身份，写时复制</td></tr>
+  <tr><td class="term">文件表</td><td>files_struct</td><td>fd 到 <code>struct file</code> 的映射表，线程间可共享</td></tr>
+  <tr><td class="term">命名空间代理</td><td>nsproxy</td><td>指向该进程所属的 mount/pid/net/uts 等命名空间集合</td></tr>
+  <tr><td class="term">线程组</td><td>thread group</td><td>共享 mm 和信号处理的一组 task，tgid 相同</td></tr>
+  <tr><td class="term">tgid</td><td>thread group id</td><td>线程组 ID，等于主线程的 pid，也就是用户看到的“进程号”</td></tr>
+  <tr><td class="term">僵尸</td><td>zombie / EXIT_ZOMBIE</td><td>已退出但父进程还没 wait 的 task，只剩一条记录</td></tr>
+  <tr><td class="term">thread_struct</td><td>thread_struct</td><td>CPU 相关硬件状态：栈指针、TLS 基址、FPU 状态、调试寄存器</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 一个 task 的全部家当</h3>
+
+<p>把 <code>task_struct</code> 想成一张“人物卡”，卡上按主题分区：身份区（pid/tgid/comm）、关系区（parent/children/sibling/group_leader）、状态区（state/flags/exit_state）、资源区（mm/files/fs/nsproxy/signal/sighand/cred）、调度区（prio/sched_class/se）、硬件区（thread）。下面这张图说明它与内核栈、地址空间的关系：</p>
+
+<pre><code>用户眼里的进程                        内核里的对象
+┌───────────────┐                    ┌───────────────────────────────┐
+│  PID 1234     │  ──── 查表 ────►   │  struct task_struct（约 9KB）  │
+│  shell / vim  │                    │  pid=1234 tgid=1234           │
+└───────────────┘                    │  state / flags / prio / se    │
+        ▲                            │  mm ──────────┐  files ──┐   │
+        │ 用户栈/代码在用户地址空间        │  cred / nsproxy / signal  │   │
+        │                            └───────────────┼───────────┼───┘
+        │                                            ▼           ▼
+   ┌────┴─────┐                              mm_struct     files_struct
+   │ 页表+数据 │                              (页表、VMA)    (fd 表)
+   └──────────┘
+                                             stack 字段
+                                                 │
+                                                 ▼
+                                    内核栈 16KB（THREAD_SIZE）
+                                    ┌──────────────────────┐
+                                    │ pt_regs（系统调用入口）│
+                                    │ 函数调用帧 …           │
+                                    └──────────────────────┘
+</code></pre>
+
+<p>注意一个 5.10 的细节：<code>thread_info</code> 不再放在内核栈底部，而是放在 <code>task_struct</code> 的第一个字段（<code>CONFIG_THREAD_INFO_IN_TASK</code>）。这是为了防止内核栈溢出时改坏 <code>thread_info</code> 里的标志位——老内核把两者放一起，溢出会静默篡改 <code>TIF_NEED_RESCHED</code> 之类的位，非常难查。</p>
+
+<h3>3.2 状态机：state 的位不是枚举</h3>
+
+<p><code>state</code> 的注释写着 “-1 unrunnable, 0 runnable, >0 stopped”，但 5.10 实际上把它当<strong>位掩码</strong>用。真正决定“现在能不能被调度”的是：<code>state == TASK_RUNNING</code> 且该 task 在运行队列上（<code>on_rq</code>）。常见状态：</p>
+
+<table>
+  <tr><th>宏</th><th>值</th><th>ps 显示</th><th>含义</th></tr>
+  <tr><td><code>TASK_RUNNING</code></td><td>0x0000</td><td>R</td><td>可运行（正在跑或在 runqueue 排队）</td></tr>
+  <tr><td><code>TASK_INTERRUPTIBLE</code></td><td>0x0001</td><td>S</td><td>睡眠，可被信号唤醒（如 read 等待数据）</td></tr>
+  <tr><td><code>TASK_UNINTERRUPTIBLE</code></td><td>0x0002</td><td>D</td><td>睡眠，不响应信号（等磁盘 IO 典型）</td></tr>
+  <tr><td><code>__TASK_STOPPED</code></td><td>0x0004</td><td>T</td><td>被 SIGSTOP/SIGTSTP 停住（Ctrl-Z）</td></tr>
+  <tr><td><code>__TASK_TRACED</code></td><td>0x0008</td><td>t</td><td>被 ptrace 调试器停住</td></tr>
+  <tr><td><code>EXIT_ZOMBIE</code></td><td>0x0020</td><td>Z</td><td>已退出，等父进程回收</td></tr>
+  <tr><td><code>EXIT_DEAD</code></td><td>0x0010</td><td>X</td><td>正在被释放，瞬间状态</td></tr>
+</table>
+
+<pre><code>TASK_RUNNING ──schedule()──► 睡眠状态（S / D）
+     ▲                            │
+     │ wake_up_process()          │ 被 wake_up 唤醒
+     └────────────────────────────┘
+
+TASK_RUNNING ──SIGSTOP──► TASK_STOPPED ──SIGCONT──► TASK_RUNNING
+TASK_RUNNING ──do_exit()──► EXIT_ZOMBIE ──wait()──► EXIT_DEAD ──► 释放
+</code></pre>
+
+<div class="note">关键区分：<code>state</code> 管“睡眠原因”，<code>flags</code>（PF_*）管“这个 task 的属性”，<code>exit_state</code> 管“退出阶段”。三个字段各司其职，读代码时不要混。比如 <code>PF_EXITING</code>（正在退出）是 flags 位，不是 state 值。</div>
+
+<h3>3.3 current 如何 O(1) 找到自己</h3>
+
+<p>内核代码里到处出现 <code>current</code>，比如 <code>current-&gt;pid</code>。如果每次都要靠“当前栈指针减某个偏移”来推算，会很脆弱。5.10 的 x86_64 做法是：<strong>每个 CPU 有一个 percpu 变量 <code>current_task</code>，切换进程时（<code>switch_to</code>）就地更新它，读的时候用 <code>%gs</code> 段基址 + 固定偏移，一条指令级别完成。</strong></p>
+
+<p>老式做法（32 位内核常见）是让内核栈底存放 <code>thread_info</code>，再把栈指针按 <code>THREAD_SIZE</code> 对齐后取到它，再 <code>thread_info-&gt;task</code> 拿到 task_struct。5.10 里 <code>current_thread_info()</code> 直接就是 <code>(struct thread_info *)current</code>——因为 <code>thread_info</code> 已经是 <code>task_struct</code> 的第一个成员，两者地址相同，零成本强制转换。</p>
+
+<h3>3.4 内核栈与 thread_struct</h3>
+
+<p>每个 task 有自己私有的内核栈，x86_64 上是 <code>THREAD_SIZE = PAGE_SIZE &lt;&lt; 2 = 16KB</code>（<code>THREAD_SIZE_ORDER = 2</code>）。为什么是 16KB 而不是更大？因为内核栈不能像用户栈那样按需增长（没有缺页机制支撑栈扩张的复杂判定），一旦溢出就是静默踩内存，所以它必须足够小以限制每个 task 的内存开销（几百个 task × 16KB 已经不小），又足够大以容纳最深的调用链（文件系统 + 网络 + 驱动嵌套）。5.10 有 <code>CONFIG_VMAP_STACK</code>，栈在 vmalloc 区且两页之间有 guard page，溢出会触发缺页而不是静默破坏内存。</p>
+
+<p><code>thread_struct</code> 保存“CPU 硬件视角”的私有状态：内核栈指针 <code>sp</code>（切换时由 <code>__switch_to</code> 写进 TSS）、FS/GS 基址（TLS）、浮点/AVX 状态 <code>fpu</code>、调试寄存器、<code>cr2</code>（上次缺页地址）等。它是 <code>task_struct</code> 的最后一个字段（在 <code>randomized_struct_fields_end</code> 之后），因为切换路径要按固定偏移直接访问它。</p>
+
+<h3>3.5 /proc/[pid]/status 字段对照</h3>
+
+<p><code>/proc/&lt;pid&gt;/status</code> 是内核把这些字段“翻译”给用户看的窗口。<code>fs/proc/array.c</code> 的 <code>task_state()</code> 依次打印：</p>
+
+<table>
+  <tr><th>status 行</th><th>来源字段</th><th>说明</th></tr>
+  <tr><td>Name</td><td><code>tsk-&gt;comm</code></td><td>进程名，15 字符，<code>prctl(PR_SET_NAME)</code> 可改</td></tr>
+  <tr><td>State</td><td><code>tsk-&gt;state | tsk-&gt;exit_state</code></td><td>经 <code>task_state_index()</code> 映射成 R/S/D/T/t/X/Z/P/I</td></tr>
+  <tr><td>Tgid</td><td><code>tsk-&gt;tgid</code></td><td>线程组 ID，即“进程号”</td></tr>
+  <tr><td>Pid</td><td><code>tsk-&gt;pid</code></td><td>本线程（task）的 ID</td></tr>
+  <tr><td>PPid</td><td><code>real_parent-&gt;pid</code></td><td>父进程号</td></tr>
+  <tr><td>Uid / Gid</td><td><code>cred</code> 的四个 uid/gid</td><td>real/effective/saved/fs 四组</td></tr>
+  <tr><td>FDSize</td><td><code>files-&gt;max_fds</code></td><td>fd 表当前容量（不是已用数）</td></tr>
+  <tr><td>Threads</td><td><code>signal-&gt;nr_threads</code></td><td>线程组内 task 数量</td></tr>
+  <tr><td>VmRSS</td><td><code>mm-&gt;rss_stat</code></td><td>实际驻留物理内存</td></tr>
+  <tr><td>SigQ / SigPnd / ShdPnd</td><td><code>signal-&gt;</code> 计数与 <code>pending</code></td><td>排队信号数与待处理位图</td></tr>
+</table>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 开头三个字段：state / stack / flags</h3>
+
+<p>这是 <code>task_struct</code> 的头部。<code>thread_info</code> 必须在最前（注释写了原因），紧接着是 <code>state</code>，然后才是“可随机化区域”。内核用 GCC 的 <code>-frandomize-layout</code> 打乱中间字段的顺序，用来对抗内核漏洞利用——但调度关键字段必须固定位置，所以被放在随机化标记之外。</p>
+
+<p class="srcline">include/linux/sched.h:640-662  struct task_struct（头部）</p>
+<pre><code>struct task_struct {
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	/*
+	 * For reasons of header soup (see current_thread_info()), this
+	 * must be the first element of task_struct.
+	 */
+	struct thread_info		thread_info;
+#endif
+	/* -1 unrunnable, 0 runnable, &gt;0 stopped: */
+	volatile long			state; /*进程状态*/
+
+	/*
+	 * This begins the randomizable portion of task_struct. Only
+	 * scheduling-critical items should be added above here.
+	 */
+	randomized_struct_fields_start
+
+	void				*stack; /*进程内核栈 ... */
+	refcount_t			usage; /*进程描述符的使用计数 ... */
+	/* Per task flags (PF_*), defined further below: */
+	unsigned int			flags; /*进程标志 ... */
+	unsigned int			ptrace;
+</code></pre>
+
+<ul>
+  <li><code>thread_info</code> 放在第一位，使 <code>current_thread_info()</code> 可以零成本把 <code>task_struct *</code> 转成 <code>thread_info *</code>；<code>thread_info</code> 里只有 <code>flags</code>（TIF_* 位）和 <code>status</code> 两个域，是汇编入口代码要快速访问的部分。</li>
+  <li><code>volatile long state</code>：<code>volatile</code> 防止编译器把它缓存进寄存器，因为别的 CPU（唤醒路径）会在锁保护下直接写它。</li>
+  <li><code>void *stack</code>：指向该 task 的 16KB 内核栈。进入内核时 <code>entry_SYSCALL_64</code> 从 percpu 的 <code>cpu_current_top_of_stack</code> 取栈顶，那个值就是在切换时从这个字段写过去的。</li>
+  <li><code>refcount_t usage</code>：结构体自身的引用计数，<code>get_task_struct()/put_task_struct()</code> 操作它，归零才 <code>free_task()</code>。</li>
+  <li><code>flags</code>（PF_*）：<code>PF_KTHREAD</code>（内核线程）、<code>PF_EXITING</code>（正在退出）、<code>PF_MEMALLOC</code>（允许动用内存保留区）等。</li>
+</ul>
+
+<h3>4.2 身份与亲属关系</h3>
+
+<p><code>pid</code> 与 <code>tgid</code> 是整个“进程/线程”模型的骨架。<code>real_parent</code> 与 <code>parent</code> 平时相同，但被 ptrace 附加后，<code>parent</code> 会指向调试器（谁该收到 SIGCHLD 就发给谁）。</p>
+
+<p class="srcline">include/linux/sched.h:835-859  pid / tgid / 父子链表</p>
+<pre><code>	pid_t				pid;
+	pid_t				tgid;
+
+#ifdef CONFIG_STACKPROTECTOR
+	/* Canary value for the -fstack-protector GCC feature: */
+	unsigned long			stack_canary;
+#endif
+	/* ... */
+	/* Real parent process: */
+	struct task_struct __rcu	*real_parent; /*指向创建了P的进程描述符 ... */
+
+	/* Recipient of SIGCHLD, wait4() reports: */
+	struct task_struct __rcu	*parent; /*如果指向P当前父进程 ... */
+
+	/*
+	 * Children/sibling form the list of natural children:
+	 */
+	struct list_head		children; /*子进程列表的头节点。*/
+	struct list_head		sibling; /*在父进程的 children 链表中的节点。...*/
+	struct task_struct		*group_leader; /*线程组的领导者。...*/
+</code></pre>
+
+<ul>
+  <li><code>pid</code> 是 task 级 ID，每个线程都不同；<code>tgid</code> 是线程组级 ID，同组线程相同，等于组长（主线程）的 pid。你 <code>ps</code> 看到的“进程号”是 tgid。</li>
+  <li><code>children</code> 是链表头，<code>sibling</code> 是挂在这个链表里的节点——这是内核经典的侵入式链表用法：父进程遍历 <code>children</code>，每个子进程通过自己的 <code>sibling</code> 串起来，不需要额外分配节点。</li>
+  <li><code>parent</code> 才是 SIGCHLD 与 <code>wait4()</code> 的接收者。孤儿进程会被 <code>reparent</code> 到 init 或最近的 subreaper，改的就是这两个指针。</li>
+</ul>
+
+<h3>4.3 资源指针：mm / active_mm / cred / files / nsproxy</h3>
+
+<p>这一段是“共享还是私有”的核心。<code>mm</code> 是进程的地址空间，线程共享同一个 <code>mm</code>；<code>active_mm</code> 是“当前 CPU 上真的装着的页表”，内核线程没有 <code>mm</code>，就借用上一个用户进程的 <code>active_mm</code>（lazy TLB）。</p>
+
+<p class="srcline">include/linux/sched.h:755-758  地址空间指针</p>
+<pre><code>	struct mm_struct		*mm;
+	struct mm_struct		*active_mm;
+
+	/* Per-thread vma caching: */
+	struct vmacache			vmacache;
+</code></pre>
+
+<p class="srcline">include/linux/sched.h:920-969  cred / fs / files / nsproxy</p>
+<pre><code>	/* Process credentials: */
+
+	/* Tracer's credentials at attach: */
+	const struct cred __rcu		*ptracer_cred;
+
+	/* Objective and real subjective task credentials (COW): */
+	const struct cred __rcu		*real_cred;
+
+	/* Effective (overridable) subjective task credentials (COW): */
+	const struct cred __rcu		*cred;
+	/* ... 此处省略 comm/nameidata/sysvsem 等字段 ... */
+	/* Filesystem information: */
+	struct fs_struct		*fs;
+
+	/* Open file information: */
+	struct files_struct		*files;
+	/* ... 此处省略 io_uring/signal 之外的若干字段 ... */
+	/* Namespaces: */
+	struct nsproxy			*nsproxy;
+
+	/* Signal handlers: */
+	struct signal_struct		*signal;
+	struct sighand_struct __rcu	*sighand;
+</code></pre>
+
+<ul>
+  <li><code>cred</code> 是 <code>const</code> 的，且注释写着 COW：要改 uid 不能原地改（别的线程可能共享同一份），必须先 <code>prepare_creds()</code> 复制一份新的，改完再 <code>commit_creds()</code> 挂上去。这是“读多写少 + 无锁读”的经典设计。</li>
+  <li><code>files</code> 是 fd 表。<code>fork()</code> 默认复制一份，<code>clone(CLONE_FILES)</code> 则共享同一份并加引用计数——这就是“一个线程 close 了 fd，另一个线程也看不到”的原因。</li>
+  <li><code>fs</code> 存 cwd、root、umask；<code>nsproxy</code> 存 mount/pid/net/uts/ipc/cgroup/time 命名空间指针，容器就是靠它隔离的；<code>signal</code> 是整个线程组共享的信号状态（pending 位图、nr_threads），<code>sighand</code> 是处理函数表（<code>sigaction</code> 装的东西，线程间共享）。</li>
+  <li>注意 <code>signal</code> 是普通指针，<code>sighand</code> 带 <code>__rcu</code>。因为信号处理函数表会被 <code>sigaction()</code> 替换，读侧要靠 RCU 保护；而 <code>signal_struct</code> 在线程组内永久共享，生命周期跟组绑定。</li>
+</ul>
+
+<h3>4.4 current：一条 percpu 读取指令</h3>
+
+<p>x86_64 不再用“栈指针取整”那套。它把当前 task 的指针放进每个 CPU 自己的变量里，<code>current</code> 展开成 <code>this_cpu_read_stable(current_task)</code>，编译后基本就是 <code>mov %gs:current_task, %rax</code>。</p>
+
+<p class="srcline">arch/x86/include/asm/current.h:10-18  取当前 task</p>
+<pre><code>struct task_struct;
+
+DECLARE_PER_CPU(struct task_struct *, current_task);
+
+static __always_inline struct task_struct *get_current(void)
+{
+	return this_cpu_read_stable(current_task);
+}
+
+#define current get_current()
+</code></pre>
+
+<p class="srcline">include/linux/thread_info.h:15-23  current_thread_info() 的真相</p>
+<pre><code>#ifdef CONFIG_THREAD_INFO_IN_TASK
+/*
+ * For CONFIG_THREAD_INFO_IN_TASK kernels we need &lt;asm/current.h&gt; for the
+ * definition of current, but for !CONFIG_THREAD_INFO_IN_TASK kernels,
+ * including &lt;asm/current.h&gt; can cause a circular dependency on some platforms.
+ */
+#include &lt;asm/current.h&gt;
+#define current_thread_info() ((struct thread_info *)current)
+#endif
+</code></pre>
+
+<ul>
+  <li><code>DECLARE_PER_CPU</code> 定义的是“每个 CPU 一份”的变量。写它的人必须在关抢占/关中断的上下文里，比如 <code>__switch_to</code> 两侧；读它则不用加锁，因为读的永远是“本 CPU 当前任务”，不会读到别的 CPU 的值。</li>
+  <li><code>__always_inline</code> 保证不会生成函数调用——<code>current</code> 在内核里出现频率极高，一次多余的 call 都不可接受。</li>
+  <li><code>current_thread_info()</code> 只是把同一个指针换个类型：因为 <code>thread_info</code> 是 <code>task_struct</code> 的第一个成员，偏移为 0。老内核那套“栈底找 thread_info”的代码在 5.10 x86_64 上已经不存在了。</li>
+</ul>
+
+<h3>4.5 thread_info 与内核栈大小</h3>
+
+<p class="srcline">arch/x86/include/asm/thread_info.h:56-59  x86 的 thread_info</p>
+<pre><code>struct thread_info {
+	unsigned long		flags;		/* low level flags */
+	u32			status;		/* thread synchronous flags */
+};
+</code></pre>
+
+<p class="srcline">arch/x86/include/asm/page_64_types.h:13-16  栈大小</p>
+<pre><code>#define THREAD_SIZE_ORDER	(2 + KASAN_STACK_ORDER)
+#define THREAD_SIZE  (PAGE_SIZE &lt;&lt; THREAD_SIZE_ORDER)
+</code></pre>
+
+<ul>
+  <li><code>flags</code> 里是 TIF_* 位：<code>TIF_NEED_RESCHED</code>（该重新调度了）、<code>TIF_SIGPENDING</code>（有信号待处理）、<code>TIF_NOTIFY_RESUME</code>（返回用户态前要做点事）。它们被“远程写”的频率很高（别的 CPU 唤醒你），所以放在 task_struct 里、单独一个 cache line 附近。</li>
+  <li><code>PAGE_SIZE</code> 通常是 4KB，<code>THREAD_SIZE_ORDER = 2</code> 表示连续 4 页 = 16KB。打开 KASAN（内核地址消毒器）时再 +1 个 order，变成 32KB，因为 KASAN 需要影子内存来标记栈变量。</li>
+  <li>16KB 意味着内核调用链深度大概 1000 多层帧，超过就溢出。所以内核代码严禁深递归，也严禁在栈上放大数组（<code>char buf[4096]</code> 在内核里是危险动作）。</li>
+</ul>
+
+<h3>4.6 状态如何变成 ps 里的一个字母</h3>
+
+<p><code>state</code> 和 <code>exit_state</code> 都可能是“位”，但 ps 只能显示一个字母。内核用 <code>task_state_index()</code> 把位或成一个 <code>TASK_REPORT</code> 掩码，再取 <code>fls()</code>（最高有效位位置）当数组下标。</p>
+
+<p class="srcline">fs/proc/array.c:129-139  状态字母表</p>
+<pre><code>static const char * const task_state_array[] = {
+
+	/* states in TASK_REPORT: */
+	"R (running)",		/* 0x00 */
+	"S (sleeping)",		/* 0x01 */
+	"D (disk sleep)",	/* 0x02 */
+	"T (stopped)",		/* 0x04 */
+	"t (tracing stop)",	/* 0x08 */
+	"X (dead)",		/* 0x10 */
+	"Z (zombie)",		/* 0x20 */
+	"P (parked)",		/* 0x40 */
+</code></pre>
+
+<p>数组下标与位值一一对应：<code>fls(0x20) = 6</code>，正好是 <code>"Z (zombie)"</code>。<code>state == 0</code>（R）时 <code>fls(0) = 0</code>，落在第 0 项。这个技巧让“判断状态”和“打印状态”共用同一套位定义，避免两处枚举不同步。</p>
+
+<h2>5. 动手验证</h2>
+
+<div class="tip">下面所有命令在普通 x86_64 Linux 上都能跑，不需要编译内核。内核版本建议 5.10 附近，输出字段名一致。</div>
+
+<p><strong>实验一：看自己的状态字段。</strong></p>
+<pre><code>$ cat /proc/self/status | head -12
+Name:	cat
+Umask:	0022
+State:	R (running)
+Tgid:	4242
+Ngid:	0
+Pid:	4242
+PPid:	4001
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	256
+</code></pre>
+
+<p>预期：<code>State</code> 是 R，因为 cat 正在跑（虽然它大部分时间在 sleep，但读取自己的 status 这一刻在 CPU 上）。<code>Tgid == Pid</code> 说明它是单线程进程；开一个多线程程序再对比，会看到 Tgid 相同而 Pid 不同。</p>
+
+<p><strong>实验二：state 的“位”特性。</strong></p>
+<pre><code>$ sleep 100 &amp;
+$ ps -o pid,stat,comm -p $!
+  PID STAT COMMAND
+ 4321 S    sleep
+$ grep State /proc/$!/status
+State:	S (sleeping)
+</code></pre>
+
+<p><code>sleep</code> 在等定时器，处于 <code>TASK_INTERRUPTIBLE</code>（0x1），所以显示 S。再看一个不可中断的例子：</p>
+<pre><code>$ dd if=/dev/zero of=/tmp/x bs=1M count=200 &amp;
+$ while :; do ps -o stat= -p $!; done | grep -m1 D || echo "没抓到 D（磁盘太快）"
+</code></pre>
+
+<p>D 状态（<code>TASK_UNINTERRUPTIBLE</code>）通常出现在等块设备 IO 时，转瞬即逝；抓不到很正常，这正说明它是一种“短暂但不可被信号打断”的等待。</p>
+
+<p><strong>实验三：观察僵尸与父进程关系。</strong></p>
+<pre><code>$ bash -c 'sleep 0.1 &amp; exit 0' &amp;
+$ ps -o pid,ppid,stat,comm -C sleep
+  PID  PPID STAT COMMAND
+ 4401     1  Z    sleep
+</code></pre>
+
+<p>子进程先退出、父进程（bash）已退出，于是它被 reparent 到 PID 1（或 systemd 的 subreaper），此时处于 <code>EXIT_ZOMBIE</code>（0x20）。<code>ps</code> 的 STAT 显示 Z，且 PPID 变成 1——这对应源码里的 <code>real_parent/parent</code> 被重写。<code>Z</code> 进程不能 <code>kill -9</code> 掉，只能等父进程 wait 或系统重新挂载父进程。</p>
+
+<p><strong>实验四：核对源码里的常量。</strong></p>
+<pre><code>$ grep -n "THREAD_SIZE_ORDER" arch/x86/include/asm/page_64_types.h
+15:#define THREAD_SIZE_ORDER	(2 + KASAN_STACK_ORDER)
+$ getconf PAGESIZE
+4096
+$ echo $((4096 &lt;&lt; 2))
+16384
+</code></pre>
+
+<p>预期 16384 字节 = 16KB，与文档中“内核栈 16KB”一致。如果你的机器开了 KASAN 或 <code>CONFIG_THREAD_INFO_IN_TASK</code> 关闭，数字会变，但推导过程不变。</p>
+
+<p><strong>实验五：current 与内核态。</strong>选做：用 <code>perf</code> 观察切换，或直接读 <code>/proc/self/wchan</code>：</p>
+<pre><code>$ cat /proc/self/wchan; echo
+0
+</code></pre>
+
+<p><code>wchan</code> 显示“睡眠时内核停在哪个函数”，R 状态下是 0。用 <code>ps -o pid,stat,wchan</code> 看一个 S 状态的进程，会看到它停在 <code>do_wait</code>、<code>ep_poll</code> 之类，这就是 <code>state</code> 与内核栈内容的对应关系。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. 为什么 5.10 x86_64 的 <code>current_thread_info()</code> 可以只是把 <code>current</code> 强转？</b>因为 <code>thread_info</code> 被放进了 <code>task_struct</code> 的第一个字段（<code>CONFIG_THREAD_INFO_IN_TASK</code>），偏移为 0，两个指针值相同。老内核把 <code>thread_info</code> 放在内核栈底，才需要“栈指针按 THREAD_SIZE 对齐再取”。</div>
+
+<div class="qa"><b>Q2. <code>state == TASK_RUNNING</code> 就一定能被调度吗？</b>不一定。还要看它是否在运行队列上（<code>on_rq != 0</code>）。一个刚被 <code>wake_up_process()</code> 唤醒的 task，state 已是 RUNNING，随后由 <code>activate_task()</code> 挂进 rq；而正在 <code>schedule()</code> 里执行、已经 <code>deactivate_task()</code> 的 task 可能 state 还是 RUNNING 但不在队列上。</div>
+
+<div class="qa"><b>Q3. <code>mm</code> 与 <code>active_mm</code> 有什么区别？</b><code>mm</code> 是“这个 task 拥有的地址空间”（用户态 task 必有，内核线程为 NULL）；<code>active_mm</code> 是“当前 CPU 上真正加载的页表”。内核线程没有自己的地址空间，为了不做无谓的 CR3 切换，它会借用上一个用户 task 的 <code>active_mm</code>，这叫 lazy TLB。</div>
+
+<div class="qa"><b>Q4. 为什么 <code>cred</code> 是 <code>const</code> 的？</b>因为多个 task（同组线程、甚至 fork 后的父子）可能共享同一份 <code>cred</code>，读侧需要无锁并发访问。要修改权限（如 <code>setuid()</code>）必须 <code>prepare_creds()</code> 复制一份新的再改，最后 <code>commit_creds()</code> 替换指针。这样不是“给字段加锁”，而是“改指针不改变旧对象”。</div>
+
+<div class="qa"><b>Q5. <code>pid</code> 与 <code>tgid</code> 谁是你 <code>ps</code> 看到的进程号？</b><code>tgid</code>。一个三线程进程的 <code>ps -eLf</code> 会列出 3 行，PID 各不同，但 TGID 相同；内核调度的是每个 task（每个线程），而信号、<code>/proc/&lt;pid&gt;</code> 目录、<code>wait()</code> 大多以 tgid 为单位。</div>
+
+<footer>
+  <p>上一篇：<a href="04-debug-tools.html">04 调试与观测工具</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="06-fork-exit.html">06 fork 与 exit</a></p>
+</footer>
+
+</body>
+</html>

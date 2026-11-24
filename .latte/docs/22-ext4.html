@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>22-ext4：磁盘上的文件系统</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75; max-width: 900px; margin: 0 auto;
+    padding: 32px 24px 80px; font-size: 16px; }
+  nav.top { display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border); }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="23-pseudo-fs.html">下一篇：伪文件系统 →</a>
+</nav>
+
+<h1>💽 ext4：磁盘上的文件系统</h1>
+<p class="subtitle">从超级块到 extent 树，看文件如何铺在硬盘上、崩溃后如何不丢账 · 预计阅读 10 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>硬盘本质是一大段编号的扇区，没有“文件”这个概念。就像一间所有货架从 0 编到 N 的仓库，谁来存放都得自己记“东西在第几排”。文件系统就是<strong>在裸仓库上画出货架目录、登记本与储物规则</strong>的那套制度，ext4 是 Linux 上最常见的一本账。</p>
+<p>它要解决四件事：<strong>空间怎么分</strong>——块组把大盘切成小块，各组位图与 inode 表就近存放，寻道更短；<strong>文件怎么记</strong>——inode 存大小/权限/数据位置，目录记“名字→inode 号”；<strong>大文件怎么省</strong>——extent 用“一段连续区间”代替一长串指针；<strong>崩溃怎么办</strong>——jbd2 写前日志先记再改。此外它还用<span class="term">延迟分配</span>攒大块、用 <span class="term">htree</span> 让百万文件的目录也能快速查找。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">超级块</td><td>superblock</td><td>盘上 1024 字节起的总账：块大小、块组参数、魔数 <code>0xEF53</code>。</td></tr>
+  <tr><td class="term">块组</td><td>block group</td><td>把磁盘切成等大小的管理单位，各带位图、inode 表、组描述符。</td></tr>
+  <tr><td class="term">位图</td><td>bitmap</td><td>每 bit 表示一个块/inode 是否占用，分配时找 0 位。</td></tr>
+  <tr><td class="term">extent</td><td>extent</td><td>“逻辑起点 + 长度 + 物理起点”三元组，代表一段连续块。</td></tr>
+  <tr><td class="term">extent 树</td><td>extent tree</td><td>以 extent 为叶子的浅 B 树，根节点嵌在 inode 的 <code>i_block[]</code>。</td></tr>
+  <tr><td class="term">写前日志</td><td>jbd2</td><td>先写日志区并提交，再写回原位；崩溃时重放或丢弃。</td></tr>
+  <tr><td class="term">延迟分配</td><td>delalloc</td><td><code>write()</code> 只标脏页，回写时才真正分配磁盘块。</td></tr>
+  <tr><td class="term">htree</td><td>hashed tree</td><td>目录项按名字哈希分块，用浅树二分定位，避免线性扫描。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<pre><code>块号  0      1       2        3        4       5..N
+   ┌──────┬──────┬────────┬────────┬──────┬───────────┐
+   │ boot │超级块│组描述符│块位图  │inode │ inode 表  │
+   │      │(1024)│ (GDT)  │(1块)   │位图  │ (N块)     │
+   └──────┴──────┴────────┴────────┴──────┴───────────┘
+                              ↑ 每 bit = 1 块
+                    其后是数据块（文件内容/目录块/extent 树块）</code></pre>
+<p>超级块给出全局参数；组描述符表每项（<code>struct ext4_group_desc</code>）记录本组块位图块号、inode 位图块号、inode 表起始块与空闲计数。分配时先挑组（尽量靠近父目录），再在位图里找 0 位。</p>
+<p>inode（<code>struct ext4_inode</code>，<code>fs/ext4/ext4.h:767</code>）固定 256 字节，含 <code>i_mode/i_uid/i_size/i_links_count</code> 与 <code>i_block[60]</code>。开了 <code>EXT4_EXTENTS_FL</code> 时 <code>i_block[]</code> 整块当 extent 树根，否则是老式直接/间接块指针。</p>
+<pre><code>i_block[60]（extent 模式）
+┌─────────────────────────────────────────┐
+│ header: magic=f30a, entries, max, depth │  12 字节
+├─────────────────────────────────────────┤
+│ extent[0]: lblk=0   len=128 pblk=2048   │  depth=0 时
+│ extent[1]: lblk=128 len=64  pblk=8192   │  叶子直接在 inode 里
+└─────────────────────────────────────────┘
+depth&gt;0 时改为 extent_idx，指向下一层的树块</code></pre>
+<p><strong>extent vs 间接块</strong>：老式每个 4KB 指针块存 1024 个块号，1GB 文件要 256 个指针块、读一个字节要跳三四层；extent 用一个三元组描述“连续 128 块”，记录本身就带连续性，顺序读几乎不用寻道。</p>
+<p><strong>jbd2</strong>：元数据修改都在事务里。“要改的块副本写入日志区 → 写提交块（带校验，表示这组修改完整）→ 才写回原位”。崩溃恢复时找最后一条完整提交重放，不完整的丢弃。日志区是 inode 8，ext4 通过 <code>ext4_journal_start/stop</code> 参与。</p>
+<p><strong>延迟分配</strong>：<code>ext4_da_write_begin</code> 只把页挂进页缓存并在内存 extent status tree 记一条 delayed，不占磁盘块；<code>ext4_writepages</code> 回写时才调 <code>ext4_map_blocks</code> 真正分配。<strong>htree</strong>：小目录是一块里顺序排的目录项；超过一块后改成 <code>dx_root</code>，按名字哈希在 <code>dx_entry{hash, block}</code> 中二分定位叶子块。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 盘上超级块</h3>
+<p class="srcline">fs/ext4/ext4.h:1288-1302  struct ext4_super_block（开头）</p>
+<pre><code>struct ext4_super_block {
+/*00*/	__le32	s_inodes_count;		/* Inodes count */
+	__le32	s_blocks_count_lo;	/* Blocks count */
+	__le32	s_r_blocks_count_lo;	/* Reserved blocks */
+	__le32	s_free_blocks_count_lo;	/* Free blocks */
+/*10*/	__le32	s_free_inodes_count;
+	__le32	s_first_data_block;
+	__le32	s_log_block_size;	/* 块大小 = 1024 &lt;&lt; n */
+/*20*/	__le32	s_blocks_per_group;	/* 通常 32768 */
+	__le32	s_inodes_per_group;
+/*30*/	__le16	s_mnt_count;	__le16 s_max_mnt_count;
+	__le16	s_magic;		/* 0xEF53 */
+	// ... 后面是 feature 位图、UUID、日志 inode 号、校验和</code></pre>
+<p><code>s_log_block_size</code> 是块大小的对数：0→1KB，1→2KB，2→4KB。<code>s_blocks_per_group</code> 通常 32768——一块 4KB 位图恰好管 32768 个块。挂载时 <code>ext4_fill_super</code> 读它并算出每组组描述符位置。</p>
+<p class="srcline">fs/ext4/ext4.h:323-334  struct ext4_group_desc（节选）</p>
+<pre><code>struct ext4_group_desc
+{
+	__le32	bg_block_bitmap_lo;	/* 块位图所在块 */
+	__le32	bg_inode_bitmap_lo;	/* inode 位图所在块 */
+	__le32	bg_inode_table_lo;	/* inode 表起始块 */
+	__le16	bg_free_blocks_count_lo;
+	__le16	bg_free_inodes_count_lo;
+	__le16	bg_used_dirs_count_lo;
+	// ... 省略高 32 位（支持 &gt;2^32 块）与 crc16 校验</code></pre>
+<p>三项指针是分配器的全部依据；<code>bg_used_dirs_count</code> 支持“把新目录放进目录多的组”这类启发式，以平衡负载。</p>
+
+<h3>4.2 逻辑块 → 物理块：ext4_map_blocks</h3>
+<p class="srcline">fs/ext4/inode.c:492-538  ext4_map_blocks（节选）</p>
+<pre><code>	if (unlikely(map-&gt;m_lblk &gt;= EXT_MAX_BLOCKS))
+		return -EFSCORRUPTED;
+
+	/* Lookup extent status tree firstly */
+	if (!(EXT4_SB(inode-&gt;i_sb)-&gt;s_mount_state &amp; EXT4_FC_REPLAY) &amp;&amp;
+	    ext4_es_lookup_extent(inode, map-&gt;m_lblk, NULL, &amp;es)) {
+		if (ext4_es_is_written(&amp;es) || ext4_es_is_unwritten(&amp;es)) {
+			map-&gt;m_pblk = ext4_es_pblock(&amp;es) + map-&gt;m_lblk - es.es_lblk;
+			map-&gt;m_flags |= ext4_es_is_written(&amp;es) ?
+					EXT4_MAP_MAPPED : EXT4_MAP_UNWRITTEN;
+			retval = es.es_len - (map-&gt;m_lblk - es.es_lblk);
+			if (retval &gt; map-&gt;m_len) retval = map-&gt;m_len;
+			map-&gt;m_len = retval;
+		} else if (ext4_es_is_delayed(&amp;es) || ext4_es_is_hole(&amp;es)) {
+			map-&gt;m_pblk = 0;	/* 空洞或延迟块：无物理块 */
+			// ... 同样按 es_len 截断 m_len
+		} else {
+			BUG();
+		}
+		goto found;
+	}
+	// ... 省略：未命中时遍历磁盘 extent 树 / 旧式间接块；
+	//            带 EXT4_GET_BLOCKS_CREATE 时真正分配并回填</code></pre>
+<p>这是 ext4 的地址簿总入口。<strong>先查内存中的 extent status tree</strong>，因为延迟分配的“预留但未分配”信息只在这里，磁盘树里还没有。命中 <code>written</code> 直接算出物理块；命中 <code>delayed/hole</code> 返回 <code>m_pblk=0</code>；未命中才读磁盘 extent 树。</p>
+
+<h3>4.3 延迟写起点：ext4_da_write_begin</h3>
+<p class="srcline">fs/ext4/inode.c:2934-2975  ext4_da_write_begin（节选）</p>
+<pre><code>	index = pos &gt;&gt; PAGE_SHIFT;
+
+	if (ext4_nonda_switch(inode-&gt;i_sb) || S_ISLNK(inode-&gt;i_mode) ||
+	    ext4_verity_in_progress(inode)) {
+		*fsdata = (void *)FALL_BACK_TO_NONDELALLOC;
+		return ext4_write_begin(file, mapping, pos, len, flags, pagep, fsdata);
+	}
+	*fsdata = (void *)0;
+	// ... 省略 inline data 分支
+retry_grab:
+	page = grab_cache_page_write_begin(mapping, index, flags);
+	if (!page)
+		return -ENOMEM;
+	unlock_page(page);
+	// ... 省略 retry_journal：ext4_journal_start 取事务句柄，失败重试</code></pre>
+<p>三处判断：<strong>脏页比例过高</strong>（<code>ext4_nonda_switch</code>）时退化为非延迟分配，否则未分配脏页会积压太多；<strong>符号链接</strong>走快速路径；<strong>fs-verity</strong> 不可延迟。<code>grab_cache_page_write_begin</code> 找到或创建页缓存页并锁住，交给 <code>generic_perform_write</code> 去 <code>copy_from_user</code>。此时<strong>没有分配磁盘块</strong>——带 CREATE 的 <code>ext4_map_blocks</code> 要到回写才调用。</p>
+
+<h3>4.4 回写：ext4_writepages</h3>
+<p class="srcline">fs/ext4/inode.c:2634-2680  ext4_writepages（节选）</p>
+<pre><code>	if (!mapping-&gt;nrpages || !mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+		goto out_writepages;          /* 没脏页，直接返回 */
+
+	if (ext4_should_journal_data(inode)) {
+		ret = generic_writepages(mapping, wbc);   /* data=journal 模式 */
+		goto out_writepages;
+	}
+	// ... 省略 abort 检查、inline data 清理
+	if (wbc-&gt;range_cyclic) {
+		writeback_index = mapping-&gt;writeback_index;
+		mpd.first_page = writeback_index;
+		mpd.last_page = -1;
+	} else {
+		mpd.first_page = wbc-&gt;range_start &gt;&gt; PAGE_SHIFT;
+		mpd.last_page = wbc-&gt;range_end &gt;&gt; PAGE_SHIFT;
+	}
+	blk_start_plug(&amp;plug);
+	mpd.do_map = 0;
+	ret = mpage_prepare_extent_to_map(&amp;mpd);    /* 聚成 extent 再分配 */
+	ext4_io_submit(&amp;mpd.io_submit);             /* 统一发 bio */</code></pre>
+<p>四个要点：<strong>先看 DIRTY 标记</strong>，无脏页不建事务；<strong><code>range_cyclic</code></strong> 实现循环回写，从上次停下的 <code>writeback_index</code> 继续扫；<strong><code>blk_start_plug</code></strong> 把这段期间的 bio 攒起来一次下发，给块层合并机会；<strong><code>mpage_prepare_extent_to_map</code></strong> 把连续脏页聚成 extent 再分配——延迟分配“一次挑大段连续块”的落点。</p>
+
+<h3>4.5 IO 完成收尾：page-io.c</h3>
+<p class="srcline">fs/ext4/page-io.c:122-147  ext4_finish_bio（节选）</p>
+<pre><code>		if (bio-&gt;bi_status) {
+			SetPageError(page);
+			mapping_set_error(page-&gt;mapping, -EIO);
+		}
+		bh = head = page_buffers(page);
+		spin_lock_irqsave(&amp;head-&gt;b_uptodate_lock, flags);
+		do {
+			if (bh_offset(bh) &lt; bio_start ||
+			    bh_offset(bh) + bh-&gt;b_size &gt; bio_end) {
+				if (buffer_async_write(bh))
+					under_io++;
+				continue;
+			}
+			clear_buffer_async_write(bh);
+		} while ((bh = bh-&gt;b_this_page) != head);
+		spin_unlock_irqrestore(&amp;head-&gt;b_uptodate_lock, flags);
+		if (!under_io) {
+			fscrypt_free_bounce_page(bounce_page);
+			end_page_writeback(page);       /* 最后一个写者才释放页 */
+		}</code></pre>
+<p>ext4 用 <code>buffer_head</code> 把一页按块大小切开管理。<code>bio_start/bio_end</code> 是本次 bio 覆盖的字节范围，可能只覆盖页的一部分。只有页上所有 async_write 都清掉、没有别的 bio 还在写这部分（<code>under_io == 0</code>）才 <code>end_page_writeback</code>——这个“最后一个人关灯”的计数是回写正确性的关键。</p>
+
+<h3>4.6 htree 根块</h3>
+<p class="srcline">fs/ext4/namei.c:221-236  struct dx_root</p>
+<pre><code>struct dx_root
+{
+	struct fake_dirent dot;      char dot_name[4];
+	struct fake_dirent dotdot;   char dotdot_name[4];
+	struct dx_root_info {
+		__le32 reserved_zero;
+		u8 hash_version;
+		u8 info_length;      /* 8 */
+		u8 indirect_levels;  /* 0 = 叶子就在本块 */
+		u8 unused_flags;
+	} info;
+	struct dx_entry	entries[];   /* {hash, block}，按 hash 升序 */
+};</code></pre>
+<p>开头的 <code>dot/dotdot</code> 让不认识 htree 的工具仍能当普通目录读；<code>info_length=8</code> 自校验。<code>ext4_dx_find_entry</code> 对目标名字算哈希，在 <code>entries[]</code> 二分找到 <code>hash ≤ 目标</code> 的最后一项，跳进对应目录块继续。</p>
+
+<h2>5. 动手验证</h2>
+<p><strong>造镜像看超级块与组描述符</strong>（不动本机磁盘）：</p>
+<pre><code>dd if=/dev/zero of=/tmp/ext4.img bs=1M count=64
+mkfs.ext4 -b 4096 /tmp/ext4.img
+dumpe2fs -h /tmp/ext4.img | head -30</code></pre>
+<p>预期：<code>Filesystem magic number: 0xEF53</code>、<code>Block size: 4096</code>、<code>Blocks per group: 32768</code>、<code>Journal inode: 8</code>。去掉 <code>-h</code> 还会打印每组的 <code>Block bitmap at</code>、<code>Inode bitmap at</code>、<code>Inode table at</code>，正是 <code>bg_*</code> 三项。</p>
+<p><strong>用 debugfs 读 inode 与 extent</strong>：</p>
+<pre><code>debugfs -w -R "write /etc/hostname big.txt" /tmp/ext4.img
+debugfs -R "stat &lt;big.txt&gt;" /tmp/ext4.img</code></pre>
+<p><code>EXTENTS:</code> 段每行是 <code>(逻辑块):(长度):(物理块)</code>，与上面的 ASCII 图一致；若显示 <code>BLOCKS:</code> 列表则说明该文件未开 extent。</p>
+<p><strong>看连续性</strong>：</p>
+<pre><code>fallocate -l 200M /tmp/frag.bin
+filefrag -v /tmp/frag.bin | head -15</code></pre>
+<p>每行一条 extent。延迟分配生效时 200MB 往往只有极少数、每段很长的 extent。<strong>日志</strong>：<code>tune2fs -l /tmp/ext4.img | grep -i journal</code> 看日志大小与 inode；用 <code>data=journal</code> 挂载对比——所有数据也走日志，更安全但更慢。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. <code>i_block[60]</code> 存什么？</b>开 extent 时是 extent 树根（4 条 extent 或 1 个索引，<code>eh_magic=0xf30a</code>）；否则是 12 个直接指针加单/双/三重间接块指针。</div>
+<div class="qa"><b>Q2. 延迟分配为什么减少碎片？</b><code>write()</code> 只标脏页；回写时聚成 extent 后一次性挑大段连续空间，而不是每次写一点就抢块。</div>
+<div class="qa"><b>Q3. jbd2 崩溃恢复靠什么判断有效性？</b>每个事务末尾有带校验的提交块；恢复时只重放提交块完整的事务，之后的区块丢弃。</div>
+<div class="qa"><b>Q4. <code>ext4_map_blocks</code> 为什么先查 extent status tree？</b>延迟分配、未写（unwritten）等信息只存在内存树里；命中可省一次磁盘树遍历。</div>
+<div class="qa"><b>Q5. htree 比线性目录快在哪？</b>按名字哈希在 <code>dx_entry</code> 数组二分定位叶子块，代价 O(log n) 次块读，而非扫描整目录的所有目录项。</div>
+
+<footer>
+  <p>上一篇：<a href="21-pagecache.html">21-pagecache 页缓存</a> · 下一篇：<a href="23-pseudo-fs.html">23-pseudo-fs 伪文件系统</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

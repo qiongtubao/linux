@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>35 platform 驱动、设备树与 devm 资源管理</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="36-preempt-rt.html">下一篇：36-preempt-rt 实时性内核与抢占模型 →</a>
+</nav>
+
+<h1>🔌 platform 驱动、设备树与 devm 资源管理</h1>
+<p class="subtitle">片上外设怎么被「认领」：设备树 → platform_device → probe → 资源自动回收 · 预计阅读 13 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>想象一栋写字楼：每个房间的水电接口位置都画在楼层的平面图上，工人拿着图纸进来，按图纸找到插座、接上线、装设备。图纸不会因为换了一栋楼就重画——楼的变化体现在图纸上，工人的操作流程不变。</p>
+
+<p>Linux 内核面对的是同一件事。同一份内核要跑在无数块开发板上，板子上的 UART 在 <code>0x9000000</code> 还是 <code>0x3f8</code>、有没有 GPIO 控制芯片、中断号是多少，全都不一样。如果把这些差异写死在驱动代码里，就得为每块板子维护一个内核版本。内核的办法是：<span class="term">把硬件描述从代码里搬到数据里</span>——这就是设备树（Device Tree, DT）。驱动只写「我是谁、我需要什么」，具体「我是谁」由设备树节点回答。</p>
+
+<p>但设备树只是「图纸」。内核还需要一套机制把图纸上的节点和驱动对上号，并让驱动知道：我的寄存器在哪？中断号多少？用完怎么还回去？这套机制的主角叫 <span class="term">platform 总线</span>——它是内核为「不可枚举的片上外设」准备的虚拟总线（PCI、USB 这些能自动枚举的设备不需要它）。</p>
+
+<p>platform 总线只干三件事：</p>
+<ul>
+  <li><b>造设备</b>：把设备树里的一个节点变成一个 <code>struct platform_device</code>；</li>
+  <li><b>配驱动</b>：拿节点里的 <code>compatible</code> 字符串去和驱动声明的匹配表比对，命中就调用驱动的 <code>probe()</code>；</li>
+  <li><b>发资源</b>：把 <code>reg</code>（寄存器区）、<code>interrupts</code>（中断）、<code>gpios</code>（GPIO）交给驱动，并用 <code>devm_*</code> 机制保证「驱动解绑时资源自动归还」。</li>
+</ul>
+
+<p>本篇就沿着这条链路走一遍：从设备树节点怎么变成 platform_device，到 compatible 怎么匹配打分，到 probe 里怎么拿寄存器、怎么用 devm 免手动释放，最后你在 qemu 的 <code>-M virt</code> 机器上写一个真正能 probe 成功的 platform 驱动。</p>
+
+<div class="note">
+  <b>为什么 x86 上很少讲设备树</b>：x86 的硬件描述走的是 ACPI（固件提供），内核启动后由 ACPI 表生成设备。所以 x86 上 platform 设备多由板级代码或 ACPI 创建，而不是设备树。设备树是 ARM/RISC-V 等嵌入式平台的主流做法，QEMU 的 <code>virt</code> 机器恰好两种都支持，本文以设备树为主线。
+</div>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">平台总线</td><td>platform bus</td><td>内核为片上外设准备的虚拟总线，提供统一的匹配与 probe 框架</td></tr>
+  <tr><td class="term">平台设备</td><td>struct platform_device</td><td>一个片上外设在内核里的表示，含名字、资源表、设备树节点指针</td></tr>
+  <tr><td class="term">平台驱动</td><td>struct platform_driver</td><td>驱动这类外设的代码，含 probe/remove 回调和匹配表</td></tr>
+  <tr><td class="term">设备树</td><td>Device Tree / DT</td><td>描述硬件拓扑的数据结构，由 bootloader 传给内核</td></tr>
+  <tr><td class="term">设备节点</td><td>device_node</td><td>设备树里的一个节点，描述一块硬件</td></tr>
+  <tr><td class="term">兼容串</td><td>compatible</td><td>节点里的「我是谁」标识，如 <code>"arm,pl011"</code>，驱动靠它认领设备</td></tr>
+  <tr><td class="term">匹配表</td><td>of_match_table</td><td>驱动里的 <code>of_device_id</code> 数组，列出自己能支持的 compatible</td></tr>
+  <tr><td class="term">探测</td><td>probe</td><td>驱动「认领」设备的回调，在这里申请资源、配置硬件</td></tr>
+  <tr><td class="term">资源</td><td>struct resource</td><td>设备占用的物理区间或中断号，platform_device 里的数组</td></tr>
+  <tr><td class="term">寄存器区</td><td>reg 属性</td><td>设备树里描述「寄存器在哪个物理地址、多长」的属性</td></tr>
+  <tr><td class="term">内存映射 I/O</td><td>ioremap</td><td>把设备寄存器地址映射成内核可安全访问的指针</td></tr>
+  <tr><td class="term">中断</td><td>interrupts 属性</td><td>设备树里描述「设备的中断线怎么连」的属性</td></tr>
+  <tr><td class="term">GPIO</td><td>General Purpose I/O</td><td>通用输入输出引脚，设备树里用 <code>*-gpios</code> 属性描述</td></tr>
+  <tr><td class="term">托管资源</td><td>devres / devm_*</td><td>把资源登记到设备上，设备解绑时自动释放的一整套 API</td></tr>
+  <tr><td class="term">一致性 DMA 内存</td><td>dma_alloc_coherent</td><td>分配一块 CPU 与设备都能直接访问、且物理地址连续的内存</td></tr>
+  <tr><td class="term">延迟探测</td><td>-EPROBE_DEFER</td><td>probe 返回它表示「依赖还没就绪」，内核稍后重试</td></tr>
+  <tr><td class="term">设备模型</td><td>driver model</td><td>bus / device / driver 三者的统一框架（上一篇 33 的主题）</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 从设备树节点到 probe 的完整链路</h3>
+<pre><code>
+ bootloader
+    │  把设备树（DTB）传给内核
+    ▼
+ 启动早期：unflatten_device_tree()
+    │  把扁平的 DTB 展开成树形的 device_node
+    ▼
+ of_platform_default_populate_init()   （arch_initcall）
+    │  遍历根节点的每个子节点
+    ▼
+ of_platform_device_create_pdata(node)
+    │  ├─ 检查 status 属性（"okay" 才创建，"disabled" 跳过）
+    │  ├─ 分配 struct platform_device
+    │  ├─ dev.bus = &amp;platform_bus_type
+    │  └─ 把节点的 reg / interrupts / gpios 翻译成 struct resource 数组
+    ▼
+ platform_device_add() → device_add() → 发 uevent
+    │
+    ▼
+ 内核遍历 platform_bus 上的所有驱动，逐个调用 bus-&gt;match(dev, drv)
+    │
+    ▼
+ platform_match()  ──► of_driver_match_device(dev, drv)
+    │                    └─ of_match_device() → of_match_node()
+    │                         └─ 逐条比对 compatible，按「具体程度」打分
+    │  命中 → really_probe()
+    ▼
+ platform_drv_probe()   ← drivers/base/platform.c
+    │  ├─ of_clk_set_defaults()  配时钟
+    │  ├─ dev_pm_domain_attach()  挂电源域
+    │  └─ 调用 drv-&gt;probe(pdev)   ← 你的代码在这里
+    │        ├─ platform_get_resource(pdev, IORESOURCE_MEM, 0)
+    │        ├─ devm_platform_ioremap_resource(pdev, 0)   ← 自动 ioremap + 自动回收
+    │        ├─ platform_get_irq(pdev, 0)
+    │        ├─ devm_gpiod_get(&pdev-&gt;dev, "reset")
+    │        └─ devm_add_action_or_reset(...)              ← 自定义清理
+    ▼
+ probe 返回 0 → driver_bound()，绑定完成
+    │
+    │  （卸载时）
+    ▼
+ platform_drv_remove() → drv-&gt;remove(pdev) → devres_release_all(dev)
+    └─ 逆序执行所有 devm_* 登记的释放动作：iounmap、kfree、free_irq……
+</code></pre>
+
+<h3>3.2 compatible 匹配：不是「相等」而是「打分」</h3>
+<p>设备节点的 <code>compatible</code> 属性可以写<b>多个</b>字符串，从最具体到最笼统：</p>
+<pre><code>
+	pl011@9000000 {
+		compatible = "arm,pl011", "primecell";
+		...
+	};
+</code></pre>
+<p>而驱动的匹配表也可以有多条。内核不会简单比较字符串是否相等，而是给每个候选打一个分，取最高分的那个。打分规则在 <code>drivers/of/base.c</code> 里写得很清楚：</p>
+<pre><code>
+ 优先级（从高到低）：
+   1. specific compatible &amp;&amp; type &amp;&amp; name
+   2. specific compatible &amp;&amp; type
+   3. specific compatible &amp;&amp; name
+   4. specific compatible            ← 最常见的命中方式
+   5. general compatible &amp;&amp; type &amp;&amp; name
+   ...
+  9. type &amp;&amp; name
+ 10. type
+ 11. name
+</code></pre>
+<p>「specific（具体）」指的是 <code>compatible</code> 列表里靠前的字符串——越靠前越具体。所以一个驱动可以同时支持 <code>"arm,pl011"</code>（精确型号）和 <code>"arm,primecell"</code>（通用 IP），设备报哪个就匹配哪个。</p>
+
+<h3>3.3 设备树里描述硬件的三种常见属性</h3>
+<table>
+  <tr><th>属性</th><th>含义</th><th>驱动怎么拿</th></tr>
+  <tr><td><code>compatible</code></td><td>「我是谁」，用于匹配</td><td><code>of_match_table</code> / <code>of_device_get_match_data()</code></td></tr>
+  <tr><td><code>reg</code></td><td>寄存器区：<code>&lt;地址 长度&gt;</code>，可以有多个</td><td><code>platform_get_resource(pdev, IORESOURCE_MEM, n)</code></td></tr>
+  <tr><td><code>interrupts</code></td><td>中断线：<code>&lt;控制器号 中断号 触发方式&gt;</code></td><td><code>platform_get_irq(pdev, n)</code></td></tr>
+  <tr><td><code>gpios</code> / <code>&lt;name&gt;-gpios</code></td><td>GPIO 连接：<code>&lt;控制器 偏移 极性&gt;</code></td><td><code>devm_gpiod_get(dev, "&lt;name&gt;")</code></td></tr>
+  <tr><td><code>status</code></td><td><code>"okay"</code> 才创建设备</td><td>内核自动处理（<code>of_device_is_available</code>）</td></tr>
+  <tr><td><code>clock-names</code></td><td>需要的时钟</td><td><code>devm_clk_get()</code></td></tr>
+</table>
+
+<h3>3.4 devm：让「申请资源」和「释放资源」解耦</h3>
+<p>老式驱动在 probe 里申请资源，就必须在 remove 里一份份手动释放。写漏一个就是泄漏，写错顺序就是 use-after-free。内核给出的解法叫 <span class="term">devres（设备资源托管）</span>：你把「资源」和「怎么释放它」一起登记到设备上，设备解绑时内核统一按<b>逆序</b>释放。</p>
+<pre><code>
+ probe 里：                          解绑时（自动，无需你写）：
+ ─────────                          ──────────────────────────
+ devm_kzalloc(dev, sz, gfp)      →   kfree(ptr)
+ devm_ioremap_resource(dev, res) →   iounmap(ptr)
+ devm_request_irq(dev, irq, ...) →   free_irq(irq, dev)
+ devm_gpiod_get(dev, "reset")    →   gpiod_put(desc)
+ devm_add_action_or_reset(dev, f, arg) → f(arg)
+</code></pre>
+<p>它的实现朴素得让人意外：每个设备有一个链表 <code>dev-&gt;devres_head</code>，登记时挂到链表头，释放时从头遍历逐个调用释放函数。逆序释放正好符合「后申请的先释放」的直觉。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 设备树节点 → platform_device</h3>
+<p>这一步由 <code>drivers/of/platform.c</code> 完成：遍历设备树，为每个可用节点造一个 platform_device，并把节点里的属性翻译成内核认识的资源。</p>
+<p class="srcline">drivers/of/platform.c:166-199 of_platform_device_create_pdata</p>
+<pre><code>static struct platform_device *of_platform_device_create_pdata(
+					struct device_node *np,
+					const char *bus_id,
+					void *platform_data,
+					struct device *parent)
+{
+	struct platform_device *dev;
+
+	if (!of_device_is_available(np) ||
+	    of_node_test_and_set_flag(np, OF_POPULATED))
+		return NULL;
+
+	dev = of_device_alloc(np, bus_id, parent);
+	if (!dev)
+		goto err_clear_flag;
+
+	dev-&gt;dev.coherent_dma_mask = DMA_BIT_MASK(32);
+	if (!dev-&gt;dev.dma_mask)
+		dev-&gt;dev.dma_mask = &amp;dev-&gt;dev.coherent_dma_mask;
+	dev-&gt;dev.bus = &amp;platform_bus_type;
+	dev-&gt;dev.platform_data = platform_data;
+	of_msi_configure(&amp;dev-&gt;dev, dev-&gt;dev.of_node);
+
+	if (of_device_add(dev) != 0) {
+		platform_device_put(dev);
+		goto err_clear_flag;
+	}
+
+	return dev;
+
+err_clear_flag:
+	of_node_clear_flag(np, OF_POPULATED);
+	return NULL;
+}</code></pre>
+<ul>
+  <li><code>of_device_is_available(np)</code>：读节点的 <code>status</code> 属性。<code>"okay"</code>（或没有 status）才返回真；写成 <code>"disabled"</code> 就跳过——这是板级「暂时不用这个外设」的标准做法。</li>
+  <li><code>of_node_test_and_set_flag(np, OF_POPULATED)</code>：给节点打标记，防止同一个节点被创建两次设备（设备树里一个节点可能同时被两条路径遍历到）。</li>
+  <li><code>dev-&gt;dev.bus = &amp;platform_bus_type</code>：这一行决定了它会走 platform 总线的匹配规则。</li>
+  <li><code>dev-&gt;dev.coherent_dma_mask = DMA_BIT_MASK(32)</code>：默认只允许 32 位 DMA 地址；需要 64 位（ IOMMU 或大内存）的驱动会自己改。</li>
+</ul>
+<p>真正的翻译工作（<code>reg</code> → resource、<code>interrupts</code> → IRQ）在 <code>of_device_alloc()</code>/<code>of_device_add()</code> 里完成，产出的资源就存在 <code>pdev-&gt;resource[]</code> 这个数组里。</p>
+
+<h3>4.2 platform_match：总线怎么决定「这个设备归你」</h3>
+<p class="srcline">drivers/base/platform.c:1170-1193 platform_match</p>
+<pre><code>static int platform_match(struct device *dev, struct device_driver *drv)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct platform_driver *pdrv = to_platform_driver(drv);
+
+	/* When driver_override is set, only bind to the matching driver */
+	if (pdev-&gt;driver_override)
+		return !strcmp(pdev-&gt;driver_override, drv-&gt;name);
+
+	/* Attempt an OF style match first */
+	if (of_driver_match_device(dev, drv))
+		return 1;
+
+	/* Then try ACPI style match */
+	if (acpi_driver_match_device(dev, drv))
+		return 1;
+
+	/* Then try to match against the id table */
+	if (pdrv-&gt;id_table)
+		return platform_match_id(pdrv-&gt;id_table, pdev) != NULL;
+
+	/* fall-back to driver name match */
+	return (strcmp(pdev-&gt;name, drv-&gt;name) == 0);
+}</code></pre>
+<p>四条匹配路径，按优先级：</p>
+<ul>
+  <li><b>driver_override</b>：强制指定。写 <code>echo "mydrv" &gt; /sys/bus/platform/devices/xxx/driver_override</code> 就能手动指定驱动，调试神器。</li>
+  <li><b>设备树匹配</b>：<code>of_driver_match_device()</code> → <code>of_match_device()</code> → <code>of_match_node()</code>，也就是本文重点讲的 compatible 打分。</li>
+  <li><b>ACPI 匹配</b>：x86 平台走这条路。</li>
+  <li><b>id_table 匹配</b>：老式做法，驱动用 <code>platform_device_id</code> 数组按名字匹配。</li>
+  <li><b>名字兜底</b>：设备名和驱动名完全相同就算匹配。没有设备树的场景（比如内核里手工造平台设备）就靠这一条。</li>
+</ul>
+<p>设备树匹配最终落到打分函数：</p>
+<p class="srcline">drivers/of/base.c:484-514 __of_device_is_compatible</p>
+<pre><code>static int __of_device_is_compatible(const struct device_node *device,
+				     const char *compat, const char *type, const char *name)
+{
+	struct property *prop;
+	const char *cp;
+	int index = 0, score = 0;
+
+	/* Compatible match has highest priority */
+	if (compat &amp;&amp; compat[0]) {
+		prop = __of_find_property(device, "compatible", NULL);
+		for (cp = of_prop_next_string(prop, NULL); cp;
+		     cp = of_prop_next_string(prop, cp), index++) {
+			if (of_compat_cmp(cp, compat, strlen(compat)) == 0) {
+				score = INT_MAX/2 - (index &lt;&lt; 2);
+				break;
+			}
+		}
+		if (!score)
+			return 0;
+	}
+
+	/* Matching type is better than matching name */
+	if (type &amp;&amp; type[0]) {
+		if (!__of_node_is_type(device, type))
+			return 0;
+		score += 2;
+	}
+
+	/* Matching name is a bit better than not */
+	if (name &amp;&amp; name[0]) {
+		if (!of_node_name_eq(device, name))
+    // ...（省略：返回 score）</code></pre>
+<ul>
+  <li><code>INT_MAX/2 - (index &lt;&lt; 2)</code>：compatible 列表里越靠前的字符串（index 越小）分越高，每往后一个位置扣 4 分。</li>
+  <li>匹配上 <code>type</code> 再加 2 分，匹配上 <code>name</code> 再加 1 分——这就是「compatible 优先于 type，type 优先于 name」的来源。</li>
+  <li>返回 0 表示完全不匹配，直接出局。</li>
+</ul>
+
+<h3>4.3 platform_probe：总线把设备交给驱动</h3>
+<p>platform 总线在注册驱动时把自己的 <code>probe</code> 钩子挂上去，所以真正调用 <code>drv-&gt;probe()</code> 的是这段代码：</p>
+<p class="srcline">drivers/base/platform.c:746-773 platform_drv_probe</p>
+<pre><code>static int platform_drv_probe(struct device *_dev)
+{
+	struct platform_driver *drv = to_platform_driver(_dev-&gt;driver);
+	struct platform_device *dev = to_platform_device(_dev);
+	int ret;
+
+	ret = of_clk_set_defaults(_dev-&gt;of_node, false);
+	if (ret &lt; 0)
+		return ret;
+
+	ret = dev_pm_domain_attach(_dev, true);
+	if (ret)
+		goto out;
+
+	if (drv-&gt;probe) {
+		ret = drv-&gt;probe(dev);
+		if (ret)
+			dev_pm_domain_detach(_dev, true);
+	}
+
+out:
+	if (drv-&gt;prevent_deferred_probe &amp;&amp; ret == -EPROBE_DEFER) {
+		dev_warn(_dev, "probe deferral not supported\n");
+		ret = -ENXIO;
+	}
+
+	return ret;
+}</code></pre>
+<ul>
+  <li><code>of_clk_set_defaults()</code>：按设备树里的 <code>clocks</code> 属性把时钟框架准备妥当——所以你的 probe 里可以直接 <code>devm_clk_get()</code>。</li>
+  <li><code>dev_pm_domain_attach()</code>：挂上电源域（PM domain），某些 SoC 上设备上电需要这个。</li>
+  <li><code>drv-&gt;probe(dev)</code> 就是你的函数。返回 0 表示成功；返回负数表示失败，内核会解绑并释放所有 devm 资源。</li>
+  <li>返回 <code>-EPROBE_DEFER</code> 表示「我依赖的另一个驱动还没就绪」，内核会把这个设备挂到延迟探测链表，等依赖满足后重试 probe。这是处理驱动间依赖的标准手法。</li>
+</ul>
+
+<h3>4.4 platform_get_resource 与 platform_get_irq</h3>
+<p>驱动拿到设备后，第一件事是问「我的寄存器在哪、中断是多少」。</p>
+<p class="srcline">drivers/base/platform.c:51-64 platform_get_resource</p>
+<pre><code>struct resource *platform_get_resource(struct platform_device *dev,
+				       unsigned int type, unsigned int num)
+{
+	u32 i;
+
+	for (i = 0; i &lt; dev-&gt;num_resources; i++) {
+		struct resource *r = &amp;dev-&gt;resource[i];
+
+		if (type == resource_type(r) &amp;&amp; num-- == 0)
+			return r;
+	}
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(platform_get_resource);</code></pre>
+<ul>
+  <li><code>type</code> 是资源类型：<code>IORESOURCE_MEM</code>(0x200) 内存区、<code>IORESOURCE_REG</code>(0x300) 寄存器描述、<code>IORESOURCE_IRQ</code>(0x400) 中断。判断依据是 <code>resource_type(r)</code>，也就是 <code>r-&gt;flags &amp; IORESOURCE_TYPE_BITS</code>。</li>
+  <li><code>num</code> 是同类资源里的第几个。设备树里写了几个 <code>reg</code>，这里就用 0、1、2 依次取。</li>
+  <li><code>num-- == 0</code> 这个写法很巧：命中第一个时 num 变 0 返回，第二个时 num 已是 -1 不等于 0……实际效果就是「数到第 num 个同类资源」。</li>
+  <li>返回 <code>NULL</code> 表示没有这类资源，驱动必须检查。</li>
+</ul>
+<p>中断号的获取多一层逻辑，因为要同时支持设备树和 ACPI：</p>
+<p class="srcline">drivers/base/platform.c:260-270 platform_get_irq</p>
+<pre><code>int platform_get_irq(struct platform_device *dev, unsigned int num)
+{
+	int ret;
+
+	ret = platform_get_irq_optional(dev, num);
+	if (ret &lt; 0 &amp;&amp; ret != -EPROBE_DEFER)
+		dev_err(&amp;dev-&gt;dev, "IRQ index %u not found\n", num);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(platform_get_irq);</code></pre>
+<p>而 <code>platform_get_irq_optional()</code> 里的顺序是：</p>
+<ol>
+  <li>如果设备有设备树节点，<code>of_irq_get(dev-&gt;dev.of_node, num)</code> 从 <code>interrupts</code> 属性解析出中断号；</li>
+  <li>否则退回从 <code>IORESOURCE_IRQ</code> 资源里取 <code>r-&gt;start</code>；</li>
+  <li>如果资源带了 <code>IORESOURCE_BITS</code> 里的触发类型标志，还会顺带设置 IRQ 的触发方式（边沿/电平）。</li>
+</ol>
+<p>注意返回值语义：<b>成功返回中断号（正数），失败返回负错误码</b>。所以驱动里要写 <code>if (irq &lt; 0) return irq;</code>，绝不能把负数当中断号传给 <code>request_irq()</code>。</p>
+
+<h3>4.5 devm_ioremap_resource：把寄存器变成能安全访问的指针</h3>
+<p>设备寄存器不能直接解引用物理地址，必须先 <code>ioremap</code>。而 <code>devm_ioremap_resource()</code> 把「申请 + 映射 + 自动回收」三件事打包了。</p>
+<p class="srcline">lib/devres.c:116-154 __devm_ioremap_resource</p>
+<pre><code>static void __iomem *
+__devm_ioremap_resource(struct device *dev, const struct resource *res,
+			enum devm_ioremap_type type)
+{
+	resource_size_t size;
+	void __iomem *dest_ptr;
+	char *pretty_name;
+
+	BUG_ON(!dev);
+
+	if (!res || resource_type(res) != IORESOURCE_MEM) {
+		dev_err(dev, "invalid resource\n");
+		return IOMEM_ERR_PTR(-EINVAL);
+	}
+
+	size = resource_size(res);
+
+	if (res-&gt;name)
+		pretty_name = devm_kasprintf(dev, GFP_KERNEL, "%s %s",
+					     dev_name(dev), res-&gt;name);
+	else
+		pretty_name = devm_kstrdup(dev, dev_name(dev), GFP_KERNEL);
+	if (!pretty_name)
+		return IOMEM_ERR_PTR(-ENOMEM);
+
+	if (!devm_request_mem_region(dev, res-&gt;start, size, pretty_name)) {
+		dev_err(dev, "can't request region for resource %pR\n", res);
+		return IOMEM_ERR_PTR(-EBUSY);
+	}
+
+	dest_ptr = __devm_ioremap(dev, res-&gt;start, size, type);
+	if (!dest_ptr) {
+		dev_err(dev, "ioremap failed for resource %pR\n", res);
+		devm_release_mem_region(dev, res-&gt;start, size);
+		dest_ptr = IOMEM_ERR_PTR(-ENOMEM);
+	}
+
+	return dest_ptr;
+}</code></pre>
+<ul>
+  <li>先检查资源类型必须是 <code>IORESOURCE_MEM</code>，否则返回 <code>-EINVAL</code>——传错类型（比如把 <code>IORESOURCE_REG</code> 拿来）会在这里被挡住。</li>
+  <li><code>devm_request_mem_region()</code>：向 I/O 资源管理器申请独占这段物理地址。别人已经占了就返回 <code>-EBUSY</code>。这一步能挡住「两个驱动乱映射同一段寄存器」。</li>
+  <li><code>__devm_ioremap()</code>：真正做映射，并把「释放动作」登记到 devres 链上。</li>
+  <li>映射失败时把刚申请的内存区退回去，错误码用 <code>IOMEM_ERR_PTR()</code> 包装。</li>
+</ul>
+<p>对外的接口更简单：</p>
+<p class="srcline">lib/devres.c:175-180 devm_ioremap_resource</p>
+<pre><code>void __iomem *devm_ioremap_resource(struct device *dev,
+				    const struct resource *res)
+{
+	return __devm_ioremap_resource(dev, res, DEVM_IOREMAP);
+}
+EXPORT_SYMBOL(devm_ioremap_resource);</code></pre>
+<p>platform 驱动还有两个「一步到位」的封装：<code>devm_platform_ioremap_resource(pdev, 0)</code>（自己取第 0 个内存资源再映射）和 <code>devm_platform_get_and_ioremap_resource()</code>（顺便把 resource 指针也返回给你）。</p>
+
+<h3>4.6 devm 资源是怎么被自动释放的</h3>
+<p>释放发生在驱动解绑时。内核先调用驱动的 <code>remove</code>，然后统一回收 devres。</p>
+<p class="srcline">drivers/base/dd.c:580-586 really_probe 的解绑路径</p>
+<pre><code>		if (dev-&gt;bus-&gt;remove)
+			dev-&gt;bus-&gt;remove(dev);
+		else if (drv-&gt;remove)
+			drv-&gt;remove(dev);
+
+		devres_release_all(dev);
+		driver_sysfs_remove(dev);</code></pre>
+<p class="srcline">drivers/base/devres.c:537-547 devres_release_all</p>
+<pre><code>int devres_release_all(struct device *dev)
+{
+	unsigned long flags;
+
+	/* Looks like an uninitialized device structure */
+	if (WARN_ON(dev-&gt;devres_head.next == NULL))
+		return -ENODEV;
+	spin_lock_irqsave(&amp;dev-&gt;devres_lock, flags);
+	return release_nodes(dev, dev-&gt;devres_head.next, &amp;dev-&gt;devres_head,
+			     flags);
+}</code></pre>
+<p><code>release_nodes()</code> 沿着链表挨个调用每个资源登记时留下的释放函数。<b>链表是头插的，所以遍历顺序正好是「后申请的先释放」</b>——这正是我们想要的顺序（比如先释放依赖别的东西的资源）。</p>
+<p>如果你要加自己的清理逻辑（不是内核已有的 devm 类型），用 <code>devm_add_action_or_reset()</code>：</p>
+<p class="srcline">include/linux/device.h:257-267 devm_add_action_or_reset</p>
+<pre><code>static inline int devm_add_action_or_reset(struct device *dev,
+					   void (*action)(void *), void *data)
+{
+	int ret;
+
+	ret = devm_add_action(dev, action, data);
+	if (ret)
+		action(data);
+
+	return ret;
+}</code></pre>
+<p><code>or_reset</code> 的意思是：如果登记动作本身失败了（比如内存不足），就<b>立刻</b>把 action 执行一遍做清理，避免漏掉资源。<code>devm_add_action()</code> 本身在 <code>drivers/base/devres.c</code> 里实现，也是用 devres 分配器分配的节点：</p>
+<p class="srcline">drivers/base/devres.c:739-754 devm_add_action</p>
+<pre><code>int devm_add_action(struct device *dev, void (*action)(void *), void *data)
+{
+	struct action_devres *devres;
+
+	devres = devres_alloc(devm_action_release,
+			      sizeof(struct action_devres), GFP_KERNEL);
+	if (!devres)
+		return -ENOMEM;
+
+	devres-&gt;data = data;
+	devres-&gt;action = action;
+
+	devres_add(dev, devres);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(devm_add_action);</code></pre>
+
+<h3>4.7 gpiod_get：拿 GPIO 的正确姿势</h3>
+<p>GPIO 在设备树里的描述是一个 <code>&lt;name&gt;-gpios</code> 属性，驱动用 <code>gpiod_get()</code> 按名字去要。</p>
+<p class="srcline">drivers/gpio/gpiolib.c:3817-3832 gpiod_get</p>
+<pre><code>/**
+ * gpiod_get - obtain a GPIO for a given GPIO function
+ * @dev:	GPIO consumer, can be NULL for system-global GPIOs
+ * @con_id:	function within the GPIO consumer
+ * @flags:	optional GPIO initialization flags
+ *
+ * Return: the GPIO descriptor corresponding to the function con_id of device
+ * dev, -ENOENT if no GPIO has been assigned to the requested function, or
+ * another IS_ERR() code if an error occurred while trying to acquire the GPIO.
+ */
+struct gpio_desc *__must_check gpiod_get(struct device *dev, const char *con_id,
+					 enum gpiod_flags flags)
+{
+	return gpiod_get_index(dev, con_id, 0, flags);
+}
+EXPORT_SYMBOL_GPL(gpiod_get);</code></pre>
+<p><code>gpiod_get_index()</code> 会依次尝试设备树、ACPI、平台数据三种来源，设备树这一路最终落到 <code>of_find_gpio()</code>：</p>
+<p class="srcline">drivers/gpio/gpiolib-of.c:492-517 of_find_gpio</p>
+<pre><code>struct gpio_desc *of_find_gpio(struct device *dev, const char *con_id,
+			       unsigned int idx, unsigned long *flags)
+{
+	char prop_name[32]; /* 32 is max size of property name */
+	enum of_gpio_flags of_flags;
+	struct gpio_desc *desc;
+	unsigned int i;
+
+	/* Try GPIO property "foo-gpios" and "foo-gpio" */
+	for (i = 0; i &lt; ARRAY_SIZE(gpio_suffixes); i++) {
+		if (con_id)
+			snprintf(prop_name, sizeof(prop_name), "%s-%s", con_id,
+				 gpio_suffixes[i]);
+		else
+			snprintf(prop_name, sizeof(prop_name), "%s",
+				 gpio_suffixes[i]);
+
+		desc = of_get_named_gpiod_flags(dev-&gt;of_node, prop_name, idx,
+						&amp;of_flags);
+
+		if (!IS_ERR(desc) || PTR_ERR(desc) != -ENOENT)
+			break;
+	}
+
+	// ...（省略：SPI/regulator/azona/usb 等特殊 GPIO 的兜底查找）</code></pre>
+<ul>
+  <li><code>con_id</code> 就是设备树属性的名字前缀：<code>gpiod_get(dev, "reset")</code> 找的是 <code>reset-gpios</code> 或 <code>reset-gpio</code>。</li>
+  <li>返回值是 <code>struct gpio_desc *</code>（不透明描述符），不是 GPIO 编号——这样才能同时表达「哪个 GPIO 控制器 + 控制器里的第几根线」。</li>
+  <li>用 <code>gpiod_get_optional()</code> 的场合，找不到时返回 <code>NULL</code> 而不是错误码，适合「有没有都行」的引脚。</li>
+  <li>一定要用 <code>devm_gpiod_get()</code>，它会在设备解绑时自动 <code>gpiod_put()</code>。</li>
+</ul>
+
+<h3>4.8 一句话记住 DMA</h3>
+<p>驱动要一块「CPU 和设备都能直接访问、物理地址连续」的内存时，用 <code>dma_alloc_coherent(dev, size, &amp;dma_handle, gfp)</code>：它返回的虚拟指针你可以直接解引用，返回的 <code>dma_handle</code> 是要写进设备寄存器的总线地址（设备通过 IOMMU 时它和物理地址不同）。释放用 <code>dma_free_coherent()</code>，或者用 <code>devm_</code> 版本的托管接口。</p>
+<p class="srcline">include/linux/dma-mapping.h:392-398 dma_alloc_coherent</p>
+<pre><code>static inline void *dma_alloc_coherent(struct device *dev, size_t size,
+		dma_addr_t *dma_handle, gfp_t gfp)
+{
+
+	return dma_alloc_attrs(dev, size, dma_handle, gfp,
+			(gfp &amp; __GFP_NOWARN) ? DMA_ATTR_NO_WARN : 0);
+}</code></pre>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 先在现有系统上观察 platform 总线</h3>
+<p>下面是一块 ARM 开发板上的真实输出，你的机器上设备列表会不一样，但结构是一样的：</p>
+<pre><code>
+$ ls /sys/bus/platform/devices/
+# 或者带详细信息的版本
+$ ls -l /sys/bus/platform/devices/
+total 0
+drwxr-xr-x 2 root root 0 Aug 20 10:00 800f0000.dwmmc
+drwxr-xr-x 2 root root 0 Aug 20 10:00 serial8250
+...
+
+$ ls /sys/bus/platform/drivers/
+8250-uart  cpuid  efi-vars  iommu  microcode  qcom-scm  ...
+
+$ cat /sys/bus/platform/devices/800f0000.dwmmc/modalias
+of:N800f0000dwmmcT(null)T(null)Tbcm2835-bcm2835d
+
+$ ls /sys/bus/platform/devices/800f0000.dwmmc/
+driver/     modalias  of_node/  power/  uevent  ...
+
+$ cat /sys/bus/platform/devices/800f0000.dwmmc/uevent
+DRIVER=...
+OF_NAME=800f0000.dwmmc
+OF_FULLNAME=/soc/dwmmc@800f0000
+OF_COMPATIBLE_0=brcm,bcm2835-dwmmc
+OF_COMPATIBLE_1=brcm,bcm2835-dwmmc
+MAJOR=254
+OF_ALIAS_ID=...
+</code></pre>
+<p>预期输出说明：<code>/sys/bus/platform/devices/</code> 下每个目录是一个平台设备；<code>modalias</code> 就是设备树里的 compatible 串（<code>OF_NAME</code> 是节点名，<code>OF_COMPATIBLE_0/1</code> 是 compatible 列表，<code>OF_FULLNAME</code> 是节点的完整路径）；<code>/sys/bus/platform/drivers/</code> 下是已注册的驱动，每个驱动目录里的软链接指向它绑定的设备。</p>
+<p>如果你的内核带 <code>CONFIG_PROC_DEVICETREE</code>，还能直接看设备树：</p>
+<pre><code>
+$ ls /proc/device-tree/
+# 找到某个节点的 compatible
+$ cat /proc/device-tree/soc/serial@9000000/compatible | tr '\0' ' '
+arm,pl011 primecell
+
+$ ls /proc/device-tree/soc/serial@9000000/reg/     # reg 是 3 个 32 位字：地址(2) + 长度
+</code></pre>
+<p>没有 <code>/proc/device-tree</code> 的话，可以从 <code>/sys/firmware/fdt</code>（设备树原始 blob）用 <code>dtc</code> 反编译：</p>
+<pre><code>
+$ dtc -I dtb -O dts /sys/firmware/fdt | head -40
+/dts-v1/;
+/ {
+	compatible = "linux,dummy-virt";
+	model = "Dummy virt";
+	#address-cells = &lt;0x1&gt;;
+	#size-cells = &lt;0x1&gt;;
+	...
+};
+</code></pre>
+<p>能看到设备树源码，就说明这台机器的硬件描述是「数据」而不是「代码」，也就理解了 platform 总线的意义。</p>
+
+<h3>5.2 实验 A：自己造一个 platform 设备和驱动（任何 Linux 都能做）</h3>
+<p>这个实验不需要设备树，也不需要特殊硬件：我们在模块里造一个 platform_device（带一个假寄存器资源），再注册一个同名驱动，看内核如何自动匹配并调用 probe，最后看 devm 资源如何自动回收。</p>
+
+<p><b>virt_demo.c</b>：</p>
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+#include &lt;linux/module.h&gt;
+#include &lt;linux/init.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/ioport.h&gt;
+#include &lt;linux/slab.h&gt;
+
+#define VIRT_DEV_NAME "virt-demo"
+#define VIRT_REG_BASE 0x1000
+#define VIRT_REG_SIZE 0x100
+
+struct virt_demo {
+	int counter;
+};
+
+/* 自定义的 devm 清理动作：设备解绑时自动调用 */
+static void virt_demo_cleanup(void *data)
+{
+	struct virt_demo *v = data;
+	pr_info("virt-demo: devm cleanup runs, counter=%d\n", v-&gt;counter);
+}
+
+static int virt_demo_probe(struct platform_device *pdev)
+{
+	struct virt_demo *v;
+	struct resource *res;
+
+	pr_info("virt-demo: probe, name=%s id=%d\n", pdev-&gt;name, pdev-&gt;id);
+
+	/* 1) 私货：用 devm 分配，驱动解绑时自动释放 */
+	v = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return -ENOMEM;
+
+	/* 2) 取资源：设备树 reg 或内核传进来的 resource 都在这里 */
+	res = platform_get_resource(pdev, IORESOURCE_REG, 0);
+	if (!res) {
+		pr_err("virt-demo: no REG resource\n");
+		return -ENODEV;
+	}
+	pr_info("virt-demo: reg 0x%llx..0x%llx\n",
+		(unsigned long long)res-&gt;start,
+		(unsigned long long)res-&gt;end);
+
+	/* 3) 中断：真实设备里来自设备树的 interrupts 属性 */
+	if (platform_get_irq(pdev, 0) &lt; 0)
+		pr_info("virt-demo: no irq (normal for a synthetic device)\n");
+
+	/* 4) 自定义清理动作 */
+	devm_add_action_or_reset(&amp;pdev-&gt;dev, virt_demo_cleanup, v);
+
+	platform_set_drvdata(pdev, v);
+	v-&gt;counter = 42;
+	pr_info("virt-demo: probed ok\n");
+	return 0;
+}
+
+static int virt_demo_remove(struct platform_device *pdev)
+{
+	struct virt_demo *v = platform_get_drvdata(pdev);
+
+	pr_info("virt-demo: remove, counter=%d\n", v ? v-&gt;counter : -1);
+	return 0;
+}
+
+static struct platform_driver virt_demo_driver = {
+	.probe	= virt_demo_probe,
+	.remove	= virt_demo_remove,
+	.driver = {
+		.name = VIRT_DEV_NAME,
+	},
+};
+
+static struct platform_device *virt_demo_dev;
+
+static int __init virt_demo_init(void)
+{
+	struct resource res[1] = {
+		{
+			.start = VIRT_REG_BASE,
+			.end   = VIRT_REG_BASE + VIRT_REG_SIZE - 1,
+			.flags = IORESOURCE_REG,
+			.name  = "regs",
+		},
+	};
+
+	/* 先造设备 */
+	virt_demo_dev = platform_device_register_simple(VIRT_DEV_NAME,
+							PLATFORM_DEVID_NONE,
+							res, ARRAY_SIZE(res));
+	if (IS_ERR(virt_demo_dev))
+		return PTR_ERR(virt_demo_dev);
+
+	/* 再注册驱动：内核会立刻匹配并调用 probe */
+	return platform_driver_register(&amp;virt_demo_driver);
+}
+
+static void __exit virt_demo_exit(void)
+{
+	platform_driver_unregister(&amp;virt_demo_driver);
+	platform_device_unregister(virt_demo_dev);
+	pr_info("virt-demo: bye\n");
+}
+
+module_init(virt_demo_init);
+module_exit(virt_demo_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("A synthetic platform device demo");</code></pre>
+
+<p><b>Makefile</b>（和上一篇一样）：</p>
+<pre><code>obj-m := virt_demo.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+
+<p><b>跑起来看：</b></p>
+<pre><code>
+$ make &amp;&amp; sudo insmod virt_demo.ko
+$ dmesg | tail -8
+[ 12345.678901] virt-demo: probe, name=virt-demo id=-1
+[ 12345.678902] virt-demo: reg 0x1000..0x10ff
+[ 12345.678903] virt-demo: IRQ index 0 not found
+[ 12345.678904] virt-demo: no irq (normal for a synthetic device)
+[ 12345.678905] virt-demo: probed ok
+
+$ ls /sys/bus/platform/devices/ | grep virt
+virt-demo
+
+$ ls -l /sys/bus/platform/drivers/virt-demo/
+bind  device_override  uevent  virt-demo -&gt; ../../../devices/platform/virt-demo
+
+$ sudo rmmod virt_demo
+$ dmesg | tail -4
+[ 12346.111111] virt-demo: remove, counter=42
+[ 12346.111112] virt-demo: devm cleanup runs, counter=42
+[ 12346.111113] virt-demo: bye
+</code></pre>
+<p>预期输出说明（按出现顺序）：</p>
+<ol>
+  <li><code>probe, name=virt-demo id=-1</code>：驱动被调用了。注意 <code>id=-1</code>，因为我们传的是 <code>PLATFORM_DEVID_NONE</code>。</li>
+  <li><code>reg 0x1000..0x10ff</code>：<code>platform_get_resource(pdev, IORESOURCE_REG, 0)</code> 成功拿到了我们登记的资源。</li>
+  <li><code>IRQ index 0 not found</code>：<code>platform_get_irq()</code> 找不到中断时内核会打印这条错误——它内部调的是 <code>platform_get_irq_optional()</code>，找不到就返回 <code>-ENXIO</code>。真实设备的中断号来自设备树的 <code>interrupts</code> 属性。</li>
+  <li><code>remove</code> 之后紧跟 <code>devm cleanup runs</code>：这正是 devres 的自动释放——我们在 probe 里登记的清理动作，在 remove 之后被内核自动调用了，一行手动释放代码都没写。</li>
+  <li><code>/sys/bus/platform/drivers/virt-demo/virt-demo</code> 是指向设备的软链接，表示绑定关系。</li>
+</ol>
+
+<h3>5.3 实验 B：在 qemu <code>-M virt</code> 上写一个真正的设备树驱动</h3>
+<p>这个实验要走完整的设备树路线，需要一个 <b>aarch64</b> 内核（设备树是 ARM 平台的主场）和一个 busybox initramfs。</p>
+
+<p><b>第 1 步：准备内核</b></p>
+<pre><code>
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+$ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image -j8
+# 顺便确认设备树支持打开了
+$ grep CONFIG_OF= .config
+CONFIG_OF=y
+</code></pre>
+
+<p><b>第 2 步：导出 QEMU 的设备树并加一个自己的节点</b></p>
+<pre><code>
+$ qemu-system-aarch64 -M virt,dumpdtb=virt.dtb
+$ dtc -I dtb -O dts -o virt.dts virt.dtb
+$ less virt.dts
+</code></pre>
+<p>你会看到 QEMU 生成的设备树，里面有 <code>pl011@9000000</code>（串口，compatible = "arm,pl011"）、<code>virtio_mmio@...</code>、<code>fw_cfg@9000000</code> 等节点。现在编辑 <code>virt.dts</code>，在根节点的 <code>/ { ... }</code> 里加入我们自己的设备：</p>
+<pre><code>
+	mydev@20000000 {
+		compatible = "mycompany,mydev";
+		reg = &lt;0x0 0x20000000 0x0 0x1000&gt;;
+		interrupts = &lt;0 1 100&gt;;
+		status = "okay";
+	};
+</code></pre>
+<ul>
+  <li><code>compatible</code> 是我们驱动要匹配的关键字。</li>
+  <li><code>reg</code> 是「地址 + 长度」。x86/arm64 的设备树里 <code>#address-cells = &lt;1&gt;</code>、<code>#size-cells = &lt;1&gt;</code>，所以 32 位地址写成 <code>&lt;0x0 0x20000000 0x0 0x1000&gt;</code>（每项 2 个 32 位字）。</li>
+  <li><code>interrupts = &lt;0 1 100&gt;</code>：三元组「中断控制器号 / 类型 / 中断号」，这里 0=GIC、1=SPI、100=中断号。</li>
+</ul>
+<pre><code>
+$ dtc -I dts -O dtb -o virt-mydev.dtb virt.dts
+</code></pre>
+
+<p><b>第 3 步：写驱动</b>（<b>mydev.c</b>）：</p>
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/of.h&gt;
+#include &lt;linux/io.h&gt;
+
+static int mydev_probe(struct platform_device *pdev)
+{
+	struct resource *res;
+	void __iomem *base;
+	int irq;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		pr_err("mydev: no reg resource\n");
+		return -ENODEV;
+	}
+	pr_info("mydev: reg at 0x%llx size 0x%llx\n",
+		(unsigned long long)res-&gt;start,
+		(unsigned long long)resource_size(res));
+
+	/* 取资源 + ioremap + 自动回收，一步到位 */
+	base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(base))
+		return PTR_ERR(base);
+
+	irq = platform_get_irq(pdev, 0);
+	pr_info("mydev: base=%p irq=%d\n", base, irq);
+
+	return 0;
+}
+
+static const struct of_device_id mydev_of_match[] = {
+	{ .compatible = "mycompany,mydev" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, mydev_of_match);
+
+static struct platform_driver mydev_driver = {
+	.probe = mydev_probe,
+	.driver = {
+		.name = "mydev",
+		.of_match_table = mydev_of_match,
+	},
+};
+module_platform_driver(mydev_driver);
+
+MODULE_LICENSE("GPL");</code></pre>
+
+<p><b>第 4 步：启动 qemu</b></p>
+<pre><code>
+$ qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512 \
+      -kernel arch/arm64/boot/Image \
+      -dtb virt-mydev.dtb \
+      -initrd initramfs.cpio.gz \
+      -append "console=ttyAMA0" -nographic
+</code></pre>
+<p>在串口终端里（先 <code>mount -t sysfs sysfs /sys</code>）：</p>
+<pre><code>
+/ # ls /sys/bus/platform/devices/
+20000000.mydev      ← 我们在设备树里加的节点，已经变成 platform_device
+pl011               ← QEMU 自带的串口
+virtio-mmio
+...
+
+/ # cat /sys/bus/platform/devices/20000000.mydev/of_node/compatible | tr '\0' ' '
+mycompany.mydev
+
+/ # insmod mydev.ko
+/ # dmesg | tail -3
+[    2.345678] mydev: reg at 0x20000000 size 0x1000
+[    2.345679] mydev: base=ffff900001000000 irq=33
+
+/ # ls /sys/bus/platform/drivers/mydev/
+20000000.mydev -&gt; ../../../devices/platform/20000000.mydev
+</code></pre>
+<p>其中内核地址和中断号的具体数值随机器不同会变，重点是「reg 打印出来了、base 不为空、irq 是一个正数」。</p>
+<p>预期输出说明：设备树节点 <code>20000000.mydev</code> 自动变成了平台设备；加载驱动后 <code>of_match_table</code> 命中 compatible，内核调用 probe；<code>devm_platform_ioremap_resource()</code> 打印出映射后的内核地址；<code>platform_get_irq()</code> 从 <code>interrupts</code> 属性取到了中断号。</p>
+<div class="warn">
+  <b>不要真的去读写那个寄存器</b>：<code>0x20000000</code> 在 QEMU 的 aarch64 virt 机器上并没有对应的设备，访问它会触发 QEMU 的「Invalid access」而让虚拟机abort。演示时只做 ioremap 和打印即可；如果你想真的读写，就把 <code>reg</code> 指向一个 QEMU 里真实存在且读起来无害的设备区域。
+</div>
+<div class="tip">
+  <b>省事的替代方案</b>：不想编译 arm64 内核的话，可以只做实验 A——它用纯软件造出 platform_device，把「匹配 → probe → 拿资源 → devm 自动释放」这条链路完整走了一遍，而这正是 platform 驱动的全部核心。设备树只是把「设备从哪来」换了个来源而已。
+</div>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. platform 总线存在的意义是什么？为什么不直接用 PCI 那种总线？</b>因为片上外设（UART、I2C 控制器、GPIO 芯片）挂在芯片内部，没有 PCI 那种可枚举的总线，操作系统无法自动发现它们。platform 总线提供了一套统一的「设备—驱动」匹配框架，让这些设备的描述方式（设备树 / ACPI / 内核代码）和驱动的写法（probe/remove）都与 PCI 设备保持一致。</div>
+
+<div class="qa"><b>Q2. compatible 和驱动的名字必须完全一样吗？</b>不一定。设备树路线下，匹配靠的是驱动 <code>of_match_table</code> 里的 compatible 串和节点 <code>compatible</code> 属性的字符串比较（带打分）。只有在没有设备树、也没有 id_table 时，才退化成「设备名 == 驱动名」的兜底匹配。设备名通常来自节点名（<code>20000000.mydev</code>），驱动名是自己取的，两者通常完全不同。</div>
+
+<div class="qa"><b>Q3. <code>platform_get_resource(pdev, IORESOURCE_MEM, 0)</code> 返回 NULL 怎么办？<code>platform_get_irq()</code> 返回负数又是什么意思？</b>前者说明这个设备没有第 0 个内存资源：要么设备树里没写 <code>reg</code>，要么索引写错了。驱动必须检查返回值并返回错误码（如 <code>-ENODEV</code>），否则后面 <code>devm_ioremap_resource()</code> 会因为传进 NULL 而在 <code>BUG_ON</code> 处直接让内核崩溃。后者是错误码，常见的是 <code>-ENXIO</code>（这个设备没有第 0 个中断）——中断号本身是正数，所以驱动里必须写 <code>if (irq &lt; 0) return irq;</code>，绝不能把负数传给 <code>request_irq()</code>。用 <code>platform_get_irq_optional()</code> 则不会打印错误日志，适合中断可选的设备。</div>
+
+<div class="qa"><b>Q4. devm_* 资源到底是谁释放的？驱动 remove 里还需要手动释放吗？</b>不需要。devm 资源登记在 <code>dev-&gt;devres_head</code> 链表上，驱动解绑时内核在调用完 <code>remove()</code> 之后执行 <code>devres_release_all()</code>，按「后申请先释放」的逆序逐个调用释放函数。驱动自己 remove 里还要手动释放的，只有那些<b>不是</b>用 devm API 申请的普通资源。</div>
+
+<div class="qa"><b>Q5. probe 返回 <code>-EPROBE_DEFER</code> 是什么意思？设备树里 <code>status = "disabled"</code> 的节点会怎样？</b>前者表示「我依赖的另一个设备/驱动还没准备好」，比如我要的时钟、电源域、IOMMU 还没注册。内核会把这个设备挂到延迟探测队列，等依赖满足后重新调用 probe——所以 probe 里遇到「资源暂时拿不到」时，返回 <code>-EPROBE_DEFER</code> 而不是 <code>-ENODEV</code>，是驱动之间正确排序的关键。后者则根本不会被创造成 platform_device：<code>of_platform_device_create_pdata()</code> 里的 <code>of_device_is_available()</code> 会跳过它。这给板级裁剪提供了手段：硬件在板上但这次不使能，就在设备树里关掉它。</div>
+
+<footer>
+  <p>上一篇：<a href="34-char-dev.html">34-char-dev 字符设备</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="36-preempt-rt.html">36-preempt-rt 实时性内核与抢占模型</a></p>
+</footer>
+
+</body>
+</html>

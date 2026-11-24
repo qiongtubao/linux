@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18 · 内存回收：direct reclaim、kswapd 与 LRU 的取舍</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="19-thp.html">下一篇：透明大页 THP：把页表项变少 →</a>
+</nav>
+
+<h1>♻️ 内存回收：direct reclaim、kswapd 与 LRU 的取舍</h1>
+<p class="subtitle">内存不够时，内核必须从"已经分配出去的页"里挑一些扔掉，问题是扔谁、什么时候扔、扔之前要不要先写到磁盘 · 预计阅读 45 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>前面两讲讲了"怎么给"：缺页时分配物理页，mmap 时建立映射。但内存管理还有另一半——<b>怎么收</b>。想象一家图书馆：书架是有限的，借出去的书不可能无限增加。当有人来借书而书架满了，管理员必须做两件事之一——要么把暂时没人看的书先搬到后面的储藏室（这就是换出到 swap），要么把纯粹是复印出来的、谁都没在借的副本扔掉（这就是回收文件缓存）。管理员还必须<b>挑对要处理的 book</b>：把热门书搬走，下次有人借就得跑一趟仓库，得不偿失；把冷门书扔掉则毫无损失。</p>
+<p>Linux 的策略和这个比喻高度一致。物理内存被划分成 <b>active/inactive × anon/file</b> 四条 LRU 链表（第 3.1 节详述）：<code>active</code> 表示"最近还在用"，<code>inactive</code> 表示"最近没用"；<code>anon</code> 是匿名页（没有文件后备，换出要写 swap），<code>file</code> 是文件页（页缓存里的内容，换出只是扔掉，因为磁盘上还有）。回收时，内核<b>优先从 inactive 链表下手</b>，因为那里的页最"冷"。</p>
+<p>回收由两条路径触发，二者分工明确：</p>
+<ul>
+  <li><b>直接回收（direct reclaim）</b>：某个进程申请内存时发现空闲页不够了，<b>它自己停下来去回收</b>。好处是不浪费任何内存（省下的正好给自己用），坏处是这个进程被卡住了——用户态表现为程序卡顿、延迟飙升。生产环境里"应用突然变慢"经常就是撞上了 direct reclaim。</li>
+  <li><b>后台回收（kswapd）</b>：一个专门的内核线程，平时就常驻。它盯着各个 zone 的水位线，一旦空闲页低于"低水位"，就主动醒来回收，把空闲页补回"高水位"，然后睡下。好处是<b>回收的延迟被提前了</b>，大多数情况下应用根本不会撞上 direct reclaim。</li>
+</ul>
+<p>如果两条路都救不回来——内存全满、swap 也满、回收也回收不出东西了——就只剩最后一招：<b>OOM（Out Of Memory，杀进程）</b>。内核用 <code>oom_badness()</code> 给每个进程打分，杀掉那个"最该杀"的（占用内存最多、且价值最低的）。</p>
+<p>本文按"LRU 链表怎么组织 → 怎么决定扔哪些（swappiness）→ 两条回收路径的代码 → 水位线与唤醒 → swap 的角色 → OOM 判定 → 怎么看监控数据"这条线讲。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">回收</td><td>reclaim</td><td>把已分配的物理页释放回空闲池，或换出到 swap 的过程。</td></tr>
+  <tr><td class="term">直接回收</td><td>direct reclaim</td><td>申请内存的进程自己去回收；同步、阻塞、延迟直接打到用户态。</td></tr>
+  <tr><td class="term">后台回收</td><td>kswapd</td><td>每 NUMA 节点一个的内核线程，按水位线 proactive 地回收，避免应用直接撞上回收。</td></tr>
+  <tr><td class="term">LRU 链表</td><td>Least Recently Used list</td><td>按"最近使用程度"分组的物理页链表；回收优先从 inactive 链表取。</td></tr>
+  <tr><td class="term">active / inactive</td><td>—</td><td>active = 最近被访问过（工作集）；inactive = 一段时间没被碰过（候选回收对象）。</td></tr>
+  <tr><td class="term">anon / file</td><td>anonymous / file-backed</td><td>anon = 匿名页（无文件后备）；file = 文件页缓存内容。</td></tr>
+  <tr><td class="term">unevictable</td><td>LRU_UNEVICTABLE</td><td>不可回收链表：被 mlock 的页、正在被写的页、有 IO 错误的页等。</td></tr>
+  <tr><td class="term">refault</td><td>refault</td><td>被回收的页很快又被访问、重新从磁盘读回；频繁 refault 说明回收策略选错了对象。</td></tr>
+  <tr><td class="term">水位线</td><td>watermark</td><td>每个 zone 的三个阈值（min/low/high），决定何时触发回收。</td></tr>
+  <tr><td class="term">swappiness</td><td>—</td><td>0~100 的旋钮，控制"多愿意把匿名页换出去"；默认 60。</td></tr>
+  <tr><td class="term">swap</td><td>swap area</td><td>磁盘上的换出区；匿名页被换出时内容写到这里。</td></tr>
+  <tr><td class="term">换入 / 换出</td><td>swap-in / swap-out</td><td>swap-in = 从 swap 读回内存；swap-out = 把内存内容写到 swap。</td></tr>
+  <tr><td class="term">OOM</td><td>Out Of Memory</td><td>内存彻底耗尽，内核必须杀进程保命的状态。</td></tr>
+  <tr><td class="term">oom_badness</td><td>oom_badness()</td><td>给进程打的"OOM 该不该杀我"的分数；分数最高者被杀。</td></tr>
+  <tr><td class="term">oom_score_adj</td><td>—</td><td><code>/proc/[pid]/oom_score_adj</code>，可手工调高/调低某进程被杀的概率。</td></tr>
+  <tr><td class="term">pgscan / pgsteal</td><td>—</td><td>扫描掉的页数 / 真正回收掉的页数；两者比值反映回收效率。</td></tr>
+  <tr><td class="term">drop_caches</td><td>—</td><td><code>/proc/sys/vm/drop_caches</code>，手动丢弃页缓存的开关。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 四条 LRU 链表</h3>
+<p>每个 NUMA 节点（<code>pg_data_t</code>）下有 4 条可回收链表 + 1 条不可回收链表。链表的排列顺序不是随意的，源码里有明确注释要求：</p>
+<p class="srcline">include/linux/mmzone.h:246-257  enum lru_list</p>
+<pre><code>enum lru_list {
+	LRU_INACTIVE_ANON = LRU_BASE,
+	LRU_ACTIVE_ANON = LRU_BASE + LRU_ACTIVE,
+	LRU_INACTIVE_FILE = LRU_BASE + LRU_FILE,
+	LRU_ACTIVE_FILE = LRU_BASE + LRU_FILE + LRU_ACTIVE,
+	LRU_UNEVICTABLE,
+	NR_LRU_LISTS
+};
+
+#define for_each_lru(lru) for (lru = 0; lru &lt; NR_LRU_LISTS; lru++)
+
+#define for_each_evictable_lru(lru) for (lru = 0; lru &lt;= LRU_ACTIVE_FILE; lru++)
+</code></pre>
+<p>结构图：</p>
+<pre><code>  每个 NUMA 节点（pg_data_t）：
+
+  +--------------------------------------------------+
+  |  LRU_INACTIVE_ANON   冷匿名页（堆、栈、堆外 malloc）|
+  |        ^  新页先进 inactive，被访问则升到 active      |
+  |        |                                            |
+  |        v  长期不用则被回收（写 swap 或直接释放）      |
+  |  LRU_ACTIVE_ANON     热匿名页                        |
+  +--------------------------------------------------+
+  |  LRU_INACTIVE_FILE   冷文件页（页缓存里的旧文件内容）  |
+  |        ^  读文件产生，第二次访问才升到 active          |
+  |        |                                            |
+  |        v  回收 = 直接丢弃（磁盘上还有副本）           |
+  |  LRU_ACTIVE_FILE     热文件页                        |
+  +--------------------------------------------------+
+  |  LRU_UNEVICTABLE     不可回收：mlock 的页、正在写的页  |
+  +--------------------------------------------------+
+</code></pre>
+<p>三条重要规则：<b>①</b> 新分配的页先进 <code>INACTIVE</code>，只有被再次访问才升到 <code>ACTIVE</code>——这样可以避免"刚分配的页"因为一次访问就被误判为热页；<b>②</b> 回收只从 <code>INACTIVE</code> 开始，<code>ACTIVE</code> 里的页要先"降级"（deactivate）才可能被回收；<b>③</b> 文件页回收最"便宜"（丢弃即可，磁盘上有副本），匿名页回收最"贵"（要写 swap，有 IO 成本）——这个成本差异就是 <code>swappiness</code> 要平衡的核心。</p>
+
+<h3>3.2 两条回收路径</h3>
+<pre><code>                     内存不足
+                        |
+     +------------------+------------------+
+     |                                     |
+     v                                     v
+  应用申请内存                        水位线跌破
+  (alloc_pages 慢路径)                 (zone_watermark_ok 失败)
+     |                                     |
+     |  wakeup_kswapd()  &lt;----------------+
+     |  （先叫后台线程去干活）
+     |
+     v
+  try_to_free_pages()  【直接回收】
+     |  同步执行，进程被阻塞
+     |  may_swap = 1：匿名页写 swap
+     |  may_unmap = 1：丢掉文件页
+     |
+     v
+  do_try_to_free_pages() -&gt; shrink_node() -&gt; shrink_lruvec()
+     |                                          |
+     |                                          +-&gt; get_scan_count()
+     |                                              决定每条 LRU 扫多少
+     |                                          +-&gt; shrink_list()
+     |                                              逐个页尝试回收
+     v
+  回收够了吗？
+     |
+     +-- 不够 &amp;&amp; !__GFP_DIRECT_RECLAIM --&gt; 睡一会儿等 kswapd
+     +-- 不够 &amp;&amp;  __GFP_DIRECT_RECLAIM --&gt; 继续扫（同步）
+     +-- 还是不够 --&gt; OOM Killer
+
+  后台线程 kswapd（每节点一个）：
+     kswapd() 循环
+        |
+        v
+     balance_pgdat() -&gt; kswapd_shrink_node()  【后台回收】
+        |   nr_to_reclaim = 各 zone 的 high_wmark 之和
+        v
+     shrink_node() -&gt; shrink_lruvec()  （同一套代码）
+</code></pre>
+<p>关键点：<b>两条路径共用同一套回收代码</b>（<code>shrink_node()</code> → <code>shrink_lruvec()</code> → <code>shrink_list()</code>），区别只在于"谁调用它"和"scan_control 里的参数不同"。</p>
+
+<h3>3.3 水位线：什么时候该动手</h3>
+<p>每个 zone 有三个水位：</p>
+<pre><code>  可用内存（free）
+     ^
+     |
+  high +---------------------------------+  &lt;- kswapd 睡到这里（回收目标）
+     |  \
+  low  +---+-----------------------------+  &lt;- 跌破：唤醒 kswapd
+     |  \
+  min  +---+-----------------------------+  &lt;- 跌破：分配者自己也得参与回收
+     |
+     +-----------------------------------+
+       0
+
+  /proc/zoneinfo 里的 low/high/min 就是这三个值
+</code></pre>
+<p>对应源码里的三个宏（<code>include/linux/mmzone.h:314-316</code>）：</p>
+<pre><code>#define min_wmark_pages(z) (z-&gt;_watermark[WMARK_MIN] + z-&gt;watermark_boost)
+#define low_wmark_pages(z) (z-&gt;_watermark[WMARK_LOW] + z-&gt;watermark_boost)
+#define high_wmark_pages(z) (z-&gt;_watermark[WMARK_HIGH] + z-&gt;watermark_boost)
+</code></pre>
+<p><b>kswapd 的目标是把空闲内存补到 <code>high</code> 水位</b>（而不是刚好够用），这样下次分配就不会紧张。分配者只有在跌破 <code>min</code> 水位时才会自己参与 direct reclaim。</p>
+
+<h3>3.4 swap 在其中的角色</h3>
+<p>匿名页（堆、栈）没有"磁盘上的副本"，要回收必须先把内容写到 swap，这就是"换出"。文件页可以直接扔（因为磁盘上就是它的副本）。所以：</p>
+<ul>
+  <li><b>有 swap 时</b>：匿名页可以被回收（写 swap），系统能撑住更大的内存占用；代价是 swap 读写有 IO 延迟，而且换出的页再访问时会有"换入延迟"。</li>
+  <li><b>无 swap 时</b>：匿名页<b>不能被回收</b>——写了也白写（<code>may_swap</code> 被置 0 或 swap 页数为 0）。此时系统只能回收文件页；如果文件页也不够，OOM 就会来得很快。</li>
+</ul>
+<p>这就解释了 <code>swappiness</code> 的意义：<code>swappiness=0</code> 表示"尽量别动匿名页"（适合数据库这种想把数据留在内存里的场景），<code>swappiness=100</code> 表示"随便换"。默认值 60 是一种折中。</p>
+
+<h3>3.5 OOM：最后的选择</h3>
+<p>回收失败且内存仍然不足时，分配者会触发 OOM 处理：内核遍历所有进程，用 <code>oom_badness()</code> 打分，选分数最高的杀掉，释放它的内存，然后重试分配。打分主要看三样：<b>RSS（常驻内存）+ swap 占用 + 页表占用</b>，再叠加 <code>oom_score_adj</code> 的调整。</p>
+<pre><code>  OOM Killer 的选择流程：
+
+  for_each_process(p)
+        |
+        v
+    oom_badness(p, totalpages)
+        |
+        +-- p 被标记为不可杀（oom_score_adj = -1000）-&gt; 跳过
+        +-- 分数 = RSS + swap + pgtables + oom_score_adj 调整
+        |
+        v
+    保留分数最高的那个进程
+        |
+        v
+    oom_kill_process() -&gt; 杀掉它 -&gt; 释放它的内存
+</code></pre>
+<p>你可以用 <code>/proc/[pid]/oom_score</code> 看某个进程当前的分数（不用等 OOM 发生，这个值平时就能查）。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 <code>get_scan_count()</code>：每条 LRU 该扫多少</h3>
+<p>回收的第一个决策是"这次回收，匿名页和文件页各出多少力"。这个决策由 <code>get_scan_count()</code> 做出，核心是 <code>swappiness</code> 加权的比例计算。</p>
+<p class="srcline">mm/vmscan.c:2586-2612  get_scan_count</p>
+<pre><code>	 * The amount of pressure we put on each LRU is inversely
+	 * proportional to the cost of reclaiming each list, as
+	 * determined by the share of pages that are refaulting, times
+	 * the relative IO cost of bringing back a swapped out
+	 * anonymous page vs reloading a filesystem page (swappiness).
+	 *
+	 * Although we limit that influence to ensure no list gets
+	 * left behind completely: at least a third of the pressure is
+	 * applied, before swappiness.
+	 *
+	 * With swappiness at 100, anon and file have equal IO cost.
+	 */
+	total_cost = sc-&gt;anon_cost + sc-&gt;file_cost;
+	anon_cost = total_cost + sc-&gt;anon_cost;
+	file_cost = total_cost + sc-&gt;file_cost;
+	total_cost = anon_cost + file_cost;
+
+	ap = swappiness * (total_cost + 1);
+	ap /= anon_cost + 1;
+
+	fp = (200 - swappiness) * (total_cost + 1);
+	fp /= file_cost + 1;
+
+	fraction[0] = ap;
+	fraction[1] = fp;
+	denominator = ap + fp;
+out:
+</code></pre>
+<p>逐行拆解：<code>anon_cost</code> / <code>file_cost</code> 是内核统计的"最近把这两类页回收出去之后，它们又被重新访问（refault）的比例"。refault 越高，说明回收这两类页<b>不划算</b>（刚收走又要读回来），所以 cost 高、以后少收一点。</p>
+<p>然后是 swappiness 加权：<code>ap</code>（anon 的权重）= <code>swappiness × ...</code>，<code>fp</code>（file 的权重）= <code>(200 - swappiness) × ...</code>。<b>注意 file 那边的系数是 200 而不是 100</b>——这是为了让"即使 swappiness=0，也仍然保留约 1/3 的压力给 file 链表"（注释里的 "at least a third of the pressure"），避免匿名页完全不被回收导致 OOM。</p>
+<p>最终每条 LRU 扫多少页在 2672-2709 行算出来：</p>
+<pre><code>		scan &gt;&gt;= sc-&gt;priority;
+
+		switch (scan_balance) {
+		case SCAN_EQUAL:
+			/* Scan lists relative to size */
+			break;
+		case SCAN_FRACT:
+			/*
+			 * Scan types proportional to swappiness and
+			 * their relative recent reclaim efficiency.
+			 */
+			scan = mem_cgroup_online(memcg) ?
+			       div64_u64(scan * fraction[file], denominator) :
+			       DIV64_U64_ROUND_UP(scan * fraction[file],
+						  denominator);
+			break;
+		case SCAN_FILE:
+		case SCAN_ANON:
+			/* Scan one type exclusively */
+			if ((scan_balance == SCAN_FILE) != file)
+				scan = 0;
+			break;
+		default:
+			/* Look ma, no brain */
+			BUG();
+		}
+
+		nr[lru] = scan;
+</code></pre>
+<p>四个 <code>scan_balance</code> 模式：<code>SCAN_EQUAL</code>（按链表大小等比）、<code>SCAN_FRACT</code>（按 swappiness 比例，默认路径）、<code>SCAN_FILE</code> / <code>SCAN_ANON</code>（只扫其中一类）。<code>scan &gt;&gt;= sc-&gt;priority</code> 是<b>优先级机制</b>：<code>sc-&gt;priority</code> 从 0 开始，每一轮回收失败就 +1（最大 12），每加 1 扫描量减半。这是"越回收不到，越要少扫一点，避免 CPU 空转"的保护。</p>
+
+<h3>4.2 <code>shrink_lruvec()</code>：真正逐条链表去扫</h3>
+<p class="srcline">mm/vmscan.c:2727-2757  shrink_lruvec</p>
+<pre><code>static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	unsigned long nr[NR_LRU_LISTS];
+	unsigned long targets[NR_LRU_LISTS];
+	unsigned long nr_to_scan;
+	enum lru_list lru;
+	unsigned long nr_reclaimed = 0;
+	unsigned long nr_to_reclaim = sc-&gt;nr_to_reclaim;
+	struct blk_plug plug;
+	bool scan_adjusted;
+
+	get_scan_count(lruvec, sc, nr);
+
+	/* Record the original scan target for proportional adjustments later */
+	memcpy(targets, nr, sizeof(nr));
+
+	/*
+	 * Global reclaiming within direct reclaim at DEF_PRIORITY is a normal
+	 * event that can occur when there is little memory pressure e.g.
+	 * multiple streaming readers/writers. Hence, we do not abort scanning
+	 * when the requested number of pages are reclaimed when scanning at
+	 * DEF_PRIORITY on the assumption that the fact we are direct
+	 * reclaiming implies that kswapd is not keeping up and it is best to
+	 * do a batch of work at once. For memcg reclaim one check is made to
+	 * abort proportional reclaim if either the file or anon lru has already
+	 * dropped to zero at the first pass.
+	 */
+	scan_adjusted = (!cgroup_reclaim(sc) &amp;&amp; !current_is_kswapd() &amp;&amp;
+			 sc-&gt;priority == DEF_PRIORITY);
+
+	blk_start_plug(&plug);
+</code></pre>
+<p><code>get_scan_count()</code> 填的是"计划扫多少"，<code>targets</code> 保存一份原始计划（后面要按比例修正）。<code>scan_adjusted</code> 这段注释解释了一个精妙的取舍：<b>处于 DEF_PRIORITY（默认优先级）的全局 direct reclaim，即使已经回收够数了也继续扫</b>——因为"能进 direct reclaim"本身就说明 kswapd 没跟上，多扫一点比来回触发更划算。</p>
+
+<p class="srcline">mm/vmscan.c:2760-2782  shrink_lruvec（主循环）</p>
+<pre><code>		unsigned long nr_anon, nr_file, percentage;
+		unsigned long nr_scanned;
+
+		for_each_evictable_lru(lru) {
+			if (nr[lru]) {
+				nr_to_scan = min(nr[lru], SWAP_CLUSTER_MAX);
+				nr[lru] -= nr_to_scan;
+
+				nr_reclaimed += shrink_list(lru, nr_to_scan,
+							    lruvec, sc);
+			}
+		}
+
+		cond_resched();
+
+		if (nr_reclaimed &lt; nr_to_reclaim || scan_adjusted)
+			continue;
+</code></pre>
+<p>每次循环处理 4 条链表，每条最多取 <code>SWAP_CLUSTER_MAX</code>（默认 32 页）个，避免一次做太多导致长时间不调度；<code>shrink_list()</code> 才是真正逐页尝试回收的地方（文件页直接丢弃，匿名页写 swap）。<code>cond_resched()</code> 是必要的礼貌：回收是重 CPU 的活，不能霸占 CPU 不让别的进程跑。</p>
+
+<h3>4.3 <code>shrink_node()</code>：节点级的调度</h3>
+<p class="srcline">mm/vmscan.c:3003-3026  shrink_node</p>
+<pre><code>static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+{
+	struct reclaim_state *reclaim_state = current-&gt;reclaim_state;
+	unsigned long nr_reclaimed, nr_scanned;
+	struct lruvec *target_lruvec;
+	bool reclaimable = false;
+	unsigned long file;
+
+	target_lruvec = mem_cgroup_lruvec(sc-&gt;target_mem_cgroup, pgdat);
+
+again:
+	memset(&amp;sc-&gt;nr, 0, sizeof(sc-&gt;nr));
+
+	nr_reclaimed = sc-&gt;nr_reclaimed;
+	nr_scanned = sc-&gt;nr_scanned;
+
+	/*
+	 * Determine the scan balance between anon and file LRUs.
+	 */
+	spin_lock_irq(&amp;pgdat-&gt;lru_lock);
+	sc-&gt;anon_cost = target_lruvec-&gt;anon_cost;
+	sc-&gt;file_cost = target_lruvec-&gt;file_cost;
+	spin_unlock_irq(&amp;pgdat-&gt;lru_lock);
+</code></pre>
+<p><code>shrink_node()</code> 是"一个 NUMA 节点一次回收"的调度者：先取出 <code>anon_cost</code> / <code>file_cost</code>（供 <code>get_scan_count()</code> 用），决定要不要把某些 active 页"降级"到 inactive（<code>may_deactivate</code>），然后调 <code>shrink_node_memcgs()</code> 真正扫描。</p>
+
+<p class="srcline">mm/vmscan.c:3176-3193  shrink_node（收尾与重试）</p>
+<pre><code>	if (!current_is_kswapd() &amp;&amp; current_may_throttle() &amp;&amp;
+	    !sc-&gt;hibernation_mode &amp;&amp;
+	    test_bit(LRUVEC_CONGESTED, &amp;target_lruvec-&gt;flags))
+		wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+
+	if (should_continue_reclaim(pgdat, sc-&gt;nr_reclaimed - nr_reclaimed,
+				    sc))
+		goto again;
+
+	/*
+	 * Kswapd gives up on balancing particular nodes after too
+	 * many failures to reclaim anything from them and goes to
+	 * sleep. On reclaim progress, reset the failure counter. A
+	 * successful direct reclaim run will revive a dormant kswapd.
+	 */
+	if (reclaimable)
+		pgdat-&gt;kswapd_failures = 0;
+}
+</code></pre>
+<p><code>should_continue_reclaim()</code> 判断"要不要再来一轮"（高阶分配、碎片化场景需要更多回收）；<code>wait_iff_congested()</code> 是<b>IO 拥塞时的刹车</b>——如果块设备已经忙不过来了，回收再多也是白费（写 swap 反而更堵），不如先等等。最后 <code>pgdat-&gt;kswapd_failures = 0</code> 是"回收有进展就把失败计数清零"，kswapd 连续失败太多次就会放弃这个节点去睡觉。</p>
+
+<h3>4.4 kswapd 的回收目标：水位线</h3>
+<p class="srcline">mm/vmscan.c:3948-3970  kswapd_shrink_node</p>
+<pre><code>static bool kswapd_shrink_node(pg_data_t *pgdat,
+			       struct scan_control *sc)
+{
+	struct zone *zone;
+	int z;
+
+	/* Reclaim a number of pages proportional to the number of zones */
+	sc-&gt;nr_to_reclaim = 0;
+	for (z = 0; z &lt;= sc-&gt;reclaim_idx; z++) {
+		zone = pgdat-&gt;node_zones + z;
+		if (!managed_zone(zone))
+			continue;
+
+		sc-&gt;nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
+	}
+
+	/*
+	 * Historically care was taken to put equal pressure on all zones but
+	 * now pressure is applied based on node LRU order.
+	 */
+	shrink_node(pgdat, sc);
+</code></pre>
+<p><b><code>nr_to_reclaim += high_wmark_pages(zone)</code> 这一行就是 kswapd 的行为定义</b>：它要把每个 zone 的空闲内存补到<b>高水位</b>。高水位通常远大于"分配所需"，所以 kswapd 一次回收的量往往比 direct reclaim 大得多——它是在"提前准备"。</p>
+
+<h3>4.5 <code>wakeup_kswapd()</code>：什么时候叫醒后台线程</h3>
+<p class="srcline">mm/vmscan.c:4441-4484  wakeup_kswapd</p>
+<pre><code>void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
+		   enum zone_type highest_zoneidx)
+{
+	pg_data_t *pgdat;
+	enum zone_type curr_idx;
+
+	if (!managed_zone(zone))
+		return;
+
+	if (!cpuset_zone_allowed(zone, gfp_flags))
+		return;
+
+	pgdat = zone-&gt;zone_pgdat;
+	curr_idx = READ_ONCE(pgdat-&gt;kswapd_highest_zoneidx);
+
+	if (curr_idx == MAX_NR_ZONES || curr_idx &lt; highest_zoneidx)
+		WRITE_ONCE(pgdat-&gt;kswapd_highest_zoneidx, highest_zoneidx);
+
+	if (READ_ONCE(pgdat-&gt;kswapd_order) &lt; order)
+		WRITE_ONCE(pgdat-&gt;kswapd_order, order);
+
+	if (!waitqueue_active(&amp;pgdat-&gt;kswapd_wait))
+		return;
+
+	/* Hopeless node, leave it to direct reclaim if possible */
+	if (pgdat-&gt;kswapd_failures &gt;= MAX_RECLAIM_RETRIES ||
+	    (pgdat_balanced(pgdat, order, highest_zoneidx) &amp;&amp;
+	     !pgdat_watermark_boosted(pgdat, highest_zoneidx))) {
+		/*
+		 * There may be plenty of free memory available, but it's too
+		 * fragmented for high-order allocations.  Wake up kcompactd
+		 * and rely on compaction_suitable() to determine if it's
+		 * needed.  If it fails, it will defer subsequent attempts to
+		 * ratelimit its work.
+		 */
+		if (!(gfp_flags &amp; __GFP_DIRECT_RECLAIM))
+			wakeup_kcompactd(pgdat, order, highest_zoneidx);
+		return;
+	}
+
+	trace_mm_vmscan_wakeup_kswapd(pgdat-&gt;node_id, highest_zoneidx, order,
+				      gfp_flags);
+	wake_up_interruptible(&amp;pgdat-&gt;kswapd_wait);
+}
+</code></pre>
+<p>这个函数由页分配器在慢路径上调用。三种情况会<b>不叫</b> kswapd：<b>①</b> kswapd 已经醒着（<code>waitqueue_active</code> 为假，说明它正在干活）；<b>②</b> 这个节点已经"没救了"（<code>kswapd_failures</code> 太多次失败），那就交给 direct reclaim 硬碰硬；<b>③</b> 节点其实已经平衡了（<code>pgdat_balanced()</code> 检查水位线是否已达标）——此时可能真正的问题是<b>碎片</b>而非内存不足，所以转去唤醒 <code>kcompactd</code> 做内存整理。</p>
+
+<h3>4.6 <code>try_to_free_pages()</code>：直接回收的入口</h3>
+<p class="srcline">mm/vmscan.c:3652-3693  try_to_free_pages</p>
+<pre><code>unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+				gfp_t gfp_mask, nodemask_t *nodemask)
+{
+	unsigned long nr_reclaimed;
+	struct scan_control sc = {
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.gfp_mask = current_gfp_context(gfp_mask),
+		.reclaim_idx = gfp_zone(gfp_mask),
+		.order = order,
+		.nodemask = nodemask,
+		.priority = DEF_PRIORITY,
+		.may_writepage = !laptop_mode,
+		.may_unmap = 1,
+		.may_swap = 1,
+	};
+
+	/*
+	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
+	 * Confirm they are large enough for max values.
+	 */
+	BUILD_BUG_ON(MAX_ORDER &gt; S8_MAX);
+	BUILD_BUG_ON(DEF_PRIORITY &gt; S8_MAX);
+	BUILD_BUG_ON(MAX_NR_ZONES &gt; S8_MAX);
+
+	/*
+	 * Do not enter reclaim if fatal signal was delivered while throttled.
+	 * 1 is returned so that the page allocator does not OOM kill at this
+	 * point.
+	 */
+	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
+		return 1;
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);
+
+	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
+
+	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
+	set_task_reclaim_state(current, NULL);
+
+	return nr_reclaimed;
+}
+</code></pre>
+<p><code>scan_control sc</code> 这个初始化块就是"回收策略面板"：<code>may_unmap = 1</code>（可以丢弃文件页）、<code>may_swap = 1</code>（可以写 swap）、<code>may_writepage = !laptop_mode</code>（笔记本模式下不写 swap，避免磨损 SSD）、<code>priority = DEF_PRIORITY</code>（初始优先级 12）。<code>throttle_direct_reclaim()</code> 是<b>直接的限流</b>：如果这个进程被标记为"被 throttle 的"，直接返回，避免它占用太多 CPU 做回收。</p>
+
+<h3>4.7 <code>oom_badness()</code>：该杀谁</h3>
+<p class="srcline">mm/oom_kill.c:201-239  oom_badness</p>
+<pre><code>long oom_badness(struct task_struct *p, unsigned long totalpages)
+{
+	long points;
+	long adj;
+
+	if (oom_unkillable_task(p))
+		return LONG_MIN;
+
+	p = find_lock_task_mm(p);
+	if (!p)
+		return LONG_MIN;
+
+	/*
+	 * Do not even consider tasks which are explicitly marked oom
+	 * unkillable or have been already oom reaped or the are in
+	 * the middle of vfork
+	 */
+	adj = (long)p-&gt;signal-&gt;oom_score_adj;
+	if (adj == OOM_SCORE_ADJ_MIN ||
+			test_bit(MMF_OOM_SKIP, &amp;p-&gt;mm-&gt;flags) ||
+			in_vfork(p)) {
+		task_unlock(p);
+		return LONG_MIN;
+	}
+
+	/*
+	 * The baseline for the badness score is the proportion of RAM that each
+	 * task's rss, pagetable and swap space use.
+	 */
+	points = get_mm_rss(p-&gt;mm) + get_mm_counter(p-&gt;mm, MM_SWAPENTS) +
+		mm_pgtables_bytes(p-&gt;mm) / PAGE_SIZE;
+	task_unlock(p);
+
+	/* Normalize to oom_score_adj units */
+	adj *= totalpages / 1000;
+	points += adj;
+
+	return points;
+}
+</code></pre>
+<p>打分公式：<b>分数 = RSS + swap 占用 + 页表页数 + oom_score_adj 调整量</b>。三档保护：<code>oom_unkillable_task()</code>（内核线程等）、<code>oom_score_adj == OOM_SCORE_ADJ_MIN</code>（即 -1000，完全免疫）、<code>MMF_OOM_SKIP</code>（已被标记为 OOM 牺牲品）。最后 <code>adj *= totalpages / 1000</code> 把 <code>oom_score_adj</code> 归一化到"页数"的量纲，这样它才能和 RSS 直接相加。</p>
+<p>调试技巧：<code>cat /proc/[pid]/oom_score</code> 平时就能看到该进程当前的分数；<code>echo -500 &gt; /proc/[pid]/oom_score_adj</code> 可以降低某进程被杀的概率（值越低越安全），<code>+1000</code> 则让它优先被杀。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看回收统计：<code>/proc/vmstat</code></h3>
+<pre><code>$ grep -E "pgscan|pgsteal|pgrefill|pgactivate|pgdeactivate" /proc/vmstat
+pgscan_kswapd 1234567
+pgscan_direct 234567
+pgscan_anon 987654
+pgscan_file 913113
+pgsteal_kswapd 1100000
+pgsteal_direct 200000
+pgsteal_anon 800000
+pgsteal_file 921113
+pgrefill 55000
+pgactivate 1234567
+pgdeactivate 432100
+</code></pre>
+<p>读法：</p>
+<ul>
+  <li><code>pgscan_*</code> = <b>扫描</b>掉的页数（内核检查过、认为可以回收的页）。</li>
+  <li><code>pgsteal_*</code> = <b>真正回收</b>掉的页数。</li>
+  <li><code>pgscan_kswapd</code> / <code>pgsteal_kswapd</code> 来自后台线程；<code>pgscan_direct</code> / <code>pgsteal_direct</code> 来自直接回收。</li>
+  <li><b>效率 = pgsteal / pgscan</b>。这个比值越接近 1 越好；如果 <code>pgscan</code> 很大而 <code>pgsteal</code> 很小，说明扫了很多页但收不动（页被钉住了、或者 refault 太频繁）。</li>
+  <li><b><code>pgscan_direct</code> 持续增长是危险信号</b>——说明应用正在被直接回收拖慢。</li>
+</ul>
+<p>做一次前后对比，回收活动就看得见：</p>
+<pre><code>$ grep pgscan_direct /proc/vmstat; free -m
+$ sudo dd if=/dev/zero of=/tmp/big bs=1M count=2000 oflag=direct
+$ grep -E "pgscan|pgsteal" /proc/vmstat; free -m
+</code></pre>
+<p>写 2 GB 文件会撑大页缓存，触发回收；<code>pgscan_kswapd</code> 会明显上涨，而 <code>pgscan_direct</code> 通常涨得不多（说明 kswapd 跟上了）。</p>
+
+<h3>5.2 看水位线：<code>/proc/zoneinfo</code></h3>
+<pre><code>$ cat /proc/zoneinfo | head -30
+Node 0, zone      DMA
+  pages free     1024
+        min      45
+        low      58
+        high     72
+  ...
+  pagesets
+  cpu: 0
+              count: 0
+              high: 0
+              low: 0
+              free: 12345
+</code></pre>
+<p><code>min/low/high</code> 就是水位线（单位：页）。<code>free</code> 是当前空闲页数。你可以这样观察 kswapd 的行为：</p>
+<pre><code>$ watch -n 1 'grep -A5 "^Node 0, zone      DMA" /proc/zoneinfo'
+</code></pre>
+<p>当 <code>free</code> 跌到 <code>low</code> 以下，kswapd 会被唤醒开始回收，<code>free</code> 会回升到 <code>high</code> 附近——<b>这就是"后台回收把水位补满"的直观证据</b>。</p>
+
+<h3>5.3 看 LRU 链表长度</h3>
+<pre><code>$ grep -E "^(active|inactive|unevictable)" /proc/vmstat
+nr_active_anon 123456
+nr_inactive_anon 23456
+nr_active_file 34567
+nr_inactive_file 4567
+nr_unevictable 123
+nr_zone_unevictable 0
+nr_zone_write_pending 0
+</code></pre>
+<p><code>nr_inactive_anon</code> 和 <code>nr_inactive_file</code> 就是两条 inactive 链表的长度——<b>它们是"待回收的库存"</b>。如果 <code>nr_inactive_file</code> 长期为 0，说明文件页缓存全被访问成 active 了，这时一旦内存紧张就没有便宜的页可收。</p>
+
+<h3>5.4 实验：<code>drop_caches</code> 丢页缓存</h3>
+<pre><code>$ free -m
+              total        used        free      shared  buff/cache   available
+Mem:          15887        3210        2456         312        10221        11500
+
+$ sudo sync &amp;&amp; sudo echo 1 &gt; /proc/sys/vm/drop_caches
+$ free -m
+              total        used        free      shared  buff/cache   available
+Mem:          15887        3210        12677         312            0        11500
+</code></pre>
+<p><code>echo 1</code> 的含义是"只丢 dentry/inode 缓存和页缓存，不丢 swap"。对应的其他取值：</p>
+<table>
+  <tr><th>值</th><th>含义</th></tr>
+  <tr><td>0</td><td>什么都不做（默认）</td></tr>
+  <tr><td>1</td><td>释放页缓存（page cache）和 dentry/inode 缓存</td></tr>
+  <tr><td>2</td><td>额外释放 swap 里的缓存</td></tr>
+  <tr><td>3</td><td>1 + 2</td></tr>
+</table>
+<p><b>预期输出</b>：<code>buff/cache</code> 从 10 GB 掉到接近 0，<code>free</code> 相应增加，而 <code>used</code> 和 <code>available</code> 基本不变（因为 available 本来就把可回收的页缓存算进去了）。</p>
+<p>做性能测试时常用这个来"清干净再跑"，避免前一次运行的文件缓存干扰结果。<b>注意：必须先 <code>sync</code></b>，否则脏页还没落盘就被丢弃可能造成数据丢失（内核会写警告）。</p>
+
+<h3>5.5 实验：观察 OOM 评分</h3>
+<pre><code>$ cat /proc/self/oom_score
+$ cat /proc/self/oom_score_adj
+0
+$ sleep 1000 &amp;
+$ cat /proc/$(pgrep sleep | head -1)/oom_score
+2
+$ echo -1000 &gt; /proc/$(pgrep sleep | head -1)/oom_score_adj
+$ cat /proc/$(pgrep sleep | head -1)/oom_score
+0
+</code></pre>
+<p>把 <code>oom_score_adj</code> 设为 -1000 后，该进程的 <code>oom_score</code> 变成 0，<b>意味着 OOM 时它永远不会被选中</b>。这是给关键进程（数据库、监控代理）上"免死金牌"的实用手段。</p>
+
+<h3>5.6 实验：制造 swap 压力</h3>
+<pre><code>$ free -m
+$ sudo fallocate -l 2G /swapfile
+$ sudo chmod 600 /swapfile &amp;&amp; sudo mkswap /swapfile &amp;&amp; sudo swapon /swapfile
+$ free -m
+$ sudo sysctl vm.swappiness=100
+$ # 然后跑一个吃内存的程序，观察 SwapUsed 上涨
+$ cat /proc/meminfo | grep -E "SwapTotal|SwapFree|Active\(anon\)|Inactive\(anon\)"
+</code></pre>
+<p>把 <code>swappiness</code> 调高后，匿名页更容易被换出，<code>SwapUsed</code> 会上涨；同时 <code>Active(anon)</code> / <code>Inactive(anon)</code> 的分布也会变化。这能直观看出 swappiness 对回收行为的影响。</p>
+
+<h3>5.7 在 qemu 里观察 kswapd（可选）</h3>
+<pre><code># 用极小的内存启动，观察 kswapd 频繁活动
+$ qemu-system-x86_64 -kernel bzImage -m 256 -append "console=ttyS0" -nographic
+# 另一个终端
+$ cat /proc/vmstat | grep pgscan_kswapd
+$ cat /proc/$(pgrep kswapd)/stat
+</code></pre>
+<p>内存越小、分配越猛，<code>pgscan_kswapd</code> 涨得越快。在 <code>/proc/[pid]/stat</code> 里可以看到 kswapd 的上下文切换次数，<code>kswapd</code> 进程本身就是后台回收在跑的证据。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. direct reclaim 和 kswapd 的区别是什么？什么时候会用到哪一种？</b>direct reclaim 是<b>申请内存的进程自己</b>停下来做回收（同步、阻塞，把延迟直接打在用户态）；kswapd 是<b>每 NUMA 节点一个的后台内核线程</b>，按水位线提前回收。正常情况下 kswapd 会把空闲内存维持在 high 水位，应用不该撞上 direct reclaim。只有当分配速度太快、kswapd 跟不上（比如突发大额分配、或者高阶分配需要连续大块内存）时，才会退化成 direct reclaim。<b>生产环境里 <code>pgscan_direct</code> 持续增长就是"应用正在被回收拖慢"的信号。</b></div>
+<div class="qa"><b>Q2. 为什么回收优先从 inactive 链表开始，而不是 active？</b>因为 active 表示"最近还在被访问"，收走它几乎必然导致马上 refault（重新从磁盘读回来），白折腾。inactive 里的页已经一段时间没被碰过，收走的概率高、代价低。另外新分配的页先进 inactive、第二次访问才升到 active，就是为了避免"刚分配的页"因为一次访问就被当成热页保护起来。<b>不过</b>内核并不禁止回收 active——只是要先做"降级"（deactivate），而且优先级更低。</div>
+<div class="qa"><b>Q3. <code>swappiness=0</code> 是不是就等于"完全不换出匿名页"？</b>不是。0 表示"几乎不主动换出匿名页"，但 <code>get_scan_count()</code> 的公式里 file 那边的系数是 <code>200 - swappiness</code>，源码注释明确说：<b>即使 swappiness=0，也仍然保留大约三分之一的压力给 file 链表</b>，目的是保证匿名页最终仍能被回收（否则一旦文件页也不够，系统会直接 OOM 而没有任何渐进过程）。所以 swappiness=0 是"强烈倾向不换出"，不是"绝对不换出"。</div>
+<div class="qa"><b>Q4. <code>pgscan</code> 很大但 <code>pgsteal</code> 很小，说明什么？</b>说明<b>回收效率低</b>：内核扫描了很多页，但真正能收走的很少。常见原因有：① 页面被 <code>mlock</code> 或被引用固定，属于 unevictable；② 页正在被写（脏页回收要等写回）；③ <b>refault 过于频繁</b>——刚收走的页马上又被访问，说明选错了回收对象，或者工作集已经超过了物理内存能承载的规模（这时候要加内存或减工作集，调参数没用）。</div>
+<div class="qa"><b>Q5. 为什么 Linux 5.10 的 LRU 只有四条链表？新内核不是有 MGLRU 吗？</b>Linux 5.10 只有经典的 <b>active/inactive × anon/file</b> 四条链表（加上 unevictable），用简单的时钟近似算法维护。MGLRU（Multi-Generation LRU）是 6.1 才合入主线的改进方案，它用"代际（generation）"来区分"高频访问的页"和"刚被换出又换入的页"，在负载不均衡时表现更好。<b>本仓库是 5.10，源码里没有 <code>lru_gen</code>、<code>MGLRU</code> 这些符号</b>，读到新内核文章里的 MGLRU 时不要对号入座。</div>
+
+<footer>
+  <p>上一篇：<a href="17-vma.html">17-vma VMA 与进程地址空间布局</a> · 下一篇：<a href="19-thp.html">19-thp 透明大页 THP：把页表项变少</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

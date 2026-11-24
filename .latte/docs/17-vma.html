@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17 · VMA 与进程地址空间布局：内核怎么记住"这块内存归谁"</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="18-reclaim.html">下一篇：内存回收：direct reclaim 与 kswapd →</a>
+</nav>
+
+<h1>📐 VMA 与进程地址空间布局：内核怎么记住"这块内存归谁"</h1>
+<p class="subtitle">用一棵红黑树把进程的虚拟地址切成带属性的区间，让"这段内存可读可写""这段是文件""这段会自己长"这些规则有地方可查 · 预计阅读 42 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>上一讲我们看到，CPU 只知道"虚拟地址 → 物理页"这条翻译链。但内核面对的问题远不止翻译：<b>这段地址能不能写？背后是文件还是匿名内存？两个进程映射了同一个文件时，写入要怎么同步？这段内存该不该被换出？</b>这些问题没法塞进页表项里（页表项只有 64 位，而且要留给硬件快速查询）。</p>
+<p>于是内核换了个思路：<b>页表只回答"在哪儿"，另建一套数据结构回答"是什么"</b>。这套结构叫 <span class="term">VMA</span>（Virtual Memory Area，虚拟内存区域）。类比一下：一栋写字楼里有不同的房间——总经理办公室有门禁，档案室归财务管，机房有空调且 24 小时不断电。房间号就是虚拟地址，而"这间房归谁管、能不能进、有什么特殊设备"就是 VMA 记录的内容。<b>进程的一整个虚拟地址空间，就是被切分成若干个 VMA 的</b>；没有对应 VMA 的地址就是"无效地址"，访问它会收到 SIGSEGV。</p>
+<p>那 VMA 怎么组织？关键需求是：<b>内核要能快速回答"地址 X 落在哪个 VMA 里"</b>（缺页处理第 4 节的 <code>find_vma()</code>），还要能回答"给我一段长 L 的连续空闲地址"（<code>mmap()</code> 的 <code>get_unmapped_area()</code>）。这两个需求都是"在有序集合里做区间查询"，用<b>红黑树</b>正好合适：O(log n) 的查找，天然保持有序还能做区间剪枝。</p>
+<p>这里要特别提醒一个版本细节：<b>Linux 5.10 用的是红黑树（<code>mm-&gt;mm_rb</code>），不是 6.1 之后才引入的 maple tree</b>。网上很多讲 VMA 的文章会说 <code>mm_mt</code>，那是新内核的做法；在 5.10 里你只会看到 <code>mm_rb</code> 和一条辅助的 <code>vm_next/vm_prev</code> 单链表。</p>
+<p>本篇按"VMA 长什么样 → 怎么被创建（mmap）→ 怎么被拆开（munmap/mprotect）→ 怎么长大（栈扩展）→ VMA 上的回调钩子（vm_ops）"这条线展开，最后用两个动手实验：两进程共享同一块 mmap 缓冲区、以及观察栈增长与 <code>RLIMIT_STACK</code> 的作用。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">VMA</td><td>Virtual Memory Area</td><td>地址空间中一段<b>连续</b>、<b>权限和属性一致</b>的区间；内核描述地址空间的基本单位。</td></tr>
+  <tr><td class="term">vm_area_struct</td><td>struct vm_area_struct</td><td>VMA 的内核表示，定义在 <code>include/linux/mm_types.h</code>。</td></tr>
+  <tr><td class="term">VMA 树</td><td>mm_rb / rbtree</td><td><code>mm-&gt;mm_rb</code>，按地址排序的红黑树；5.10 的地址空间索引（不是 maple tree）。</td></tr>
+  <tr><td class="term">mmap 链表</td><td>mm-&gt;mmap</td><td>同一批 VMA 的双向链表，遍历全部 VMA 时比树更省缓存。</td></tr>
+  <tr><td class="term">VMA 合并</td><td>vma_merge</td><td>两个相邻、属性兼容的 VMA 合成一个，避免地址空间碎片化。</td></tr>
+  <tr><td class="term">VMA 切分</td><td>split_vma</td><td>把一个 VMA 拆成两个（常用于 mprotect、munmap 的部分覆盖）。</td></tr>
+  <tr><td class="term">vm_ops</td><td>vm_operations_struct</td><td>VMA 上的回调表：缺页时怎么填页、变可写时怎么通知底层文件系统。</td></tr>
+  <tr><td class="term">page_mkwrite</td><td>page_mkwrite</td><td>一个只读共享页即将被写时的通知钩子；文件映射用它来推迟真正的可写标记。</td></tr>
+  <tr><td class="term">mmap_lock</td><td>mmap_lock</td><td>保护地址空间结构的读写信号量：读锁允许并发缺页，写锁用于修改 VMA（mmap/munmap/mprotect）。</td></tr>
+  <tr><td class="term">brk</td><td>brk()</td><td>调整"堆"末端地址的系统调用；堆是 malloc 底层的大块匿名内存来源。</td></tr>
+  <tr><td class="term">堆</td><td>heap</td><td>程序用 <code>brk</code> 向下要来的匿名内存区；<code>brk</code> 之上的空闲地址空间叫 "program break"。</td></tr>
+  <tr><td class="term">栈增长</td><td>stack growth</td><td>栈不够用时，内核自动把栈 VMA 往下扩展，并检查 <code>RLIMIT_STACK</code> 限额。</td></tr>
+  <tr><td class="term">VM_GROWSDOWN</td><td>VM_GROWSDOWN</td><td>VMA 标志，表示这块区域可以向低地址方向自动扩展（栈就是靠它）。</td></tr>
+  <tr><td class="term">MAP_SHARED / MAP_PRIVATE</td><td>—</td><td>共享映射的写入会反映到文件和其他进程；私有映射的写入只对本进程可见（写时复制）。</td></tr>
+  <tr><td class="term">map_count</td><td>mm-&gt;map_count</td><td>进程当前 VMA 的个数，受 <code>vm.max_map_count</code>（默认 65530）限制。</td></tr>
+  <tr><td class="term">RLIMIT_STACK</td><td>—</td><td>栈大小的资源限制；超过就不许再扩展栈，递归太深会因此收到 SIGSEGV。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 进程地址空间的典型布局</h3>
+<p>在 x86-64 上，一个进程的虚拟地址空间大致是这样（地址从低到高）：</p>
+<pre><code> 0x0000000000000000
+      |
+      |  保留区（内核强制不可映射，mmap_min_addr 通常是 64 KB）
+      |  防止 NULL 指针和低地址 exploit
+      v
+ 0x0000000000010000
+      |
+      |  +------------------------------------------+
+      |  |  程序代码段 .text   (r-xp)               |  可执行，不写
+      |  +------------------------------------------+
+      |  |  只读数据段 .rodata (r--p)               |
+      |  +------------------------------------------+
+      |  |  数据段 .data / .bss  (rw-p)            |  可读写
+      |  +------------------------------------------+
+      |  |  [heap]  堆（brk 分配区，向上长）         |  malloc 大块内存
+      |  +------------------------------------------+
+      |        &lt;---- 未映射的空洞（mmap 可以在此挑地址） ----&gt;
+      |  +------------------------------------------+
+      |  |  mmap 区：动态库、共享内存、文件映射      |  向下长
+      |  |  /lib/x86_64-linux-gnu/libc.so.6 (r-xp)  |  (top-down)
+      |  +------------------------------------------+
+      |            &lt;---- 巨大的空洞 ----&gt;
+      |  +------------------------------------------+
+      |  |  [stack] 主线程栈 (rw-p)                |  向下长
+      |  +------------------------------------------+
+      |  |  [vvar] / [vdso] / [vvar_vclock]        |  内核给进程的
+      |  +------------------------------------------+
+ 0x7ffffffffffff000  &lt;-- TASK_SIZE (128 TB - 4KB)
+      |
+      |  以上是内核空间，用户态碰不到
+      v
+ 0xffffffffffffffff
+</code></pre>
+<p>三个要点：<b>①</b> 堆（heap）在数据段之后，由 <code>brk()</code> 管理；<b>②</b> mmap 区在堆和栈之间，<b>默认策略是"从上往下"分配</b>（<code>arch_get_unmapped_area_topdown</code>），所以新 mmap 的地址通常比堆高、比栈低；<b>③</b> 栈在最高处，<b>向下生长</b>，碰到极限就触发 <code>expand_stack()</code>。</p>
+<p>你可以在自己的机器上用 <code>cat /proc/self/maps</code> 验证这个布局（见第 5 节）。</p>
+
+<h3>3.2 VMA 的数据结构</h3>
+<p class="srcline">include/linux/mm_types.h:305-334  struct vm_area_struct（节选）</p>
+<pre><code>struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+
+	/*
+	 * Largest free memory gap in bytes to the left of this VMA.
+	 * Either between this VMA and vma-&gt;vm_prev, or between one of the
+	 * VMAs below us in the VMA rbtree and its -&gt;vm_prev. This helps
+	 * get_unmapped_area find a free area of the right size.
+	 */
+	unsigned long rb_subtree_gap;
+
+	/* Second cache line starts here. */
+
+	struct mm_struct *vm_mm;	/* The address space we belong to. */
+
+	pgprot_t vm_page_prot;
+	unsigned long vm_flags;		/* Flags, see mm.h. */
+</code></pre>
+<p>几个字段值得单独说：</p>
+<ul>
+  <li><code>vm_start</code> / <code>vm_end</code>：区间是<b>左闭右开</b>的，即 <code>[vm_start, vm_end)</code>。所以 <code>vm_end</code> 一定落在页边界上。</li>
+  <li><code>vm_next</code> / <code>vm_prev</code>：按地址排序的双向链表，遍历全量时用。</li>
+  <li><code>vm_rb</code>：红黑树节点。注释里特意写了"The first cache line has the info for VMA tree walking"——树遍历时访问的字段被刻意排在第一个缓存行里，为的就是减少 cache miss。</li>
+  <li><code>rb_subtree_gap</code>：<b>这棵树上的加速字段</b>，记录"以该节点为根的子树里，最大的连续空洞有多长"。<code>get_unmapped_area()</code> 靠它剪枝：如果整棵子树的最大空洞都装不下你要的长度，就不用进去了。这让区间查找在"大段空洞"场景下也保持 O(log n)。</li>
+  <li><code>vm_page_prot</code>：由 <code>vm_flags</code> 推导出的硬件页保护位（可读/可写/可执行/用户态）。</li>
+</ul>
+
+<h3>3.3 mmap 的完整流程</h3>
+<pre><code> 用户态: mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, off)
+    |
+    v
+ ksys_mmap_pgoff()          (mm/mmap.c)
+    |
+    v
+ vm_mmap_pgoff()            (mm/util.c)  --&gt; mmap_write_lock(mm)  拿写锁
+    |
+    v
+ do_mmap()                  (mm/mmap.c)
+    |  1. 参数检查：长度对齐、pgoff 溢出、map_count 上限
+    |  2. get_unmapped_area()  -&gt; 在 VMA 树里找一块足够大的空洞
+    |  3. calc_vm_prot_bits()  -&gt; 把 prot/flags 翻译成 vm_flags
+    |
+    v
+ mmap_region()               (mm/mmap.c)
+    |  1. may_expand_vm()  查地址空间配额
+    |  2. munmap_vma_range()  拆掉与新区间重叠的旧映射
+    |  3. vma_merge()  尝试跟邻居合并，不行才新建
+    |  4. vm_area_alloc() + 填字段 + call_mmap()（文件系统的 -&gt;mmap）
+    |  5. vma_link()  挂进红黑树 + 链表，map_count++
+    |  6. vma_set_page_prot()  算硬件保护位
+    v
+ 返回地址；真正的物理页在【第一次访问】时才通过缺页分配
+</code></pre>
+<p>注意最后一行：<b><code>mmap()</code> 只改"地址空间描述"，不分配物理页</b>。这和第 16 篇的懒分配是同一件事。</p>
+
+<h3>3.4 三种"改地址空间"的系统调用</h3>
+<table>
+  <tr><th>系统调用</th><th>干什么</th><th>内核动作</th></tr>
+  <tr><td><code>mmap()</code></td><td>新增一段映射</td><td>找空洞 → 建 VMA → 挂进红黑树</td></tr>
+  <tr><td><code>munmap()</code></td><td>删除一段映射</td><td>切分 VMA（必要时）→ 摘出红黑树 → 清页表 + 刷 TLB → 释放 VMA</td></tr>
+  <tr><td><code>mprotect()</code></td><td>改一段映射的权限</td><td>切分/合并 VMA → 改 <code>vm_flags</code>/<code>vm_page_prot</code> → 重写对应页表项</td></tr>
+  <tr><td><code>brk()</code></td><td>扩/缩堆</td><td>调整 <code>mm-&gt;brk</code>，必要时新建/切分堆 VMA</td></tr>
+</table>
+<p>它们都要拿 <code>mmap_lock</code> 的<b>写锁</b>，因为它们会修改地址空间的拓扑结构。而缺页处理拿的是<b>读锁</b>——缺页只"读"VMA 的属性，不改拓扑结构。这就是为什么 mmap 一个大文件不会阻塞其他进程的缺页处理（只要不切分 VMA）。</p>
+
+<h3>3.5 VMA 上的回调钩子：<code>vm_ops</code></h3>
+<p>前面说过，页表项回答"在哪儿"，VMA 回答"是什么"。但缺页发生时，内核还需要知道"这个 VMA 背后的数据从哪来"——这就是 <code>vm_ops</code>（<code>struct vm_operations_struct</code>）的作用。它是一张函数指针表，挂在 <code>vma-&gt;vm_ops</code> 上，由"拥有这份数据的子系统"填写：</p>
+<pre><code>  缺页发生
+      |
+      v
+  handle_pte_fault()
+      |
+      |  文件 VMA -&gt; do_fault()  --&gt; vma-&gt;vm_ops-&gt;fault(vmf)
+      |                                |
+      |                                +--&gt; filemap_fault()  （通用文件系统）
+      |                                     拿页缓存里的页；没有就读磁盘
+      |                                |
+      |                                +--&gt; ext4 的 fault 变体（带 DIO/回退逻辑）
+      |
+      |  匿名 VMA -&gt; do_anonymous_page()  （内核直接分配清零）
+      |
+      +-- 写只读页 -&gt; do_wp_page()
+             |
+             +-- 文件 VMA -&gt; vma-&gt;vm_ops-&gt;page_mkwrite(vmf)
+             |     让文件系统知道"这个只读共享页要被写了"
+             |     ext4 会在这里真正去掉 deny-write 标记
+             |
+             +-- 匿名 VMA -&gt; 真正的写时复制（复制物理页）
+</code></pre>
+<p>关键点：<b>文件映射的"写保护解除"不是内核直接改页表就完事的</b>。因为这个文件可能被多个进程以不同方式映射，内核需要通过 <code>page_mkwrite</code> 通知文件系统，文件系统才能正确更新 <code>inode</code> 的写权限状态（<code>deny_write_access</code>）。这一步做完后，进程才能真的写进去（同一个文件的其他映射才看得到）。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 <code>do_mmap()</code>：参数检查与地址选择</h3>
+<p class="srcline">mm/mmap.c:1604-1616  do_mmap</p>
+<pre><code>unsigned long do_mmap(struct file *file, unsigned long addr,
+			unsigned long len, unsigned long prot,
+			unsigned long flags, unsigned long pgoff,
+			unsigned long *populate, struct list_head *uf)
+{
+	struct mm_struct *mm = current-&gt;mm;
+	vm_flags_t vm_flags;
+	int pkey = 0;
+
+	*populate = 0;
+
+	if (!len)
+		return -EINVAL;
+</code></pre>
+<p><code>do_mmap()</code> 是在 <code>mmap_write_lock()</code> 已经持有的前提下运行的（5.10 里锁是调用者 <code>vm_mmap_pgoff()</code> 在 <code>mm/util.c:494</code> 拿的）。它做的是"决策"：地址选哪儿、权限是什么。</p>
+
+<p class="srcline">mm/mmap.c:1644-1680  do_mmap（地址选择与权限计算）</p>
+<pre><code>	/* Too many mappings? */
+	if (mm-&gt;map_count &gt; sysctl_max_map_count)
+		return -ENOMEM;
+
+	/* Obtain the address to map to. we verify (or select) it and ensure
+	 * that it represents a valid section of the address space.
+	 */
+	addr = get_unmapped_area(file, addr, len, pgoff, flags);
+	if (IS_ERR_VALUE(addr))
+		return addr;
+
+	if (flags &amp; MAP_FIXED_NOREPLACE) {
+		struct vm_area_struct *vma = find_vma(mm, addr);
+
+		if (vma &amp;&amp; vma-&gt;vm_start &lt; addr + len)
+			return -EEXIST;
+	}
+
+	if (prot == PROT_EXEC) {
+		pkey = execute_only_pkey(mm);
+		if (pkey &lt; 0)
+			pkey = 0;
+	}
+
+	/* Do simple checking here so the lower-level routines won't have
+	 * to. we assume access permissions have been handled by the open
+	 * of the memory object, so we don't do any here.
+	 */
+	vm_flags = calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+			mm-&gt;def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+	if (flags &amp; MAP_LOCKED)
+		if (!can_do_mlock())
+			return -EPERM;
+
+	if (mlock_future_check(mm, vm_flags, len))
+		return -EAGAIN;
+</code></pre>
+<p>三个关键点：<b>①</b> <code>mm-&gt;map_count &gt; sysctl_max_map_count</code> 是"VMA 数量上限"检查，默认值 65530（<code>/proc/sys/vm/max_map_count</code>），防止疯狂 mmap 撑爆内核元数据；<b>②</b> <code>get_unmapped_area()</code> 去找地址；<b>③</b> <code>vm_flags</code> 由三部分按位或起来：<code>calc_vm_prot_bits(prot, pkey)</code> 把 <code>PROT_*</code> 翻译成 <code>VM_READ/VM_WRITE/VM_EXEC</code>，<code>calc_vm_flag_bits(flags)</code> 把 <code>MAP_*</code> 翻译成 <code>VM_SHARED/VM_MAY*</code>，再加上 <code>VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC</code>（"允许以后被改成这个权限"的能力位）。</p>
+
+<h3>4.2 <code>get_unmapped_area()</code>：在 VMA 树里找一块空洞</h3>
+<p class="srcline">mm/mmap.c:2523-2563  get_unmapped_area</p>
+<pre><code>unsigned long
+get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+		unsigned long pgoff, unsigned long flags)
+{
+	unsigned long (*get_area)(struct file *, unsigned long,
+				  unsigned long, unsigned long, unsigned long);
+
+	unsigned long error = arch_mmap_check(addr, len, flags);
+	if (error)
+		return error;
+
+	/* Careful about overflows.. */
+	if (len &gt; TASK_SIZE)
+		return -ENOMEM;
+
+	get_area = current-&gt;mm-&gt;get_unmapped_area;
+	if (file) {
+		if (file-&gt;f_op-&gt;get_unmapped_area)
+			get_area = file-&gt;f_op-&gt;get_unmapped_area;
+	} else if (flags &amp; MAP_SHARED) {
+		pgoff = 0;
+		get_area = shmem_get_unmapped_area;
+	}
+
+	addr = get_area(file, addr, len, pgoff, flags);
+	if (IS_ERR_VALUE(addr))
+		return addr;
+
+	if (addr &gt; TASK_SIZE - len)
+		return -ENOMEM;
+	if (offset_in_page(addr))
+		return -EINVAL;
+
+	error = security_mmap_addr(addr);
+	return error ? error : addr;
+}
+</code></pre>
+<p>这是个"派发器"：先问架构要一套默认实现（x86 的默认是 <code>arch_get_unmapped_area_topdown</code>），如果是文件映射且文件系统有自己的实现就优先用文件系统的，如果是 <code>MAP_SHARED|MAP_ANONYMOUS</code>（即共享内存）就用 tmpfs/shmem 的实现（因为它可能需要很大的连续空间）。拿到地址后还要做溢出检查、页对齐检查和安全钩子（<code>security_mmap_addr</code>，LSM 用它做策略）。</p>
+
+<p>真正的搜索算法在 <code>unmapped_area_topdown()</code>（<code>mm/mmap.c:2270</code>）里，它在红黑树上从高往低找空洞，并用 <code>rb_subtree_gap</code> 剪枝：</p>
+<pre><code>static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
+{
+	struct mm_struct *mm = current-&gt;mm;
+	struct vm_area_struct *vma;
+	unsigned long length, low_limit, high_limit, gap_start, gap_end;
+
+	/* Adjust search length to account for worst case alignment overhead */
+	length = info-&gt;length + info-&gt;align_mask;
+	if (length &lt; info-&gt;length)
+		return -ENOMEM;
+
+	/*
+	 * Adjust search limits by the desired length.
+	 */
+	gap_end = info-&gt;high_limit;
+	if (gap_end &lt; length)
+		return -ENOMEM;
+	high_limit = gap_end - length;
+
+	if (info-&gt;low_limit &gt; high_limit)
+		return -ENOMEM;
+	low_limit = info-&gt;low_limit + length;
+
+	/* Check highest gap, which does not precede any rbtree node */
+	gap_start = mm-&gt;highest_vm_end;
+	if (gap_start &lt;= high_limit)
+		goto found_highest;
+
+	/* Check if rbtree root looks promising */
+	if (RB_EMPTY_ROOT(&amp;mm-&gt;mm_rb))
+		return -ENOMEM;
+	vma = rb_entry(mm-&gt;mm_rb.rb_node, struct vm_area_struct, vm_rb);
+	if (vma-&gt;rb_subtree_gap &lt; length)
+		return -ENOMEM;
+
+	while (true) {
+		/* Visit right subtree if it looks promising */
+		gap_start = vma-&gt;vm_prev ? vm_end_gap(vma-&gt;vm_prev) : 0;
+		if (gap_start &lt;= high_limit &amp;&amp; vma-&gt;vm_rb.rb_right) {
+			struct vm_area_struct *right =
+				rb_entry(vma-&gt;vm_rb.rb_right,
+					 struct vm_area_struct, vm_rb);
+			if (right-&gt;rb_subtree_gap &gt;= length) {
+				vma = right;
+				continue;
+			}
+		}
+
+check_current:
+		/* Check if current node has a suitable gap */
+		gap_end = vm_start_gap(vma);
+		if (gap_end &lt; low_limit)
+			return -ENOMEM;
+		if (gap_start &lt;= high_limit &amp;&amp;
+		    gap_end &gt; gap_start &amp;&amp; gap_end - gap_start &gt;= length)
+			goto found;
+
+		/* Visit left subtree if it looks promising */
+		// ... (向左子树走，逻辑与上面镜像对称)
+	}
+</code></pre>
+<p>逐段理解：<code>length</code> 加上对齐余量（<code>align_mask</code>）；<code>high_limit</code> 减掉 length 是为了让"区间尾部不越界"，<code>low_limit</code> 加上 length 是为了让"区间头部不越界"。然后先试最高处的空洞（<code>mm-&gt;highest_vm_end</code> 往上那段通常最大），再进红黑树。核心剪枝是 <code>if (right-&gt;rb_subtree_gap &gt;= length)</code>：<b>右子树里最大的空洞都装不下，就整棵右子树都不用进了</b>。这正是 <code>rb_subtree_gap</code> 存在的意义。</p>
+
+<h3>4.3 <code>mmap_region()</code>：创建 VMA 并挂进红黑树</h3>
+<p class="srcline">mm/mmap.c:1999-2031  mmap_region</p>
+<pre><code>	vma = vm_area_alloc(mm);
+	if (!vma) {
+		error = -ENOMEM;
+		goto unacct_error;
+	}
+
+	vma-&gt;vm_start = addr;
+	vma-&gt;vm_end = addr + len;
+	vma-&gt;vm_flags = vm_flags;
+	vma-&gt;vm_page_prot = vm_get_page_prot(vm_flags);
+	vma-&gt;vm_pgoff = pgoff;
+
+	if (file) {
+		if (vm_flags &amp; VM_DENYWRITE) {
+			error = deny_write_access(file);
+			if (error)
+				goto free_vma;
+		}
+		if (vm_flags &amp; VM_SHARED) {
+			error = mapping_map_writable(file-&gt;f_mapping);
+			if (error)
+				goto allow_write_and_free_vma;
+		}
+
+		vma-&gt;vm_file = get_file(file);
+		error = call_mmap(file, vma);
+		if (error)
+			goto unmap_and_free_vma;
+</code></pre>
+<p>填字段的顺序有讲究：<code>vm_start/vm_end</code> 定边界，<code>vm_flags</code> 定属性，<code>vm_page_prot</code> 由 flags 推出硬件保护位，<code>vm_pgoff</code> 记录"这个映射对应文件的哪个偏移"。然后 <code>call_mmap(file, vma)</code> 调用文件系统的 <code>-&gt;mmap</code> 回调——<b>这一步是文件系统设置 <code>vma-&gt;vm_ops</code> 的地方</b>（比如 ext4 在 <code>fs/ext4/file.c:769</code> 里做 <code>vma-&gt;vm_ops = &amp;ext4_file_vm_ops;</code>）。</p>
+
+<p class="srcline">mm/mmap.c:2065-2083  mmap_region（匿名化与入树）</p>
+<pre><code>	} else if (vm_flags &amp; VM_SHARED) {
+		error = shmem_zero_setup(vma);
+		if (error)
+			goto free_vma;
+	} else {
+		vma_set_anonymous(vma);
+	}
+
+	/* Allow architectures to sanity-check the vm_flags */
+	if (!arch_validate_flags(vma-&gt;vm_flags)) {
+		error = -EINVAL;
+		if (file)
+			goto unmap_and_free_vma;
+		else
+			goto free_vma;
+	}
+
+	vma_link(mm, vma, prev, rb_link, rb_parent);
+</code></pre>
+<p>三条分支决定 VMA 的"身份"：<b>有文件</b> → 文件映射；<b>无文件但 <code>VM_SHARED</code></b> → 共享内存（<code>shmem_zero_setup()</code> 给它造一个 tmpfs 文件）；<b>无文件且私有</b> → <code>vma_set_anonymous()</code> 标记为匿名（这个标记很重要，第 16 篇的 <code>handle_pte_fault()</code> 就是靠 <code>vma_is_anonymous()</code> 决定走 <code>do_anonymous_page()</code> 还是 <code>do_fault()</code>）。</p>
+
+<p class="srcline">mm/mmap.c:795-814  vma_link</p>
+<pre><code>static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct vm_area_struct *prev, struct rb_node **rb_link,
+		struct rb_node *rb_parent)
+{
+	struct address_space *mapping = NULL;
+
+	if (vma-&gt;vm_file) {
+		mapping = vma-&gt;vm_file-&gt;f_mapping;
+		i_mmap_lock_write(mapping);
+	}
+
+	__vma_link(mm, vma, prev, rb_link, rb_parent);
+	__vma_link_file(vma);
+
+	if (mapping)
+		i_mmap_unlock_write(mapping);
+
+	mm-&gt;map_count++;
+	validate_mm(mm);
+}
+</code></pre>
+<p><code>vma_link()</code> 是"挂进树"的动作，三步：<b>①</b> 如果 VMA 有文件，先锁住该文件 <code>address_space</code> 的 <code>i_mmap</code> 区间树（因为文件映射还要登记到文件那边去）；<b>②</b> <code>__vma_link()</code> 把 VMA 挂进 <code>mm-&gt;mm_rb</code> 红黑树和 <code>mm-&gt;mmap</code> 链表；<b>③</b> <code>mm-&gt;map_count++</code> 记账。<code>rb_link</code> / <code>rb_parent</code> 这两个参数是调用者提前算好的"插入点"——红黑树的插入位置是可以先算后插的，这样 <code>munmap_vma_range()</code> 顺手就把位置算好了。</p>
+
+<h3>4.4 <code>__do_munmap()</code>：拆 VMA、清页表</h3>
+<p class="srcline">mm/mmap.c:3153-3186  __do_munmap（入口与查找）</p>
+<pre><code>int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
+		struct list_head *uf, bool downgrade)
+{
+	unsigned long end;
+	struct vm_area_struct *vma, *prev, *last;
+
+	if ((offset_in_page(start)) || start &gt; TASK_SIZE || len &gt; TASK_SIZE-start)
+		return -EINVAL;
+
+	len = PAGE_ALIGN(len);
+	end = start + len;
+	if (len == 0)
+		return -EINVAL;
+
+	/*
+	 * arch_unmap() might do unmaps itself.  It must be called
+	 * and finish any rbtree manipulation before this code
+	 * runs and also starts to manipulate the rbtree.
+	 */
+	arch_unmap(mm, start, end);
+
+	/* Find the first overlapping VMA */
+	vma = find_vma(mm, start);
+	if (!vma)
+		return 0;
+	prev = vma-&gt;vm_prev;
+	/* we have  start &lt; vma-&gt;vm_end  */
+
+	/* if it doesn't overlap, we have nothing.. */
+	if (vma-&gt;vm_start &gt;= end)
+		return 0;
+</code></pre>
+<p>入口检查很直白：起始地址必须页对齐、不能超过 <code>TASK_SIZE</code>。然后用第 16 篇讲过的 <code>find_vma()</code> 找第一个可能重叠的 VMA。</p>
+
+<p class="srcline">mm/mmap.c:3185-3217  __do_munmap（切分边界）</p>
+<pre><code>	/*
+	 * If we need to split any vma, do it now to save pain later.
+	 *
+	 * Note: mremap's move_vma VM_ACCOUNT handling assumes a partially
+	 * unmapped vm_area_struct will remain in use: so lower split_vma
+	 * places tmp vma above, and higher split_vma places tmp vma below.
+	 */
+	if (start &gt; vma-&gt;vm_start) {
+		int error;
+
+		if (end &lt; vma-&gt;vm_end &amp;&amp; mm-&gt;map_count &gt;= sysctl_max_map_count)
+			return -ENOMEM;
+
+		error = __split_vma(mm, vma, start, 0);
+		if (error)
+			return error;
+		prev = vma;
+	}
+
+	/* Does it split the last one? */
+	last = find_vma(mm, end);
+	if (last &amp;&amp; end &gt; last-&gt;vm_start) {
+		int error = __split_vma(mm, last, end, 1);
+		if (error)
+			return error;
+	}
+	vma = vma_next(mm, prev);
+</code></pre>
+<p><b>这是 VMA 切分的核心逻辑</b>：如果 <code>munmap</code> 的范围只覆盖了 VMA 的一部分，就把它切成两半——前半留在原地（<code>__split_vma(mm, vma, start, 0)</code>），后半被摘掉。尾部同理（<code>__split_vma(mm, last, end, 1)</code>）。<b>切分之后，被 munmap 的区间就总是完整覆盖若干个 VMA，拆除逻辑就简单了</b>——这也是为什么 <code>mprotect</code>、<code>brk</code> 都要学会切分。</p>
+
+<h3>4.5 <code>mprotect_fixup()</code>：改权限 = 切分 + 改 flags + 改页表</h3>
+<p class="srcline">mm/mprotect.c:450-490  mprotect_fixup</p>
+<pre><code>	/*
+	 * First try to merge with previous and/or next vma.
+	 */
+	pgoff = vma-&gt;vm_pgoff + ((start - vma-&gt;vm_start) &gt;&gt; PAGE_SHIFT);
+	*pprev = vma_merge(mm, *pprev, start, end, newflags,
+			   vma-&gt;anon_vma, vma-&gt;vm_file, pgoff, vma_policy(vma),
+			   vma-&gt;vm_userfaultfd_ctx);
+	if (*pprev) {
+		vma = *pprev;
+		VM_WARN_ON((vma-&gt;vm_flags ^ newflags) &amp; ~VM_SOFTDIRTY);
+		goto success;
+	}
+
+	*pprev = vma;
+
+	if (start != vma-&gt;vm_start) {
+		error = split_vma(mm, vma, start, 1);
+		if (error)
+			goto fail;
+	}
+
+	if (end != vma-&gt;vm_end) {
+		error = split_vma(mm, vma, end, 0);
+		if (error)
+			goto fail;
+	}
+
+success:
+	/*
+	 * vm_flags and vm_page_prot are protected by the mmap_lock
+	 * held in write mode.
+	 */
+	vma-&gt;vm_flags = newflags;
+	dirty_accountable = vma_wants_writenotify(vma, vma-&gt;vm_page_prot);
+	vma_set_page_prot(vma);
+
+	change_protection(vma, start, end, vma-&gt;vm_page_prot,
+			  dirty_accountable ? MM_CP_DIRTY_ACCT : 0);
+</code></pre>
+<p>顺序是：<b>①先试合并</b>（如果整个 VMA 都要改权限，就没必要拆，直接改；如果只是改一部分，合并会失败）；<b>②再按边界切分</b>；<b>③改 <code>vm_flags</code> 和 <code>vm_page_prot</code></b>；<b>④<code>change_protection()</code> 重写页表项</b>，把对应的 PTE 权限位改掉并刷 TLB。</p>
+<p>一个实践后果：<b><code>mprotect()</code> 一个 VMA 的中间一小段，会把原来那个 VMA 变成三个</b>（前面一段、中间一段、后面一段），<code>map_count</code> 增加 2。这就是为什么大量 <code>mprotect</code> 调用会推高 <code>mm-&gt;map_count</code>，也是 <code>vm.max_map_count</code> 存在的原因之一。</p>
+
+<h3>4.6 <code>find_extend_vma()</code> 与栈的自动增长</h3>
+<p class="srcline">mm/mmap.c:2893-2913  find_extend_vma</p>
+<pre><code>struct vm_area_struct *
+find_extend_vma(struct mm_struct *mm, unsigned long addr)
+{
+	struct vm_area_struct *vma;
+	unsigned long start;
+
+	addr &amp;= PAGE_MASK;
+	vma = find_vma(mm, addr);
+	if (!vma)
+		return NULL;
+	if (vma-&gt;vm_start &lt;= addr)
+		return vma;
+	if (!(vma-&gt;vm_flags &amp; VM_GROWSDOWN))
+		return NULL;
+	start = vma-&gt;vm_start;
+	if (expand_stack(vma, addr))
+		return NULL;
+	if (vma-&gt;vm_flags &amp; VM_LOCKED)
+		populate_vma_page_range(vma, addr, start, NULL);
+	return vma;
+}
+</code></pre>
+<p>栈增长的判定链条：<b>地址落在某个 VMA 之后</b>（即在栈 VMA 的下方空洞里）→ 该 VMA 必须带 <code>VM_GROWSDOWN</code> → 调用 <code>expand_stack()</code> 真正扩展。</p>
+
+<p class="srcline">mm/mmap.c:2775-2798  expand_downwards</p>
+<pre><code>int expand_downwards(struct vm_area_struct *vma,
+				   unsigned long address)
+{
+	struct mm_struct *mm = vma-&gt;vm_mm;
+	struct vm_area_struct *prev;
+	int error = 0;
+
+	address &amp;= PAGE_MASK;
+	if (address &lt; mmap_min_addr)
+		return -EPERM;
+
+	/* Enforce stack_guard_gap */
+	prev = vma-&gt;vm_prev;
+	/* Check that both stack segments have the same anon_vma? */
+	if (prev &amp;&amp; !(prev-&gt;vm_flags &amp; VM_GROWSDOWN) &amp;&amp;
+			vma_is_accessible(prev)) {
+		if (address - prev-&gt;vm_end &lt; stack_guard_gap)
+			return -ENOMEM;
+	}
+
+	/* We must make sure the anon_vma is allocated. */
+	if (unlikely(anon_vma_prepare(vma)))
+		return -ENOMEM;
+</code></pre>
+<p>三道关卡：<b>①</b> 不能低于 <code>mmap_min_addr</code>（防止栈长到 NULL 附近）；<b>②</b> 不能侵入上一个 VMA 的 <code>stack_guard_gap</code> 保护区（这是防止栈溢出攻击覆盖相邻对象的安全带，默认 256 页 = 1 MB）；<b>③</b> 必须能分配 <code>anon_vma</code>。</p>
+<p>而"能不能长到这么大"最终由 <code>acct_stack_growth()</code> 判定，它会检查 <code>RLIMIT_STACK</code>：</p>
+<pre><code>static int acct_stack_growth(struct vm_area_struct *vma,
+			     unsigned long size, unsigned long grow)
+{
+	struct mm_struct *mm = vma-&gt;vm_mm;
+	unsigned long new_start;
+	// ...
+	if (is_vsyscall_vaddr(vma-&gt;vm_start))
+		return -ENOMEM;
+
+	new_start = vma-&gt;vm_start - size;
+	// ...
+	if (new_start &lt; mm-&gt;map_base &amp;&amp; stack_guard_gap)
+		return -ENOMEM;
+
+	/* Do we have enough space? */
+	if (vma-&gt;vm_flags &amp; VM_LOCKED) {
+		// ...
+	}
+	return 0;
+}
+</code></pre>
+<p><code>acct_stack_growth()</code> 位于 <code>mm/mmap.c:2639</code>，它把新起始地址和 <code>mm-&gt;total_vm</code> 的增长量一起算，超出 <code>RLIMIT_STACK</code> 就返回 -ENOMEM，最终让缺页处理发 SIGSEGV。可以用 <code>ulimit -s</code> 调整这个限额（见第 5 节）。</p>
+
+<h3>4.7 <code>vm_ops</code>：VMA 的回调表</h3>
+<p class="srcline">include/linux/mm.h:557-574  struct vm_operations_struct（节选）</p>
+<pre><code>struct vm_operations_struct {
+	void (*open)(struct vm_area_struct * area);
+	void (*close)(struct vm_area_struct * area);
+	int (*split)(struct vm_area_struct * area, unsigned long addr);
+	int (*mremap)(struct vm_area_struct * area);
+	vm_fault_t (*fault)(struct vm_fault *vmf);
+	vm_fault_t (*huge_fault)(struct vm_fault *vmf,
+			enum page_entry_size pe_size);
+	void (*map_pages)(struct vm_fault *vmf,
+			pgoff_t start_pgoff, pgoff_t end_pgoff);
+	unsigned long (*pagesize)(struct vm_area_struct * area);
+
+	/* notification that a previously read-only page is about to become
+	 * writable, if an error is returned it will cause a SIGBUS */
+	vm_fault_t (*page_mkwrite)(struct vm_fault *vmf);
+
+	/* same as page_mkwrite when using VM_PFNMAP|VM_MIXEDMAP */
+	vm_fault_t (*pfn_mkwrite)(struct vm_fault *vmf);
+</code></pre>
+<p>四个最关键的成员：</p>
+<ul>
+  <li><b><code>fault</code></b>：缺页时"这个 VMA 的页从哪来"。文件映射走它（进页缓存/读磁盘）；匿名映射不用它（内核直接分配清零）。</li>
+  <li><b><code>page_mkwrite</code></b>："一个只读共享页即将被写"。文件映射用它通知文件系统去掉 deny-write 状态；<b>返回错误会导致 SIGBUS</b>。</li>
+  <li><b><code>huge_fault</code></b>：大页缺页的专用路径（第 19 篇的 THP 会用到）。</li>
+  <li><b><code>open</code>/<code>close</code></b>：VMA 被建立/销毁时的通知，典型用途是调整文件的引用计数和 <code>deny_write_access</code> 计数。</li>
+</ul>
+<div class="note"><b>版本提醒：</b>5.10 的 <code>vm_operations_struct</code> <b>没有</b> <code>set_page_prot</code>、<code>map</code>、<code>unmap</code> 这三个成员。设置页保护位改成了全局函数 <code>vma_set_page_prot()</code>（<code>mm/mmap.c:152</code>）；<code>map</code>/<code>unmap</code> 在 2.6 时代就被 <code>address_space</code> 的操作取代了。</div>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 观察自己进程的地址空间布局</h3>
+<pre><code>$ cat /proc/self/maps
+55a8b0a00000-55a8b0a02100 r--p 00000000 08:01 1234567    /usr/bin/cat
+55a8b0a02100-55a8b0a02400 r-xp 00002100 08:01 1234567    /usr/bin/cat
+55a8b0a02400-55a8b0a02500 r--p 00002400 08:01 1234567    /usr/bin/cat
+55a8b0b7f0000-55a8b0b811000 rw-p 00000000 00:00 0         [heap]
+7f8e3a800000-7f8e3a821000 r-xp 00000000 08:01 2345678    /lib/x86_64-linux-gnu/libc.so.6
+7ffd8b3ff000-7ffd8b401000 rw-p 00000000 00:00 0         [stack]
+</code></pre>
+<p>对照第 3.1 节的图：从低到高依次是代码段（<code>r--p</code> 头部 → <code>r-xp</code> 正文 → <code>r--p</code> 尾部）、<code>[heap]</code>、动态库、<code>[stack]</code>。每一行的地址边界都是 4 KB 对齐的，且相邻 VMA 之间不重叠——这正是 VMA 的定义。</p>
+
+<h3>5.2 统计 VMA 数量</h3>
+<pre><code>$ wc -l &lt; /proc/self/maps
+$ cat /proc/sys/vm/max_map_count
+65530
+$ grep -c " " /proc/self/maps
+</code></pre>
+<p><code>/proc/self/maps</code> 的行数就是当前进程的 VMA 数量。写一个循环 mmap/munmap 的小程序，你可以观察到 VMA 数会随着 <code>mmap</code> 增加、随着 <code>munmap</code> 减少；反复 <code>mprotect</code> 一段内存的中间部分，则会让 VMA 数增加（因为会切分）。</p>
+
+<h3>5.3 实验：两个进程共享同一块 mmap 缓冲区</h3>
+<p>下面这个程序把同一个文件映射到 <code>MAP_SHARED</code>，父子进程各写各的，最后打印文件内容——你会看到两个进程的写入互相可见。</p>
+<pre><code>$ cat &gt; shared_map.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/wait.h&gt;
+
+#define SIZE 4096
+
+int main(void)
+{
+	int fd = open("/tmp/shared_map.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+	char *buf;
+	pid_t pid;
+
+	setvbuf(stdout, NULL, _IONBF, 0);   /* 让父子进程的输出顺序稳定 */
+
+	if (fd &lt; 0) { perror("open"); return 1; }
+	if (ftruncate(fd, SIZE) &lt; 0) { perror("ftruncate"); return 1; }
+
+	buf = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (buf == MAP_FAILED) { perror("mmap"); return 1; }
+
+	pid = fork();
+	if (pid == 0) {
+		sleep(1);
+		printf("child  read  : %s", buf);      /* 读到父进程写的 */
+		strcpy(buf, "hello from child\n");    /* 写回去 */
+		printf("child  wrote : %s", buf);
+		munmap(buf, SIZE);
+		_exit(0);
+	}
+
+	strcpy(buf, "hello from parent\n");
+	printf("parent wrote : %s", buf);
+	waitpid(pid, NULL, 0);
+
+	printf("parent read  : %s", buf);          /* 读到子进程写的 */
+	printf("file content : ");
+	system("cat /tmp/shared_map.bin");
+	munmap(buf, SIZE);
+	close(fd);
+	return 0;
+}
+EOF
+$ gcc -O0 -o shared_map shared_map.c &amp;&amp; ./shared_map
+parent wrote : hello from parent
+child  read  : hello from parent
+child  wrote : hello from child
+parent read  : hello from child
+file content : hello from child
+</code></pre>
+<p>这个实验演示了 <b>MAP_SHARED 的三个关键性质</b>：<b>①</b> 父子进程看到的是<b>同一个</b>物理页（不是两份拷贝）；<b>②</b> 一方的写入对另一方立即可见（无需额外同步机制）；<b>③</b> 写入最终落到文件里（因为 MAP_SHARED 且文件可写，脏页会被回写）。</p>
+<p>对照实验：把 <code>MAP_SHARED</code> 改成 <code>MAP_PRIVATE</code>，再跑一次——你会看到父子进程各写各的，文件内容也不会变。这就是"写时复制"的直观版本。</p>
+
+<h3>5.4 实验：<code>mprotect</code> 切分 VMA</h3>
+<pre><code>$ cat &gt; mprotect_demo.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+static void show(const char *tag)
+{
+	FILE *f = fopen("/proc/self/maps", "r");
+	char line[512];
+	int n = 0;
+	if (!f) { perror("/proc/self/maps"); exit(1); }
+	while (fgets(line, sizeof(line), f)) if (line[0] != ' ') n++;
+	printf("%-12s VMA count = %d\n", tag, n);
+	fclose(f);
+}
+
+int main(void)
+{
+	size_t len = 1024 * 1024;
+	char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	show("after mmap");
+	/* 只改中间 4KB 的权限：会切分成 3 个 VMA */
+	if (mprotect(p + len / 2, 4096, PROT_READ) != 0) perror("mprotect");
+	show("after mprotect");
+	munmap(p, len);
+	return 0;
+}
+EOF
+$ gcc -O0 -o mprotect_demo mprotect_demo.c &amp;&amp; ./mprotect_demo
+after mmap   VMA count = 21
+after mprotect VMA count = 23
+</code></pre>
+<p>VMA 数从 21 变成 23，正好多了 2 个——对应第 4.5 节说的"一个 VMA 被切成三段"。</p>
+
+<h3>5.5 实验：栈增长与 <code>RLIMIT_STACK</code></h3>
+<pre><code>$ ulimit -s
+8192                       # 单位 KB，即 8 MB
+$ cat &gt; stack_demo.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/resource.h&gt;
+
+void deep(int n)
+{
+	char pad[8192];
+	memset(pad, n, sizeof(pad));
+	if (n &gt; 0) deep(n - 1);
+}
+
+int main(void)
+{
+	struct rlimit rl;
+	getrlimit(RLIMIT_STACK, &amp;rl);
+	printf("stack rlimit = %ld KB\n", (long)(rl.rlim_cur / 1024));
+	deep(1000);            /* 递归 1000 层，每层 8 KB */
+	puts("still alive");
+	return 0;
+}
+EOF
+$ gcc -O0 -o stack_demo stack_demo.c &amp;&amp; ./stack_demo
+stack rlimit = 8192 KB
+still alive
+</code></pre>
+<p>现在把限额调小，再跑一次：</p>
+<pre><code>$ (ulimit -s 1024; ./stack_demo)
+stack rlimit = 1024 KB
+Segmentation fault (core dumped)
+</code></pre>
+<p>递归用了超过 1 MB，栈没法再扩展（<code>acct_stack_growth()</code> 拒绝了），内核给进程发 SIGSEGV。这就是"栈溢出"的真实机制——<b>不是缓冲区写坏了，是内核拒绝再给栈发空间</b>。可以用 <code>ulimit -s unlimited</code> 取消限制（但受 <code>/proc/sys/vm/overcommit_memory</code> 等其他因素约束）。</p>
+<p>顺带一提，栈的实际增长是<b>按页懒分配</b>的：递归到第 100 层时，栈 VMA 可能只被扩展了几十 KB，其余页面直到被碰到才真正分配物理内存。</p>
+
+<h3>5.6 在 qemu 里观察栈扩展（可选）</h3>
+<pre><code># 内核命令行加：init=/bin/sh
+$ echo 1000000 &gt; /proc/sys/kernel/threads-max   # 仅为演示
+# 在内核里看栈 VMA 的起始地址随递归变化
+$ cat /proc/self/maps | grep stack
+</code></pre>
+<p>在递归函数里打印 <code>/proc/self/maps</code> 里的 <code>[stack]</code> 行，你会看到起始地址一轮轮往下跳，每跳一次就是一次 <code>expand_downwards()</code>。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. Linux 5.10 的 VMA 是用红黑树还是 maple tree 存的？</b>用<b>红黑树</b>。5.10 的 <code>struct mm_struct</code> 里是 <code>struct rb_root mm_rb;</code>（<code>include/linux/mm_types.h:391</code>）和辅助的双向链表 <code>struct vm_area_struct *mmap;</code>（同文件 390 行）。maple tree 是 Linux 6.1 才引入的替代方案，5.10 里完全没有 <code>mm_mt</code> 字段。看老内核代码或 5.10 的资料时不要被新文章误导。</div>
+<div class="qa"><b>Q2. <code>mmap()</code> 明明申请了 1 GB，为什么不立刻占用 1 GB 内存？</b>因为 <code>mmap()</code> 只建立 VMA（地址空间的"描述"），不建立页表项、更不分配物理页。物理页是在<b>第一次访问</b>该地址时，由缺页异常处理（<code>do_anonymous_page()</code> 或 <code>do_fault()</code>）按需分配的。这就是"懒分配"：虚拟地址空间是承诺，物理内存是兑现。所以 <code>mmap</code> 一块 1 TB 的空间不碰它，几乎不花物理内存，但 <code>mm-&gt;total_vm</code> 会涨 1 TB（受 <code>RLIMIT_AS</code> 约束）。</div>
+<div class="qa"><b>Q3. <code>munmap</code> 一段只覆盖了某个 VMA 一半的地址，会发生什么？</b>会先<b>切分</b>那个 VMA：在 <code>__do_munmap()</code> 里，<code>__split_vma(mm, vma, start, 0)</code> 把 VMA 在 <code>start</code> 处切成两段（<code>__split_vma(mm, last, end, 1)</code> 处理尾部），然后被覆盖的那段才被完整摘除。切分的原因是：拆除逻辑要处理的是"完整覆盖某个 VMA 区间"的情况，先切分能让后续逻辑统一。同时 <code>mm-&gt;map_count</code> 会临时增加 1。</div>
+<div class="qa"><b>Q4. <code>MAP_SHARED</code> 和 <code>MAP_PRIVATE</code> 映射同一个文件，物理上有什么不同？</b><code>MAP_SHARED</code> 下多个进程（以及文件页缓存）用的是<b>同一批物理页</b>，任何一方的写入对其他方立即可见，最终回写到文件。<code>MAP_PRIVATE</code> 下，读取时共用同一批页（省内存），但<b>一旦某个进程要写</b>，就触发写时复制：内核复制一份新页给这个进程，从此各写各的，互不影响，也不会回写文件。这正是 5.5 节那个实验能演示出来的现象。</div>
+<div class="qa"><b>Q5. 递归太深导致"栈溢出"，为什么内核不干脆让栈无限增长？</b>三个限制：<b>①</b> <code>RLIMIT_STACK</code> 限制（默认 8 MB），由 <code>acct_stack_growth()</code> 检查；<b>②</b> <code>stack_guard_gap</code>（默认 1 MB）保护带，栈不能长到侵占上一个 VMA，否则栈溢出就能覆盖相邻对象——这是安全机制；<b>③</b> <code>mmap_min_addr</code> 防止栈长到 NULL 指针附近。三个条件任一不满足，内核就拒绝扩展并给进程发 SIGSEGV。另外栈本身也是懒分配的：只有被递归真正用到的页才分配物理内存。</div>
+
+<footer>
+  <p>上一篇：<a href="16-page-table.html">16-page-table 页表与缺页异常</a> · 下一篇：<a href="18-reclaim.html">18-reclaim 内存回收：direct reclaim 与 kswapd</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · 系统调用</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="09-signals.html">下一篇：09 信号 →</a>
+</nav>
+
+<h1>🚪 系统调用：用户态走进内核的那道门</h1>
+<p class="subtitle">一条 <code>syscall</code> 指令把 6 个寄存器里的参数变成内核函数调用，再把 -errno 塞回 ax · 预计阅读 26 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>银行柜台。你在营业厅（用户态）可以随便走动、自己数钱、填单子，但你<strong>不能</strong>直接走进金库（内核态）。要取钱你必须走到柜台窗口，把身份证和一本书面的申请单递进去，柜员（内核）核对后办业务，把结果和回执递回给你。窗口是唯一的合法接口，柜台里面的规则不需要你知道，你也改不了。</p>
+
+<p>CPU 硬件就是这么设计的。x86_64 有四个特权级（ring 0..3），Linux 只用 ring 0（内核）和 ring 3（用户）。用户态代码不能执行 <code>cli</code>/<code>hlt</code>、不能改 CR3（页表基址）、不能访问内核地址空间。想读文件、发网络包、创建进程，必须<strong>主动</strong>触发一次“受控的降级进入”：这条指令就是 <span class="term">syscall</span>（老式 CPU 用 <code>int 0x80</code>）。</p>
+
+<p>所以系统调用（<span class="term">system call</span>）的本质是：<strong>用户态与内核态之间唯一被审查的接口</strong>。它既要足够快（Linux 每秒可能发生几百万次），又要足够安全（用户传进来的一切都是不可信数据，必须校验）。这两个要求塑造了整个实现：寄存器传参、固定入口、查表分发、返回值用负值编码错误。</p>
+
+<p>理解一条 <code>write()</code> 从用户代码到 <code>vfs_write</code> 的完整路径，你就理解了“进内核”的全部秘密：硬件做了什么、汇编入口保存了什么、C 代码怎么查表、参数怎么到函数里、错误怎么回传。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">系统调用</td><td>syscall / system call</td><td>用户态请求内核服务的唯一合法入口</td></tr>
+  <tr><td class="term">特权级</td><td>ring / CPL</td><td>x86 的 0-3 级，Linux 用 0（内核）与 3（用户）</td></tr>
+  <tr><td class="term">MSR</td><td>Model Specific Register</td><td>CPU 的特殊寄存器；<code>syscall</code> 指令从 <code>IA32_LSTAR</code> 读内核入口地址</td></tr>
+  <tr><td class="term">swapgs</td><td>swapgs</td><td>一条指令互换 GS 基址，让内核能访问 percpu 数据</td></tr>
+  <tr><td class="term">pt_regs</td><td>struct pt_regs</td><td>进入内核时压栈保存的完整用户寄存器快照</td></tr>
+  <tr><td class="term">系统调用号</td><td>syscall number</td><td>整数，放在 <code>rax</code> 里传入，如 write=1</td></tr>
+  <tr><td class="term">系统调用表</td><td>sys_call_table</td><td>函数指针数组，下标是调用号，元素是 <code>__x64_sys_*</code></td></tr>
+  <tr><td class="term">SYSCALL_DEFINE</td><td>SYSCALL_DEFINE0..6</td><td>定义系统调用的宏，生成 <code>__x64_sys_xxx</code> 包装函数</td></tr>
+  <tr><td class="term">-errno</td><td>negative errno</td><td>内核用负值表示错误（如 -EBADF=-9），libc 转成 errno 并返回 -1</td></tr>
+  <tr><td class="term">strace</td><td>strace</td><td>ptrace 工具，打印进程每次系统调用的参数与返回值</td></tr>
+  <tr><td class="term">vDSO</td><td>virtual dynamic shared object</td><td>内核映射到用户空间的只读代码页，让 gettimeofday 等免陷入</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 一次 write 的全程</h3>
+
+<pre><code>用户态：printf -&gt; glibc write() -&gt; 准备 rax=1(调用号), rdi=fd, rsi=buf, rdx=count
+                    │
+                    ▼
+            syscall 指令（0F 05）
+                    │  硬件自动：CPL 3→0，保存 RIP→RCX、RFLAGS→R11
+                    │            RIP ← IA32_LSTAR (entry_SYSCALL_64)
+                    ▼
+内核态汇编 entry_SYSCALL_64 (arch/x86/entry/entry_64.S:95)
+   swapgs                          ← 换成内核 GS，能读到 percpu
+   保存用户 RSP 到 TSS.sp2
+   SWITCH_TO_KERNEL_CR3            ← 换成内核页表
+   RSP ← cpu_current_top_of_stack   ← 切到本 task 的内核栈
+   push ss/sp/flags/cs/ip/rax      ← 构造 pt_regs
+   PUSH_AND_CLEAR_REGS             ← 保存 r15..rdi，并清掉部分寄存器防泄漏
+   rdi = rax (调用号) ; rsi = rsp (pt_regs*)
+   call do_syscall_64
+                    │
+                    ▼
+C 代码 do_syscall_64 (arch/x86/entry/common.c:39)
+   nr = syscall_enter_from_user_mode()   ← 可能做 seccomp/ptrace 检查
+   if (nr &lt; NR_syscalls) regs-&gt;ax = sys_call_table[nr](regs)
+                    │
+                    ▼
+__x64_sys_write(regs)  ← 由 SYSCALL_DEFINE3 宏生成
+   从 regs 里解出 fd/buf/count，再调 __do_sys_write(...)
+                    │
+                    ▼
+SYSCALL_DEFINE3(write) 的实现体 -&gt; ksys_write -&gt; vfs_write -&gt; 具体文件系统
+                    │
+                    ▼
+返回值放回 regs-&gt;ax，逐层返回；汇编 POP_REGS + sysret 回到用户态
+</code></pre>
+
+<h3>3.2 参数寄存器与返回值</h3>
+
+<p>x86_64 System V ABI 里函数参数用 rdi、rsi、rdx、rcx、r8、r9，但<strong>系统调用不用 rcx</strong>——因为 <code>syscall</code> 指令硬件会用 <code>rcx</code> 保存返回地址。所以第 4 个参数改放 <code>r10</code>。这也解释了为什么内核里 <code>SYSCALL_DEFINE6</code> 最多 6 个参数。</p>
+
+<table>
+  <tr><th>参数序号</th><th>寄存器</th><th>说明</th></tr>
+  <tr><td>调用号</td><td><code>rax</code></td><td>如 write 是 1</td></tr>
+  <tr><td>第 1 个</td><td><code>rdi</code></td><td>fd</td></tr>
+  <tr><td>第 2 个</td><td><code>rsi</code></td><td>buf</td></tr>
+  <tr><td>第 3 个</td><td><code>rdx</code></td><td>count</td></tr>
+  <tr><td>第 4 个</td><td><code>r10</code></td><td>（不是 rcx！）</td></tr>
+  <tr><td>第 5 个</td><td><code>r8</code></td><td></td></tr>
+  <tr><td>第 6 个</td><td><code>r9</code></td><td></td></tr>
+  <tr><td>返回值</td><td><code>rax</code></td><td>成功是结果值，失败是负 errno</td></tr>
+</table>
+
+<div class="note"><code>syscall</code> 指令只做三件硬件动作：把 <code>RIP</code> 存入 <code>RCX</code>、把 <code>RFLAGS</code> 存入 <code>R11</code>、把 <code>RIP</code> 设为 MSR <code>IA32_LSTAR</code> 里的地址，同时把 <code>CS</code> 切到内核段（CPL=0）。它<strong>不会</strong>保存其他寄存器，也<strong>不会</strong>切栈——切栈是内核汇编自己做的（<code>movq PER_CPU_VAR(cpu_current_top_of_stack), %rsp</code>）。</div>
+
+<h3>3.3 调用号表怎么来的</h3>
+
+<p><code>arch/x86/entry/syscalls/syscall_64.tbl</code> 是人类可读的清单，构建时被脚本转成 <code>asm/syscalls_64.h</code>，里面全是 <code>__SYSCALL_COMMON(nr, sym)</code> 或 <code>__SYSCALL_64(nr, sym)</code> 宏调用。然后 <code>arch/x86/entry/syscall_64.c</code> 两次 include 这个文件：第一次生成函数声明，第二次生成表项初始化。</p>
+
+<pre><code>syscall_64.tbl            syscalltbl.sh           syscalls_64.h
+0  common  read  sys_read   ────────────►  __SYSCALL_COMMON(0, sys_read)
+1  common  write sys_write  ────────────►  __SYSCALL_COMMON(1, sys_write)
+                                                 │
+                                                 ▼
+                        syscall_64.c 两次 #include
+                        第一次: extern long __x64_sys_read(...)
+                        第二次: [0] = __x64_sys_read, [1] = __x64_sys_write, ...
+</code></pre>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 表项：数字 → 函数名</h3>
+
+<p class="srcline">arch/x86/entry/syscalls/syscall_64.tbl:11-12  read / write 的编号</p>
+<pre><code>0	common	read			sys_read
+1	common	write			sys_write
+</code></pre>
+
+<p>四列依次是：编号、ABI（<code>common</code>/<code>64</code>/<code>x32</code>）、用户可见名字、内核符号名。<code>common</code> 表示 64 位和 x32 共用；<code>64</code> 表示只给原生 64 位。</p>
+
+<h3>4.2 生成 sys_call_table</h3>
+
+<p class="srcline">arch/x86/entry/syscall_64.c:14-26  表的构造</p>
+<pre><code>#define __SYSCALL_64(nr, sym) extern long __x64_##sym(const struct pt_regs *);
+#include &lt;asm/syscalls_64.h&gt;
+#undef __SYSCALL_64
+
+#define __SYSCALL_64(nr, sym) [nr] = __x64_##sym,
+
+asmlinkage const sys_call_ptr_t sys_call_table[__NR_syscall_max+1] = {
+	/*
+	 * Smells like a compiler bug -- it doesn't work
+	 * when the &amp; below is removed.
+	 */
+	[0 ... __NR_syscall_max] = &amp;__x64_sys_ni_syscall,
+#include &lt;asm/syscalls_64.h&gt;
+};
+</code></pre>
+
+<ul>
+  <li><code>__SYSCALL_COMMON(nr, sym)</code> 会在 <code>#include</code> 之前被定义成 <code>__SYSCALL_64</code>（源码第 11 行），所以 common 与 64 项都走同一路。</li>
+  <li>第一次 include 只声明函数原型，让第二个 include 里能写 <code>[nr] = __x64_sys_xxx</code>。</li>
+  <li><code>[0 ... __NR_syscall_max] = &amp;__x64_sys_ni_syscall</code> 是 GNU 扩展（指定范围初始化），把所有槽先填成 <code>sys_ni_syscall</code>（返回 <code>-ENOSYS</code>），然后表项里的 [nr] 覆盖它。这样即使某个架构没实现某调用，用户也不会跳到空指针。</li>
+  <li><code>const</code> 与 <code>asmlinkage</code> 让表放在 <code>.rodata</code>：内核代码不能改它（防 rootkit）；<code>asmlinkage</code> 在 x86_64 上基本是空宏，历史遗留的“从栈上传参”标记。</li>
+</ul>
+
+<h3>4.3 汇编入口：entry_SYSCALL_64</h3>
+
+<p class="srcline">arch/x86/entry/entry_64.S:95-120  entry_SYSCALL_64</p>
+<pre><code>SYM_CODE_START(entry_SYSCALL_64)
+	UNWIND_HINT_EMPTY
+
+	swapgs
+	/* tss.sp2 is scratch space. */
+	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
+	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+
+SYM_INNER_LABEL(entry_SYSCALL_64_safe_stack, SYM_L_GLOBAL)
+
+	/* Construct struct pt_regs on stack */
+	pushq	$__USER_DS				/* pt_regs-&gt;ss */
+	pushq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2)	/* pt_regs-&gt;sp */
+	pushq	%r11					/* pt_regs-&gt;flags */
+	pushq	$__USER_CS				/* pt_regs-&gt;cs */
+	pushq	%rcx					/* pt_regs-&gt;ip */
+SYM_INNER_LABEL(entry_SYSCALL_64_after_hwframe, SYM_L_GLOBAL)
+	pushq	%rax					/* pt_regs-&gt;orig_ax */
+
+	PUSH_AND_CLEAR_REGS rax=$-ENOSYS
+
+	/* IRQs are off. */
+	movq	%rax, %rdi
+	movq	%rsp, %rsi
+	call	do_syscall_64		/* returns with IRQs disabled */
+</code></pre>
+
+<ul>
+  <li><code>swapgs</code>：用户态的 <code>%gs</code> 指向线程 TLS，内核态的 <code>%gs</code> 指向 percpu 数据。这条指令交换两者，让下一条就能读 <code>PER_CPU_VAR</code>。返回时还要再 <code>swapgs</code> 一次。</li>
+  <li><code>movq %rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)</code>：<code>syscall</code> 没保存用户栈指针，所以先临时塞进 TSS 的 sp2 槽，等会儿 <code>pushq</code> 到 pt_regs 的 <code>sp</code> 字段里。</li>
+  <li><code>SWITCH_TO_KERNEL_CR3</code>：KPTI（内核页表隔离）开启时切到内核 CR3；关闭时是空操作。这是 Meltdown 缓解措施的成本。</li>
+  <li><code>movq PER_CPU_VAR(cpu_current_top_of_stack), %rsp</code>：切到当前 task 的内核栈顶。这个 percpu 值在上下文切换时被更新（<code>__switch_to</code> 里写 <code>TSS_sp0</code> 与 <code>cpu_current_top_of_stack</code>）。</li>
+  <li>然后按 <code>struct pt_regs</code> 的布局依次压 ss、sp、flags、cs、ip、orig_ax。<code>orig_ax</code> 保存原始调用号，用于 <code>restart_syscall</code> 与 ptrace。</li>
+  <li><code>PUSH_AND_CLEAR_REGS rax=$-ENOSYS</code>：压入 r15..rdi 全部通用寄存器（形成完整 pt_regs），同时把 <code>rax</code> 先置成 <code>-ENOSYS</code>（万一后面路径失败，返回值天然是“未实现”），并把 rdi/rsi 等寄存器清零以防内核数据泄漏到用户可见位置（Spectre 缓解）。</li>
+  <li><code>movq %rax, %rdi</code>：按 SysV 调用约定，第一个参数是调用号；<code>%rsp</code> 是 pt_regs 指针，作为第二个参数。注意这里 <code>%rax</code> 是从 pt_regs 里重新载入的（宏返回后 <code>rax</code> 已是 <code>orig_ax</code> 的值）。</li>
+</ul>
+
+<h3>4.4 do_syscall_64：查表分发</h3>
+
+<p class="srcline">arch/x86/entry/common.c:39-57  do_syscall_64</p>
+<pre><code>__visible noinstr void do_syscall_64(unsigned long nr, struct pt_regs *regs)
+{
+	nr = syscall_enter_from_user_mode(regs, nr);
+
+	instrumentation_begin();
+	if (likely(nr &lt; NR_syscalls)) {
+		nr = array_index_nospec(nr, NR_syscalls);
+		regs-&gt;ax = sys_call_table[nr](regs);
+#ifdef CONFIG_X86_X32_ABI
+	} else if (likely((nr &amp; __X32_SYSCALL_BIT) &amp;&amp;
+			  (nr &amp; ~__X32_SYSCALL_BIT) &lt; X32_NR_syscalls)) {
+		nr = array_index_nospec(nr &amp; ~__X32_SYSCALL_BIT,
+					X32_NR_syscalls);
+		regs-&gt;ax = x32_sys_call_table[nr](regs);
+#endif
+	}
+	instrumentation_end();
+	syscall_exit_to_user_mode(regs);
+}
+</code></pre>
+
+<ul>
+  <li><code>syscall_enter_from_user_mode</code>：在真正调内核函数之前做准备——恢复中断、检查 <code>TIF_WORK_SYSCALL_ENTER</code>（ptrace 单步、seccomp 过滤、审计）。如果 seccomp 拦截，它会把 <code>nr</code> 改成 <code>__NR_seccomp</code> 或直接返回错误。下一篇的 seccomp 就挂在这里。</li>
+  <li><code>array_index_nospec(nr, NR_syscalls)</code>：Spectre v1 缓解。虽然前面已检查 <code>nr &lt; NR_syscalls</code>，但 CPU 可能推测执行到越界地址；这个宏在越界时把索引归零，让推测执行读到合法表项。</li>
+  <li><code>sys_call_table[nr](regs)</code>：所有 <code>__x64_sys_*</code> 都接受一个 <code>const struct pt_regs *</code> 参数，返回 <code>long</code>。这就是为什么用户参数要先从 <code>regs</code> 里“解包”，而不是直接当 C 参数传。</li>
+  <li><code>regs-&gt;ax = ...</code>：返回值直接写回 pt_regs 的 <code>ax</code> 槽。返回用户态时 <code>POP_REGS</code> 会把它装回 <code>%rax</code>。错误码就是负数，例如 <code>-EBADF</code> 是 -9。</li>
+  <li><code>syscall_exit_to_user_mode</code>：退出前处理 <code>TIF_WORK_SYSCALL_EXIT</code>（如 <code>TIF_SIGPENDING</code> → 投递信号、<code>TIF_NOTIFY_RESUME</code> → task_work）。这就是“系统调用返回时检查信号”的位置。</li>
+</ul>
+
+<h3>4.5 SYSCALL_DEFINE 宏：从 regs 到 C 参数</h3>
+
+<p class="srcline">include/linux/syscalls.h:213-224  入口宏</p>
+<pre><code>#define SYSCALL_DEFINE1(name, ...) SYSCALL_DEFINEx(1, _##name, __VA_ARGS__)
+#define SYSCALL_DEFINE2(name, ...) SYSCALL_DEFINEx(2, _##name, __VA_ARGS__)
+#define SYSCALL_DEFINE3(name, ...) SYSCALL_DEFINEx(3, _##name, __VA_ARGS__)
+/* ... 此处省略 DEFINE4~6 与 DEFINE_MAXARGS ... */
+
+#define SYSCALL_DEFINEx(x, sname, ...)				\
+	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
+	__SYSCALL_DEFINEx(x, sname, __VA_ARGS__)
+</code></pre>
+
+<ul>
+  <li><code>_##name</code> 把 <code>write</code> 变成 <code>_write</code>，拼出符号 <code>__x64_sys_write</code> / <code>__do_sys_write</code>。</li>
+  <li><code>SYSCALL_METADATA</code> 生成 ftrace 元数据（syscall 名字表），供 <code>trace-cmd</code>/perf 显示可读名字。</li>
+  <li><code>__VA_ARGS__</code> 是 <code>(type1, name1, type2, name2, ...)</code> 形式，宏用 <code>__MAP</code> 把它展开成函数参数列表。</li>
+</ul>
+
+<p class="srcline">include/linux/syscalls.h:236-246  __SYSCALL_DEFINEx</p>
+<pre><code>#ifndef __SYSCALL_DEFINEx
+#define __SYSCALL_DEFINEx(x, name, ...)					\
+	__diag_push();							\
+	__diag_ignore(GCC, 8, "-Wattribute-alias",			\
+		      "Type aliasing is used to sanitize syscall arguments");\
+	asmlinkage long sys##name(__MAP(x,__SC_DECL,__VA_ARGS__))	\
+		__attribute__((alias(__stringify(__se_sys##name))));	\
+	ALLOW_ERROR_INJECTION(sys##name, ERRNO);			\
+	static inline long __do_sys##name(__MAP(x,__SC_DECL,__VA_ARGS__));\
+	asmlinkage long __se_sys##name(__MAP(x,__SC_LONG,__VA_ARGS__));	\
+	asmlinkage long __se_sys##name(__MAP(x,__SC_LONG,__VA_ARGS__))	\
+	{								\
+		long ret = __do_sys##name(__MAP(x,__SC_CAST,__VA_ARGS__));\
+		__MAP(x,__SC_TEST,__VA_ARGS__);				\
+		__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));	\
+		return ret;						\
+	}								\
+	__diag_pop();							\
+	static inline long __do_sys##name(__MAP(x,__SC_DECL,__VA_ARGS__))
+#endif /* __SYSCALL_DEFINEx */
+</code></pre>
+
+<ul>
+  <li><code>sys_write</code> 是 <code>__se_sys_write</code> 的别名（<code>alias</code> 属性），保持旧 ABI 符号存在。</li>
+  <li><code>__se_sys_write</code> 的参数类型是 <code>__SC_LONG</code>（全部转成 <code>long</code>），因为从寄存器拿来的值就是 64 位；然后 <code>__SC_CAST</code> 强转回声明类型再调 <code>__do_sys_write</code>。这一步是为了正确处理“用户传了 32 位 int 但寄存器是 64 位”的符号扩展问题（宏注释里说的 sign-extend）。</li>
+  <li><code>__SC_TEST</code> 用 <code>BUILD_BUG_ON</code> 检查用户传来的指针类型是否带 <code>__user</code> 注解——忘写 <code>__user</code> 编译就报错，强制开发者标注。</li>
+  <li><code>__PROTECT</code>（x86 上是 <code>asmlinkage_protect</code>）确保返回值不被参数寄存器污染。</li>
+  <li>所以 <code>SYSCALL_DEFINE3(write, ...)</code> 展开后，实际执行体是一个 <code>static inline long __do_sys_write(unsigned int fd, const char __user *buf, size_t count)</code>，前面包一层从 pt_regs 解包的汇编/内联桩。</li>
+</ul>
+
+<h3>4.6 真正的实现：write 只有三行</h3>
+
+<p class="srcline">fs/read_write.c:1051-1054  SYSCALL_DEFINE3(write)</p>
+<pre><code>SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
+		size_t, count)
+{
+	return ksys_write(fd, buf, count); /* 直接调用内核write实现 */
+}
+</code></pre>
+
+<p>内核 syscall 实现层的惯例是：syscall 函数只做参数解包与转发，真正逻辑在 <code>ksys_xxx</code>（kernel syscall）里，这样内核内部代码也能调用它而不必构造 pt_regs。</p>
+
+<p class="srcline">fs/read_write.c:1015-1038  ksys_write</p>
+<pre><code>ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+{
+	struct fd f = fdget_pos(fd);
+	ssize_t ret = -EBADF;
+
+	if (f.file) {
+		loff_t pos, *ppos = file_ppos(f.file);
+		/* 处理文件位置指针：获取当前位置或使用NULL */
+		if (ppos) {
+			pos = *ppos; /* 复制当前文件位置 */
+			ppos = &amp;pos; /* 使用本地变量避免并发修改 */
+		}
+		/* 调用VFS层写入函数执行实际写入操作 */
+		ret = vfs_write(f.file, buf, count, ppos);
+		/* 写入成功后更新文件的当前位置 */
+		if (ret &gt;= 0 &amp;&amp; ppos)
+			f.file-&gt;f_pos = pos;
+		/* 释放文件描述符引用和位置锁 */
+		fdput_pos(f);
+	}
+
+	return ret;
+}
+</code></pre>
+
+<ul>
+  <li><code>fdget_pos(fd)</code>：把整数 fd 解析成 <code>struct fd</code>（本质是 <code>struct file *</code> + flags）。<code>-EBADF</code>（= -9）是默认返回值，非法 fd 时 <code>f.file</code> 为 NULL，函数直接返回 -9。</li>
+  <li><code>file_ppos()</code>：只有“可定位”的文件（普通文件）才返回 <code>&amp;f_pos</code>；管道、socket 返回 NULL，表示“没有偏移概念”。</li>
+  <li><code>ppos = &amp;pos</code> 让 <code>vfs_write</code> 写本地副本，成功后再回写 <code>f_pos</code>——配合 <code>fdget_pos</code> 拿到的文件位置锁，避免两个进程同时 append 时算错偏移。</li>
+  <li><code>vfs_write</code> 会再做一次 <code>access_ok()</code> 校验用户缓冲区在用户地址范围内（不能指向内核地址），然后调 <code>file-&gt;f_op-&gt;write_iter</code>。这就是“用户传的指针全部不可信”的第一道关。</li>
+  <li>返回 <code>ret</code> 一路传回，最终写进 <code>regs-&gt;ax</code>。成功是写入字节数（≥0），失败是负值。</li>
+</ul>
+
+<h3>4.7 未实现的调用</h3>
+
+<p class="srcline">kernel/sys_ni.c:19-23  sys_ni_syscall</p>
+<pre><code>/*
+ * Non-implemented system calls get redirected here.
+ */
+asmlinkage long sys_ni_syscall(void)
+{
+	return -ENOSYS;
+}
+</code></pre>
+
+<p>表里所有没被填充的槽都指向它，所以用户调一个不存在的调用号会拿到 <code>-ENOSYS</code>（-38），libc 转成 <code>errno = ENOSYS</code>，<code>syscall()</code> 返回 -1。这比跳空指针安全得多。</p>
+
+<h2>5. 动手验证</h2>
+
+<p><strong>实验一：strace 看 write 的原始参数。</strong></p>
+<pre><code>$ strace -e trace=write echo hello
+write(1, "hello\n", 6)                   = 6
+hello
++++ exited with 0 +++
+</code></pre>
+
+<p><code>1</code> 是 fd（stdout），<code>"hello\n"</code> 是 buf，<code>6</code> 是 count，<code>= 6</code> 是 <code>regs-&gt;ax</code> 的返回值。如果你用 <code>strace -e trace=write -xx</code>，buf 会以十六进制显示原始字节。</p>
+
+<p><strong>实验二：看调用号。</strong></p>
+<pre><code>$ strace -e trace=write -e raw=write echo hi 2&gt;&amp;1 | head -2
+write(0x1, 0x7ffd..., 0x3)              = 0x3
+</code></pre>
+
+<p><code>-e raw=</code> 显示未解码的参数值。write 在 x86_64 上是 1，可用 <code>ausyscall --dump | grep write</code> 或读 <code>/usr/include/asm/unistd_64.h</code> 确认。</p>
+
+<p><strong>实验三：错误返回是负 errno。</strong></p>
+<pre><code>$ strace -e trace=write python3 -c 'import os; os.write(999, b"x")' 2&gt;&amp;1 | tail -2
+write(999, "x", 1)                      = -1 EBADF (Bad file descriptor)
+</code></pre>
+
+<p>内核返回 <code>-9</code>，strace 把它解码成 <code>EBADF</code>。libc 的 <code>write()</code> 包装会把 -9 存进 <code>errno</code> 并返回 -1。</p>
+
+<p><strong>实验四：用 syscall(2) 直接调用、绕过 libc 封装。</strong></p>
+<pre><code>$ cat &gt; /tmp/sc.c &lt;&lt;'EOF'
+#include &lt;unistd.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;stdio.h&gt;
+int main(void) {
+    long r = syscall(SYS_getpid);        /* getpid 其实走 vDSO，但这里演示 */
+    printf("pid=%ld\n", r);
+    long w = syscall(SYS_write, 1, "raw\n", 4);
+    printf("write returned %ld\n", w);
+    return 0;
+}
+EOF
+$ cc -o /tmp/sc /tmp/sc.c &amp;&amp; strace -e trace=getpid,write /tmp/sc</code></pre>
+
+<p>你会看到 <code>syscall()</code> 里没有 <code>printf</code> 那一层的额外调用，直接落到 <code>write(1, "raw\n", 4)</code>。注意 <code>getpid</code> 在现代 glibc 上走 vDSO，不会出现在 strace 输出里——这正好说明“不是所有 libc 函数都会陷入内核”。</p>
+
+<p><strong>实验五：自己加一个系统调用（在 qemu 里做）。</strong> 需要一份可编译的 5.10 内核。步骤：</p>
+<pre><code>1) 在 arch/x86/entry/syscalls/syscall_64.tbl 末尾加一行：
+   548	common	mysyscall		sys_mysyscall
+   （548 是当时未占用的号，可用 scripts/check-syscall.sh 之类确认）
+
+2) 在 kernel/sys.c 末尾加实现：
+   SYSCALL_DEFINE1(mysyscall, int, x)
+   {
+       pr_info("mysyscall called with %d\n", x);
+       return x * 2;
+   }
+
+3) make ARCH=x86_64 menuconfig 保持默认，make -j$(nproc)
+4) 用 qemu-system-x86_64 -kernel arch/x86/boot/bzImage -append "console=ttyS0" \
+     -initrd busybox.cpio.gz -nographic 启动
+
+5) 在 guest 里用 syscall(548, 21) 调用，dmesg 里会看到日志，返回值是 42。
+</code></pre>
+
+<p><strong>实验六：用 eBPF 观测系统调用而不编译内核（更常用）。</strong></p>
+<pre><code>$ sudo bpftrace -e 'tracepoint:syscalls:sys_enter_write { @[comm] = count(); }'
+^C
+@[bash]: 12
+@[sshd]: 3
+</code></pre>
+
+<p><code>tracepoint:syscalls:sys_enter_write</code> 就在 <code>do_syscall_64</code> 调内核函数前触发的 tracepoint 上。<code>sys_exit_write</code> 里能读到返回值。用 bpftrace 观测不需要重启内核，是生产环境排查系统调用问题的标准手段。</p>
+
+<p><strong>实验七：验证源码里的表项。</strong></p>
+<pre><code>$ grep -n "write" arch/x86/entry/syscalls/syscall_64.tbl | head -3
+1	common	write			sys_write
+$ grep -n "SYSCALL_DEFINE3(write" fs/read_write.c
+1051:SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
+</code></pre>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. 为什么系统调用的第 4 个参数用 r10，而普通函数用 rcx？</b><code>syscall</code> 指令硬件约定用 <code>RCX</code> 保存用户态的 <code>RIP</code>（返回地址）、用 <code>R11</code> 保存 <code>RFLAGS</code>。如果参数也放在 rcx，进入内核时原值就被覆盖了。所以 System V ABI 里第 4 个参数（rcx）在 syscall 场景让位给 r10。</div>
+
+<div class="qa"><b>Q2. <code>swapgs</code> 到底在换什么？</b>它交换 <code>IA32_GS_BASE</code> 与 <code>IA32_KERNEL_GS_BASE</code> 两个 MSR。用户态 <code>%gs</code> 基址指向线程的 TLS 块；内核态需要 <code>%gs</code> 指向 percpu 区（才能读 <code>current_task</code>、<code>cpu_current_top_of_stack</code>）。进入内核时 swap 一次，返回用户态前再 swap 回去。</div>
+
+<div class="qa"><b>Q3. 为什么 <code>do_syscall_64</code> 里要调 <code>array_index_nospec()</code>？</b>防止 Spectre v1 推测执行绕过边界检查。虽然 C 代码里已经 <code>if (nr &lt; NR_syscalls)</code>，但 CPU 可能在你还没完成检查时就去取 <code>sys_call_table[nr]</code>（nr 是恶意大的值）。宏会把越界索引变成 0，让推测读到的也是合法表项。</div>
+
+<div class="qa"><b>Q4. <code>SYSCALL_DEFINE3(write)</code> 展开后，真正干活的是哪个函数？</b>是 <code>static inline long __do_sys_write(unsigned int fd, const char __user *buf, size_t count)</code>。外面还有 <code>__se_sys_write</code> 负责把 pt_regs 里的 64 位值做符号扩展后强转成声明类型，以及 <code>__x64_sys_write</code> 负责从 <code>struct pt_regs *</code> 解包。分层的目的是把“ABI 解码”和“业务逻辑”解耦。</div>
+
+<div class="qa"><b>Q5. 内核返回 <code>-EBADF</code>，用户看到的是什么？</b>用户看到 <code>write()</code> 返回 -1，<code>errno = EBADF (9)</code>。libc 的包装函数检查返回值：如果 <code>rax</code> 在 <code>-4095..-1</code> 范围内，就取负存进 errno 并返回 -1；否则原样返回。内核永远不返回“假成功”，所以负值编码是可靠的。</div>
+
+<footer>
+  <p>上一篇：<a href="07-scheduler.html">07 调度器</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="09-signals.html">09 信号</a></p>
+</footer>
+
+</body>
+</html>

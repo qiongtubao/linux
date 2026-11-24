@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>36 · PREEMPT_RT 与抢占模型</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="37-power.html">下一篇：电源管理 →</a>
+</nav>
+
+<h1>⏱️ PREEMPT_RT 与抢占模型</h1>
+<p class="subtitle">救护车为什么必须比货车先走：内核可抢占性的代价与实现 · 预计阅读 20 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>城市按“平均车速最高”来调度红绿灯：大货车优先放行，谁排队谁走。平时吞吐确实最高，可急救车鸣笛冲过来，还得排在两辆货车后面——等多久没人事先知道。<span class="term">实时性</span>要求换一套规则：高优先级任务一出现，最多几十微秒内必须放行，而且每次波动要小。</p>
+
+<p>内核里，“决定下一个谁跑”由调度器完成（见 07 篇），但决定不等于立刻发生。如果 CPU 正在内核里执行一段不许打断的代码，更高优先级的任务只能干等，这段等待就是<span class="term">调度延迟</span>。两个指标：<span class="term">延迟</span>是事件到任务真正开始运行的时间，<span class="term">抖动</span>是多次延迟之间的波动。机械臂、刹车、交易网关在意“最坏那次”和抖动，平均值毫无意义。</p>
+
+<p>阻碍低延迟的就三类东西：内核临界区不可抢占（别人抱着锁跑长循环）、关中断太久（事件进不来）、自旋锁忙等加优先级反转（高优先级给低优先级持有者陪跑）。本篇按这三条线讲 preempt_count、四种抢占模型、中断线程化、rtmutex 与优先级继承。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">抢占</td><td>preemption</td><td>内核主动打断当前任务，把 CPU 让给更该跑的，而不是等它自己让出。</td></tr>
+  <tr><td class="term">延迟 / 抖动</td><td>latency / jitter</td><td>事件到任务启动的时间 / 该时间的波动幅度。</td></tr>
+  <tr><td class="term">硬实时</td><td>hard real-time</td><td>超时即失败（刹车、飞控）；软实时只是体验变差（音视频）。</td></tr>
+  <tr><td class="term">抢占计数</td><td>preempt_count</td><td>每 CPU 一个整数，记录“当前有几层不许抢占/正在处理中断”，为 0 才可能抢占。</td></tr>
+  <tr><td class="term">重调度标志</td><td>NEED_RESCHED</td><td>“有人该跑了”的标志；x86 上折进 preempt_count 最高位。</td></tr>
+  <tr><td class="term">自旋锁</td><td>spinlock</td><td>拿不到就原地循环等待的锁，持锁期间禁止抢占，所以不能睡。</td></tr>
+  <tr><td class="term">实时互斥锁</td><td>rtmutex</td><td>带优先级继承的睡眠锁，RT 上替代普通 spinlock。</td></tr>
+  <tr><td class="term">优先级继承</td><td>priority inheritance</td><td>低优先级持锁者临时借用等待者的高优先级，避免被中优先级插队。</td></tr>
+  <tr><td class="term">中断线程化</td><td>threaded IRQ</td><td>中断处理函数搬进内核线程 <code>irq/N-name</code>，可被调度、可被抢占。</td></tr>
+  <tr><td class="term">软中断</td><td>softirq</td><td>中断下半部，在“中断上下文”延迟执行；RT 上交给 <code>ksoftirqd/N</code>。</td></tr>
+  <tr><td class="term">迁移禁用</td><td>migrate_disable</td><td>只禁任务换 CPU；普通内核里等价于 preempt_disable。</td></tr>
+  <tr><td class="term">基准工具</td><td>cyclictest</td><td>反复“睡 N 微秒再醒”，测实际唤醒延迟（rt-tests 包）。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 四种抢占模型</h3>
+<p>模型是 <code>kernel/Kconfig.preempt</code> 里的一个 choice，编译期定死：</p>
+<table>
+  <tr><th>配置项</th><th>典型用途</th><th>行为</th></tr>
+  <tr><td><code>CONFIG_PREEMPT_NONE</code></td><td>服务器</td><td>只有主动睡眠/调用 <code>schedule()</code> 才让出，吞吐最高、延迟最差。</td></tr>
+  <tr><td><code>CONFIG_PREEMPT_VOLUNTARY</code></td><td>桌面</td><td>在长循环里插“自愿抢占点”（<code>cond_resched()</code>），延迟变小、吞吐略降。</td></tr>
+  <tr><td><code>CONFIG_PREEMPT</code></td><td>桌面/嵌入式</td><td>内核态也可抢占，只要 <code>preempt_count == 0</code>；在 <code>preempt_enable()</code> 处检查。</td></tr>
+  <tr><td><code>CONFIG_PREEMPT_RT</code></td><td>硬实时</td><td>再把 spinlock 换 rtmutex、强制中断线程化，除极少数核心路径外全部可抢占。</td></tr>
+</table>
+<p>抢占的唯一闸门可以画成这样：</p>
+<pre><code>中断/系统调用返回、preempt_enable()、spin_unlock()
+                 │
+                 ▼
+        ┌───────────────────────┐  否   ┌────────────────────┐
+        │ preempt_count()==0 且 │──────►│ 继续跑，等计数归零 │
+        │ 中断已开启            │       └────────────────────┘
+        └───────────┬───────────┘
+                    │ 是
+                    ▼
+        NEED_RESCHED 有效？（x86 用反相位表示）
+                    │ 是
+                    ▼
+        preempt_schedule() → __schedule() → 换人
+</code></pre>
+
+<h3>3.2 preempt_count 的位图</h3>
+<p>它不是布尔值，而是 32 位整数切成几段，每段一个“嵌套深度”：</p>
+<pre><code>31        24 23     20 19      16 15             8 7            0
+┌──────────┬──────────┬──────────┬────────────────┬──────────────┐
+│ NEED_    │  NMI     │ HARDIRQ  │   SOFTIRQ      │   PREEMPT    │
+│ RESCHED  │  4 bit   │  4 bit   │   8 bit        │    8 bit     │
+│0x80000000│0x00f00000│0x000f0000│   0x0000ff00   │  0x000000ff  │
+└──────────┴──────────┴──────────┴────────────────┴──────────────┘
+   ↑ 反相位：不需要调度时反而置 1        ↑ 关抢占/关下半部都使低 8 位 +1
+</code></pre>
+
+<h3>3.3 PREEMPT_RT 做的四件事</h3>
+<ul>
+  <li><b>自旋锁换睡眠锁</b>：<code>spin_lock()</code> 拿不到时不再忙等，而是睡进 <code>rt_mutex</code>，让出 CPU 并带优先级继承；真正不能睡的短路径改用 <code>raw_spinlock_t</code>。</li>
+  <li><b>中断线程化</b>：硬中断处理函数变成内核线程 <code>irq/N-name</code>，按 SCHED_FIFO 排队，可被更高优先级抢占。</li>
+  <li><b>软中断交给线程</b>：<code>ksoftirqd/N</code> 本就是每 CPU 内核线程（<code>kernel/softirq.c:722-738</code>），RT 让它以实时优先级运行，长软中断不再无限占用 CPU。</li>
+  <li><b>拆长临界区</b>：需要“别换 CPU”的地方改用 <code>migrate_disable()</code>，把抢占还给调度器。</li>
+</ul>
+
+<h3>3.4 优先级继承链</h3>
+<pre><code>无 PI：H(10) ──等锁──► L(90) 持锁 ──被──► M(50) 抢占
+                        │
+                        └─► H 实际被 M 间接阻塞（时长不可预期）
+
+有 PI：H(10) ──等锁──► L(90) 持锁
+                        │ rt_mutex_adjust_prio_chain()
+                        ▼
+                      L 的 prio 提升到 10
+                        │
+                        ▼
+                      M(50) 抢不动 L → L 快速放锁 → H 立即运行
+                        │
+                        ▼
+                      放锁后 L 降回 90（deboost）
+</code></pre>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 位定义与抢占触发点</h3>
+<p class="srcline">include/linux/preempt.h:24-35  preempt_count 位布局</p>
+<pre><code> *         PREEMPT_MASK:	0x000000ff
+ *         SOFTIRQ_MASK:	0x0000ff00
+ *         HARDIRQ_MASK:	0x000f0000
+ *             NMI_MASK:	0x00f00000
+ * PREEMPT_NEED_RESCHED:	0x80000000
+ */
+#define PREEMPT_BITS	8
+#define SOFTIRQ_BITS	8
+#define HARDIRQ_BITS	4
+#define NMI_BITS	4
+</code></pre>
+<ul>
+  <li>低 8 位是抢占深度：<code>preempt_disable()</code> 加一，最多 256 层。</li>
+  <li>8-15 位是软中断 / 关下半部的深度；16-19 是硬中断；20-23 是 NMI。</li>
+  <li>因此 <code>in_interrupt()</code> 等价于“高 16 位里有非零段”，<code>in_task()</code> 只看中断段、不看抢占位（<code>include/linux/preempt.h:80-103</code>）。</li>
+</ul>
+<p>抢占真正发生的地方是宏 <code>preempt_enable()</code>：</p>
+<p class="srcline">include/linux/preempt.h:185-191  preempt_enable</p>
+<pre><code>#ifdef CONFIG_PREEMPTION
+#define preempt_enable() \
+do { \
+	barrier(); \
+	if (unlikely(preempt_count_dec_and_test())) \
+		__preempt_schedule(); \
+} while (0)
+</code></pre>
+<p><code>barrier()</code> 防止编译器把临界区内外的代码重排到计数之外；<code>preempt_count_dec_and_test()</code> 在 <code>!CONFIG_PREEMPT_COUNT</code> 时是空操作，所以 NONE/VOLUNTARY 模型完全零开销——这才是它们吞吐更高的原因。入口函数做最后一道把关：</p>
+<p class="srcline">kernel/sched/core.c:5800-5812  preempt_schedule</p>
+<pre><code>asmlinkage __visible void __sched notrace preempt_schedule(void)
+{
+	/*
+	 * If there is a non-zero preempt_count or interrupts are disabled,
+	 * we do not want to preempt the current task. Just return..
+	 */
+	if (likely(!preemptible()))
+		return;
+
+	preempt_schedule_common();
+}
+</code></pre>
+<p><code>preemptible()</code> 定义为 <code>preempt_count() == 0 &amp;&amp; !irqs_disabled()</code>（同文件 183 行），一句话涵盖两个前提。通过后进入 <code>preempt_schedule_common()</code>（<code>kernel/sched/core.c:5766-5793</code>），那里先 <code>preempt_disable_notrace()</code> 防止函数跟踪器递归，再 <code>__schedule(true)</code>，循环至 <code>need_resched()</code> 为假。</p>
+<div class="note">x86 的特殊设计：<code>PREEMPT_NEED_RESCHED = 0x80000000</code>，且<b>不需要调度时该位反而置 1</b>（<code>arch/x86/include/asm/preempt.h:12-26</code>）。这样计数递减到 0 就同时表示“可抢占且该抢占”，<code>preempt_enable()</code> 热路径少一次读。对外 <code>preempt_count()</code> 始终把最高位掩掉，驱动看到的仍是“0 表示可抢占”。</div>
+
+<h3>4.2 migrate_disable：只禁迁移</h3>
+<p class="srcline">include/linux/preempt.h:325-338  migrate_disable</p>
+<pre><code>/**
+ * migrate_disable - Prevent migration of the current task
+ *
+ * Maps to preempt_disable() which also disables preemption. Use
+ * migrate_disable() to annotate that the intent is to prevent migration,
+ * but not necessarily preemption.
+ *
+ * Can be invoked nested like preempt_disable() and needs the corresponding
+ * number of migrate_enable() invocations.
+ */
+static __always_inline void migrate_disable(void)
+{
+	preempt_disable();
+}
+</code></pre>
+<p>per-CPU 数据只要求“任务别换 CPU”，没要求“不许被打断”。普通内核图省事，把两件事合成一个宏；注释里“not necessarily preemption”就是提醒：RT 上它会单独记迁移计数，把抢占还给调度器。普通内核里它是语义超集（禁得更多），但正确，所以需要 per-CPU 语义的代码（如 BPF 每 CPU 映射，<code>include/linux/filter.h:596</code>）可以提前这样写。</p>
+
+<h3>4.3 中断线程化：irq_thread</h3>
+<p>线程化后，硬中断只做“确认 + 唤醒”，真正干活的是内核线程：</p>
+<p class="srcline">kernel/irq/manage.c:1150-1181  irq_thread（节选）</p>
+<pre><code>static int irq_thread(void *data)
+{
+	struct callback_head on_exit_work;
+	struct irqaction *action = data;
+	struct irq_desc *desc = irq_to_desc(action-&gt;irq);
+	irqreturn_t (*handler_fn)(struct irq_desc *desc,
+			struct irqaction *action);
+
+	if (force_irqthreads &amp;&amp; test_bit(IRQTF_FORCED_THREAD,
+					&amp;action-&gt;thread_flags))
+		handler_fn = irq_forced_thread_fn;
+	else
+		handler_fn = irq_thread_fn;
+	// ... 省略 init_task_work / irq_thread_check_affinity
+	while (!irq_wait_for_interrupt(action)) {
+		irqreturn_t action_ret;
+
+		irq_thread_check_affinity(desc, action);
+
+		action_ret = handler_fn(desc, action);
+		if (action_ret == IRQ_WAKE_THREAD)
+			irq_wake_secondary(desc, action);
+
+		wake_threads_waitq(desc);
+	}
+</code></pre>
+<ul>
+  <li><code>irq_wait_for_interrupt()</code>（同文件 937-959 行）先 <code>set_current_state(TASK_INTERRUPTIBLE)</code> 再忙 <code>test_and_clear_bit(IRQTF_RUNTHREAD)</code>，没标志才 <code>schedule()</code>。先置状态后检查是防丢唤醒的经典顺序。</li>
+  <li><code>force_irqthreads</code> 由启动参数 <code>threadirqs</code> 打开（同文件 27-33 行）；<code>IRQTF_FORCED_THREAD</code> 表示该 action 是被强制转换的。</li>
+  < <li><code>irq_forced_thread_fn()</code> 先 <code>local_bh_disable()</code> 再调原函数（1070-1083 行），兼容老驱动的隐式假设；显式线程化的中断走 <code>irq_thread_fn()</code>，允许睡眠。</li>
+  <li>线程由 <code>setup_irq_thread()</code> 用 <code>kthread_create(irq_thread, …)</code> 创建，名字 <code>irq/%d-%s</code>，随后 <code>sched_set_fifo(t)</code>（1308-1330 行）。</li>
+  <li>准入规则在 <code>irq_setup_forced_threading()</code>：<code>IRQF_NO_THREAD|IRQF_PERCPU|IRQF_ONESHOT</code> 跳过，其余把 handler 挪进 <code>thread_fn</code>（1219-1250 行）。注意 <code>manage.c:27</code> 的 <code>!defined(CONFIG_PREEMPT_RT)</code>——RT 下中断本来就全线程化。</li>
+</ul>
+
+<h3>4.4 rtmutex：睡着的锁 + 优先级继承</h3>
+<p><code>struct rt_mutex</code> 只有三样东西：<code>raw_spinlock_t wait_lock</code>、按优先级排序的等待者红黑树、<code>owner</code> 指针（<code>include/linux/rtmutex.h:30-43</code>）。入队与提升逻辑：</p>
+<p class="srcline">kernel/locking/rtmutex.c:950-1002  task_blocks_on_rt_mutex（节选）</p>
+<pre><code>	raw_spin_lock(&amp;task-&gt;pi_lock);
+	waiter-&gt;task = task;
+	waiter-&gt;lock = lock;
+	waiter-&gt;prio = task-&gt;prio;
+	waiter-&gt;deadline = task-&gt;dl.deadline;
+
+	/* Get the top priority waiter on the lock */
+	if (rt_mutex_has_waiters(lock))
+		top_waiter = rt_mutex_top_waiter(lock);
+	rt_mutex_enqueue(lock, waiter);
+
+	task-&gt;pi_blocked_on = waiter;
+
+	raw_spin_unlock(&amp;task-&gt;pi_lock);
+
+	if (!owner)
+		return 0;
+
+	raw_spin_lock(&amp;owner-&gt;pi_lock);
+	if (waiter == rt_mutex_top_waiter(lock)) {
+		rt_mutex_dequeue_pi(owner, top_waiter);
+		rt_mutex_enqueue_pi(owner, waiter);
+
+		rt_mutex_adjust_prio(owner);
+		if (owner-&gt;pi_blocked_on)
+			chain_walk = 1;
+	} else if (rt_mutex_cond_detect_deadlock(waiter, chwalk)) {
+		chain_walk = 1;
+	}
+</code></pre>
+<ul>
+  <li>两把锁分工：<code>lock-&gt;wait_lock</code> 保护等待队列，<code>task-&gt;pi_lock</code> 保护“阻塞在什么锁上”及每任务的继承树 <code>pi_waiters</code>。</li>
+  <li>只有 <code>rt_mutex_top_waiter()</code>（锁上优先级最高的等待者）才需要把优先级传给持有者；更低者传了也无意义。</li>
+  <li><code>owner-&gt;pi_blocked_on</code> 非空说明持有者自己也在等另一把锁，于是 <code>chain_walk = 1</code>，沿链继续上溯——由 <code>rt_mutex_adjust_prio_chain()</code>（447 行起）完成，链深上限 <code>max_lock_depth = 1024</code>（377 行），超限返回 <code>-EDEADLK</code>。</li>
+  <li>真正改优先级是 <code>rt_mutex_setprio()</code>（<code>kernel/sched/core.c:5970</code> 起）：取 <code>__rt_effective_prio()</code>，相同则提前返回，否则重排调度类并记录 <code>p-&gt;pi_top_task</code> 供解锁时降级。</li>
+</ul>
+<div class="tip">RT 上 <code>spinlock_t</code> 变 rtmutex，但 <code>raw_spinlock_t</code> 保留自旋语义（<code>include/linux/spinlock_types.h:71-83</code>）。读 RT 代码最常踩的坑就是分不清 <code>spin_lock</code> 与 <code>raw_spin_lock</code>——前者在 RT 允许睡，后者不许。</div>
+<div class="warn">上游合并状态：本仓库 5.10 主线<b>只有 rtmutex 与 <code>CONFIG_PREEMPT_RT</code> 选项</b>（<code>kernel/Kconfig.preempt:58-74</code>），完整 RT 补丁集仍是树外补丁，2024 年才合入主线 v6.12。</div>
+
+<h2>5. 动手验证</h2>
+
+<p><b>① 当前内核是哪种模型。</b>模型编译进内核，运行时可查：</p>
+<pre><code>$ zgrep -E 'CONFIG_PREEMPT(_NONE|_VOLUNTARY|_RT)?=' /proc/config.gz
+# 没有 /proc/config.gz 时：grep PREEMPT /boot/config-$(uname -r)
+CONFIG_PREEMPT=y          # NONE/RT 同理</code></pre>
+
+<p><b>② 看中断线程长什么样。</b></p>
+<pre><code>$ ps -eo pid,cls,rtprio,comm | grep -E 'irq/|ksoftirqd'
+ 12  FF      50 irq/16-xhci_hcd     # FF = SCHED_FIFO
+ 18  TS       - ksoftirqd/2          # TS = SCHED_OTHER（普通内核）
+$ cat /proc/interrupts | head -3    # 行尾名字即线程名</code></pre>
+<p>加 <code>threadirqs</code> 启动参数后，几乎所有中断都以 <code>irq/</code> 开头；RT 内核默认如此。</p>
+
+<p><b>③ 用 cyclictest 量延迟</b>（<code>rt-tests</code> 包，需要 root 以设 SCHED_FIFO）：</p>
+<pre><code># cyclictest -m -Sp90 -i200 -h400 -n -D 30s
+T: 0 ( 1234) P:90 I:200 C:150000 Min:  12 Act:  18 Avg:  19 Max:  85</code></pre>
+<p><code>Min/Act/Avg</code> 是常态，<code>Max</code> 才是硬实时关心的“最坏一次”：<code>-m</code> 锁内存、<code>-S</code> 每线程独立计时、<code>-i200</code> 睡 200μs、<code>-h400</code> 直方图到 400μs。<code>Max</code> 从几十微秒跳到几千，说明有长临界区、关中断太久或虚拟化/SMI 偷时间。</p>
+
+<p><b>④ 定位元凶。</b><code>latencytop</code> 按调用栈聚合延迟，接口 <code>/proc/latency_stats</code>（需 <code>CONFIG_LATENCYTOP</code>，<code>kernel/Makefile:99</code>）：</p>
+<pre><code># cd /sys/kernel/debug/tracing
+# echo function_graph &gt; current_tracer
+# echo 1 &gt; options/funcgraph-irqs
+# echo '*spin_lock*' &gt; set_graph_function &amp;&amp; cat trace | head -30</code></pre>
+<p><code>funcgraph-irqs</code> 会在图上标出 IRQ 开关与抢占计数变化，直接看到某段代码是否长时间不可抢占。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. preempt_count 为 0 就一定能抢占吗？</b>不。还要中断已开启（<code>preemptible()</code> 的两个条件），并且 NEED_RESCHED 真的有效；三者同时满足，<code>preempt_enable()</code> 或中断返回路径才会进 <code>preempt_schedule()</code>。</div>
+<div class="qa"><b>Q2. 为什么 RT 不是直接删掉自旋锁，而是换成 rtmutex？</b>因为很多临界区真的不能睡（在中断上下文，或保护调度器自身），它们用 <code>raw_spinlock_t</code> 保留自旋。RT 只把“任务上下文里可以睡”的那部分换成 rtmutex，并靠优先级继承保证持锁者尽快被唤醒。</div>
+<div class="qa"><b>Q3. 优先级继承解决“低优先级跑得慢”吗？</b>不。它解决的是中优先级插队：把持锁者有效优先级抬到等待者水平，使 M 抢不动它，从而尽快放锁。</div>
+<div class="qa"><b>Q4. migrate_disable 与 preempt_disable 差在哪？</b>per-CPU 数据只要求不换 CPU。普通内核把两者合并（<code>include/linux/preempt.h:335-338</code>），RT 分开：迁移禁了、抢占还在，于是拿到 per-CPU 数据后仍可被更高优先级任务抢占。</div>
+<div class="qa"><b>Q5. 中断线程化后上半部还做什么？</b>只做读状态、清中断源、置 <code>IRQTF_RUNTHREAD</code> 唤醒 <code>irq/…</code> 线程；耗时、可能睡眠的处理逻辑在 <code>thread_fn</code> 里，可按优先级排队并被抢占。</div>
+
+<footer>
+  <p>上一篇：<a href="35-platform.html">35 · platform 驱动、设备树与 DMA</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="37-power.html">37 · 电源管理</a></p>
+</footer>
+
+</body>
+</html>

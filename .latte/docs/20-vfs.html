@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20-VFS：文件系统的统一接口层</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75; max-width: 900px; margin: 0 auto;
+    padding: 32px 24px 80px; font-size: 16px; }
+  nav.top { display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border); }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="21-pagecache.html">下一篇：Page Cache →</a>
+</nav>
+
+<h1>📂 VFS：文件系统的统一接口层</h1>
+<p class="subtitle">让 ext4、procfs、tmpfs 都接受同一套 open/read/write · 预计阅读 9 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>墙上的插座有两孔、三孔、圆头、方头，每添一件电器就重新布线，日子没法过，于是买个<strong>万能插排</strong>：正面孔位固定，背面接谁都行。<span class="term">VFS</span>（Virtual File System）就是内核里的这个插排，是系统调用与具体文件系统之间的转接头。</p>
+<p>ext4 的数据在硬盘块里，procfs 的内容由内核现算，tmpfs 全在内存。没有 VFS，<code>read()</code> 得先判断 fd 背后是谁再写一长串分支；有了 VFS，<code>read()</code> 只认 <code>file-&gt;f_op-&gt;read_iter</code> 这个函数指针，指向谁由各文件系统注册。所以 VFS 只提供<strong>一套统一数据结构</strong>与<strong>一组指针表</strong>，本身不存数据，只做路由、缓存和权限检查——它是接口层，不是文件系统。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">超级块</td><td>super_block</td><td>一个已挂载的文件系统实例：块大小、根 dentry、操作表。</td></tr>
+  <tr><td class="term">索引节点</td><td>inode</td><td>文件本身（不含名字）：大小、权限、时间、数据块位置。</td></tr>
+  <tr><td class="term">目录项</td><td>dentry</td><td>“名字→inode”的映射，路径查找的缓存节点，组成目录树。</td></tr>
+  <tr><td class="term">文件对象</td><td>file</td><td>一次打开：fd 指向它，记录偏移 <code>f_pos</code> 与打开模式。</td></tr>
+  <tr><td class="term">挂载点</td><td>mount point</td><td>把另一文件系统根“嫁接”到某目录，用 <code>vfsmount</code> 描述。</td></tr>
+  <tr><td class="term">硬链接/软链接</td><td>hard / sym link</td><td>前者多个目录项共享一个 inode；后者是存路径字符串的独立文件。</td></tr>
+  <tr><td class="term">目录项缓存</td><td>dcache</td><td>把“名字→dentry”结果留在内存，路径查找不必每次读盘。</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<pre><code>super_block（/dev/sda1 上的 ext4）
+ └ s_root ─► dentry("/") ─► dentry("home") ─► dentry("a.txt")
+                              │                  │
+                              ▼                  ▼
+                          inode(目录)        inode(文件)
+进程 fd ─► struct file ─ f_inode ───────────────┘
+                        f_op ─► ext4_file_operations</code></pre>
+<p>四对象各管一段：super_block 管“哪个文件系统”，inode 管“哪个文件”，dentry 管“叫什么、在哪”，file 管“这次打开”。同一文件被两进程打开只有一个 inode、两个 file；同一 inode 可有多个 dentry（硬链接），由 <code>i_nlink</code> 计数。四张操作表是 VFS 的合同：<code>super_operations</code>（<code>sb-&gt;s_op</code>：分配/写回/驱逐 inode）、<code>inode_operations</code>（<code>i_op</code>：<code>lookup</code>/<code>create</code>/<code>mkdir</code>/<code>rename</code>）、<code>file_operations</code>（<code>f_op</code>：<code>read_iter</code>/<code>write_iter</code>/<code>mmap</code>/<code>fsync</code>）、<code>dentry_operations</code>（<code>d_op</code>：<code>d_revalidate</code>/<code>d_hash</code>）。</p>
+<p>路径查找把名字树变成 dentry 链：从根逐段推进，先查 dcache，未命中才调父目录 <code>i_op-&gt;lookup</code> 读盘；若某 dentry 是<span class="term">挂载点</span>，查找跳到新文件系统的 <code>s_root</code>。软链接由 <code>get_link</code> 取回路径串，交回 <code>link_path_walk</code> 继续解析，最多 40 层。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 超级块与 inode</h3>
+<p class="srcline">include/linux/fs.h:1416-1433  struct super_block（节选）</p>
+<pre><code>struct super_block {
+	dev_t			s_dev;		/* 按设备号可查 */
+	unsigned long		s_blocksize;
+	struct file_system_type	*s_type;
+	const struct super_operations	*s_op;
+	unsigned long		s_magic;	/* ext4 为 0xEF53 */
+	struct dentry		*s_root;	/* 路径查找起点 */
+	struct rw_semaphore	s_umount;
+	int			s_count;
+	atomic_t		s_active;
+};</code></pre>
+<p><code>s_dev</code> 让 <code>get_super()</code> 找到它；<code>s_op</code> 是文件系统级操作；<code>s_root</code> 是查找起点；<code>s_magic</code> 即 <code>statfs</code> 报的类型码。</p>
+<p class="srcline">include/linux/fs.h:610-634  struct inode（节选）</p>
+<pre><code>
+struct inode {
+	umode_t			i_mode;		/* 类型 + 权限 */
+	unsigned short		i_opflags;
+	kuid_t			i_uid;
+	kgid_t			i_gid;
+	unsigned int		i_flags;
+
+	const struct inode_operations	*i_op;
+	struct super_block	*i_sb;
+	struct address_space	*i_mapping;	/* 页缓存入口 */
+
+	unsigned long		i_ino;
+	union {
+		const unsigned int i_nlink;
+		unsigned int __i_nlink;
+	};
+	dev_t			i_rdev;
+	loff_t			i_size;
+	struct timespec64	i_atime;
+	struct timespec64	i_mtime;
+	struct timespec64	i_ctime;
+};
+	struct timespec64	i_atime, i_mtime, i_ctime;
+};</code></pre>
+<p><code>stat</code> 的字段都能对上：<code>i_ino</code>→Inode，<code>i_mode</code>→权限，<code>i_nlink</code>→Links，<code>i_size</code>→Size，三时间→Access/Modify/Change。<code>dentry</code>（<code>dcache.h:89</code>）带 <code>d_name</code>、<code>d_parent</code>、<code>d_op</code> 和 <code>d_inode</code>（<code>NULL</code> 即“负目录项”，表示查过磁盘确认不存在）；<code>file</code>（<code>fs.h:916</code>）带 <code>f_path</code>、<code>f_inode</code>、<code>f_op</code>、<code>f_pos</code>。</p>
+
+<h3>4.2 路径查找</h3>
+<p class="srcline">fs/namei.c:2106-2148  link_path_walk（节选）</p>
+<pre><code>	nd-&gt;flags |= LOOKUP_PARENT;
+	for(;;) {
+		const char *link; u64 hash_len; int type;
+		err = may_lookup(nd);       /* 目录需有 x 权限 */
+		if (err) return err;
+		hash_len = hash_name(nd-&gt;path.dentry, name);  /* 长度+哈希 */
+		type = LAST_NORM;
+		if (name[0] == '.') switch (hashlen_len(hash_len)) {
+			case 2:
+				if (name[1] == '.') { type = LAST_DOTDOT; nd-&gt;flags |= LOOKUP_JUMPED; }
+				break;
+			case 1: type = LAST_DOT;
+		}
+		nd-&gt;last.hash_len = hash_len;  nd-&gt;last.name = name;  nd-&gt;last_type = type;
+		// ... 省略：跳过 '/'、符号链接栈、walk_component
+	}</code></pre>
+<p class="srcline">fs/namei.c:1842-1859  walk_component（节选）</p>
+<pre><code>	dentry = lookup_fast(nd, &amp;inode, &amp;seq);   /* RCU 查 dcache，无锁 */
+	if (unlikely(!dentry))
+		dentry = lookup_slow(&amp;nd-&gt;last, nd-&gt;path.dentry, nd-&gt;flags);
+	return step_into(nd, flags, dentry, inode, seq);  /* 推进 nd-&gt;path */</code></pre>
+<p><code>hash_name</code> 一次算出长度与哈希供 dcache 用；<code>.</code>/<code>..</code> 单独标记，因为 <code>..</code> 可能跨挂载点回父文件系统。<code>lookup_fast</code> 走 <code>__d_lookup_rcu</code>，只用 seqlock（<code>d_seq</code>）校验、不加锁；未命中才 <code>lookup_slow</code>，加 inode 共享锁调 <code>i_op-&gt;lookup</code> 读盘并 <code>d_add</code>。</p>
+
+<h3>4.3 open 与 read</h3>
+<p class="srcline">fs/open.c:1280-1302  do_sys_openat2（节选）</p>
+<pre><code>	tmp = getname(filename);                /* 路径拷进内核 */
+	fd = get_unused_fd_flags(how-&gt;flags);   /* 先占 fd 号 */
+	if (fd &gt;= 0) {
+		struct file *f = do_filp_open(dfd, tmp, &amp;op);
+		if (IS_ERR(f)) { put_unused_fd(fd); fd = PTR_ERR(f); }
+		else { fsnotify_open(f); fd_install(fd, f); }  /* fd → file */
+	}</code></pre>
+<p>先占号再打开，避免打开成功才发现没 fd 可用。<code>path_openat</code>（<code>fs/namei.c:3349</code>）循环 <code>link_path_walk</code>+<code>open_last_lookups</code>（必要时 <code>i_op-&gt;create</code> 或展开软链接），最后由 <code>do_dentry_open</code> 设 <code>f-&gt;f_op = inode-&gt;i_fop</code> 并调文件系统的 <code>.open</code>。</p>
+<p class="srcline">fs/read_write.c:675-700  vfs_read（节选）</p>
+<pre><code>	if (!(file-&gt;f_mode &amp; FMODE_READ)) return -EBADF;
+	if (unlikely(!access_ok(buf, count))) return -EFAULT;
+	ret = rw_verify_area(READ, file, pos, count);   /* 文件锁 */
+	if (count &gt; MAX_RW_COUNT) count = MAX_RW_COUNT;
+	if (file-&gt;f_op-&gt;read)
+		ret = file-&gt;f_op-&gt;read(file, buf, count, pos);
+	else if (file-&gt;f_op-&gt;read_iter)
+		ret = new_sync_read(file, buf, count, pos);  /* 包成 iov_iter */</code></pre>
+<p>统一前置检查：打开方式、用户指针、文件锁、单次长度上限，然后分派。<code>vfs_write</code>（<code>:869</code>）对称，多了 <code>file_start_write/end_write</code>，与只读挂载、文件系统冻结协调。现代文件系统一般只实现 <code>read_iter/write_iter</code>，因为 <code>iov_iter</code> 能描述多个不连续用户缓冲区。</p>
+
+<h3>4.4 挂载入口</h3>
+<p><code>get_fs_type()</code>（<code>fs/filesystems.c:266</code>）按名字在全局链表找 <code>file_system_type</code>，找不到就 <code>request_module("fs-ext4")</code> 加载模块。块设备文件系统随后走 <code>mount_bdev()</code>（<code>fs/super.c:1835</code>）：<code>blkdev_get_by_path</code> 以 <code>FMODE_EXCL</code> 独占打开设备（防两个文件系统同写一块盘），<code>sget</code> 查/建超级块，再调 <code>fill_super</code>（ext4 是 <code>ext4_fill_super</code>）解析盘上超级块、填好 <code>s_root</code>。</p>
+
+<h2>5. 动手验证</h2>
+<pre><code>mkdir -p /tmp/vfsdemo &amp;&amp; cd /tmp/vfsdemo
+echo hello &gt; a.txt; ln a.txt a_hard.txt; ln -s a.txt a_soft.txt
+stat a.txt a_hard.txt a_soft.txt</code></pre>
+<p><code>a.txt</code> 与 <code>a_hard.txt</code> 的 Inode 相同、<code>Links: 2</code>；<code>a_soft.txt</code> 类型为 <code>symbolic link</code>，大小为 5（目标串长度），独立 inode，<code>readlink</code> 输出 <code>a.txt</code>。再观察缓存与独立偏移：</p>
+<pre><code>cat /proc/sys/fs/dentry-state      # nr_dentry / nr_unused
+cat /proc/mounts | head -5         # 每行 = 一个 super_block + vfsmount
+exec 3&lt; a.txt; exec 4&lt; a.txt
+cat /proc/self/fdinfo/3 /proc/self/fdinfo/4   # pos 各自独立</code></pre>
+<p>两个 fd 的 <code>pos</code> 互不影响，因为是两个 <code>struct file</code>；但 <code>f_inode</code> 相同。若由 <code>fork</code> 继承，则共享同一 file，<code>pos</code> 联动。</p>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 一个文件被两进程同时打开，几个 inode、几个 file？</b>一个 inode、两个 file；若 fd 由 <code>fork</code> 继承，则共享同一 file，<code>f_pos</code> 也共享。</div>
+<div class="qa"><b>Q2. 硬链接与软链接的结构差别？</b>硬链接：两个 dentry 的 <code>d_inode</code> 指向同一 inode，<code>i_nlink++</code>；软链接：独立 inode 存路径串，<code>get_link</code> 取回后交回 <code>link_path_walk</code>。</div>
+<div class="qa"><b>Q3. dcache 命中与未命中各走哪条路？</b>命中 <code>lookup_fast</code>（RCU+seqlock，无锁）；未命中 <code>lookup_slow</code>，加 inode 共享锁调 <code>i_op-&gt;lookup</code>。</div>
+
+<footer>
+  <p>上一篇：<a href="19-thp.html">19-thp 透明大页</a> · 下一篇：<a href="21-pagecache.html">21-pagecache 页缓存</a> · 返回<a href="index.html">主题目录</a></p>
+</footer>
+
+</body>
+</html>

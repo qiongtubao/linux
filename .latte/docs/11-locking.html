@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · 内核锁</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="12-rcu.html">下一篇：12 RCU →</a>
+</nav>
+
+<h1>🔒 内核锁：多核世界的交通规则</h1>
+<p class="subtitle">竞态、临界区、自旋锁、互斥锁、死锁与 lockdep：内核如何让几十个 CPU 同时跑而不互相踩脚 · 预计阅读 26 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>想象一个小区只有一个快递柜，物业规定“取件时把柜门关上”。但某天来了两个人：A 伸手去取件，B 同时也伸手去取件。A 刚把门拉开一半，B 就把门往外一拽——柜子里的东西掉地上摔坏了。这就是<span class="term">竞态（race condition）</span>：结果取决于两个动作谁先谁后，而不是取决于代码的意图。</p>
+
+<p>操作系统里的竞态要严重得多。你的内核跑在 16 个 CPU 上，同一段代码（比如“把网络包挂进接收队列”）可能<strong>同时</strong>在 16 个核上执行；而且内核随时可能把任务抢占下去、切换到另一个任务，等它再回来时世界已经变了。用一句话概括内核必须解决的并发问题：<strong>保护一小段代码，使得这段代码执行期间，不会有另一个 CPU（或另一个任务）插进来破坏它的中间状态</strong>。这段代码叫<span class="term">临界区（critical section）</span>，临界区里操作的共享数据叫临界资源。</p>
+
+<p>那“插进来”具体怎么发生？三种方式：一是<strong>真并行</strong>——两个核真的同时执行；二是<strong>抢占</strong>——CPU 0 正在临界区里，调度器把它踢下核，CPU 1 接着跑同一段代码；三是<strong>中断</strong>——CPU 0 正在临界区里，硬件中断来了，中断处理程序也想操作同一份数据。前两种靠“关抢占/加锁”解决，第三种则引出了本篇最重要的一个坑：<span class="term">spin_lock_irqsave</span> 为什么必须关中断。</p>
+
+<p>解决竞态的办法只有两类，生活中都见过。第一类是<strong>站着等</strong>：锁被占着我就原地转圈等（自旋锁 <code>spinlock</code>），适合“等的时间只有几百纳秒”的场景；第二类是<strong>排队等</strong>：锁被占着我就去排队睡觉，等持锁人 release 时把我叫醒（互斥锁 <code>mutex</code>），适合“可能要等几毫秒甚至更久”的场景。选错了会要命：在中断处理程序里睡眠是禁止的（中断上下文不能调用调度器），在持有自旋锁时睡眠也是禁止的（会死锁）。</p>
+
+<p>最后，内核还自带了一个“交警”——<span class="term">lockdep</span>。锁的用法看起来简单，写错一两个字母就变成“中断里拿同一把锁导致死锁”这种极难复现的 bug。lockdep 会把每一次加锁/解锁记成一张有向图，一旦发现环（<code>A→B→A</code>）或者顺序反了（<code>A→B</code> 同时又有 <code>B→A</code>），立刻在 dmesg 里甩出一大段带调用栈的警告。本篇最后会带你写一个故意死锁的内核模块，亲眼看到这份报告。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">竞态</td><td>race condition</td><td>两个并发操作以任意顺序交错，产生非预期的结果</td></tr>
+  <tr><td class="term">临界区</td><td>critical section</td><td>访问共享数据的那一段代码，必须互斥执行</td></tr>
+  <tr><td class="term">原子性</td><td>atomicity</td><td>一个操作要么完整做完，要么完全没做，中间不被别人看见</td></tr>
+  <tr><td class="term">自旋锁</td><td>spinlock</td><td>抢不到就原地忙等的锁，不睡眠，绝不会错过唤醒</td></tr>
+  <tr><td class="term">原始自旋锁</td><td>raw_spinlock_t</td><td>不带 lockdep 元数据的裸自旋锁，用于 lockdep 自身或极热路径</td></tr>
+  <tr><td class="term">排队锁</td><td>queued spinlock / qspinlock</td><td>x86 上的自旋锁实现，先到先得（ticket 思路），不饿死</td></tr>
+  <tr><td class="term">互斥锁</td><td>mutex</td><td>可睡眠的锁，抢不到就把自己挂到等待队列上</td></tr>
+  <tr><td class="term">乐观自旋</td><td>optimistic spin</td><td>mutex 慢路径上先空转一阵子，而不是立刻睡眠</td></tr>
+  <tr><td class="term">读写信号量</td><td>rwsem / rw_semaphore</td><td>多个读者可同时持有，写者独占，且写者不饿死</td></tr>
+  <tr><td class="term">顺序锁</td><td>seqlock</td><td>读者完全无锁，写者用序号标记；读到脏数据就重读</td></tr>
+  <tr><td class="term">完成量</td><td>completion</td><td>“某件事做完了”的信号量，用于线程/进程间的一次性通知</td></tr>
+  <tr><td class="term">中断上下文</td><td>interrupt context</td><td>在中断处理程序里运行，不能睡眠、不能调度</td></tr>
+  <tr><td class="term">抢占</td><td>preemption</td><td>内核把当前任务踢下 CPU 换另一个任务上来</td></tr>
+  <tr><td class="term">关中断</td><td>local_irq_disable</td><td>屏蔽本 CPU 的硬件中断，防止中断处理程序插进来</td></tr>
+  <tr><td class="term">死锁</td><td>deadlock</td><td>两个（或多个）执行流互相等待对方持有的资源，谁也走不动</td></tr>
+  <tr><td class="term">锁依赖检测</td><td>lockdep</td><td>内核的运行时锁正确性验证器，能发现死锁与非法解锁</td></tr>
+  <tr><td class="term">might_sleep</td><td>might_sleep()</td><td>断言“这里可以睡眠”，在原子上下文里调用会直接 panic</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 锁家族总览</h3>
+
+<p>内核里的锁不是一种东西，而是按“等待时能不能睡觉”“中断里能不能用”两个维度分出来的一族。选错的典型后果不是性能下降，而是 panic 或整机卡死。</p>
+
+<table>
+  <tr><th>类型</th><th>抢不到时</th><th>中断上下文可用</th><th>典型场景</th></tr>
+  <tr><td><code>spinlock_t</code></td><td>原地自旋（忙等）</td><td>可以（用 <code>_irq</code>/<code>_irqsave</code> 变体）</td><td>保护短小的内核数据结构，如 slab 链表</td></tr>
+  <tr><td><code>raw_spinlock_t</code></td><td>原地自旋</td><td>可以</td><td>lockdep 自身代码、不想付 lockdep 开销的热路径</td></tr>
+  <tr><td><code>mutex</code></td><td>睡眠进等待队列</td><td><strong>不可以</strong></td><td>进程上下文里保护稍长的临界区（inode、文件操作）</td></tr>
+  <tr><td><code>rw_semaphore</code></td><td>睡眠（读者可并发）</td><td><strong>不可以</strong></td><td>VFS 的 <code>inode</code> 锁：读多写少</td></tr>
+  <tr><td><code>seqlock_t</code></td><td>读者重试；写者用锁串行化</td><td>读侧可以</td><td>读多写极少的统计值、时间戳</td></tr>
+  <tr><td><code>completion</code></td><td>睡眠</td><td><strong>不可以</strong></td><td>“I/O 完成”“子进程退出”的一次性通知</td></tr>
+</table>
+
+<div class="note">
+<b>一句话选择法：</b>临界区只有几十条指令 → 自旋锁；临界区可能睡眠或做 I/O → mutex；读远多于写 → rwsem 或 seqlock；只是通知“做完了” → completion。
+</div>
+
+<h3>3.2 自旋锁的 ticket（排队号）思路</h3>
+
+<p>最简单的自旋锁就是一个标志位：<code>test_and_set</code>。但它有个致命缺点——<strong>不公平</strong>。CPU 0 反复失败又反复成功，CPU 1 可能一直抢不到，理论上可以饿死。Linux 5.10 的 x86 用的是 <span class="term">qspinlock（queued spinlock）</span>，继承了经典 ticket 锁“<strong>先来先得，按号排队</strong>”的思路：</p>
+
+<pre><code>一个 32 位原子字，被拆成 4 个字节来看：
+
+  31        18 17    16 15   9 8  7      0
+ +------------+-----+----+-----+--+----------+
+ |  tail cpu  |tail |   不用 |P|  locked  |   &lt;- P = pending 位
+ +------------+-----+----+-----+--+----------+
+   发放的号（谁该上）      等待标记   锁是否被占
+
+抢锁流程（快路径）：
+   1. 读出 val
+   2. 如果 locked 字节为 0 -&gt; 用 cmpxchg 把 val 改成 _Q_LOCKED_VAL -&gt; 抢到
+   3. 否则走慢路径 queued_spin_lock_slowpath()：
+        - 给自己发一个号：tail = encode_tail(我的 CPU 号, 我的排队序号)
+        - 把自己的 MCS 节点挂到等待队列尾部（挂进别人 CPU 的缓存行 -&gt; 缓存行乒乓）
+        - 轮询等待，直到“锁里记录的 tail == 我手里的 tail” → 我是队首 -&gt; 拿锁
+
+比“谁抢到谁拿”多出来的好处：FIFO 公平，不饿死；每个等待者只碰自己的缓存行，减少 cache line 争抢。</code></pre>
+
+<h3>3.3 为什么 spin_lock_irqsave 必须关中断</h3>
+
+<p>这是全篇最重要的一张图。假设驱动代码在进程上下文里用 <code>spin_lock_irqsave(&amp;lock, flags)</code> 保护设备寄存器，而中断处理程序里也用 <code>spin_lock(&amp;lock)</code>（不关中断版）保护同一份数据。问题出在<strong>关中断只挡住了别人抢锁，挡不住“我自己被中断”</strong>——不对，恰恰相反：<code>irqsave</code> 关中断正是为了防止下面这个局面。</p>
+
+<pre><code>时间轴（CPU 0）：
+
+ 进程上下文                        中断处理程序
+ ------------                     -----------------
+ spin_lock_irqsave(&amp;lock)          （此刻中断是开着的！）
+   关中断 ✓
+   拿到锁 ✓
+   ├──── 访问设备寄存器 ────┐
+   │                       │
+   │  ◄── 中断来了！        │  中断处理程序启动（同一 CPU）
+   │       中断处理程序 spin_lock(&amp;lock)
+   │       → 发现锁被进程上下文持有 → 自旋等待
+   │       （中断处理程序此刻不能睡眠，只能一直转）
+   │
+   └─ 进程上下文要访问设备寄存器
+      → 但中断处理程序正占着 CPU，中断没返回，
+        进程上下文根本拿不到 CPU 去执行下面的代码
+        → 进程上下文永远等不到中断返回
+        → 中断处理程序永远等不到锁被释放
+        ══════════════════════════════════════► 死锁！
+
+结论：进程上下文必须用 spin_lock_irqsave（或 _irq），
+      关中断，保证“持锁期间不会被自己打断”。
+      中断处理程序里如果也要这把锁，用普通 spin_lock 即可
+      （中断上下文本来就没开中断）。</code></pre>
+
+<div class="warn">
+<b>反过来的坑同样致命：</b>如果中断处理程序用 <code>spin_lock_irqsave</code>，而进程上下文用普通 <code>spin_lock</code>，lockdep 会报 “irq-unsafe lock acquired by irq-safe lock” 类警告。<b>规则是：</b>同一把锁，在<b>越"高"的上下文里必须用越强的关中断版本</b>（进程 → irqsave，中断 → irq 或普通）。
+</div>
+
+<h3>3.4 mutex 的三级尝试</h3>
+
+<p><code>mutex_lock()</code> 不是一上来就睡眠，它按成本从低到高试三招：</p>
+
+<pre><code>mutex_lock(&amp;m)
+   │
+   ├─ 招式一：__mutex_trylock_fast()   —— 一个 cmpxchg 抢锁
+   │      成功？ ── 是 ──▶ 完事，函数返回（绝大多数情况走这条）
+   │      否 ↓
+   │
+   ├─ 招式二：mutex_optimistic_spin()  —— 乐观自旋一小会儿
+   │      反复 trylock；失败就 cpu_relax() 让出流水线
+   │      为什么划算：持锁者可能马上就释放了，
+   │      自旋几微秒比"睡下→被唤醒→再调度回来"快得多
+   │      注意：要判断持锁者是不是在"睡眠"，睡眠者就不值得等
+   │      否 ↓
+   │
+   └─ 招式三：__mutex_lock_slowpath()  —— 把自己挂到 wait_list 尾部
+          set_current_state(TASK_UNINTERRUPTIBLE); schedule();
+          → 真正睡下，等持锁者 mutex_unlock() 时把自己唤醒
+          → FIFO 排队，不插队（ww_mutex 除外）</code></pre>
+
+<div class="tip">
+<b>为什么 mutex 允许睡眠而自旋锁不允许？</b>睡眠意味着让出 CPU，而让出 CPU 意味着调度器要选下一个任务、可能要处理中断、要拿运行队列锁……这一整套动作在持锁临界区里做非常危险（甚至不可能，因为运行队列锁自己也是自旋锁）。自旋锁则全程不离开 CPU，绝不会“睡着”，因此适合任何上下文，包括中断处理程序。
+</div>
+
+<h3>3.5 另外三种锁的定位</h3>
+
+<ul>
+  <li><strong>rwsem（读写信号量）</strong>：像图书馆的“借阅区”。一堆读者可以同时进借阅区（<code>down_read</code>），但写管理员要改架子上时，所有人必须先出来（<code>down_write</code>）。写者之间互斥、写者优先，读者之间共享。它<strong>可睡眠</strong>，所以只能在进程上下文用。内核里最典型的是 VFS 的 <code>inode-&gt;i_rwsem</code>。</li>
+  <li><strong>seqlock（顺序锁）</strong>：读者完全不加任何锁，只读一个序号，读完数据后再看序号变没变；变了说明读到了写者改动中的中间状态，丢掉重来。写者用序号（奇数=正在写，偶数=写完了）和一把普通锁把写者串行化。适合“读极多、写极少、数据本身可以容忍撕裂”的场景，比如时钟、统计计数。</li>
+  <li><strong>completion（完成量）</strong>：只有一个计数器和一个等待队列。<code>complete()</code> 把计数加一并唤醒等待者，<code>wait_for_completion()</code> 睡到计数不为 0。它表达的是“一次性的事件通知”，而不是互斥。</li>
+</ul>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 <code>spin_lock</code> 只是 <code>raw_spin_lock</code> 的壳</h3>
+
+<p><code>spinlock_t</code> 内部包了一个 <code>raw_spinlock_t</code>；两者唯一的区别是前者多了 lockdep 用来画依赖图的 <code>dep_map</code>（见 <code>include/linux/spinlock_types.h:71-83</code>）。真正干活的是 <code>raw_spin_lock()</code>。</p>
+
+<p class="srcline">include/linux/spinlock.h:352-355  spin_lock</p>
+<pre><code>static __always_inline void spin_lock(spinlock_t *lock)
+{
+	raw_spin_lock(&amp;lock-&gt;rlock);
+}</code></pre>
+
+<p>也就是说 <code>spin_lock()</code> 就是取内部裸锁加锁。<code>raw_spin_lock()</code> 本身在 <code>include/linux/spinlock.h:225</code> 被定义成 <code>_raw_spin_lock(lock)</code>。</p>
+
+<h3>4.2 <code>__raw_spin_lock</code>：关抢占 + 记账 + 真加锁</h3>
+
+<p class="srcline">include/linux/spinlock_api_smp.h:139-144  __raw_spin_lock</p>
+<pre><code>static inline void __raw_spin_lock(raw_spinlock_t *lock)
+{
+	preempt_disable();
+	spin_acquire(&amp;lock-&gt;dep_map, 0, 0, _RET_IP_);
+	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
+}</code></pre>
+
+<ul>
+  <li><code>preempt_disable()</code>：关掉抢占，保证持锁期间不会被踢下 CPU（关的是“任务级抢占”，不是关硬件中断）。</li>
+  <li><code>spin_acquire()</code>：告诉 lockdep“当前任务现在持有这把锁”。没开 <code>CONFIG_DEBUG_LOCK_ALLOC</code> 时它是个空宏。</li>
+  <li><code>LOCK_CONTENDED(lock, trylock, lock)</code>：真正去抢锁。它是个包装宏：先试 <code>do_raw_spin_trylock</code>，失败就进入 <code>do_raw_spin_lock</code>（在 x86 上最终落到 <code>arch_spin_lock</code>）。同时把“等待”这件事报告给 lockdep，让它能检测锁等待时间过长。</li>
+</ul>
+
+<p>当内核把 <code>CONFIG_INLINE_SPIN_LOCK</code> 关掉（省代码体积）时，会走 out-of-line 版本：</p>
+
+<p class="srcline">kernel/locking/spinlock.c:148-154  _raw_spin_lock</p>
+<pre><code>#ifndef CONFIG_INLINE_SPIN_LOCK
+void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
+{
+	__raw_spin_lock(lock);
+}
+EXPORT_SYMBOL(_raw_spin_lock);
+#endif</code></pre>
+
+<p>只是一层转发。真正的“排队号”逻辑在架构层。</p>
+
+<h3>4.3 排队锁的快路径：<code>queued_spin_lock</code></h3>
+
+<p class="srcline">include/asm-generic/qspinlock.h:78-86  queued_spin_lock</p>
+<pre><code>static __always_inline void queued_spin_lock(struct qspinlock *lock)
+{
+	u32 val = 0;
+
+	if (likely(atomic_try_cmpxchg_acquire(&amp;lock-&gt;val, &amp;val, _Q_LOCKED_VAL)))
+		return;
+
+	queued_spin_lock_slowpath(lock, val);
+}</code></pre>
+
+<p><code>atomic_try_cmpxchg_acquire</code> 就是那条 x86 的 <code>lock cmpxchg</code>：如果我读到的 <code>val</code> 还是 0（没人占），就原子地把它改成 <code>_Q_LOCKED_VAL</code>（locked 字节置 1）。成功即拿到锁。失败说明有人占着，走慢路径去排队领号。</p>
+
+<p>那 4 个字节长什么样？看类型定义：</p>
+
+<p class="srcline">include/asm-generic/qspinlock_types.h:14-44  arch_spinlock_t</p>
+<pre><code>typedef struct qspinlock {
+	union {
+		atomic_t val;
+
+#ifdef __LITTLE_ENDIAN
+		struct {
+			u8	locked;
+			u8	pending;
+		};
+		struct {
+			u16	locked_pending;
+			u16	tail;
+		};
+#else
+		struct {
+			u16	tail;
+			u16	locked_pending;
+		};
+		...
+#endif
+	};
+} arch_spinlock_t;</code></pre>
+
+<p>小端机器上：<code>locked</code>（第 0 字节）表示锁是否被占；<code>pending</code>（第 1 字节）表示“已经有人在排队了”；<code>tail</code>（第 2-3 字节）就是<strong>发放的号</strong>。号由 <code>encode_tail(cpu, idx)</code> 编码成“高 14 位是 CPU 号，低 2 位是序号”，所以锁本身就能记住“现在该第几号上场”，这就是 ticket 思想在现代实现里的样子。</p>
+
+<h3>4.4 <code>spin_lock_irqsave</code>：关中断的版本</h3>
+
+<p class="srcline">include/linux/spinlock_api_smp.h:104-122  __raw_spin_lock_irqsave</p>
+<pre><code>static inline unsigned long __raw_spin_lock_irqsave(raw_spinlock_t *lock)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	preempt_disable();
+	spin_acquire(&amp;lock-&gt;dep_map, 0, 0, _RET_IP_);
+	/*
+	 * On lockdep we dont want the hand-coded irq-enable of
+	 * do_raw_spin_lock_flags() code, because lockdep assumes
+	 * that interrupts are not re-enabled during lock-acquire:
+	 */
+#ifdef CONFIG_LOCKDEP
+	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
+#else
+	do_raw_spin_lock_flags(lock, &amp;flags);
+#endif
+	return flags;
+}</code></pre>
+
+<p>关键在第 108 行 <code>local_irq_save(flags)</code>：把当前 CPU 的中断标志位存进 <code>flags</code> 并关掉中断。<code>flags</code> 返回给调用者，配对的 <code>spin_unlock_irqrestore(&amp;lock, flags)</code> 会在释放锁后把中断状态<strong>恢复成原样</strong>（而不是无脑打开）——这就是为什么 API 叫 “irqsave” 而不是 “irqdisable”。</p>
+
+<p>对外的宏在 <code>include/linux/spinlock.h:382-385</code>：</p>
+
+<p class="srcline">include/linux/spinlock.h:382-385  spin_lock_irqsave</p>
+<pre><code>#define spin_lock_irqsave(lock, flags)				\
+do {								\
+	raw_spin_lock_irqsave(spinlock_check(lock), flags);	\
+} while (0)</code></pre>
+
+<div class="note">
+<b>三个变体的区别一句话版：</b><code>spin_lock</code> 不动中断状态（只能用在本来就关了中断的地方，比如中断处理程序）；<code>spin_lock_irq</code> 关中断、释放时打开；<code>spin_lock_irqsave</code> 关中断并保存原状态、释放时恢复。进程上下文用 irqsave，中断上下文用 irq 或裸 spin_lock。
+</div>
+
+<h3>4.5 <code>mutex_lock</code>：快路径与慢路径</h3>
+
+<p class="srcline">kernel/locking/mutex.c:279-286  mutex_lock</p>
+<pre><code>void __sched mutex_lock(struct mutex *lock)
+{
+	might_sleep();
+
+	if (!__mutex_trylock_fast(lock))
+		__mutex_lock_slowpath(lock);
+}
+EXPORT_SYMBOL(mutex_lock);</code></pre>
+
+<p><code>might_sleep()</code> 在 <code>lockdep</code> 开启时会检查当前是不是原子上下文（关着中断/关着抢占）——如果有人在中断处理程序里调 <code>mutex_lock</code>，这里直接 panic，而不是让你在几秒后收到一个莫名其妙的 oops。</p>
+
+<p class="srcline">kernel/locking/mutex.c:1361-1365  __mutex_lock_slowpath</p>
+<pre><code>static noinline void __sched
+__mutex_lock_slowpath(struct mutex *lock)
+{
+	__mutex_lock(lock, TASK_UNINTERRUPTIBLE, 0, NULL, _RET_IP_);
+}</code></pre>
+
+<p><code>noinline</code> 是故意把慢路径踢出热路径；<code>TASK_UNINTERRUPTIBLE</code> 表示“睡下去不可被信号打断”（普通 <code>mutex_lock</code> 的语义；<code>mutex_lock_killable</code> 用 <code>TASK_KILLABLE</code>）。</p>
+
+<p class="srcline">kernel/locking/mutex.c:1099-1104  __mutex_lock</p>
+<pre><code>static int __sched
+__mutex_lock(struct mutex *lock, long state, unsigned int subclass,
+	     struct lockdep_map *nest_lock, unsigned long ip)
+{
+	return __mutex_lock_common(lock, state, subclass, nest_lock, ip, NULL, false);
+}</code></pre>
+
+<p>真正的逻辑在 <code>__mutex_lock_common()</code>，把三种尝试串起来（下面是节选，省略了 ww_mutex 相关分支）：</p>
+
+<p class="srcline">kernel/locking/mutex.c:925-966  __mutex_lock_common</p>
+<pre><code>static __always_inline int __sched
+__mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+		    struct lockdep_map *nest_lock, unsigned long ip,
+		    struct ww_acquire_ctx *ww_ctx, const bool use_ww_ctx)
+{
+	struct mutex_waiter waiter;
+	bool first = false;
+	/* ... ww_mutex 相关判断略 ... */
+
+	might_sleep();
+
+	preempt_disable();
+	mutex_acquire_nest(&amp;lock-&gt;dep_map, subclass, 0, nest_lock, ip);
+
+	if (__mutex_trylock(lock) ||
+	    mutex_optimistic_spin(lock, ww_ctx, use_ww_ctx, NULL)) {
+		/* got the lock, yay! */
+		lock_acquired(&amp;lock-&gt;dep_map, ip);
+		preempt_enable();
+		return 0;
+	}
+
+	spin_lock(&amp;lock-&gt;wait_lock);
+	/*
+	 * After waiting to acquire the wait_lock, try again.
+	 */
+	if (__mutex_trylock(lock)) {
+		goto skip_wait;
+	}
+
+	lock_contended(&amp;lock-&gt;dep_map, ip);
+
+	if (!use_ww_ctx) {
+		/* add waiting tasks to the end of the waitqueue (FIFO): */
+		__mutex_add_waiter(lock, &amp;waiter, &amp;lock-&gt;wait_list);
+	}
+	waiter.task = current;
+
+	set_current_state(state);
+	/* ... 睡进等待队列，等 mutex_unlock() 唤醒 ... */
+}</code></pre>
+
+<p>注意两个细节：<b>①</b> 真正排队前还要抢一把内部自旋锁 <code>lock-&gt;wait_lock</code> 保护等待队列——因为等待队列是共享数据，不能裸着改；<b>②</b> 排队是 FIFO（<code>list_add_tail</code>），后来的不能插队。</p>
+
+<h3>4.6 乐观自旋：<code>mutex_optimistic_spin</code></h3>
+
+<p class="srcline">kernel/locking/mutex.c:637-684  mutex_optimistic_spin</p>
+<pre><code>static __always_inline bool
+mutex_optimistic_spin(struct mutex *lock, struct ww_acquire_ctx *ww_ctx,
+		      const bool use_ww_ctx, struct mutex_waiter *waiter)
+{
+	if (!waiter) {
+		/* 持锁者可能正睡着，睡着就不值得等 */
+		if (!mutex_can_spin_on_owner(lock))
+			goto fail;
+
+		/*
+		 * In order to avoid a stampede of mutex spinners trying to
+		 * acquire the mutex all at once, the spinners need to take a
+		 * MCS (queued) lock first before spinning on the owner field.
+		 */
+		if (!osq_lock(&amp;lock-&gt;osq))
+			goto fail;
+	}
+
+	for (;;) {
+		struct task_struct *owner;
+
+		/* Try to acquire the mutex... */
+		owner = __mutex_trylock_or_owner(lock);
+		if (!owner)
+			break;			/* 抢到了！ */
+
+		if (!mutex_spin_on_owner(lock, owner, ww_ctx, waiter))
+			goto fail_unlock;		/* 持锁者在睡觉，去睡吧 */
+
+		/*
+		 * The cpu_relax() call is a compiler barrier which forces
+		 * everything in this loop to be re-loaded.
+		 */
+		cpu_relax();
+	}
+
+	if (!waiter)
+		osq_unlock(&amp;lock-&gt;osq);
+
+	return true;
+
+fail_unlock:
+	if (!waiter)
+		osq_unlock(&amp;lock-&gt;osq);
+fail:
+	if (need_resched()) {
+		__set_current_state(TASK_RUNNING);
+		schedule_preempt_disabled();
+	}
+	return false;
+}</code></pre>
+
+<p>三个设计要点：</p>
+
+<ul>
+  <li><code>mutex_can_spin_on_owner()</code>：如果持锁者处于<strong>不可睡眠的状态</strong>（比如它正在跑用户态、或者正在忙），那它很快就可能释放锁，值得等；如果持锁者自己睡下了（比如它正阻塞在 I/O 上），那我等它毫无意义，应该立刻去睡。<strong>这是乐观自旋能提高性能的核心判据。</strong></li>
+  <li><code>osq_lock(&amp;lock-&gt;osq)</code>：Optimization Spinlock Queue。一个 MCS 排队锁，保证同一时刻只有一个自旋者在盯 owner 字段，避免“一窝蜂全冲上去读 owner”造成缓存行抖动。</li>
+  <li><code>cpu_relax()</code>：在 x86 上是 <code>pause</code> 指令，提示 CPU “我这步没活干，别浪费流水线”；在 ARM 上是 <code>yield</code>。它<strong>不是</strong>内存屏障（注释里也说了，这里不需要内存屏障，因为最终会看到正确的值）。</li>
+</ul>
+
+<h3>4.7 rwsem：读多写少</h3>
+
+<p class="srcline">kernel/locking/rwsem.c:1489-1496  down_read</p>
+<pre><code>void __sched down_read(struct rw_semaphore *sem)
+{
+	might_sleep();
+	rwsem_acquire_read(&amp;sem-&gt;dep_map, 0, 0, _RET_IP_);
+
+	LOCK_CONTENDED(sem, __down_read_trylock, __down_read);
+}
+EXPORT_SYMBOL(down_read);</code></pre>
+
+<p><code>__down_read_trylock</code> 是快路径：给 <code>sem-&gt;count</code> 加一个 <code>RWSEM_READER_BIAS</code>（读者偏置），读者可以并发持有；写者则要把 count 减到 0 才能进去。<code>__down_read</code> 是慢路径，会真的睡下等写者。</p>
+
+<h3>4.8 seqlock：读者不拿锁，只看序号</h3>
+
+<p class="srcline">include/linux/seqlock.h:329-338  __read_seqcount_begin</p>
+<pre><code>#define __read_seqcount_begin(s)					\
+({									\
+	unsigned seq;							\
+									\
+	while ((seq = __seqcount_sequence(s)) &amp; 1)			\
+		cpu_relax();						\
+									\
+	kcsan_atomic_next(KCSAN_SEQLOCK_REGION_MAX);			\
+	seq;								\
+})</code></pre>
+
+<p class="srcline">include/linux/seqlock.h:346-352  raw_read_seqcount_begin</p>
+<pre><code>#define raw_read_seqcount_begin(s)					\
+({									\
+	unsigned seq = __read_seqcount_begin(s);			\
+									\
+	smp_rmb();							\
+	seq;								\
+})</code></pre>
+
+<p class="srcline">include/linux/seqlock.h:450-454  read_seqcount_t_retry</p>
+<pre><code>static inline int read_seqcount_t_retry(const seqcount_t *s, unsigned start)
+{
+	smp_rmb();
+	return __read_seqcount_t_retry(s, start);
+}</code></pre>
+
+<p>串起来看：<strong>序号为奇数 = 写者正在改（读者必须等）</strong>；<code>__read_seqcount_begin</code> 自旋到序号变偶数，记住这个偶数 <code>start</code>；读完数据后 <code>read_seqcount_retry()</code> 比较当前序号和 <code>start</code>，不等就说明中途有写者来过，这份数据作废、重读。两处 <code>smp_rmb()</code> 保证“读序号”和“读数据”之间的顺序（详见第 13 篇）。</p>
+
+<h3>4.9 completion：一次性事件通知</h3>
+
+<p class="srcline">include/linux/completion.h:26-29  struct completion</p>
+<pre><code>struct completion {
+	unsigned int done;
+	struct swait_queue_head wait;
+};</code></pre>
+
+<p>简单到不可思议：一个计数 + 一个可睡眠等待队列。<code>complete()</code> 把 <code>done</code> 加一并唤醒全部等待者；<code>wait_for_completion()</code> 睡到 <code>done != 0</code>。它不提供互斥，只提供“等一件事发生”。</p>
+
+<h3>4.10 lockdep 抓死锁：一张有向图</h3>
+
+<p>lockdep 记录每一次“持有 A 的同时去拿 B”，形成边 <code>A → B</code>。如果新加的边让图里出现了环，就报“可能存在循环锁依赖”。</p>
+
+<p class="srcline">kernel/locking/lockdep.c:1880-1896  print_circular_bug</p>
+<pre><code>	pr_warn("\n");
+	pr_warn("======================================================\n");
+	pr_warn("WARNING: possible circular locking dependency detected\n");
+	print_kernel_ident();
+	pr_warn("------------------------------------------------------\n");
+	pr_warn("%s/%d is trying to acquire lock:\n",
+		curr-&gt;comm, task_pid_nr(curr));
+	print_lock(check_src);
+
+	pr_warn("\nbut task is already holding lock:\n");
+
+	print_lock(check_tgt);
+	pr_warn("\nwhich lock already depends on the new lock.\n\n");
+	pr_warn("\nthe existing dependency chain (in reverse order) is:\n");
+
+	print_circular_bug_entry(entry, depth);
+}</code></pre>
+
+<p>而 <code>print_lock()</code>（<code>kernel/locking/lockdep.c:725-748</code>）负责把每把锁的“实例地址 + 名字 + 获取位置”打出来：</p>
+
+<pre><code>	printk(KERN_CONT "%px", hlock-&gt;instance);
+	print_lock_name(lock);
+	printk(KERN_CONT ", at: %pS\n", (void *)hlock-&gt;acquire_ip);</code></pre>
+
+<p><code>%pS</code> 会把裸地址解析成 <code>函数名+偏移</code> 的形式，这正是报告末尾那些 <code>at: spin_lock+0x1a/0x30</code> 的来源——它直接告诉你锁是在哪一行被拿走的。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 看看你的内核有没有开 lockdep</h3>
+
+<pre><code>$ zcat /proc/config.gz | grep -E "PROVE_LOCKING|DEBUG_LOCK_ALLOC|LOCK_STAT"
+CONFIG_DEBUG_LOCK_ALLOC=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_LOCK_STAT=y
+
+# 或者直接看内核是否在跑 lockdep：
+$ cat /proc/lockdep_stats | head -20</code></pre>
+
+<p>典型输出：</p>
+
+<pre><code>lock_stat version 0.4
+debug_locks:                   1
+lock_class_stat_lock:          0
+lock_class_stat_lock:          0
+...
+lock_class_stat_lock:          0
+</code></pre>
+
+<p><code>debug_locks: 1</code> 表示 lockdep 处于工作状态（如果曾报告过 bug，内核会把 <code>debug_locks</code> 置 0 并打印 “turning off the locking correctness validator”，此时 lockdep 已经停止工作，不会再报新问题）。</p>
+
+<h3>5.2 四个观测入口</h3>
+
+<p>这四个文件由 <code>kernel/locking/lockdep_proc.c:679-688</code> 创建：</p>
+
+<pre><code>	proc_create_seq("lockdep", S_IRUSR, NULL, &amp;lockdep_ops);
+#ifdef CONFIG_PROVE_LOCKING
+	proc_create_seq("lockdep_chains", S_IRUSR, NULL, &amp;lockdep_chains_ops);
+#endif
+	proc_create_single("lockdep_stats", S_IRUSR, NULL, lockdep_stats_show);
+#ifdef CONFIG_LOCK_STAT
+	proc_create("lock_stat", S_IRUSR | S_IWUSR, NULL, &amp;lock_stat_proc_ops);
+#endif</code></pre>
+
+<table>
+  <tr><th>文件</th><th>看什么</th></tr>
+  <tr><td><code>/proc/lockdep</code></td><td>所有被 lockdep 认识的锁类，以及它们之间的依赖边（<code>-&gt; [地址] 名字</code>）</td></tr>
+  <tr><td><code>/proc/lockdep_chains</code></td><td>锁依赖链，能看出“A 之后会拿 B”这种跨模块关系</td></tr>
+  <tr><td><code>/proc/lockdep_stats</code></td><td>各把锁的争用次数、等待时间、每 CPU 分解（找热点锁用）</td></tr>
+  <tr><td><code>/proc/lock_stat</code></td><td>按等待时间排序的锁统计；写 <code>0</code> 进去可清零</td></tr>
+</table>
+
+<pre><code>$ cat /proc/lockdep | head -30
+all lock classes:
+0xffffffffc0a3b240 OPS:  231240 PD: 0 BD: 0  &lt;- rwsem
+0xffffffffc0a3b2a0 OPS:  120355 PD: 0 BD: 0  &lt;- slab_mutex
+...
+
+$ grep -A3 "lock_stat" /dev/null; cat /proc/lock_stat | head -12
+lock_stat version 0.4
+         class           total   wait  maxwait  rwait  rmaxwait   nowait  ...
+</code></pre>
+
+<div class="note">
+<b>别搞混：</b><code>/proc/locks</code>（由 <code>fs/locks.c</code> 提供）列的是 <strong>POSIX 文件锁</strong>（<code>flock</code>/<code>fcntl</code>），那是给用户进程用的，<b>不是</b>内核内部的自旋锁。
+</div>
+
+<h3>5.3 亲手制造一次死锁，让 lockdep 报警</h3>
+
+<p>下面这个模块让两个内核线程以<strong>相反顺序</strong>获取两把 mutex：A→B 和 B→A。经典 AB-BA 死锁，lockdep 会在第一次发现环时就报告（不用真等到卡死）。</p>
+
+<pre><code>// deadlock_demo.c
+#include &lt;linux/module.h&gt;
+#include &lt;linux/mutex.h&gt;
+#include &lt;linux/kthread.h&gt;
+#include &lt;linux/delay.h&gt;
+
+static DEFINE_MUTEX(lock_a);
+static DEFINE_MUTEX(lock_b);
+
+static int worker_ab(void *arg)
+{
+	mutex_lock(&amp;lock_a);       /* 先拿 A */
+	msleep(500);                 /* 拉长窗口，等对方拿到 B */
+	mutex_lock(&amp;lock_b);       /* 再拿 B —— 这里死锁 */
+	mutex_unlock(&amp;lock_b);
+	mutex_unlock(&amp;lock_a);
+	return 0;
+}
+
+static int worker_ba(void *arg)
+{
+	mutex_lock(&amp;lock_b);       /* 先拿 B */
+	msleep(500);
+	mutex_lock(&amp;lock_a);       /* 再拿 A —— 这里死锁 */
+	mutex_unlock(&amp;lock_a);
+	mutex_unlock(&amp;lock_b);
+	return 0;
+}
+
+static int __init dd_init(void)
+{
+	struct task_struct *t1, *t2;
+
+	t1 = kthread_run(worker_ab, NULL, "dd_ab");
+	if (IS_ERR(t1))
+		return PTR_ERR(t1);
+
+	t2 = kthread_run(worker_ba, NULL, "dd_ba");
+	if (IS_ERR(t2))
+		return PTR_ERR(t2);
+
+	pr_info("deadlock demo: two threads, opposite lock order\n");
+	return 0;
+}
+
+static void __exit dd_exit(void)
+{
+	/* 两个线程都卡住了，正常路径退不出来 */
+}
+
+module_init(dd_init);
+module_exit(dd_exit);
+MODULE_LICENSE("GPL");</code></pre>
+
+<p>配套的 Makefile：</p>
+
+<pre><code>obj-m := deadlock_demo.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+
+<p>编译与运行（在模块所在目录）：</p>
+
+<pre><code>$ make -C /lib/modules/$(uname -r)/build M=$PWD modules
+$ sudo insmod deadlock_demo.ko
+$ dmesg | tail -40</code></pre>
+
+<p>期望在 dmesg 里看到（关键行）：</p>
+
+<pre><code>======================================================
+WARNING: possible circular locking dependency detected
+4:0-1234   {other:3/3} -&gt; {other:3/3}
+...
+5:0-1235   {other:3/3} -&gt; {other:3/3}
+...
+the existing dependency chain (in reverse order) is:
+ -&gt; {other:3/3}   (lock_a)
+    -&gt; {other:3/3}   (lock_b)
+      -&gt; {other:3/3}   (lock_a)
+
+ *** DEADLOCK ***
+
+4:0-1234   {other:3/3} -&gt; {other:3/3}
+...
+stack backtrace:
+CPU: 2 PID: 1235 Comm: dd_ba
+Call Trace:
+ &lt;TASK&gt;
+ mutex_lock+0x11/0x30
+ worker_ba+0x40/0x80 [deadlock_demo]
+ ...
+</code></pre>
+
+<p>报告会告诉你：哪两个任务、谁正在拿哪把锁、依赖链是什么、以及<strong>拿锁的调用栈</strong>（<code>worker_ba+0x40/0x80</code>）——最后这条最值钱，直接指向你代码里的问题行。</p>
+
+<p>清理（两个线程已经卡在锁上，正常 <code>rmmod</code> 会阻塞）：</p>
+
+<pre><code>$ sudo rmmod -f deadlock_demo      # -f 强制卸载（会告警，忽略即可）
+$ dmesg | grep -i "circular\|DEADLOCK" | head</code></pre>
+
+<div class="warn">
+<b>实验纪律：</b>这个模块会真的让两个线程卡死。做完一定要 <code>rmmod -f</code> 清掉，否则那两个线程会一直占着 CPU。如果你的机器上 lockdep 没开（<code>/proc/lockdep_stats</code> 里 <code>debug_locks: 0</code>），你会看到进程被卡住但没有报告——那就需要自己编一个开了 <code>CONFIG_PROVE_LOCKING=y</code> 的内核，或用 <code>qemu</code> 跑一个。
+</div>
+
+<h3>5.4 不写模块也能观察锁争用</h3>
+
+<pre><code>$ cat /proc/lock_stat | head -15
+$ echo 0 | sudo tee /proc/lock_stat    # 清零统计
+$ sudo dmesg -c &gt;/dev/null
+# 然后跑点负载，再看
+$ cat /proc/lock_stat | head -15
+$ cat /proc/lockdep_chains | head -40</code></pre>
+
+<p><code>/proc/lock_stat</code> 里 <code>wait</code> 列大的锁就是争用热点，<code>/proc/lockdep_chains</code> 里能看到“拿到 A 之后紧接着会拿 B”的链条，这是分析锁顺序问题最直接的入口。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. 进程上下文里能不能用普通 <code>spin_lock</code>？</b>不能，或者说“能但不安全”。普通 <code>spin_lock</code> 不动中断状态，进程持锁期间可能来中断，中断处理程序若拿同一把锁就会死锁（见 3.3 的时序图）。进程上下文必须用 <code>spin_lock_irqsave</code>（或 <code>_irq</code>），把中断关掉；释放时用 <code>spin_unlock_irqrestore</code> 恢复原状态。</div>
+
+<div class="qa"><b>Q2. <code>raw_spinlock_t</code> 和 <code>spinlock_t</code> 到底差在哪？</b>差在 <code>spinlock_t</code> 内嵌的 <code>lockdep_map dep_map</code>（<code>include/linux/spinlock_types.h:71-83</code>）。它让 lockdep 知道这把锁的名字、类型和获取位置，从而画出依赖图、发现死锁。<code>raw_spinlock_t</code> 没有这块元数据，所以 lockdep 看不见它——代价是省掉 lockdep 的记账开销，代价的代价是你写错了也不会有人提醒。<code>spin_lock()</code> 的实现就是 <code>raw_spin_lock(&amp;lock-&gt;rlock)</code>。</div>
+
+<div class="qa"><b>Q3. mutex 和 spinlock 都能保护共享数据，差在哪？什么时候用哪个？</b>核心差别是“抢不到时做什么”。自旋锁抢不到就原地忙等，全程占着 CPU，绝不睡眠，因此可以在中断上下文用；mutex 抢不到就把自己挂进等待队列睡眠，让出 CPU，代价是唤醒 + 调度开销，但可以等很久（几毫秒以上）。规则：临界区只有几十条指令 → 自旋锁；临界区可能耗时或需要睡眠（做 I/O）→ mutex。</div>
+
+<div class="qa"><b>Q4. 什么是“乐观自旋”？它凭什么能提速？</b>mutex 慢路径上，在真正睡下之前先原地自旋一小段时间，反复尝试 trylock。因为“自旋 → 唤醒 → 调度回本 CPU”的往返成本大约几微秒，而持锁者如果本来就在运行，很可能几百纳秒后就释放了锁，自旋直接拿到就省掉了整个睡眠/唤醒流程。判断能不能自旋的关键是 <code>mutex_can_spin_on_owner()</code>：如果持锁者自己也睡下了，自旋就没意义，应当直接去睡。<code>mutex_optimistic_spin()</code> 里还用 <code>osq_lock</code> 保证同一时刻只有一个自旋者，避免缓存行抖动。</div>
+
+<div class="qa"><b>Q5. lockdep 是怎么发现死锁的？它报的“circular locking dependency”是什么意思？</b>lockdep 维护一张有向图：每次“持有 A 的同时申请 B”就加一条边 A→B。当新边让图里出现环（A→B→A）时，它判定存在循环锁依赖并打印报告，报告里包含：涉及的进程名和 PID、每把锁的实例地址与名字、锁是在哪一行被拿到的（<code>at: %pS</code> 打出来的调用点），以及完整的调用栈。它报的“possible”是保守措辞——在真实硬件上这确实会死锁，但报告本身不足以证明，因为时序可能刚好错开。</div>
+
+<div class="qa"><b>Q6. seqlock 的读者到底加锁了吗？</b>没有加任何锁。读者只读一个序号（偶数表示当前没有写者），读完数据后再次读序号并比较，不一致就丢弃重来（<code>read_seqcount_retry()</code>）。写者则把序号置为奇数表示“正在写”，改完后置为偶数，并用一把普通锁把多个写者串行化。代价是读者可能白读一次，但换来了读者侧零锁开销。注意它只适用于“数据本身允许不一致”的场景，绝不能用来保护指针（写者可能让读者手里的指针失效）。</div>
+
+<footer>
+  <p>上一篇：<a href="10-interrupts.html">10 中断</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="12-rcu.html">12 RCU</a></p>
+</footer>
+
+</body>
+</html>

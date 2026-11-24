@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>31 KVM 虚拟化</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="32-bpf.html">下一篇：32-bpf eBPF →</a>
+</nav>
+
+<h1>🖥️ KVM 虚拟化</h1>
+<p class="subtitle">让一个 Linux 内核同时「租」出多个独立的 CPU 和内存给别的操作系统 · 预计阅读 12 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+<p>想象你有一栋自建楼，自己想住，但空房间太多。最省事的做法不是另建一栋，而是在原有结构上加装一层「可拆卸夹层」：楼还是那栋楼，水电总管线还是那套，但每个夹层里可以住进一户完全独立的租客，他们有自己的门牌、自己的家具，甚至不知道自己住在夹层里。住户之间互不相见，房东（你）随时能上楼查看。</p>
+<p>KVM（Kernel-based Virtual Machine）就是这层夹层。它不改变 Linux 内核的本质，而是把这个内核变成 <span class="term">hypervisor</span>（虚拟机监控器）：宿主机内核照常跑进程、管内存、调度 CPU，同时在 CPU 硬件提供的「隔离模式」里再跑若干个完整的客户操作系统（<span class="term">guest</span>）。</p>
+<p>从操作系统视角看，问题是这样：一个内核默认认为自己独占 CPU 的所有特权指令（改页表基址、关中断、读写控制寄存器）。若让第二个内核也直接执行这些指令，必然互相踩踏。解决办法只有两条：一是<span class="term">全虚拟化</span>——靠硬件在每次执行特权指令时把控制权交回宿主机，「骗」客户机它仍是老大；二是<span class="term">半虚拟化</span>——改客户机代码，把敏感操作改成主动「敲门」调用宿主机（hypercall）。KVM 走第一条路，依赖 Intel VT-x / AMD-V 这样的硬件扩展。</p>
+<p>而 KVM 在内核里只做「最硬的那部分」：创建 vCPU、进入/退出客户机、处理退出原因、维护客户机内存映射。剩下的设备模拟（网卡、磁盘、显示器、BIOS）全部交给用户态的 QEMU。所以「KVM 加速的虚拟机」其实是 KVM + QEMU 的合体。</p>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">宿主机</td><td>host</td><td>跑 KVM 的那个 Linux，物理硬件归它管</td></tr>
+  <tr><td class="term">客户机</td><td>guest</td><td>被虚拟出来的操作系统，它以为自己独占一台机器</td></tr>
+  <tr><td class="term">虚拟机监控器</td><td>VMM / hypervisor</td><td>在硬件与客户机之间做隔离和调度的软件层，KVM 就是内核态的 VMM</td></tr>
+  <tr><td class="term">全虚拟化</td><td>full virtualization</td><td>不改客户机代码，靠硬件陷入来接管特权指令</td></tr>
+  <tr><td class="term">半虚拟化</td><td>paravirtualization</td><td>修改客户机内核，把敏感操作改为显式 hypercall（如 virtio 驱动）</td></tr>
+  <tr><td class="term">虚拟 CPU</td><td>vCPU</td><td>对客户机呈现的一个 CPU；在宿主机上对应一个普通线程</td></tr>
+  <tr><td class="term">VT-x</td><td>Intel VT-x / VMX</td><td>Intel 的硬件虚拟化扩展，提供 root / non-root 两种运行模式</td></tr>
+  <tr><td class="term">VMX root 模式</td><td>VMX root operation</td><td>宿主机内核运行的模式，权限最高</td></tr>
+  <tr><td class="term">VMX non-root 模式</td><td>VMX non-root operation</td><td>客户机运行的模式，特权指令被「截获」而非真正执行</td></tr>
+  <tr><td class="term">VMCS</td><td>Virtual Machine Control Structure</td><td>一块每 vCPU 一份的内存，规定「谁能执行什么」「退出时去哪里」</td></tr>
+  <tr><td class="term">VM entry / exit</td><td>VM-entry / VM-exit</td><td>切入客户机 / 因某事件被弹回宿主机的两次硬件切换</td></tr>
+  <tr><td class="term">退出原因</td><td>exit reason</td><td>VM-exit 的原因编号：I/O 指令、EPT 缺页、CPUID、HLT 等</td></tr>
+  <tr><td class="term">EPT</td><td>Extended Page Tables</td><td>Intel 的第二层页表：客户机虚拟地址→客户机物理地址→宿主机物理地址</td></tr>
+  <tr><td class="term">影子页表</td><td>shadow page table</td><td>没有 EPT 时代软件合成的页表，现在基本被 EPT 取代</td></tr>
+  <tr><td class="term">GVA / GPA / HPA</td><td>guest/host virtual &amp; physical address</td><td>客户机虚拟地址 / 客户机物理地址 / 宿主机物理地址，三段地址空间</td></tr>
+  <tr><td class="term">内存槽</td><td>memory slot</td><td>用户态把一段宿主机虚拟内存「登记」给某个客户机物理区间</td></tr>
+  <tr><td class="term">/dev/kvm</td><td>KVM device node</td><td>用户态与 KVM 交互的唯一入口，字符设备，主设备号 10（misc）</td></tr>
+  <tr><td class="term">KVM_RUN</td><td>KVM_RUN ioctl</td><td>「让这个 vCPU 跑起来」的指令；返回即表示发生了一次 VM-exit</td></tr>
+  <tr><td class="term">kvm_run</td><td>shared page</td><td>内核与用户态共享的一页内存，写回退出原因和退出数据</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+<p>先看硬件模式。CPU 加电后处于 VMX root；执行 <code>VMLAUNCH</code>/<code>VMRESUME</code> 指令就切入 non-root 跑客户机，遇到「被截获的事件」再自动回到 root 的固定入口 <code>vmx_vmexit</code>。</p>
+<pre><code>
+             ┌──────────── VMX root operation（宿主机内核）────────────┐
+             │ 普通 Linux 代码：调度、中断、文件系统、KVM 模块        │
+             │                                                        │
+             │   vmx_vcpu_run() ──► vmx_vmenter ──┐                   │
+             │                                   │ VMLAUNCH/VMRESUME │
+             │   vmx_vmexit ◄────────────────────┼── 硬件 VM-exit    │
+             └───────────────────────────────────┼────────────────────┘
+                                                 │
+             ┌──────────── VMX non-root operation（客户机）──────────┐
+             │ 客户机内核执行普通指令；遇到敏感操作被硬件「截获」      │
+             │ 例：out 指令、写 CR3、访问 EPT 里没有的页面、CPUID      │
+             └───────────────────────────────────────────────────────┘
+</code></pre>
+<p>再看软件分层与一次 <code>KVM_RUN</code> 的生命周期：</p>
+<pre><code>
+QEMU（用户态）
+  │  open("/dev/kvm") → KVM_CREATE_VM（得到 VM fd）
+  │  → KVM_CREATE_VCPU（得到 vCPU fd）→ mmap(kvm_run 共享页)
+  │
+  ├─ ioctl(vcpu_fd, KVM_RUN, 0)  ───────────────┐
+  │                                             │ 内核态
+  │                        kvm_vcpu_ioctl()     │
+  │                          └ kvm_arch_vcpu_ioctl_run()
+  │                              └ vcpu_run() ──► vcpu_enter_guest()
+  │                                   └ kvm_x86_ops.run() = vmx_vcpu_run()
+  │                                        └ __vmx_vcpu_run()  ← 汇编，真正 VMENTER
+  │                                             …客户机运行…
+  │                                        ◄── VM-EXIT（硬件跳回 vmx_vmexit）
+  │                              vcpu_enter_guest() 里 kvm_x86_ops.handle_exit()
+  │                                   └ vmx_handle_exit() → 退出原因分发表
+  │
+  └─ KVM_RUN 返回，读 kvm_run-&gt;exit_reason，QEMU 据此模拟设备/注入中断
+     然后再次 KVM_RUN，循环往复
+</code></pre>
+<p>关键点：<strong>一次 KVM_RUN 只处理「一次进入 + 一次退出」或一个内部小循环</strong>。I/O 端口访问、MMIO、HLT 这些设备行为由 QEMU 处理；EPT 缺页、CPUID、CR 访问这类由内核直接处理，用户态无感知。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 KVM_RUN 的入口</h3>
+<p>用户态 <code>ioctl</code> 落到通用层 <code>kvm_vcpu_ioctl</code>。这里先校验调用者 mm 与创建 VM 时是否一致（防止跨进程偷跑别人 VM 的 vCPU），再在 KVM_RUN 分支里记录「当前是哪个线程在跑这个 vCPU」，最后交给架构层。</p>
+<p class="srcline">virt/kvm/kvm_main.c:3213-3237  kvm_vcpu_ioctl</p>
+<pre><code>	switch (ioctl) {
+	case KVM_RUN: {
+		struct pid *oldpid;
+		r = -EINVAL;
+		if (arg)
+			goto out;
+		oldpid = rcu_access_pointer(vcpu-&gt;pid);
+		if (unlikely(oldpid != task_pid(current))) {
+			/* The thread running this VCPU changed. */
+			struct pid *newpid;
+
+			r = kvm_arch_vcpu_run_pid_change(vcpu);
+			if (r)
+				break;
+
+			newpid = get_task_pid(current, PIDTYPE_PID);
+			rcu_assign_pointer(vcpu-&gt;pid, newpid);
+			if (oldpid)
+				synchronize_rcu();
+			put_pid(oldpid);
+		}
+		r = kvm_arch_vcpu_ioctl_run(vcpu);
+		trace_kvm_userspace_exit(vcpu-&gt;run-&gt;exit_reason, r);
+		break;
+	}</code></pre>
+<p>逐点说明：</p>
+<ul>
+  <li><code>if (arg)</code> —— KVM_RUN 不接受参数，传了就是错的；所有状态通过 <code>kvm_run</code> 共享页传递。</li>
+  <li>vCPU 可以被不同的用户态线程执行（QEMU 允许迁移线程绑定），换了线程要通知架构层（比如重设 FPU/APIC 相关状态）。</li>
+  <li>用 RCU 指针 + <code>synchronize_rcu()</code> 安全地替换 <code>vcpu-&gt;pid</code>，因为其他路径可能在 RCU 读侧查看它。</li>
+  <li><code>kvm_arch_vcpu_ioctl_run</code> 就是进入 x86 专有逻辑的门；返回时 <code>vcpu-&gt;run-&gt;exit_reason</code> 已经填好。</li>
+</ul>
+
+<h3>4.2 vCPU 的主循环</h3>
+<p>架构无关的「跑一轮」由 <code>vcpu_run</code> 负责。它是一个 <code>for(;;)</code>：只要还能继续（返回 &gt; 0），就反复进出客户机，直到需要把控制权交还用户态。</p>
+<p class="srcline">arch/x86/kvm/x86.c:9082-9107  vcpu_run</p>
+<pre><code>static int vcpu_run(struct kvm_vcpu *vcpu)
+{
+	int r;
+	struct kvm *kvm = vcpu-&gt;kvm;
+
+	vcpu-&gt;srcu_idx = srcu_read_lock(&amp;kvm-&gt;srcu);
+	vcpu-&gt;arch.l1tf_flush_l1d = true;
+
+	for (;;) {
+		if (kvm_vcpu_running(vcpu)) {
+			r = vcpu_enter_guest(vcpu);
+		} else {
+			r = vcpu_block(kvm, vcpu);
+		}
+
+		if (r &lt;= 0)
+			break;
+
+		kvm_clear_request(KVM_REQ_PENDING_TIMER, vcpu);
+		if (kvm_cpu_has_pending_timer(vcpu))
+			kvm_inject_pending_timer_irqs(vcpu);
+        // ...（省略：中断窗口检查、guest-mode 工作处理）
+	}
+	srcu_read_unlock(&amp;kvm-&gt;srcu, vcpu-&gt;srcu_idx);
+	return r;
+}</code></pre>
+<p><code>srcu_read_lock</code> 保护的是客户机内存槽表：运行期间不能让内存槽被并发删掉。<code>kvm_vcpu_running()</code> 为假说明 vCPU 处于 HLT 等阻塞态，此时走 <code>vcpu_block</code> 睡眠等待事件。<strong>返回值 &lt;= 0 是「要回用户态了」的信号</strong>，最常见的 0 就是 I/O 或 MMIO 需要 QEMU 处理。</p>
+
+<h3>4.3 vcpu_enter_guest 的后半段：从硬件退回到事件处理</h3>
+<p>前面一大段在处理各类 <code>KVM_REQ_*</code> 请求（刷新 TLB、同步时钟、注入 NMI……），真正的「进客户机」是 <code>kvm_x86_ops.run(vcpu)</code>。返回后 CPU 已经回到 root 模式，接着要做的是恢复宿主机上下文、处理退出原因。</p>
+<p class="srcline">arch/x86/kvm/x86.c:8979-9028  vcpu_enter_guest（节选）</p>
+<pre><code>	vcpu-&gt;arch.last_vmentry_cpu = vcpu-&gt;cpu;
+	vcpu-&gt;arch.last_guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+
+	vcpu-&gt;mode = OUTSIDE_GUEST_MODE;
+	smp_wmb();
+
+	kvm_x86_ops.handle_exit_irqoff(vcpu);
+
+	/*
+	 * Consume any pending interrupts, including ... any ticks that occur
+	 * between VM-Exit and now.
+	 */
+	kvm_before_interrupt(vcpu);
+	local_irq_enable();
+	++vcpu-&gt;stat.exits;
+	local_irq_disable();
+	kvm_after_interrupt(vcpu);
+    // ...（省略：LAPIC 定时器延迟统计）
+	vcpu-&gt;srcu_idx = srcu_read_lock(&amp;vcpu-&gt;kvm-&gt;srcu);
+    // ...（省略：exit RIP profiling、时钟请求、vapic 同步）
+
+	r = kvm_x86_ops.handle_exit(vcpu, exit_fastpath);
+	return r;</code></pre>
+<ul>
+  <li><code>vcpu-&gt;mode = OUTSIDE_GUEST_MODE</code> 是「我已经不在客户机里」的公开标志，配合写屏障，让其他 CPU 上的 IPI/请求能看到状态切换。</li>
+  <li>VM-exit 后中断是关的（硬件保证），这里短暂 <code>local_irq_enable()</code> 把宿主机积压的中断消化掉，再关上继续处理，避免软中断/定时器饿死。</li>
+  <li><code>srcu_read_lock</code> 重新拿锁，因为 <code>handle_exit</code> 里可能访问内存槽（如 MMIO 地址翻译）。</li>
+  <li>最后一次调用 <code>kvm_x86_ops.handle_exit</code> —— 这是转到厂商实现的钩子（Intel 走 <code>vmx_handle_exit</code>）。</li>
+</ul>
+
+<h3>4.4 真正的 VMENTER 是一条汇编指令</h3>
+<p><code>vmx_vcpu_run</code> 里最终调用 <code>__vmx_vcpu_run</code>，它先把客户机通用寄存器装好，再 <code>call vmx_vmenter</code>。切换之所以能「一条指令完成」，是因为 CPU 自动从 VMCS 里加载客户机状态、并从 VMCS 的 <code>HOST_RIP</code> 找到退出后的落脚点。</p>
+<p class="srcline">arch/x86/kvm/vmx/vmenter.S:47-65  vmx_vmenter</p>
+<pre><code>SYM_FUNC_START(vmx_vmenter)
+	/* EFLAGS.ZF is set if VMCS.LAUNCHED == 0 */
+	je 2f
+
+1:	vmresume
+	ret
+
+2:	vmlaunch
+	ret
+
+3:	cmpb $0, kvm_rebooting
+	je 4f
+	ret
+4:	ud2
+
+	_ASM_EXTABLE(1b, 3b)
+	_ASM_EXTABLE(2b, 3b)
+
+SYM_FUNC_END(vmx_vmenter)</code></pre>
+<p><code>VMLAUNCH</code> 用于从未启动过的 VMCS，<code>VMRESUME</code> 用于已经启动过的。两者「成功时不返回」：CPU 直接跳进客户机；只有 VM-Fail（比如 VMCS 配置非法）才落到 <code>ret</code>。<code>_ASM_EXTABLE</code> 把异常路径指向 <code>3:</code>，那里检查 <code>kvm_rebooting</code> 后 <code>ud2</code>，属于「不可能发生但必须兜底」的处理。<code>vmx_vmexit</code>（同文件 73 行起）是 <code>HOST_RIP</code> 指向的落点，它要在 <code>ret</code> 前用 <code>FILL_RETURN_BUFFER</code> 填充 RSB，防 Spectre 类攻击。</p>
+
+<h3>4.5 EPT 缺页：客户机以为自己缺页，其实是 KVM 缺页</h3>
+<p>客户机访问一个没建立 EPT 映射的 GPA 时，硬件产生 <code>EXIT_REASON_EPT_VIOLATION</code>。KVM 的 handler 把硬件给的「退出资格」（exit qualification）翻译成类似 x86 缺页错误码的格式，再交给 MMU 层去建立映射。</p>
+<p class="srcline">arch/x86/kvm/vmx/vmx.c:5304-5342  handle_ept_violation</p>
+<pre><code>static int handle_ept_violation(struct kvm_vcpu *vcpu)
+{
+	unsigned long exit_qualification;
+	gpa_t gpa;
+	u64 error_code;
+
+	exit_qualification = vmx_get_exit_qual(vcpu);
+
+	/* ...（省略：从 NMI 中 iret 时设置 GUEST_INTR_STATE_NMI 的勘误处理） */
+
+	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+	trace_kvm_page_fault(gpa, exit_qualification);
+
+	/* Is it a read fault? */
+	error_code = (exit_qualification &amp; EPT_VIOLATION_ACC_READ)
+		     ? PFERR_USER_MASK : 0;
+	/* Is it a write fault? */
+	error_code |= (exit_qualification &amp; EPT_VIOLATION_ACC_WRITE)
+		      ? PFERR_WRITE_MASK : 0;
+	/* Is it a fetch fault? */
+	error_code |= (exit_qualification &amp; EPT_VIOLATION_ACC_INSTR)
+		      ? PFERR_FETCH_MASK : 0;
+	/* ept page table entry is present? */
+	error_code |= (exit_qualification &amp;
+		       (EPT_VIOLATION_READABLE | EPT_VIOLATION_WRITABLE |
+			EPT_VIOLATION_EXECUTABLE))
+		      ? PFERR_PRESENT_MASK : 0;
+    // ...（省略：PFERR_GUEST_FINAL / PFERR_GUEST_PAGE 的选择）
+	return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+}</code></pre>
+<p><code>GUEST_PHYSICAL_ADDRESS</code> 是出错的 GPA，也就是「客户机以为的物理地址」；<code>kvm_mmu_page_fault</code> 会去查内存槽，找到这段 GPA 对应的宿主机虚拟地址（HVA），再用 <code>__pa()</code> 换成 HPA 写进 EPT 表项。若这段 GPA 根本没有内存槽，KVM 就会产生 MMIO 退出，把控制权交回 QEMU 模拟设备——这就是「访问设备寄存器」的底层实现。目录 <code>arch/x86/kvm/mmu/</code> 中 <code>mmu.c</code> 管软件遍历，<code>tdp_mmu.c</code> 是 EPT/NPT 专用的两维页表遍历器，<code>spte.c</code> 负责 EPT 表项位的组装与检查。</p>
+
+<h3>4.6 退出原因分发表</h3>
+<p>VM-exit 的原因是一个整数，所以 Intel 侧的处理就是一张函数指针表 + 一次数组索引。注意 <code>array_index_nospec</code>：防止推测执行把越界的 exit_reason 用作索引。</p>
+<p class="srcline">arch/x86/kvm/vmx/vmx.c:5628-5636, 6063-6068  kvm_vmx_exit_handlers / vmx_handle_exit</p>
+<pre><code>static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+	[EXIT_REASON_EXCEPTION_NMI]           = handle_exception_nmi,
+	[EXIT_REASON_EXTERNAL_INTERRUPT]      = handle_external_interrupt,
+	[EXIT_REASON_TRIPLE_FAULT]            = handle_triple_fault,
+	[EXIT_REASON_NMI_WINDOW]	      = handle_nmi_window,
+	[EXIT_REASON_IO_INSTRUCTION]          = handle_io,
+	[EXIT_REASON_CR_ACCESS]               = handle_cr,
+	[EXIT_REASON_DR_ACCESS]               = handle_dr,
+	[EXIT_REASON_CPUID]                   = kvm_emulate_cpuid,
+    // ...（省略：其余几十个表项，如 EPT_VIOLATION、HLT、MSR 读写、INVLPG）
+
+	exit_reason = array_index_nospec(exit_reason,
+					 kvm_vmx_max_exit_handlers);
+	if (!kvm_vmx_exit_handlers[exit_reason])
+		goto unexpected_vmexit;
+
+	return kvm_vmx_exit_handlers[exit_reason](vcpu);</code></pre>
+<p>以 <code>handle_io</code> 为例：它解析端口号、宽度、in/out 方向，调用 <code>kvm_fast_pio</code>。如果该端口在 KVM 内部有模拟器（比如串口、PIC），内核直接完成；否则填好 <code>vcpu-&gt;run-&gt;exit_reason = KVM_EXIT_IO</code> 并带着端口信息返回 0，让 QEMU 去处理。</p>
+
+<h2>5. 动手验证</h2>
+<p><b>(1)</b> 先确认硬件与内核支持：</p>
+<pre><code>$ ls -l /dev/kvm
+crw------- 1 root root 10, 232  8月 20 09:11 /dev/kvm
+$ egrep -c '(vmx|svm)' /proc/cpuinfo   # ≥1 表示 CPU 有虚拟化扩展
+$ dmesg | grep -i kvm
+[    3.113] kvm: Nested Virtualization enabled</code></pre>
+<p><code>/dev/kvm</code> 的主设备号 10 说明它是 misc 设备；<code>virt/kvm/kvm_main.c</code> 用 <code>misc_register(&amp;kvm_dev)</code> 注册它，名字 "kvm"。若文件不存在，通常是 BIOS 里没开 VT-x/SVM，或内核没编 <code>CONFIG_KVM</code>。</p>
+<p><b>(2)</b> 查询 KVM 能力：</p>
+<pre><code>$ sudo apt install qemu-kvm     # 或 dnf install qemu-kvm
+$ kvm-ok
+INFO: /dev/kvm exists
+KVM acceleration can be used
+$ qemu-system-x86_64 -accel help
+Accelerators supported in QEMU binary:
+tcg
+kvm</code></pre>
+<p><b>(3)</b> 用 KVM 启动一个最小 VM（无需装系统，直接进 busybox 的 shell 也足够看 VM-exit）：</p>
+<pre><code>$ qemu-system-x86_64 -accel kvm -m 512 -smp 2 \
+    -kernel bzImage -append "console=ttyS0" -nographic
+$ qemu-system-x86_64 -accel kvm -cpu host ...   # 传给客户机 vmx，才能嵌套</code></pre>
+<p><b>(4)</b> 观察 vCPU 线程和统计：</p>
+<pre><code>$ ps -T -p $(pgrep -f qemu-system) | grep CPU
+  PID  SPID TTY   TIME CMD
+ 1234  1240 ?    00:00:01 CPU 0/KVM
+ 1234  1241 ?    00:00:01 CPU 1/KVM
+$ sudo perf kvm stat live           # 需要 root，展示各 exit_reason 的占比
+$ ls /sys/module/kvm_intel/parameters/
+nested  ept  unrestricted_guest  ...</code></pre>
+<p>预期：<code>-smp 2</code> 对应两个名为 <code>CPU N/KVM</code> 的线程；<code>perf kvm stat</code> 里 <code>EXTERNAL_INTERRUPT</code>、<code>MSR_WRITE</code>、<code>EPT_VIOLATION</code> 往往排前列，说明「大部分时间客户机在跑，退出是稀疏事件」——这正是硬件虚拟化高效的原因。</p>
+<div class="warn">不要在生产机上随意给 <code>/dev/kvm</code> 全局可读写。任何拿到该 fd 的进程都能创建 VM，配合 <code>KVM_SET_USER_MEMORY_REGION</code> 可读写任意物理内存。</div>
+
+<h2>6. 自测</h2>
+<div class="qa"><b>Q1. 为什么 KVM 的 VM-exit 对性能影响不大？</b>因为客户机大部分指令是「非敏感」的，直接在 non-root 模式执行，不需要陷入；只有 I/O、缺页、CPUID 这类操作才产生 VM-exit。硬件负责保存/恢复状态，退出成本约几千个周期，不是每条指令都付。</div>
+<div class="qa"><b>Q2. EPT 解决了影子页表的什么问题？</b>影子页表要为每个客户机进程维护一份「GVA→HPA」的合成页表，客户机改页表时软件必须同步，开销大且易错。EPT 让硬件做第二级翻译（GPA→HPA），客户机维护自己的页表完全不受干扰，KVM 只补 EPT 表项。</div>
+<div class="qa"><b>Q3. 一次 KVM_RUN 返回 0 且 exit_reason=KVM_EXIT_IO，谁来完成这次 I/O？</b>QEMU。内核只在 <code>kvm_run</code> 里填好端口、方向、宽度和 <code>data_offset</code>；QEMU 读那个偏移处的数据、模拟设备响应，然后再次 KVM_RUN。</div>
+<div class="qa"><b>Q4. vCPU 为什么能对应一个普通 Linux 线程？</b>因为宿主机内核仍在线程里调度它；<code>KVM_RUN</code> 期间该线程阻塞在 ioctl 里，但可被信号打断（<code>-EINTR</code> 加 <code>KVM_EXIT_INTR</code>），也可被宿主机调度器抢占，因此 vCPU 与线程是一一绑定的执行上下文。</div>
+<div class="qa"><b>Q5. 半虚拟化和全虚拟化在代码里怎么体现？</b>全虚拟化走 VM-exit 后由 KVM/QEMU 模拟；半虚拟化引入 <code>KVM_EXIT_IO</code>/hypercall 页（如 <code>KVM_HC_*</code>），客户机装 virtio 驱动，主动发起请求，避免昂贵的设备寄存器陷入。</div>
+
+<footer>
+  <p>上一篇：<a href="30-seccomp.html">30-seccomp 安全隔离</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="32-bpf.html">32-bpf eBPF</a></p>
+</footer>
+
+</body>
+</html>

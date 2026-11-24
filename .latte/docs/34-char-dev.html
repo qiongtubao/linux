@@ -1,0 +1,1035 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>34 字符设备：cdev、file_operations 与 ioctl</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, Consolas, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="35-platform.html">下一篇：35-platform platform 驱动与设备树 →</a>
+</nav>
+
+<h1>🔌 字符设备：cdev、file_operations 与 ioctl</h1>
+<p class="subtitle">怎么把内核里的一段代码变成用户态能 open/read/write/ioctl 的「设备」 · 预计阅读 12 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>先想象一个银行大厅。每个窗口都贴着一块牌子：1 号窗口办存款，2 号窗口办取款。普通人并不知道窗口背后是谁在干活，他只需要走到窗口，递进去一张单子（请求），拿回一张回执（数据）。窗口编号就是「设备号」，窗口后面那套办事流程就是「驱动」。</p>
+
+<p>字符设备（character device）就是内核里的这套「窗口」机制。它的关键特点是：<strong>窗口背后没有文件内容</strong>。普通文件（/etc/passwd）的字节躺在磁盘上，read() 就是从磁盘搬到内存；而字符设备更像一根管道或一个终端——你 open() 它拿到的不是一份数据，而是一条<b>可以来回传话的通道</b>。通道那头是什么、怎么解释传过去的东西，全由驱动自己决定：可以是内存（/dev/mem）、可以是串口（/dev/ttyS0）、可以是自定义硬件，也可以是内核里的一个计数器。</p>
+
+<p>从操作系统视角看，内核要解决三个问题：</p>
+<ul>
+  <li><b>寻址</b>：用户态要有一个「路径」能指向设备（<code>/dev/hello</code>），内核要能把「这个路径」翻译成「设备号 major:minor」，再把设备号翻译成「一组函数指针」——也就是 <code>struct file_operations</code>；</li>
+  <li><b>调用</b>：用户态调 <code>read()</code>，VFS 要知道该转给哪个 <code>file_operations</code> 的 <code>read</code> 成员；</li>
+  <li><b>传话</b>：驱动要读写用户态传来的缓冲区，而用户指针是不可信的，必须用专门的安全拷贝接口。</li>
+</ul>
+
+<p>本篇就把这三件事拆开：设备号怎么编码（major/minor）、<code>cdev</code> 怎么把设备号挂到函数表上、<code>device_create()</code> 怎么让 udev 在 <code>/dev</code> 下凭空造出节点、以及 <code>copy_to_user()</code> 到底在防什么。最后你会亲手写一个能编译、能加载、能读写的字符设备模块。</p>
+
+<div class="note">
+  <b>和块设备的区别</b>：块设备（/dev/sda）以「块」为单位，走 page cache、请求队列、I/O 调度器那一整套复杂流水线；字符设备是「字节流」语义，读写直接进驱动回调，没有中间层。规则是：数据是线性的、没有随机寻址需求 → 字符设备；数据是块状、可随机寻址、要挂文件系统 → 块设备。
+</div>
+
+<h2>2. 核心名词</h2>
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">设备号</td><td>dev_t</td><td>内核里定位一个设备的整数，32 位，内含 major 与 minor</td></tr>
+  <tr><td class="term">主设备号</td><td>major</td><td>标识「哪一类驱动」，12 位（0~4095），决定内核调用哪套 file_operations</td></tr>
+  <tr><td class="term">次设备号</td><td>minor</td><td>标识「这一类里的第几个设备」，20 位，同一驱动下的多个实例靠它区分</td></tr>
+  <tr><td class="term">字符设备结构体</td><td>struct cdev</td><td>内核里的「窗口登记处」：把一段设备号区间映射到一组 file_operations</td></tr>
+  <tr><td class="term">文件操作表</td><td>struct file_operations</td><td>驱动注册给内核的函数指针表，open/read/write/ioctl 都在这里</td></tr>
+  <tr><td class="term">设备号区间登记</td><td>alloc_chrdev_region / register_chrdev_region</td><td>向内核申请一段 major/minor；前者让内核选 major，后者自己指定</td></tr>
+  <tr><td class="term">字符设备注册</td><td>cdev_init / cdev_add</td><td>初始化 cdev 结构并把它挂进内核的字符设备索引表</td></tr>
+  <tr><td class="term">设备类</td><td>struct class</td><td>一组同类设备的分组，在 sysfs 里表现为 /sys/class/&lt;名字&gt;/</td></tr>
+  <tr><td class="term">设备节点</td><td>device node</td><td>/dev 目录下的那个文件，用户靠 open("/dev/xxx") 进入驱动</td></tr>
+  <tr><td class="term">uevent</td><td>uevent</td><td>内核向用户态广播的事件（「设备来了，带这些属性」），udev 靠它建节点</td></tr>
+  <tr><td class="term">udev</td><td>udev</td><td>用户态的设备管理器，收到 uevent 后在 /dev 建节点、改权限、建软链</td></tr>
+  <tr><td class="term">devtmpfs</td><td>devtmpfs</td><td>内核自带的伪文件系统，会自动为设备创建 /dev 节点（udev 之前的那一棒）</td></tr>
+  <tr><td class="term">用户指针</td><td>__user</td><td>标注「这是用户空间的地址」，让内核知道它不可信、必须校验</td></tr>
+  <tr><td class="term">安全拷贝</td><td>copy_to_user / copy_from_user</td><td>内核与用户空间之间搬运数据的唯一正规途径，会做地址校验并能处理缺页</td></tr>
+  <tr><td class="term">解锁 ioctl</td><td>unlocked_ioctl</td><td>驱动接收 ioctl 命令的回调，名字里的 unlocked 指「不持有文件锁时调用」</td></tr>
+  <tr><td class="term">ioctl 编码</td><td>_IO / _IOR / _IOW</td><td>把「方向 + 类型 + 序号 + 参数大小」打包成一个 32 位整数的宏</td></tr>
+  <tr><td class="term">私有数据</td><td>private_data</td><td>struct file 里那个 void *，open 时由驱动填上，read/write/ioctl 里取回</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 从模块加载到用户态 open() 的完整链路</h3>
+<pre><code>
+ 模块加载                     内核内部                        用户态
+ ─────────                    ────────                        ──────
+ insmod hello
+    │
+    ▼
+ alloc_chrdev_region()  ──►  申请一段设备号，比如 240:0
+    │                             │
+    ▼                             ▼
+ cdev_init(&amp;cdev, &amp;fops)  ──►  cdev.ops = fops
+    │
+    ▼
+ cdev_add(&amp;cdev, 240:0, 1)  ─►  cdev_map: 240:0 ──► struct cdev ──► file_operations
+    │                             （内核的字符设备索引表）
+    ▼
+ class_create("hello")
+    │
+    ▼
+ device_create(class, NULL, 240:0, NULL, "hello")
+    │
+    ├─► /sys/class/hello/hello/dev  内容 = "240:0"
+    └─► 发出 uevent: ACTION=add, DEVNAME=hello, MAJOR=240, MINOR=0
+                                    │
+                                    ▼
+                              udev 收到事件
+                                    │
+                                    ▼
+                            在 /dev 下创建节点 /dev/hello
+                                    │
+                                    ▼
+ open("/dev/hello", O_RDWR)  ───────► VFS 查路径 ──► 得到 dev_t 240:0
+                                                        │
+                                          VFS 查 cdev_map 找到 struct cdev
+                                                        │
+                                          取 cdev-&gt;ops 即 file_operations
+                                                        │
+                                          调用 fops-&gt;open()  ──► 返回 fd
+                                                        │
+ read(fd, buf, n)  ─────────────────► fops-&gt;read()
+ ioctl(fd, cmd, arg) ───────────────► fops-&gt;unlocked_ioctl()
+</code></pre>
+
+<h3>3.2 三个概念之间的关系</h3>
+<p>用「快递」再打一个比方：</p>
+<table>
+  <tr><th>概念</th><th>类比</th><th>作用</th></tr>
+  <tr><td>major:minor</td><td>快递公司编号 + 运单号</td><td>唯一定位一个字符设备；major 决定用哪套处理流程</td></tr>
+  <tr><td>struct cdev</td><td>分拣中心的登记册</td><td>登记「运单号 240:0 → 交给哪台分拣机（file_operations）」</td></tr>
+  <tr><td>struct file_operations</td><td>分拣机（流水线）</td><td>真正干活的函数指针：open/read/write/ioctl</td></tr>
+  <tr><td>class + device_create</td><td>门口的告示牌 + 叫号系统</td><td>把「设备存在」这件事告诉用户态，好让 udev 造出 /dev 节点</td></tr>
+</table>
+<p>注意一个关键点：<strong>设备号和设备节点是两回事</strong>。内核内部只认 major:minor；<code>/dev/hello</code> 这个路径只是用户态的一个入口，udev 建节点时把它和 major:minor 绑定在一起。用户态 <code>open("/dev/hello")</code>，VFS 顺着 dentry 拿到 inode 里的 <code>i_rdev</code>（就是 240:0），再去 <code>cdev_map</code> 里查表。删掉 <code>/dev/hello</code> 这个节点，内核里的设备照样在，只是用户态再也找不到入口了（可以用 <code>mknod</code> 手工补一个）。</p>
+
+<h3>3.3 两条注册路线</h3>
+<pre><code>
+ 老式（一个设备一个 fops）                      新式（推荐）
+ ────────────────────────                      ──────────────────────────
+ __register_chrdev(major, base, cnt,            alloc_chrdev_region(&amp;dev, base, cnt, name)
+                    name, &amp;fops)                  cdev_init(&amp;cdev, &amp;fops)
+   ├─ 内部自己做 cdev_init + cdev_add            cdev_add(&amp;cdev, dev, cnt)
+   └─ major=0 表示动态分配                       class_create(THIS_MODULE, name)
+                                                device_create(cls, NULL, dev, NULL, name)
+ 只能注册「设备号连续、fops 相同」的一组设备     每个设备可以是独立 struct cdev
+ 现代内核基本只保留 alloc/register + cdev_add
+</code></pre>
+
+<h3>3.4 udev 是怎么知道要建节点的</h3>
+<p>内核在 <code>device_create()</code> 时做三件事：建 sysfs 目录、在目录里写一个叫 <code>dev</code> 的文件（内容是 <code>"240:0"</code>）、发一个 uevent。uevent 的内容形如：</p>
+<pre><code>
+ACTION=add
+DEVPATH=/devices/platform/hello
+SUBSYSTEM=hello
+DEVNAME=hello
+MAJOR=240
+MINOR=0
+</code></pre>
+<p>udev（systemd 的那一半）监听 <code>/sys/kernel/uevent</code>，收到 <code>ACTION=add</code> 后查规则：<code>SUBSYSTEM=hello</code> 命中默认规则，就按 <code>DEVNAME</code> 在 <code>/dev</code> 下 <code>mknod</code> 出一个字符设备节点（主次设备号取自 MAJOR/MINOR），再按规则设权限。规则文件在 <code>/usr/lib/udev/rules.d/</code> 下。</p>
+<div class="tip">
+  <b>小知识</b>：如果你在 <code>/etc/udev/rules.d/</code> 里放一个文件 <code>99-hello.rules</code>，内容是 <code>SUBSYSTEM=="hello", MODE="0666"</code>，重新加载规则后 <code>/dev/hello</code> 的权限就会变成 666。这就是「不加 udev 规则就读写不了设备」的解法。
+</div>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 设备号：一个整数拆成两半</h3>
+<p>先看 major/minor 是怎么塞进一个 32 位整数的。<code>dev_t</code> 在 <code>include/linux/types.h</code> 里就是 <code>typedef u32 __kernel_dev_t;</code>。</p>
+<p class="srcline">include/linux/kdev_t.h:7-12</p>
+<pre><code>#define MINORBITS	20
+#define MINORMASK	((1U &lt;&lt; MINORBITS) - 1)
+
+#define MAJOR(dev)	((unsigned int) ((dev) &gt;&gt; MINORBITS))
+#define MINOR(dev)	((unsigned int) ((dev) &amp; MINORMASK))
+#define MKDEV(ma,mi)	(((ma) &lt;&lt; MINORBITS) | (mi))</code></pre>
+<ul>
+  <li><code>MINORBITS 20</code>：低 20 位留给 minor（最多 1048576 个），剩下高 12 位留给 major（最多 4096 种驱动类型）。</li>
+  <li><code>MAJOR(dev)</code> 是右移 20 位，把高 12 位取出来；<code>MINOR(dev)</code> 是 <code>&amp; MINORMASK</code>，把低 20 位抠出来。</li>
+  <li><code>MKDEV(ma,mi)</code> 是逆运算：major 左移 20 位后与 minor 或起来。</li>
+</ul>
+<p>于是 <code>MKDEV(240, 0)</code> = <code>240 &lt;&lt; 20</code> = <code>0x0F000000</code>。你在 <code>/proc/devices</code> 里看到的「240 hello」和 <code>/sys/class/hello/hello/dev</code> 里的「240:0」，就是这两个数的十进制文本形式。</p>
+
+<h3>4.2 申请设备号</h3>
+<p><code>alloc_chrdev_region()</code> 让内核自己挑一个空闲 major，你只指定起始 minor 和数量。</p>
+<p class="srcline">fs/char_dev.c:236-245 alloc_chrdev_region</p>
+<pre><code>int alloc_chrdev_region(dev_t *dev, unsigned baseminor, unsigned count,
+			const char *name)
+{
+	struct char_device_struct *cd;
+	cd = __register_chrdev_region(0, baseminor, count, name);
+	if (IS_ERR(cd))
+		return PTR_ERR(cd);
+	*dev = MKDEV(cd-&gt;major, cd-&gt;baseminor);
+	return 0;
+}</code></pre>
+<ul>
+  <li>第一个参数 <code>0</code> 表示 major 由内核动态分配（<code>register_chrdev_region()</code> 传进来的则必须是你自己指定的具体 major）。</li>
+  <li>返回的 <code>*dev</code> 是<b>起始</b>设备号；如果你申请了 4 个 minor，那么实际可用的是 <code>dev</code> 到 <code>dev+3</code>。</li>
+  <li>失败时返回的是 <code>ERR_PTR</code> 形式的负错误码，所以必须用 <code>IS_ERR()</code> 判断。</li>
+</ul>
+<p>它的表兄 <code>register_chrdev_region(from, count, name)</code> 用法几乎一样，区别是 major 必须自己指定，而且它要处理「一段范围跨了 major 边界」的情况：</p>
+<p class="srcline">fs/char_dev.c:200-223 register_chrdev_region</p>
+<pre><code>int register_chrdev_region(dev_t from, unsigned count, const char *name)
+{
+	struct char_device_struct *cd;
+	dev_t to = from + count;
+	dev_t n, next;
+
+	for (n = from; n &lt; to; n = next) {
+		next = MKDEV(MAJOR(n)+1, 0);
+		if (next &gt; to)
+			next = to;
+		cd = __register_chrdev_region(MAJOR(n), MINOR(n),
+			       next - n, name);
+		if (IS_ERR(cd))
+			goto fail;
+	}
+	return 0;
+fail:
+	// ... 回滚：把已经登记的区间逐个 __unregister_chrdev_region() 掉
+}</code></pre>
+<p>两个函数登记的其实只是「这段号归我了」这条信息，真正的分发表在下一步。</p>
+
+<h3>4.3 cdev_init 与 cdev_add</h3>
+<p><code>struct cdev</code> 的定义很短，但它就是「设备号 → 函数表」这条映射的载体。</p>
+<p class="srcline">include/linux/cdev.h:14-21</p>
+<pre><code>struct cdev {
+	struct kobject kobj;
+	struct module *owner;
+	const struct file_operations *ops;
+	struct list_head list;
+	dev_t dev;
+	unsigned int count;
+} __randomize_layout;</code></pre>
+<ul>
+  <li><code>ops</code>：指向驱动的那张 <code>file_operations</code> 表。</li>
+  <li><code>dev</code> / <code>count</code>：这段 cdev 负责的起始设备号和 minor 个数。</li>
+  <li><code>owner</code>：持有者模块，模块被卸载时内核据此检查「还有没有人开着这个设备」。</li>
+</ul>
+<p><code>cdev_init()</code> 做初始化：</p>
+<p class="srcline">fs/char_dev.c:651-657 cdev_init</p>
+<pre><code>void cdev_init(struct cdev *cdev, const struct file_operations *fops)
+{
+	memset(cdev, 0, sizeof *cdev);
+	INIT_LIST_HEAD(&amp;cdev-&gt;list);
+	kobject_init(&amp;cdev-&gt;kobj, &amp;ktype_cdev_default);
+	cdev-&gt;ops = fops;
+}</code></pre>
+<p><code>cdev_add()</code> 才是「挂上去」：它把这段设备号写进内核全局的 <code>cdev_map</code> 索引表。</p>
+<p class="srcline">fs/char_dev.c:479-497 cdev_add</p>
+<pre><code>int cdev_add(struct cdev *p, dev_t dev, unsigned count)
+{
+	int error;
+
+	p-&gt;dev = dev;
+	p-&gt;count = count;
+
+	if (WARN_ON(dev == WHITEOUT_DEV))
+		return -EBUSY;
+
+	error = kobj_map(cdev_map, dev, count, NULL,
+			 exact_match, exact_lock, p);
+	if (error)
+		return error;
+
+	kobject_get(p-&gt;kobj.parent);
+
+	return 0;
+}</code></pre>
+<ul>
+  <li><code>kobj_map(cdev_map, dev, count, ...)</code>：在字符设备索引表里插入「dev 起、连续 count 个 minor → 指向 p 这个 cdev」。查表时内核靠它把 <code>i_rdev</code> 翻译成 <code>struct cdev *</code>。</li>
+  <li><code>exact_match</code> 是查表时的比较函数：只要落在 <code>[dev, dev+count)</code> 区间内就算命中；<code>exact_lock</code> 是命中后拿引用计数（防止设备被删掉时还在用）。</li>
+  <li>因为这里用的是设备号区间，<strong>一个 <code>cdev</code> 可以连续管多个 minor</strong>——这正是 <code>alloc_chrdev_region</code> 申请 4 个 minor 时的用法。</li>
+</ul>
+
+<h3>4.4 file_operations：驱动与用户之间的全部接口</h3>
+<p>字符设备能干的事，全写在这张表里。注意 <code>owner</code> 一定要填 <code>THIS_MODULE</code>，否则模块可能被提前卸载。</p>
+<p class="srcline">include/linux/fs.h:1822-1862</p>
+<pre><code>struct file_operations {
+	struct module *owner;
+	loff_t (*llseek) (struct file *, loff_t, int);
+	ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
+	ssize_t (*write_iter) (struct kiocb *, struct iov_iter *);
+	int (*iopoll)(struct kiocb *kiocb, bool spin);
+	int (*iterate) (struct file *, struct dir_context *);
+	int (*iterate_shared) (struct file *, struct dir_context *);
+	__poll_t (*poll) (struct file *, struct poll_table_struct *);
+	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
+	int (*mmap) (struct file *, struct vm_area_struct *);
+	unsigned long mmap_supported_flags;
+	int (*open) (struct inode *, struct file *);
+	int (*flush) (struct file *, fl_owner_t id);
+	int (*release) (struct inode *, struct file *);
+	int (*fsync) (struct file *, loff_t, loff_t, int datasync);
+	// ...（省略：fasync/lock/sendpage/get_unmapped_area/check_flags/flock/
+	//      splice_write/splice_read/setlease/fallocate/show_fdinfo/
+	//      copy_file_range/remap_file_range/fadvise 等）
+} __randomize_layout;</code></pre>
+<ul>
+  <li><code>read</code>/<code>write</code> 里的缓冲区类型带 <code>__user</code> 标注 —— 这是给静态检查工具看的，表示「这个指针来自用户空间，不许直接解引用」。</li>
+  <li><code>read_iter</code>/<code>write_iter</code> 是「现代版」的读写接口，支持 splice/tee 等零拷贝管道操作；用 <code>read</code>/<code>write</code> 就够绝大多数场景。</li>
+  <li><code>poll</code> 让设备能被 <code>select()</code>/<code>epoll()</code> 监听，是驱动实现「可读/可写事件通知」的地方。</li>
+  <li><code>open</code>/<code>release</code> 成对出现：open 时申请资源、release 时释放。</li>
+</ul>
+<p>内核自带的最简单的字符设备是 <code>/dev/mem</code>（读物理内存）和 <code>/dev/null</code>。看 <code>/dev/mem</code> 的 read 实现，就能看到一张完整的表是怎么用的。</p>
+<p class="srcline">drivers/char/mem.c:115-129 read_mem</p>
+<pre><code>static ssize_t read_mem(struct file *file, char __user *buf,
+			size_t count, loff_t *ppos)
+{
+	phys_addr_t p = *ppos;
+	ssize_t read, sz;
+	void *ptr;
+	char *bounce;
+	int err;
+
+	if (p != *ppos)
+		return 0;
+
+	if (!valid_phys_addr_range(p, count))
+		return -EFAULT;
+	read = 0;
+	// ...（省略：__ARCH_HAS_NO_PAGE_ZERO_MAPPED 的特殊处理）</code></pre>
+<p class="srcline">drivers/char/mem.c:164-188 read_mem 循环体</p>
+<pre><code>		} else {
+			/*
+			 * On ia64 if a page has been mapped somewhere as
+			 * uncached, then it must also be accessed uncached
+			 * by the kernel or data corruption may occur.
+			 */
+			ptr = xlate_dev_mem_ptr(p);
+			if (!ptr)
+				goto failed;
+
+			probe = copy_from_kernel_nofault(bounce, ptr, sz);
+			unxlate_dev_mem_ptr(p, ptr);
+			if (probe)
+				goto failed;
+
+			remaining = copy_to_user(buf, bounce, sz);
+		}
+
+		if (remaining)
+			goto failed;
+
+		buf += sz;
+		p += sz;
+		count -= sz;
+		read += sz;</code></pre>
+<ul>
+  <li><code>*ppos</code> 是文件偏移量，驱动要负责维护它（末尾 <code>*ppos += read;</code>）。</li>
+  <li><code>valid_phys_addr_range()</code> 先做边界检查：用户可以把 <code>/dev/mem</code> 当成「读任意物理地址」的入口，内核必须挡住越界访问。</li>
+  <li><code>copy_from_kernel_nofault(bounce, ptr, sz)</code>：把物理地址安全地映射成内核虚拟地址并拷贝，页可能没映射，所以用 nofault 版本。</li>
+  <li><code>copy_to_user(buf, bounce, sz)</code>：把数据交给用户态。返回值是「没复制成功的字节数」，<b>非 0 就说明出错</b>，必须检查。</li>
+</ul>
+<p>写路径几乎对称：</p>
+<p class="srcline">drivers/char/mem.c:240-262 write_mem</p>
+<pre><code>		/* Skip actual writing when a page is marked as restricted. */
+		if (allowed == 1) {
+			/*
+			 * On ia64 if a page has been mapped somewhere as
+			 * uncached, then it must also be accessed uncached
+			 * by the kernel or data corruption may occur.
+			 */
+			ptr = xlate_dev_mem_ptr(p);
+			if (!ptr) {
+				if (written)
+					break;
+				return -EFAULT;
+			}
+
+			copied = copy_from_user(ptr, buf, sz);
+			unxlate_dev_mem_ptr(p, ptr);
+			if (copied) {
+				written += sz - copied;
+				if (written)
+					break;
+				return -EFAULT;
+			}
+		}</code></pre>
+<p>把这两段和 <code>mem_fops</code> 对照看，就能理解「一个字符设备的全链路」：<code>open</code> 时检查权限，<code>read</code>/<code>write</code> 时做边界检查 + 双向拷贝，<code>llseek</code> 维护偏移。</p>
+<p class="srcline">drivers/char/mem.c:907-917 mem_fops</p>
+<pre><code>static const struct file_operations __maybe_unused mem_fops = {
+	.llseek		= memory_lseek,
+	.read		= read_mem,
+	.write		= write_mem,
+	.mmap		= mmap_mem,
+	.open		= open_mem,
+#ifndef CONFIG_MMU
+	.get_unmapped_area = get_unmapped_area_mem,
+	.mmap_capabilities = memory_mmap_capabilities,
+#endif
+};</code></pre>
+
+<h3>4.5 为什么必须用 copy_to_user / copy_from_user</h3>
+<p>这是新手最容易写错的地方。<b>用户传进来的指针不能直接解引用</b>，原因有三：</p>
+<ul>
+  <li><b>地址可能非法</b>：用户可以传 <code>0xdeadbeef</code>，内核直接读就会触发缺页异常，可能让内核进程被杀死。</li>
+  <li><b>地址可能越界</b>：用户可以传一个只差 1 字节就越界的指针，拷贝 4096 字节会踩到别的内存。</li>
+  <li><b>地址可能在睡眠中变化</b>：另一个线程可以随时 <code>munmap()</code> 掉那段内存。</li>
+</ul>
+<p><code>copy_to_user()</code> 的完整链路是：最外层做长度检查 → 中间层做 <code>access_ok()</code> 范围检查 → 架构相关的 <code>raw_copy_to_user()</code> → 汇编。</p>
+<p class="srcline">include/linux/uaccess.h:196-202 copy_to_user</p>
+<pre><code>static __always_inline unsigned long __must_check
+copy_to_user(void __user *to, const void *from, unsigned long n)
+{
+	if (likely(check_copy_size(from, n, true)))
+		n = _copy_to_user(to, from, n);
+	return n;
+}</code></pre>
+<p>中间层在 x86 上是 out-of-line 的（放在 <code>lib/usercopy.c</code>，因为它要能被各个架构共用）：</p>
+<p class="srcline">lib/usercopy.c:26-37 _copy_to_user</p>
+<pre><code>unsigned long _copy_to_user(void __user *to, const void *from, unsigned long n)
+{
+	might_fault();
+	if (should_fail_usercopy())
+		return n;
+	if (likely(access_ok(to, n))) {
+		instrument_copy_to_user(to, from, n);
+		n = raw_copy_to_user(to, from, n);
+	}
+	return n;
+}
+EXPORT_SYMBOL(_copy_to_user);</code></pre>
+<p>再往下是架构相关的一层，x86 上它用 <code>alternative_call_2</code> 根据 CPU 特性在三份汇编之间自动选择（ERMS &gt; rep_good &gt; 手工展开）：</p>
+<p class="srcline">arch/x86/include/asm/uaccess_64.h:28-59 copy_user_generic / raw_copy_to_user</p>
+<pre><code>static __always_inline __must_check unsigned long
+copy_user_generic(void *to, const void *from, unsigned len)
+{
+	unsigned ret;
+
+	/*
+	 * If CPU has ERMS feature, use copy_user_enhanced_fast_string.
+	 * Otherwise, if CPU has rep_good feature, use copy_user_generic_string.
+	 * Otherwise, use copy_user_generic_unrolled.
+	 */
+	alternative_call_2(copy_user_generic_unrolled,
+			 copy_user_generic_string,
+			 X86_FEATURE_REP_GOOD,
+			 copy_user_enhanced_fast_string,
+			 X86_FEATURE_ERMS,
+			 ASM_OUTPUT2("=a" (ret), "=D" (to), "=S" (from),
+				     "=d" (len)),
+			 "1" (to), "2" (from), "3" (len)
+			 : "memory", "rcx", "r8", "r9", "r10", "r11");
+	return ret;
+}
+
+static __always_inline __must_check unsigned long
+raw_copy_to_user(void __user *dst, const void *src, unsigned long size)
+{
+	return copy_user_generic((__force void *)dst, src, size);
+}</code></pre>
+<p>真正干活的是汇编，因为要尽可能快：</p>
+<p class="srcline">arch/x86/lib/copy_user_64.S:201-219 copy_user_enhanced_fast_string</p>
+<pre><code>SYM_FUNC_START(copy_user_enhanced_fast_string)
+	ASM_STAC
+	cmpl $64,%edx
+	jb .L_copy_short_string	/* less then 64 bytes, avoid the costly 'rep' */
+	movl %edx,%ecx
+1:	rep
+	movsb
+	xorl %eax,%eax
+	ASM_CLAC
+	ret
+
+	.section .fixup,"ax"
+12:	movl %ecx,%edx		/* ecx is zerorest also */
+	jmp .Lcopy_user_handle_tail
+	.previous
+
+	_ASM_EXTABLE_CPY(1b, 12b)
+SYM_FUNC_END(copy_user_enhanced_fast_string)
+EXPORT_SYMBOL(copy_user_enhanced_fast_string)</code></pre>
+<ul>
+  <li><code>ASM_STAC</code> / <code>ASM_CLAC</code>：打开/关闭 AC（Access Check）标志位。关掉之后，CPU 访问用户地址不再触发页保护检查，于是可以在 C 层完成缺页处理（换入页面、修正用户页表），处理完再重试——这是 Linux 能让用户页延迟换入的关键。</li>
+  <li><code>rep movsb</code>：用字符串指令批量复制（ERMS 特性）。小于 64 字节走短路径，避免 <code>rep</code> 的启动开销。</li>
+  <li><code>.section .fixup</code> + <code>_ASM_EXTABLE_CPY</code>：如果拷贝过程中真的缺页了，CPU 跳到 fixup 段，把剩余字节数记进 <code>%edx</code>，跳去 <code>.Lcopy_user_handle_tail</code> 让 C 层去处理缺页并重试。</li>
+  <li>返回值语义：<b>0 表示全部拷贝成功</b>，非 0 表示「还剩多少字节没拷」。所以判断写法是 <code>if (copy_to_user(...)) return -EFAULT;</code>，而不是 <code>if (!copy_to_user(...))</code>。</li>
+</ul>
+<p>在 <code>copy_from_user()</code> 上还有一个额外细节：短拷贝时内核会把目标缓冲区<b>清零</b>，避免把内核栈上的残留数据泄露给用户态。</p>
+<p class="srcline">lib/usercopy.c:9-22 _copy_from_user</p>
+<pre><code>unsigned long _copy_from_user(void *to, const void __user *from, unsigned long n)
+{
+	unsigned long res = n;
+	might_fault();
+	if (!should_fail_usercopy() &amp;&amp; likely(access_ok(from, n))) {
+		instrument_copy_from_user(to, from, n);
+		res = raw_copy_from_user(to, from, n);
+	}
+	if (unlikely(res))
+		memset(to + (n - res), 0, res);
+	return res;
+}
+EXPORT_SYMBOL(_copy_from_user);</code></pre>
+<div class="warn">
+  <b>常见错误</b>：① 直接 <code>memcpy(buf, user_ptr, n)</code>；② 忘记检查返回值；③ 用 <code>__user</code> 之外的指针做直接解引用（比如把用户指针存进结构体后再解引用）。编译器不会帮你抓这类 bug，只能靠 code review 和 KASAN。
+</div>
+
+<h3>4.6 ioctl：给设备发「带参数的命令」</h3>
+<p><code>read</code>/<code>write</code> 只能传字节流，像「设置波特率」这种带参数的命令就要靠 <code>ioctl()</code>。它把命令号编码成一个 32 位整数，再通过 <code>arg</code> 传一个指针。</p>
+<p class="srcline">include/uapi/asm-generic/ioctl.h:69-91</p>
+<pre><code>#define _IOC(dir,type,nr,size) \
+	(((dir)  &lt;&lt; _IOC_DIRSHIFT) | \
+	 ((type) &lt;&lt; _IOC_TYPESHIFT) | \
+	 ((nr)   &lt;&lt; _IOC_NRSHIFT) | \
+	 ((size) &lt;&lt; _IOC_SIZESHIFT))
+
+#define _IO(type,nr)		_IOC(_IOC_NONE,(type),(nr),0)
+#define _IOR(type,nr,size)	_IOC(_IOC_READ,(type),(nr),(_IOC_TYPECHECK(size)))
+#define _IOW(type,nr,size)	_IOC(_IOC_WRITE,(type),(nr),(_IOC_TYPECHECK(size)))
+#define _IOWR(type,nr,size)	_IOC(_IOC_READ|_IOC_WRITE,(type),(nr),(_IOC_TYPECHECK(size)))
+#define _IOR_BAD(type,nr,size)	_IOC(_IOC_READ,(type),(nr),sizeof(size))
+#define _IOW_BAD(type,nr,size)	_IOC(_IOC_WRITE,(type),(nr),sizeof(size))
+#define _IOWR_BAD(type,nr,size)	_IOC(_IOC_READ|_IOC_WRITE,(type),(nr),sizeof(size))</code></pre>
+<p>四个字段各占一段位：</p>
+<table>
+  <tr><th>字段</th><th>位数</th><th>含义</th></tr>
+  <tr><td>dir</td><td>2</td><td>方向：<code>_IOC_NONE</code>(0) 无参数、<code>_IOC_WRITE</code>(1) 用户写内核读、<code>_IOC_READ</code>(2) 用户读内核写</td></tr>
+  <tr><td>type</td><td>8</td><td>「设备类型」，惯例用一个字符，如 <code>'H'</code>，用来避免不同驱动的命令号撞车</td></tr>
+  <tr><td>nr</td><td>8</td><td>命令序号，同一驱动内部区分不同命令</td></tr>
+  <tr><td>size</td><td>14</td><td>参数结构体大小，内核可用它做长度校验</td></tr>
+</table>
+<p>方向位有个<b>容易搞反</b>的约定，源码注释里专门提醒过：</p>
+<p class="srcline">include/uapi/asm-generic/ioctl.h:79-88</p>
+<pre><code> * NOTE: _IOW means userland is writing and kernel is reading. _IOR
+ * means userland is reading and kernel is writing.
+ */
+#define _IO(type,nr)		_IOC(_IOC_NONE,(type),(nr),0)</code></pre>
+<p>驱动侧接收命令的回调是 <code>unlocked_ioctl</code>：</p>
+<p class="srcline">include/linux/fs.h:1833-1834</p>
+<pre><code>	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);</code></pre>
+<ul>
+  <li><code>unlocked_ioctl</code> 在「没有持有该文件的 inode 锁」时调用。现代内核的 ioctl 路径没有大锁，所以绝大多数驱动只实现它就够了。</li>
+  <li><code>compat_ioctl</code> 用于 32 位用户程序跑在 64 位内核上的兼容层；不实现时，如果命令里带指针，内核会拒绝执行（避免 32 位指针被当成 64 位用）。</li>
+</ul>
+<p>一个典型的 ioctl 回调长这样（下面的代码会在第 5 节的模块里出现）：</p>
+<pre><code>static long hello_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct hello_dev *dev = filp-&gt;private_data;
+	int val = 0;
+
+	switch (cmd) {
+	case HELLO_IOCTL_GET_LEN: {
+		size_t l = dev-&gt;len;
+		if (copy_to_user((void __user *)arg, &amp;l, sizeof(l)))
+			return -EFAULT;
+		return 0;
+	}
+	case HELLO_IOCTL_SET_LEN:
+		if (copy_from_user(&amp;val, (void __user *)arg, sizeof(val)))
+			return -EFAULT;
+		dev-&gt;len = (size_t)val;
+		return 0;
+	default:
+		return -ENOTTY;
+	}
+}</code></pre>
+<p>两个细节：① <code>arg</code> 是 <code>unsigned long</code>，当它是用户指针时必须手动强转成 <code>void __user *</code>，编译器才会提醒你「这指针不可信」；② 未知命令返回 <code>-ENOTTY</code>（<i>Not a typewriter</i>），这是内核的惯例错误码。</p>
+
+<h3>4.7 class_create 与 device_create：让用户态看得见</h3>
+<p>设备号登记好了，用户态还是不知道怎么访问——因为 <code>/dev</code> 下还没有节点。先建一个「设备类」把同类设备归到一起：</p>
+<p class="srcline">drivers/base/class.c:226-251 __class_create</p>
+<pre><code>struct class *__class_create(struct module *owner, const char *name,
+			     struct lock_class_key *key)
+{
+	struct class *cls;
+	int retval;
+
+	cls = kzalloc(sizeof(*cls), GFP_KERNEL);
+	if (!cls) {
+		retval = -ENOMEM;
+		goto error;
+	}
+
+	cls-&gt;name = name;
+	cls-&gt;owner = owner;
+	cls-&gt;class_release = class_create_release;
+
+	retval = __class_register(cls, key);
+	if (retval)
+		goto error;
+
+	return cls;
+
+error:
+	kfree(cls);
+	return ERR_PTR(retval);
+}</code></pre>
+<p>然后用 <code>device_create()</code> 在这个类下创建一台具体设备：</p>
+<p class="srcline">drivers/base/core.c:3621-3633 device_create</p>
+<pre><code>struct device *device_create(struct class *class, struct device *parent,
+			     dev_t devt, void *drvdata, const char *fmt, ...)
+{
+	va_list vargs;
+	struct device *dev;
+
+	va_start(vargs, fmt);
+	dev = device_create_groups_vargs(class, parent, devt, drvdata, NULL,
+					  fmt, vargs);
+	va_end(vargs);
+	return dev;
+}</code></pre>
+<ul>
+  <li><code>devt</code>：就是前面申请到的 240:0。</li>
+  <li><code>drvdata</code>：驱动私货，会存进 <code>struct device</code>，以后用 <code>dev_get_drvdata()</code> 取回。</li>
+  <li><code>fmt</code>：设备名，支持格式化（<code>device_create(cls, NULL, devt, NULL, "hello%d", i)</code>）。</li>
+</ul>
+<p><code>device_create()</code> 内部会 <code>device_add()</code>，于是产生两样用户态看得见的东西：</p>
+<p class="srcline">drivers/base/core.c:2237-2242 dev_show</p>
+<pre><code>static ssize_t dev_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	return print_dev_t(buf, dev-&gt;devt);
+}
+static DEVICE_ATTR_RO(dev);</code></pre>
+<p>也就是 <code>/sys/class/hello/hello/dev</code> 这个文件，内容是 <code>"240:0"</code>（<code>print_dev_t()</code> 就是 <code>sprintf(buf, "%u:%u", MAJOR, MINOR)</code>）。</p>
+<p>以及一个 uevent：</p>
+<p class="srcline">drivers/base/core.c:1871-1887 dev_uevent</p>
+<pre><code>	/* add device node properties if present */
+	if (MAJOR(dev-&gt;devt)) {
+		const char *tmp;
+		const char *name;
+		umode_t mode = 0;
+		kuid_t uid = GLOBAL_ROOT_UID;
+		kgid_t gid = GLOBAL_ROOT_GID;
+
+		add_uevent_var(env, "MAJOR=%u", MAJOR(dev-&gt;devt));
+		add_uevent_var(env, "MINOR=%u", MINOR(dev-&gt;devt));
+		name = device_get_devnode(dev, &amp;mode, &amp;uid, &amp;gid, &amp;tmp);
+		if (name) {
+			add_uevent_var(env, "DEVNAME=%s", name);
+			if (mode)
+				add_uevent_var(env, "DEVMODE=%#o", mode &amp; 0777);
+			// ...
+		}
+	}</code></pre>
+<p>内核把「MAJOR=240 MINOR=0 DEVNAME=hello」写进 uevent 缓冲区，用户态的 udev 读到后按 DEVNAME 在 <code>/dev</code> 建节点。内核自己其实也能建节点（devtmpfs，<code>CONFIG_DEVTMPFS=y</code> 时自动挂载），udev 的增量价值在于：按规则改权限、改属主、建软链（比如 <code>/dev/disk/by-uuid/...</code>）、以及按 <code>ID_MODEL</code> 之类属性做智能命名。</p>
+
+<h2>5. 动手验证</h2>
+
+<h3>5.1 先在现有系统上观察字符设备</h3>
+<p>不用写代码也能看到本文的一切。随便一台 Linux 机器上执行：</p>
+<pre><code>
+$ cat /proc/devices
+Character devices:
+  1 mem
+  4 /dev/vc/0
+  4 tty
+  5 0
+  5 1
+  ...
+240 hello          ← 我们要注册的 major
+
+$ ls -l /dev/null /dev/zero /dev/mem
+crw-rw-rw- 1 root root 1, 3 Aug 20 10:00 /dev/null
+crw-rw-rw- 1 root root 1, 5 Aug 20 10:00 /dev/zero
+crw-r----- 1 root root 1, 1 Aug 20 10:00 /dev/mem
+                ↑ 主设备号 1，次设备号 3
+
+$ cat /sys/class/mem/null/dev
+1:3                ← 这就是 device_create() 写进去的那个 "dev" 文件
+
+$ cat /sys/class/tty/ttyS0/dev
+4:64
+
+$ stat -c '%t %T' /dev/null
+1 3                ← %t 是 major 的十六进制，%T 是 minor 的十六进制
+</code></pre>
+<p>预期输出说明：<code>/proc/devices</code> 里每一行「数字 名字」就是一个已注册的字符设备 major；<code>ls -l</code> 开头两个字母 <code>crw</code> 表示「字符设备 + 读写权限」，逗号前是 major，逗号后是 minor；<code>/sys/class/.../dev</code> 里的内容正是 <code>major:minor</code>，udev 就是据此造节点的。</p>
+
+<h3>5.2 写一个完整的 hello 字符设备模块</h3>
+<p>新建目录 <code>hello/</code>，放入三个文件。</p>
+
+<p><b>hello.c</b>（驱动）：</p>
+<pre><code>// SPDX-License-Identifier: GPL-2.0
+#include &lt;linux/module.h&gt;
+#include &lt;linux/init.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/cdev.h&gt;
+#include &lt;linux/device.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/uaccess.h&gt;
+#include &lt;linux/err.h&gt;
+
+#define HELLO_DEVICE_NAME "hello"
+#define HELLO_MINOR      0
+#define HELLO_MAGIC      'H'
+
+/* ioctl 命令号：type 用 'H'，nr 从 1 开始 */
+#define HELLO_IOCTL_GET_LEN _IO(HELLO_MAGIC, 1)
+#define HELLO_IOCTL_SET_LEN _IOW(HELLO_MAGIC, 2, int)
+
+struct hello_dev {
+	struct cdev cdev;
+	struct class *class;
+	dev_t devno;
+	char   buf[64];
+	size_t len;
+};
+
+static struct hello_dev *hello;
+
+static int hello_open(struct inode *inode, struct file *filp)
+{
+	struct hello_dev *dev = container_of(inode-&gt;i_cdev,
+					    struct hello_dev, cdev);
+	filp-&gt;private_data = dev;
+	return 0;
+}
+
+static int hello_release(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+
+static ssize_t hello_read(struct file *filp, char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	struct hello_dev *dev = filp-&gt;private_data;
+	size_t len;
+
+	if (*ppos &gt;= dev-&gt;len)
+		return 0;			/* 读到文件末尾 */
+
+	len = min(count, dev-&gt;len - *ppos);
+	if (copy_to_user(buf, dev-&gt;buf + *ppos, len))
+		return -EFAULT;
+
+	*ppos += len;
+	return len;
+}
+
+static ssize_t hello_write(struct file *filp, const char __user *buf,
+			   size_t count, loff_t *ppos)
+{
+	struct hello_dev *dev = filp-&gt;private_data;
+	size_t len = min(count, sizeof(dev-&gt;buf));
+
+	if (copy_from_user(dev-&gt;buf, buf, len))
+		return -EFAULT;
+
+	dev-&gt;len = len;
+	return len;
+}
+
+static long hello_unlocked_ioctl(struct file *filp, unsigned int cmd,
+				 unsigned long arg)
+{
+	struct hello_dev *dev = filp-&gt;private_data;
+	int val = 0;
+
+	switch (cmd) {
+	case HELLO_IOCTL_GET_LEN: {
+		size_t l = dev-&gt;len;
+		if (copy_to_user((void __user *)arg, &amp;l, sizeof(l)))
+			return -EFAULT;
+		return 0;
+	}
+	case HELLO_IOCTL_SET_LEN:
+		if (copy_from_user(&amp;val, (void __user *)arg, sizeof(val)))
+			return -EFAULT;
+		if (val &lt; 0 || (size_t)val &gt; sizeof(dev-&gt;buf))
+			return -EINVAL;
+		dev-&gt;len = (size_t)val;
+		return 0;
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations hello_fops = {
+	.owner		= THIS_MODULE,
+	.read		= hello_read,
+	.write		= hello_write,
+	.unlocked_ioctl	= hello_unlocked_ioctl,
+	.open		= hello_open,
+	.release	= hello_release,
+	.llseek		= default_llseek,
+};
+
+static int __init hello_init(void)
+{
+	int ret;
+	struct device *cdev_dev;
+
+	/* 0) 先给驱动私有结构体分配内存 */
+	hello = kzalloc(sizeof(*hello), GFP_KERNEL);
+	if (!hello)
+		return -ENOMEM;
+
+	/* 1) 申请设备号，major 由内核动态分配 */
+	ret = alloc_chrdev_region(&amp;hello-&gt;devno, HELLO_MINOR, 1,
+				  HELLO_DEVICE_NAME);
+	if (ret) {
+		pr_err("alloc_chrdev_region failed: %d\n", ret);
+		return ret;
+	}
+
+	/* 2) 初始化 cdev 并挂进内核索引表 */
+	cdev_init(&amp;hello-&gt;cdev, &amp;hello_fops);
+	hello-&gt;cdev.owner = THIS_MODULE;
+	ret = cdev_add(&amp;hello-&gt;cdev, hello-&gt;devno, 1);
+	if (ret) {
+		pr_err("cdev_add failed: %d\n", ret);
+		goto err_region;
+	}
+
+	/* 3) 建 class，让用户态能看见 */
+	hello-&gt;class = class_create(THIS_MODULE, HELLO_DEVICE_NAME);
+	if (IS_ERR(hello-&gt;class)) {
+		ret = PTR_ERR(hello-&gt;class);
+		goto err_cdev;
+	}
+
+	/* 4) 创建设备，发 uevent，udev 会据此建 /dev/hello */
+	cdev_dev = device_create(hello-&gt;class, NULL, hello-&gt;devno,
+				 NULL, HELLO_DEVICE_NAME);
+	if (IS_ERR(cdev_dev)) {
+		ret = PTR_ERR(cdev_dev);
+		goto err_class;
+	}
+
+	pr_info("hello: registered with major %d minor %d\n",
+		MAJOR(hello-&gt;devno), MINOR(hello-&gt;devno));
+	return 0;
+
+err_class:
+	class_destroy(hello-&gt;class);
+err_cdev:
+	cdev_del(&amp;hello-&gt;cdev);
+err_region:
+	unregister_chrdev_region(hello-&gt;devno, 1);
+	kfree(hello);
+	return ret;
+}
+
+static void __exit hello_exit(void)
+{
+	device_destroy(hello-&gt;class, hello-&gt;devno);
+	class_destroy(hello-&gt;class);
+	cdev_del(&amp;hello-&gt;cdev);
+	unregister_chrdev_region(hello-&gt;devno, 1);
+	kfree(hello);
+	pr_info("hello: bye\n");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("A minimal character device for learning");</code></pre>
+
+<p><b>Makefile</b>：</p>
+<pre><code>obj-m := hello.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+
+<p><b>test.c</b>（用户态测试程序）：</p>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;errno.h&gt;
+
+#define HELLO_MAGIC       'H'
+#define HELLO_IOCTL_GET_LEN _IO(HELLO_MAGIC, 1)
+#define HELLO_IOCTL_SET_LEN _IOW(HELLO_MAGIC, 2, int)
+
+int main(void)
+{
+	int fd = open("/dev/hello", O_RDWR);
+	char buf[64] = {0};
+	size_t len = 0;
+	int val = 42;
+	ssize_t n;
+
+	if (fd &lt; 0) {
+		perror("open");
+		return 1;
+	}
+
+	if (write(fd, "hello char device", 17) != 17) {
+		perror("write");
+		close(fd);
+		return 1;
+	}
+
+	n = read(fd, buf, sizeof(buf));
+	if (n &lt; 0) {
+		perror("read");
+		close(fd);
+		return 1;
+	}
+	printf("read %zd bytes: %s\n", n, buf);
+
+	if (ioctl(fd, HELLO_IOCTL_SET_LEN, &amp;val) &lt; 0) {
+		perror("ioctl SET_LEN");
+		close(fd);
+		return 1;
+	}
+	if (ioctl(fd, HELLO_IOCTL_GET_LEN, &amp;len) &lt; 0) {
+		perror("ioctl GET_LEN");
+		close(fd);
+		return 1;
+	}
+	printf("ioctl says len = %zu\n", len);
+
+	close(fd);
+	return 0;
+}</code></pre>
+
+<h3>5.3 编译、加载、验证</h3>
+<pre><code>
+$ cd hello
+$ make
+make[1]: Entering directory '/usr/src/linux-headers-5.10.0'
+  ...
+  MODPOST  hello.ko
+  CC [M]  /home/me/hello/test.o
+  LD [M]  /home/me/hello/hello.o
+  MODPOST  Module.symvers
+  MODPOST hello.ko
+make[1]: Leaving directory '/usr/src/linux-headers-5.10.0'
+
+$ make -C /lib/modules/$(uname -r)/build M=$PWD modules   # 内核头文件不在标准位置时用这条
+
+$ sudo insmod hello.ko
+$ dmesg | tail -2
+[ 9812.334512] hello: registered with major 240 minor 0
+
+$ ls -l /dev/hello
+crw------- 1 root root 240, 0 Nov 23 14:02 /dev/hello
+          ↑ major=240, minor=0；权限 600 是 udev 默认规则给的
+
+$ cat /sys/class/hello/hello/dev
+240:0
+
+$ gcc -o test test.c
+$ ./test
+read 17 bytes: hello char device
+ioctl says len = 42
+
+$ sudo rmmod hello
+$ dmesg | tail -1
+[ 9813.001122] hello: bye
+$ ls /dev/hello
+ls: cannot access '/dev/hello': No such file or directory
+</code></pre>
+<p>预期输出说明：<code>insmod</code> 后 dmesg 打出分配到的 major；<code>/dev/hello</code> 自动出现（udev 收到 uevent 后建的）；<code>/sys/class/hello/hello/dev</code> 显示 <code>240:0</code>；测试程序先 <code>write</code> 17 字节再 <code>read</code> 出来；<code>ioctl SET_LEN</code> 把缓冲区长度改成 42，<code>GET_LEN</code> 读回 42；<code>rmmod</code> 后节点消失。</p>
+
+<div class="warn">
+  <b>权限问题</b>：默认 udev 规则给新节点的是 <code>0600</code>（只有 root 能用）。普通用户要访问，就加一条规则：<br>
+  <code>echo 'SUBSYSTEM=="hello", MODE="0666"' | sudo tee /etc/udev/rules.d/99-hello.rules</code><br>
+  然后 <code>sudo udevadm control --reload-rules &amp;&amp; sudo udevadm trigger</code>，重新 <code>insmod</code> 即可。<br>
+  如果你的系统没有 udev（比如精简容器），可以手工建节点：<code>sudo mknod /dev/hello c 240 0</code>，<code>rmmod</code> 前记得 <code>sudo rm /dev/hello</code>。
+</div>
+
+<h3>5.4 在 qemu 里做同样的事</h3>
+<p>如果手头没有可写的 <code>/dev</code> 权限（容器环境常见），可以在 qemu 里跑。最小 busybox 步骤：</p>
+<pre><code>
+# 1. 准备 busybox 静态版 initramfs
+$ ls busybox            # 确认是静态链接的 busybox
+$ cat &gt;&gt; init.sh &lt;&lt;'EOF'
+#!/bin/sh
+mount -t proc  proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+insmod /hello.ko
+ls -l /dev/hello
+cat /sys/class/hello/hello/dev
+EOF
+
+# 2. 打包
+$ find . | cpio -o -H newc | gzip &gt; initramfs.cpio.gz
+
+# 3. 启动
+$ qemu-system-x86_64 -M virt -m 512 \
+      -kernel /boot/vmlinuz-$(uname -r) \
+      -initrd initramfs.cpio.gz \
+      -append "console=ttyS0" -nographic
+</code></pre>
+<p>预期在串口终端看到 <code>hello: registered with major 240 minor 0</code> 和 <code>crw------- 1 root root 240, 0 /dev/hello</code>。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. <code>alloc_chrdev_region()</code> 和 <code>register_chrdev_region()</code> 到底差在哪？</b>前者 major 由内核动态挑选（第一个参数传 0），返回实际的设备号；后者 major 必须由你自己指定，而且要自己保证不和别人冲突。两者都只是「登记号段」，真正把号段接到函数表上的是 <code>cdev_add()</code>。</div>
+
+<div class="qa"><b>Q2. <code>cdev_init()</code> 和 <code>cdev_add()</code> 分别做了什么？</b><code>cdev_init()</code> 把 cdev 结构清零、初始化链表和 kobject、把 <code>ops</code> 指向你的 file_operations（此时还没生效）；<code>cdev_add()</code> 才把这段设备号写进内核全局的 <code>cdev_map</code> 索引表，从这一刻起用户态 open() 才能找到你的驱动。卸载时顺序相反：先 <code>cdev_del()</code> 再 <code>unregister_chrdev_region()</code>。</div>
+
+<div class="qa"><b>Q3. 为什么内核不能直接用 <code>memcpy(buf, user_ptr, n)</code>？</b>用户指针可能非法、越界，或者在拷贝途中被另一个线程 <code>munmap()</code> 掉。直接解引用会触发内核态缺页异常，轻则杀进程，重则破坏内核内存。<code>copy_to_user()</code>/<code>copy_from_user()</code> 先做 <code>access_ok()</code> 范围检查，再由架构代码在关闭 AC 标志的情况下拷贝，缺页时交给内核补页后重试；它们的返回值是「未拷贝成功的字节数」，非 0 即出错。同样的道理，<b>不要把用户指针长期存进驱动自己的结构体</b>——它随时可能失效（进程退出、<code>munmap</code>、地址空间切换），正确做法是立刻拷进内核缓冲区，用完就丢弃。</div>
+
+<div class="qa"><b>Q4. <code>_IO</code>、<code>_IOR</code>、<code>_IOW</code> 分别什么时候用？</b><code>_IO</code> 不带参数；<code>_IOR</code> 表示「用户态读、内核写」（参数是输出）；<code>_IOW</code> 表示「用户态写、内核读」（参数是输入）。注意方向是站在<b>用户态</b>的角度说的，很容易记反。命令号里的 type 通常取一个字符（如 <code>'H'</code>），用来避免不同驱动的命令号冲突。</div>
+
+<div class="qa"><b>Q5. <code>/dev/hello</code> 这个节点是谁创建的？内核能自己建吗？</b>内核发 uevent（含 <code>DEVNAME=hello MAJOR=240 MINOR=0</code>），由用户态的 udev 按规则在 <code>/dev</code> 下 <code>mknod</code>。内核也能建：<code>CONFIG_DEVTMPFS=y</code> 时 devtmpfs 会自动创建节点，udev 在此基础上做权限、命名、软链等增强。所以「内核里注册了设备但 <code>/dev</code> 下没节点」通常意味着 udev 没装或规则没命中，此时可以手工 <code>mknod /dev/hello c 240 0</code>。</div>
+
+<footer>
+  <p>上一篇：<a href="33-driver-model.html">33-driver-model 设备模型</a> · 返回<a href="index.html">主题目录</a> · 下一篇：<a href="35-platform.html">35-platform platform 驱动与设备树</a></p>
+</footer>
+
+</body>
+</html>

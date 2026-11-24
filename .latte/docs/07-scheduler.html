@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 调度器</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --accent: #0969da; --accent-soft: #ddf4ff;
+    --border: #d1d9e0; --surface: #f6f8fa; --code-bg: #f6f8fa;
+    --warn-bg: #fff8c5; --warn-border: #d4a72c;
+    --tip-bg: #dafbe1; --tip-border: #2da44e;
+    --err-bg: #ffebe9; --err-border: #cf222e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--fg); line-height: 1.75;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px 80px;
+    font-size: 16px;
+  }
+  nav.top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; padding-bottom: 16px; margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top a { color: var(--accent); text-decoration: none; }
+  nav.top a:hover { text-decoration: underline; }
+  nav.top .next { margin-left: auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin-bottom: 8px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  .subtitle { color: var(--muted); font-size: 0.92rem; margin-bottom: 28px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0 10px 24px; }
+  li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  code { font-family: Menlo, Consolas, monospace; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 12px 0; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.84rem; line-height: 1.55; }
+  .srcline { font-size: 0.78rem; color: var(--muted); font-family: Menlo, monospace; margin: 14px 0 -6px; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .warn { border-left: 4px solid var(--warn-border); background: var(--warn-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .tip { border-left: 4px solid var(--tip-border); background: var(--tip-bg); padding: 10px 14px; margin: 14px 0; font-size: 0.92rem; border-radius: 0 6px 6px 0; }
+  .term { color: var(--accent); font-weight: 600; }
+  .qa { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 18px; margin: 16px 0; }
+  .qa b { display: block; margin-bottom: 4px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <a href="index.html">← 返回主题目录</a>
+  <a class="next" href="08-syscall.html">下一篇：08 系统调用 →</a>
+</nav>
+
+<h1>⚖️ 调度器：谁该用 CPU</h1>
+<p class="subtitle">CFS 用一个会“记账”的红黑树，让每个可运行 task 分到的 CPU 时间与它的权重成正比 · 预计阅读 30 分钟</p>
+
+<h2>1. 它在解决什么问题</h2>
+
+<p>一家只有 4 个灶台的餐厅，同时来了 20 桌客人。怎么安排？如果按“先到先服务”，一个点了 50 道菜的大订单会让后面所有等着喝汤的客人等到发火。于是老板发明了一种记账法：每桌都有一个看不见的“欠账计数器”，谁被服务得越多，欠账值越大；每次只挑欠账最少的桌子上灶。点菜多的桌子上得快（权重高），欠账涨得慢，所以能被多照顾；只点一碗面的桌子上得慢但欠账涨得快，很快又能轮到它。所有人的等待比例趋于公平，而不是服务次数相等。</p>
+
+<p>Linux 的 <span class="term">CFS（Completely Fair Scheduler，完全公平调度器）</span> 用的就是这套记账法。那个“欠账计数器”叫 <span class="term">vruntime</span>（virtual runtime，虚拟运行时间）。每次挑下一个要运行的 task，就选 vruntime 最小的那个——它欠账最少，最该被照顾。而 vruntime 的增长速度取决于 task 的“权重”：权重高（优先级高）的 task，跑同样长的真实时间，vruntime 涨得慢，于是它更容易再次成为最小者，从而分到更多 CPU。</p>
+
+<p>但 Linux 不是只有一种“公平”需求。硬实时任务（控制电机、音频中断处理）必须尽快跑，不能等记账；deadline 任务要在截止时间前跑完；完全无事可做的 idle task 只在没别的事时才跑。所以内核没有“一个万能调度器”，而是把调度拆成若干个 <span class="term">调度类（sched_class）</span>，按优先级从高到低排队：<code>stop</code> → <code>deadline</code> → <code>RT</code> → <code>fair</code> → <code>idle</code>。先问 stop 有没有活，没有才问 deadline，依次下滑。CFS 只是 fair 这个类内部的实现。</p>
+
+<p>本仓库是 Linux 5.10，fair 类就是 CFS + 红黑树。要理解调度，必须读懂三件事：<strong>vruntime 如何算</strong>、<strong>红黑树如何选出最小值</strong>、<strong>什么时候从用户代码切到另一段代码</strong>（<code>need_resched</code> 与 <code>__schedule</code>）。</p>
+
+<h2>2. 核心名词</h2>
+
+<table>
+  <tr><th>术语</th><th>英文</th><th>一句话解释</th></tr>
+  <tr><td class="term">调度器</td><td>scheduler</td><td>决定哪个 task 在哪个 CPU 上运行、运行多久</td></tr>
+  <tr><td class="term">CFS</td><td>Completely Fair Scheduler</td><td>5.10 中 fair 类调度器的实现，按 vruntime 最小挑选</td></tr>
+  <tr><td class="term">调度实体</td><td>sched_entity</td><td>可参与公平调度的单位；普通 task 或一个 cgroup 组</td></tr>
+  <tr><td class="term">运行队列</td><td>rq / runqueue</td><td>每个 CPU 一个，装着本 CPU 上等待运行的任务集合</td></tr>
+  <tr><td class="term">CFS 运行队列</td><td>cfs_rq</td><td><code>rq-&gt;cfs</code>，内含红黑树 <code>tasks_timeline</code></td></tr>
+  <tr><td class="term">虚拟运行时间</td><td>vruntime</td><td>按权重折算后的累计运行时间，挑选时比较它</td></tr>
+  <tr><td class="term">最小虚拟时间</td><td>min_vruntime</td><td>cfs_rq 中“已服务过的最落后进度”，用于新任务和唤醒任务的定位</td></tr>
+  <tr><td class="term">权重</td><td>load_weight</td><td>由 nice 值映射出的整数权重，默认 nice 0 为 1024</td></tr>
+  <tr><td class="term">nice 值</td><td>nice</td><td>-20..19，越小越“不客气”（优先级越高）</td></tr>
+  <tr><td class="term">红黑树</td><td>rbtree</td><td>自平衡二叉搜索树，O(log n) 插入/删除，最左节点即最小 vruntime</td></tr>
+  <tr><td class="term">调度类</td><td>sched_class</td><td>一组函数指针（enqueue/pick/put/tick...），按优先级串联</td></tr>
+  <tr><td class="term">调度策略</td><td>policy</td><td>SCHED_NORMAL/BATCH/IDLE（fair）、SCHED_FIFO/RR（rt）、SCHED_DEADLINE</td></tr>
+  <tr><td class="term">重新调度标志</td><td>TIF_NEED_RESCHED</td><td>thread_info 里的一个位，置位表示“到抢占点要重新选一次”</td></tr>
+  <tr><td class="term">上下文切换</td><td>context switch</td><td>保存 prev 的寄存器/栈，加载 next 的，换页表</td></tr>
+  <tr><td class="term">调度延迟</td><td>sched_latency</td><td>一个周期窗口，默认 6ms；窗口内每个 runnable task 至少跑一次</td></tr>
+  <tr><td class="term">最小粒度</td><td>min_granularity</td><td>单次运行的下限，默认 0.75ms，防止切换开销吃掉收益</td></tr>
+  <tr><td class="term">PELT</td><td>Per-Entity Load Tracking</td><td>用指数衰减平均值跟踪每个实体/CPU 的负载，供负载均衡与调频用</td></tr>
+  <tr><td class="term">负载均衡</td><td>load balance</td><td>SMP 下把任务从忙 CPU 迁移到闲 CPU 的机制</td></tr>
+  <tr><td class="term">CPU 带宽控制</td><td>CFS bandwidth / cgroup cpu</td><td>限制一个 cgroup 在一段时间内能用多少 CPU 时间</td></tr>
+</table>
+
+<h2>3. 整体结构</h2>
+
+<h3>3.1 全局视图：rq → cfs_rq → 红黑树</h3>
+
+<pre><code>每个 CPU 一个 struct rq（kernel/sched/sched.h:895）
+┌─────────────────────────────────────────────┐
+│ rq                                          │
+│  ├── lock            raw_spinlock           │
+│  ├── nr_running      本 CPU 可运行 task 数   │
+│  ├── curr            正在跑的 task_struct     │
+│  ├── cfs   ┌──────────────────────────────┐ │
+│  │         │ struct cfs_rq                │ │
+│  │         │  min_vruntime                │ │
+│  │         │  tasks_timeline (rb_root_cached)
+│  │         │        │                     │ │
+│  │         │        ▼  按 vruntime 排序      │ │
+│  │         │      ( 30 )                    │ │
+│  │         │     /      \                   │ │
+│  │         │  ( 50 )    ( 70 )              │ │
+│  │         │  最左节点 = 最小 vruntime → 下一个跑
+│  │         │  curr 不在树里（正在跑的不排队）  │ │
+│  │         └──────────────────────────────┘ │
+│  ├── rt   实时任务链表（rt_rq）               │
+│  └── dl   deadline 任务红黑树（dl_rq）        │
+└─────────────────────────────────────────────��
+</code></pre>
+
+<h3>3.2 vruntime 的记账公式</h3>
+
+<p>真实运行 <code>delta_exec</code> 纳秒后，vruntime 增加 <code>delta_exec × (NICE_0_LOAD / weight)</code>。nice 0 的权重是 1024，所以 nice 0 的 task 跑 1ms，vruntime 也涨 1ms（1:1）。nice -20 的权重约 88761，跑 1ms 只涨约 0.0115ms——要过很久才“欠账”。nice 19 的权重只有 15，跑 1ms 涨约 68ms——很快就欠账最多，被换下去。</p>
+
+<table>
+  <tr><th>nice</th><th>权重</th><th>跑 1ms 真实时间，vruntime 涨</th><th>相对 CPU 份额</th></tr>
+  <tr><td>-20</td><td>88761</td><td>≈ 0.0115 ms</td><td>≈ 86×</td></tr>
+  <tr><td>-10</td><td>9548</td><td>≈ 0.107 ms</td><td>≈ 9.3×</td></tr>
+  <tr><td>0</td><td>1024</td><td>1.000 ms</td><td>1×</td></tr>
+  <tr><td>10</td><td>110</td><td>≈ 9.3 ms</td><td>≈ 0.107×</td></tr>
+  <tr><td>19</td><td>15</td><td>≈ 68.3 ms</td><td>≈ 0.0146×</td></tr>
+</table>
+
+<p>于是“谁 vruntime 最小谁跑”自动导致“CPU 时间按权重比例分配”。这就是 “completely fair” 的含义：公平的是<strong>比例</strong>，不是绝对时长。</p>
+
+<h3>3.3 调度时刻：谁把 need_resched 置上位</h3>
+
+<pre><code>                ┌── 定时器 tick（task_tick_fair → check_preempt_tick）
+                │      当前 task 跑超了 sched_slice → resched_curr()
+                ├── 唤醒（try_to_wake_up → check_preempt_wakeup）
+触发 need_resched │      新来的 vruntime 远小于当前 → resched_curr()
+                ├── 优先级改变 / 亲和性改变 / 信号唤醒
+                └── sched_setscheduler、nice 调整
+                        │
+                        ▼
+             TIF_NEED_RESCHED 置位（thread_info.flags）
+                        │
+      ┌─────────────────┴───────────────────────┐
+      │ 抢占点（check_preemption_disabled 为 0）：│
+      │  · 中断/异常返回用户态                     │
+      │  · 系统调用返回                           │
+      │  · cond_resched() / preempt_enable()     │
+      │  · schedule() 主动让出                    │
+      └─────────────────┬───────────────────────┘
+                        ▼
+                   __schedule(preempt)
+</code></pre>
+
+<div class="note">从“决定该切换”到“真的切换”之间有一个延迟窗口：内核代码里很多地方暂时不能切换（持锁、关抢占、中断上下文）。所以 <code>resched_curr()</code> 只是置标志，真正的切换在最近的抢占点发生。这就是 why Linux 是“可抢占内核”而不是“随时抢占”——安全点由 <code>preempt_count</code> 控制。</div>
+
+<h3>3.4 调度类优先级链</h3>
+
+<p>五个调度类按链接顺序排在一段特殊 section 里，<code>for_each_class</code> 从最高往最低遍历：</p>
+
+<pre><code>stop_sched_class      (&lt;- 最高)  迁移线程、hotplug、RCU 需要立即抢占某 CPU
+      │
+dl_sched_class        SCHED_DEADLINE，按截止时间 EDT 排序
+      │
+rt_sched_class        SCHED_FIFO / SCHED_RR，优先级 1..99
+      │
+fair_sched_class      SCHED_NORMAL / BATCH / IDLE，CFS
+      │
+idle_sched_class      (&lt;- 最低)  每 CPU 的 idle task（swapper/N），halt 指令
+</code></pre>
+
+<p>注意 <code>stop</code> 与 <code>idle</code> 不可被用户设置：<code>stop</code> 是内核内部线程（<code>migration/N</code>），<code>idle</code> 是每 CPU 的 0 号 task。用户能选的是 FIFO/RR/NORMAL/BATCH/IDLE/DEADLINE。</p>
+
+<h3>3.5 SMP 负载均衡一句话</h3>
+
+<p>每个 CPU 有自己的 rq，如果一个 CPU 上有 5 个 runnable task，另一个 CPU 空闲，调度器会通过 <span class="term">load balance</span> 把任务搬过去：周期性（tick 里 <code>run_rebalance_domains</code>）和 idle 时（<code>newidle_balance</code>）检查调度域（<code>sched_domain</code>：SMT → MC → DIE → NUMA）的负载差，超过 <code>imbalance_pct</code> 就迁移。迁移的目标 CPU 由 <code>select_task_rq_fair</code> 在唤醒时也能直接挑。</p>
+
+<h2>4. 源码走读</h2>
+
+<h3>4.1 sched_entity：一个 task 在 CFS 里的“记账本”</h3>
+
+<p class="srcline">include/linux/sched.h:451-478  struct sched_entity</p>
+<pre><code>struct sched_entity {
+	/* For load-balancing: */
+	struct load_weight		load;
+	struct rb_node			run_node;
+	struct list_head		group_node;
+	unsigned int			on_rq;
+
+	u64				exec_start;
+	u64				sum_exec_runtime;
+	u64				vruntime;
+	u64				prev_sum_exec_runtime;
+
+	u64				nr_migrations;
+
+	struct sched_statistics		statistics;
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	int				depth;
+	struct sched_entity		*parent;
+	/* rq on which this entity is (to be) queued: */
+	struct cfs_rq			*cfs_rq;
+	/* rq "owned" by this entity/group: */
+	struct cfs_rq			*my_q;
+	/* cached value of my_q-&gt;h_nr_running */
+	unsigned long			runnable_weight;
+#endif
+</code></pre>
+
+<ul>
+  <li><code>load</code> 是权重（由 nice 映射），既用于算 CPU 份额，也用于负载均衡。</li>
+  <li><code>run_node</code> 是红黑树节点，<code>tasks_timeline</code> 用它把实体串成树。需要说明的是，<code>task_struct</code> 里内嵌 <code>se</code>，所以“把 task 插入树”就是“把 <code>&amp;task-&gt;se.run_node</code> 插进去”，没有额外分配。</li>
+  <li><code>vruntime</code> 是本篇主角；<code>sum_exec_runtime</code> 是累计真实运行时间；<code>prev_sum_exec_runtime</code> 是“上次被选中时”的快照，用来算本次时间片已跑了多久（<code>check_preempt_tick</code> 里那个 <code>delta_exec</code>）。</li>
+  <li><code>exec_start</code> 是本次开始运行的绝对时间戳，<code>update_curr()</code> 用它算 delta。</li>
+  <li><code>parent / my_q / depth</code> 只在开 <code>CONFIG_FAIR_GROUP_SCHED</code>（cgroup cpu 控制器）时存在：一个 cgroup 的 task_group 也有自己的 <code>sched_entity</code>，它的 <code>my_q</code> 指向该组的 cfs_rq，形成“实体树”。默认配置下这些字段不存在。</li>
+</ul>
+
+<h3>4.2 update_curr：记账发生的地方</h3>
+
+<p class="srcline">kernel/sched/fair.c:1017-1049  update_curr</p>
+<pre><code>static void update_curr(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq-&gt;curr;
+	u64 now = rq_clock_task(rq_of(cfs_rq));
+	u64 delta_exec;
+
+	if (unlikely(!curr))
+		return;
+
+	delta_exec = now - curr-&gt;exec_start;
+	if (unlikely((s64)delta_exec &lt;= 0))
+		return;
+
+	curr-&gt;exec_start = now;
+
+	schedstat_set(curr-&gt;statistics.exec_max,
+		      max(delta_exec, curr-&gt;statistics.exec_max));
+
+	curr-&gt;sum_exec_runtime += delta_exec;
+	schedstat_add(cfs_rq-&gt;exec_clock, delta_exec);
+
+	curr-&gt;vruntime += calc_delta_fair(delta_exec, curr);
+	update_min_vruntime(cfs_rq);
+
+	if (entity_is_task(curr)) {
+		struct task_struct *curtask = task_of(curr);
+
+		trace_sched_stat_runtime(curtask, delta_exec, curr-&gt;vruntime);
+		cgroup_account_cputime(curtask, delta_exec);
+		account_group_exec_runtime(curtask, delta_exec);
+	}
+
+	account_cfs_rq_runtime(cfs_rq, delta_exec);
+}
+</code></pre>
+
+<ul>
+  <li><code>rq_clock_task()</code> 是“扣掉中断时间的任务时钟”，因为中断处理不应算进用户 task 的运行时间。这是“公平”在细节上的体现。</li>
+  <li><code>delta_exec</code> 计算后立刻把 <code>exec_start</code> 推到 now，保证下次调用只算新增部分，不会重复记账。</li>
+  <li><code>calc_delta_fair(delta_exec, curr)</code>（fair.c:778）就是那套 <code>delta * NICE_0_LOAD / weight</code>，其中 nice 0 走快速路径直接返回 <code>delta</code>。</li>
+  <li><code>update_min_vruntime(cfs_rq)</code>（597 行）把 <code>min_vruntime</code> 推成“当前 curr 与树最左节点 vruntime 的较小者”，并保证单调递增。它给新任务/唤醒任务一个“当前进度基准”。</li>
+  <li><code>update_curr</code> 在调度切换、tick、唤醒、cgroup 节流、设置优先级等多处被调用，是最高频的记账路径。</li>
+</ul>
+
+<h3>4.3 __enqueue_entity：把实体插进红黑树</h3>
+
+<p class="srcline">kernel/sched/fair.c:648-676  __enqueue_entity</p>
+<pre><code>static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct rb_node **link = &amp;cfs_rq-&gt;tasks_timeline.rb_root.rb_node;
+	struct rb_node *parent = NULL;
+	struct sched_entity *entry;
+	bool leftmost = true;
+
+	/*
+	 * Find the right place in the rbtree:
+	 */
+	while (*link) {
+		parent = *link;
+		entry = rb_entry(parent, struct sched_entity, run_node);
+		/*
+		 * We dont care about collisions. Nodes with
+		 * the same key stay together.
+		 */
+		if (entity_before(se, entry)) {
+			link = &amp;parent-&gt;rb_left;
+		} else {
+			link = &amp;parent-&gt;rb_right;
+			leftmost = false;
+		}
+	}
+
+	rb_link_node(&amp;se-&gt;run_node, parent, link);
+	rb_insert_color_cached(&amp;se-&gt;run_node,
+			       &amp;cfs_rq-&gt;tasks_timeline, leftmost);
+}
+</code></pre>
+
+<ul>
+  <li><code>entity_before()</code> 比较 <code>vruntime</code>：<code>se-&gt;vruntime &lt; entry-&gt;vruntime</code>。走左子树表示“我更小”，走右子树表示“我更大”。</li>
+  <li><code>leftmost</code> 是给 <code>rb_root_cached</code> 的优化：如果这次一路都走了右子树，新节点不可能成为“最小值”，<code>leftmost</code> 保持 false，插入时就不用更新缓存的最左指针；否则要更新。<code>rb_first_cached()</code> 因此可以 O(1) 取最小值，而不是 O(log n) 沿左链爬。</li>
+  <li>红黑树的平衡修复在 <code>rb_insert_color_cached</code> 里，只涉及少量旋转，保证最坏 O(log n)。</li>
+  <li>“正在运行的 curr 不在树里”：切换出去时 <code>__dequeue_entity()</code> 把它摘掉，切回来时 <code>enqueue_task_fair</code> 再插回去。这样 pick 时树里全是“在等待”的实体。</li>
+</ul>
+
+<h3>4.4 pick_next_task_fair：选谁上 CPU</h3>
+
+<p class="srcline">kernel/sched/fair.c:7782-7791, 7860-7910  pick_next_task_fair（节选）</p>
+<pre><code>struct task_struct *
+pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	struct cfs_rq *cfs_rq = &amp;rq-&gt;cfs;
+	struct sched_entity *se;
+	struct task_struct *p;
+	int new_tasks;
+
+again:
+	if (!sched_fair_runnable(rq))
+		goto idle;
+	/* ... 此处省略 CONFIG_FAIR_GROUP_SCHED 下的层级快路径 ... */
+simple:
+#endif
+	if (prev)
+		put_prev_task(rq, prev);
+
+	do {
+		se = pick_next_entity(cfs_rq, NULL);
+		set_next_entity(cfs_rq, se);
+		cfs_rq = group_cfs_rq(se);
+	} while (cfs_rq);
+
+	p = task_of(se);
+	/* ... 此处省略 done 标签后的 SMP 处理与 idle 分支 ... */
+</code></pre>
+
+<ul>
+  <li><code>sched_fair_runnable(rq)</code> 检查 <code>rq-&gt;cfs</code> 里是否还有可运行实体；没有就直接去 <code>idle</code> 分支（返回 NULL 或尝试 <code>newidle_balance</code> 拉任务）。</li>
+  <li><code>pick_next_entity(cfs_rq, NULL)</code> 依次考虑：buddy（上次唤醒的、cache 热的）、last（上次跑的）、最左节点，返回真正要跑的实体。默认规则仍是“vruntime 最小者胜”，buddy/last 只是在 vruntime 接近时用于提升缓存命中率。</li>
+  <li><code>set_next_entity()</code> 把选中实体从树上摘掉（<code>__dequeue_entity</code>）、设 <code>cfs_rq-&gt;curr = se</code>、快照 <code>prev_sum_exec_runtime</code>。它不返回树——正在跑的不参与比较。</li>
+  <li>若开启了 group sched，<code>do...while(cfs_rq)</code> 会一层层往下钻，直到找到真的 task。默认配置下 <code>group_cfs_rq(se)</code> 为 NULL，一次循环就结束。</li>
+  <li>注意 <code>p = task_of(se)</code>：通过 <code>container_of()</code> 从 <code>&amp;task-&gt;se</code> 反推出 <code>task_struct</code>，因为 <code>se</code> 是内嵌字段，零额外开销。</li>
+</ul>
+
+<h3>4.5 sched_class：用函数指针表串起优先级</h3>
+
+<p class="srcline">kernel/sched/sched.h:1779-1796  struct sched_class（部分）</p>
+<pre><code>struct sched_class {
+
+#ifdef CONFIG_UCLAMP_TASK
+	int uclamp_enabled;
+#endif
+
+	void (*enqueue_task) (struct rq *rq, struct task_struct *p, int flags);
+	void (*dequeue_task) (struct rq *rq, struct task_struct *p, int flags);
+	void (*yield_task)   (struct rq *rq);
+	bool (*yield_to_task)(struct rq *rq, struct task_struct *p);
+
+	void (*check_preempt_curr)(struct rq *rq, struct task_struct *p, int flags);
+
+	struct task_struct *(*pick_next_task)(struct rq *rq);
+
+	void (*put_prev_task)(struct rq *rq, struct task_struct *p);
+	void (*set_next_task)(struct rq *rq, struct task_struct *p, bool first);
+</code></pre>
+
+<p class="srcline">kernel/sched/sched.h:1860-1865  for_each_class</p>
+<pre><code>#define for_class_range(class, _from, _to) \
+	for (class = (_from); class != (_to); class--)
+
+#define for_each_class(class) \
+	for_class_range(class, sched_class_highest, sched_class_lowest)
+</code></pre>
+
+<ul>
+  <li>每个类是一个 <code>const struct sched_class</code> 全局变量，放在链接脚本安排的 section 里：<code>__stop_sched_class</code>、<code>__dl_sched_class</code>、<code>__rt_sched_class</code>、<code>__fair_sched_class</code>、<code>__idle_sched_class</code>（见各文件里的 <code>__section(...)</code>）。</li>
+  <li><code>sched_class_highest = __end_sched_classes - 1</code>（即 idle 的地址），<code>sched_class_lowest = __begin_sched_classes - 1</code>。指针递减遍历，从高优先级走到低优先级。</li>
+  <li>“遍历类”的好处是数据结构统一：<code>__schedule</code> 里只需 <code>pick_next_task()</code>，后者内部 <code>for_each_class</code> 调每个类的 <code>pick_next_task</code>，第一个返回非 NULL 的赢。</li>
+  <li><code>fair_sched_class</code>（fair.c:12330）把 <code>.enqueue_task = enqueue_task_fair</code>、<code>.pick_next_task = __pick_next_task_fair</code>、<code>.task_tick = task_tick_fair</code> 等填上。这是 C 语言实现“虚函数表”的经典方式。</li>
+</ul>
+
+<h3>4.6 pick_next_task：从最高的类开始问</h3>
+
+<p class="srcline">kernel/sched/core.c:5314-5350  pick_next_task</p>
+<pre><code>static inline struct task_struct *
+pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	const struct sched_class *class;
+	struct task_struct *p;
+
+	/*
+	 * Optimization: we know that if all tasks are in the fair class we can
+	 * call that function directly, but only if the @prev task wasn't of a
+	 * higher scheduling class, because otherwise those loose the
+	 * opportunity to pull in more work from other CPUs.
+	 */
+	if (likely(prev-&gt;sched_class &lt;= &amp;fair_sched_class &amp;&amp;
+		   rq-&gt;nr_running == rq-&gt;cfs.h_nr_running)) {
+
+		p = pick_next_task_fair(rq, prev, rf);
+		if (unlikely(p == RETRY_TASK))
+			goto restart;
+
+		/* Assumes fair_sched_class-&gt;next == idle_sched_class */
+		if (!p) {
+			put_prev_task(rq, prev);
+			p = pick_next_task_idle(rq);
+		}
+
+		return p;
+	}
+
+restart:
+	put_prev_task_balance(rq, prev, rf);
+
+	for_each_class(class) {
+		p = class-&gt;pick_next_task(rq);
+		if (p)
+			return p;
+	}
+
+	/* The idle class should always have a runnable task: */
+	BUG();
+}
+</code></pre>
+
+<ul>
+  <li>快路径：如果本 CPU 上所有 runnable task 都是 fair 类（<code>nr_running == cfs.h_nr_running</code>），直接调 <code>pick_next_task_fair</code>，跳过 4 次虚函数调用。这是绝大多数桌面/服务器场景。</li>
+  <li>慢路径：<code>for_each_class</code> 依次调用，<code>stop</code> 的 <code>pick_next_task</code> 若发现有迁移线程待跑就返回它，否则返回 NULL 继续下一类。最后 <code>idle</code> 类一定返回 idle task，所以 <code>BUG()</code> 不该触发。</li>
+  <li><code>RETRY_TASK</code> 是 <code>newidle_balance</code> 拉任务时的特殊返回：它曾经释放过 rq 锁，可能有更高优先级任务进来，必须重新选一遍。</li>
+</ul>
+
+<h3>4.7 __schedule：真正的切换</h3>
+
+<p class="srcline">kernel/sched/core.c:5411-5452  __schedule（节选）</p>
+<pre><code>static void __sched notrace __schedule(bool preempt)
+{
+	struct task_struct *prev, *next;
+	unsigned long *switch_count;
+	unsigned long prev_state;
+	struct rq_flags rf;
+	struct rq *rq;
+	int cpu;
+
+	cpu = smp_processor_id();
+	rq = cpu_rq(cpu);
+	prev = rq-&gt;curr;
+	/* ... 此处省略 debug / hrtick 与注释 ... */
+	local_irq_disable();
+	rcu_note_context_switch(preempt);
+	/* ... 此处省略一段很长的内存屏障注释 ... */
+	rq_lock(rq, &amp;rf);
+	smp_mb__after_spinlock();
+
+	/* Promote REQ to ACT */
+	rq-&gt;clock_update_flags &lt;&lt;= 1;
+	update_rq_clock(rq);
+
+	switch_count = &amp;prev-&gt;nivcsw;
+
+	/*
+	 * We must load prev-&gt;state once (task_struct::state is volatile), such
+	 * that:
+	 *
+	 *  - we form a control dependency vs deactivate_task() below.
+	 *  - ptrace_{,}unfreeze_traced() can change -&gt;state underneath us.
+	 */
+	prev_state = prev-&gt;state;
+	if (!preempt &amp;&amp; prev_state) {
+		if (signal_pending_state(prev_state, prev)) {
+			prev-&gt;state = TASK_RUNNING;
+		} else {
+			prev-&gt;sched_contributes_to_load =
+				(prev_state &amp; TASK_UNINTERRUPTIBLE) &amp;&amp;
+				!(prev_state &amp; TASK_NOLOAD) &amp;&amp;
+</code></pre>
+
+<ul>
+  <li><code>preempt</code> 参数区分两种调用：<code>false</code> 表示当前 task 主动 <code>schedule()</code>（可能是在等资源），<code>true</code> 表示抢占（如中断返回、时间片到期）。后者不会 <code>deactivate_task</code>，因为被抢占的 task 仍然可运行。</li>
+  <li><code>prev_state = prev-&gt;state</code> 只读一次：<code>state</code> 是 <code>volatile</code>，反复读可能看到被别的 CPU（唤醒路径）改过的值，导致错误地把它从 runqueue 摘掉。注释里那句 “form a control dependency” 就是在解释这个单次读取的语义。</li>
+  <li><code>signal_pending_state()</code>：如果 task 是 <code>TASK_INTERRUPTIBLE</code> 且有待处理信号，则把它改回 <code>TASK_RUNNING</code> 不从队列摘——让它醒来去处理信号。这就是“Ctrl-C 能打断 read()”在内核侧的落点。</li>
+  <li>非抢占且确实要睡眠时，<code>deactivate_task(rq, prev, DEQUEUE_SLEEP)</code> 会调 <code>dequeue_task_fair</code>，把 prev 的 <code>se</code> 从红黑树移除。</li>
+</ul>
+
+<p class="srcline">kernel/sched/core.c:5497-5529  __schedule（选与切）</p>
+<pre><code>	next = pick_next_task(rq, prev, &amp;rf);
+	clear_tsk_need_resched(prev);
+	clear_preempt_need_resched();
+
+	if (likely(prev != next)) {
+		rq-&gt;nr_switches++;
+		/* ... 此处省略 RCU 与内存屏障注释 ... */
+		RCU_INIT_POINTER(rq-&gt;curr, next);
+		/* ... 此处省略各架构 barrier 方案注释 ... */
+		++*switch_count;
+
+		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
+
+		trace_sched_switch(preempt, prev, next);
+
+		/* Also unlocks the rq: */
+		rq = context_switch(rq, prev, next, &amp;rf);
+</code></pre>
+
+<ul>
+  <li><code>clear_tsk_need_resched(prev)</code> 在选完 next 之后清理标志，避免刚清掉又被 tick 置上（顺序很重要）。</li>
+  <li><code>RCU_INIT_POINTER(rq-&gt;curr, next)</code> 让其他 CPU 通过 <code>rcu_dereference(rq-&gt;curr)</code> 看到新 curr；<code>rq-&gt;curr</code> 是“谁在这个 CPU 上跑”的唯一权威。</li>
+  <li><code>context_switch()</code>（core.c:4554 附近）先按“是否需要换 mm”处理：<code>next-&gt;mm</code> 为 NULL（内核线程）则 <code>enter_lazy_tlb</code> 并接管 <code>active_mm</code>；否则 <code>switch_mm_irqs_off</code> 写 CR3。最后 <code>switch_to(prev, next, prev)</code> 是架构代码，保存 callee-saved 寄存器、换栈、写 per-cpu <code>current_task</code>。</li>
+  <li>返回后 <code>finish_task_switch(prev)</code> 做收尾：若 prev 已死则 <code>put_task_struct</code>，若 prev 的 mm 被移交给内核线程则 <code>mmdrop</code>。</li>
+</ul>
+
+<h3>4.8 schedule() 与 need_resched 循环</h3>
+
+<p class="srcline">kernel/sched/core.c:5651-5663  schedule</p>
+<pre><code>asmlinkage __visible void __sched schedule(void)
+{
+	struct task_struct *tsk = current;
+
+	sched_submit_work(tsk);  /* 处理工作队列睡眠前的准备工作 */
+	do {
+		preempt_disable();  /* 禁用抢占 */
+		__schedule(false);  /* 调用核心调度函数，false表示非抢占调度 */
+		sched_preempt_enable_no_resched();  /* 重新启用抢占但不立即检查重调度 */
+	} while (need_resched());  /* 如果仍需要重调度则继续循环 */
+	sched_update_worker(tsk);  /* 更新工作队列状态 */
+}
+</code></pre>
+
+<ul>
+  <li><code>need_resched()</code>（include/linux/sched.h:1895）就是 <code>tif_need_resched()</code>，检查 <code>TIF_NEED_RESCHED</code> 位。循环的意义是：一次切换回来之后，可能立刻又该切走（比如被更高优先级任务抢占），要把标志消化干净再返回调用者。</li>
+  <li><code>sched_submit_work</code> 会在睡眠前把当前 task 的 workqueue 里的 pending work 推给 worker，防止“持有 work 睡死导致 worker 饿死”的死锁。</li>
+  <li><code>schedule()</code> 是“主动让出”，典型调用点：<code>read()</code> 等 IO、<code>mutex_lock</code> 阻塞、<code>wait_event</code> 睡眠。内核里不能随便调它——必须确保自己不在原子上下文、不持不可睡眠的锁。</li>
+</ul>
+
+<h3>4.9 check_preempt_tick：时间片到点的判定</h3>
+
+<p class="srcline">kernel/sched/fair.c:4745-4767  check_preempt_tick（开头）</p>
+<pre><code>static void
+check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+{
+	unsigned long ideal_runtime, delta_exec;
+	struct sched_entity *se;
+	s64 delta;
+
+	ideal_runtime = sched_slice(cfs_rq, curr);
+	delta_exec = curr-&gt;sum_exec_runtime - curr-&gt;prev_sum_exec_runtime;
+	if (delta_exec &gt; ideal_runtime) {
+		resched_curr(rq_of(cfs_rq));
+		/*
+		 * The current task ran long enough, ensure it doesn't get
+		 * re-elected due to buddy favours.
+		 */
+		clear_buddies(cfs_rq, curr);
+		return;
+	}
+</code></pre>
+
+<ul>
+  <li><code>sched_slice()</code>（831 行）：先算 <code>__sched_period(nr_running)</code>，再按 <code>se-&gt;load.weight / cfs_rq-&gt;load.weight</code> 的比例切一块。默认周期 <code>sysctl_sched_latency = 6ms</code>；runnable 数超过 <code>sched_nr_latency = 6ms/0.75ms = 8</code> 时，周期改为 <code>nr_running × 0.75ms</code>，保证单次不低于最小粒度。</li>
+  <li>两个条件任一成立就置 <code>NEED_RESCHED</code>：跑超了理想时间片；或与最左节点差距超过 <code>sysctl_sched_latency</code>（防止某 task 独占太久）。</li>
+  <li><code>resched_curr()</code>（core.c:714）如果目标就是本 CPU，直接 <code>set_tsk_need_resched</code>；否则发 IPI（<code>RESCHEDULE_VECTOR</code>）让对方 CPU 在中断返回时检查。</li>
+  <li>CFS 没有“固定时间片”概念——理想时间片是按权重算出来的比例值，任务数变了它就变。这正是它区别于 O(1)/RR 调度器的地方。</li>
+</ul>
+
+<h3>4.10 sched_setscheduler：用户改策略的入口</h3>
+
+<p class="srcline">kernel/sched/core.c:7081-7087  SYSCALL_DEFINE3(sched_setscheduler)</p>
+<pre><code>SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param __user *, param)
+{
+	if (policy &lt; 0)
+		return -EINVAL;
+
+	return do_sched_setscheduler(pid, policy, param);
+}
+</code></pre>
+
+<ul>
+  <li><code>do_sched_setscheduler</code>（7002 行）先 <code>copy_from_user</code> 取 <code>sched_param</code>（含 <code>sched_priority</code>），再 <code>find_process_by_pid</code> 找 task，最后调 <code>sched_setscheduler()</code>。它检查权限：提高 RT 优先级需要 <code>CAP_SYS_NICE</code>。</li>
+  <li>RT 策略的 <code>param-&gt;sched_priority</code> 范围是 1..99；fair 策略必须是 0。nice 值则用 <code>setpriority()</code> / <code>nice()</code>，落到 <code>task-&gt;static_prio</code> 并重算 <code>load.weight</code>。</li>
+  <li>参数变更会重排 runqueue（若在队列上就先 dequeue 再 enqueue），并可能触发 <code>resched_curr</code>。</li>
+</ul>
+
+<h2>5. 动手验证</h2>
+
+<p><strong>实验一：看 policy 与 nice。</strong></p>
+<pre><code>$ ps -o pid,ni,pri,psr,policy,comm -p $$
+  PID  NI PRI PSR POL COMMAND
+ 4001   0  19   2 TS  bash
+$ chrt -p $$
+pid 4001's current scheduling policy: SCHED_OTHER
+pid 4001's current scheduling priority: 0
+</code></pre>
+
+<p><code>NI=0</code> 表示 nice 0，<code>PRI=19</code> 是 <code>ps</code> 把 nice 换算成的“越小越高”的展示值（20 + nice）。<code>POL=TS</code> 即 SCHED_OTHER（fair）。</p>
+
+<p><strong>实验二：给 CPU 加负载，看 vruntime 与红黑树。</strong></p>
+<pre><code>$ (for i in 1 2 3 4; do yes &gt;/dev/null &amp; done); sleep 1
+$ grep -A3 "cpu#0" /proc/sched_debug | head -6
+cpu#0, 2600.000 MHz
+  .nr_running                    : 4
+  .nr_switches                   : 123456
+  ...
+  cfs_rq[0]:/
+    .nr_running                    : 4
+    .min_vruntime                  : 123456.789
+    .tasks                         : 4
+</code></pre>
+
+<p><code>/proc/sched_debug</code> 需要 <code>CONFIG_SCHED_DEBUG=y</code>（多数发行版内核开启）。展开 <code>cfs_rq</code> 下的 <code>.tg_load_avg</code> 与每个 task 的 <code>se.vruntime</code>，你能直接看到红黑树里排着几个 <code>yes</code>，它们的 vruntime 只差几毫秒——因为它们权重相同，跑同样久就欠同样多账。清理：<code>pkill yes</code>。</p>
+
+<p><strong>实验三：nice 差异真的改变 CPU 份额。</strong></p>
+<pre><code>$ nice -n 0  yes &gt;/dev/null &amp;
+$ nice -n 10 yes &gt;/dev/null &amp;
+$ sleep 5; ps -o pid,ni,time,comm -C yes
+  PID  NI     TIME COMMAND
+ 6101   0 00:00:04
+ 6102  10 00:00:01
+</code></pre>
+
+<p>预期时间比约 5:1? 实际理论比是权重比 1024 : 110 ≈ 9.3:1。若两个任务都只在一个 CPU 上竞争，5 秒里 nice 0 的应拿到约 4.5s，nice 10 约 0.5s。上面的示例输出是粗略示意，实际以权重为准。清理 <code>pkill yes</code>。</p>
+
+<p><strong>实验四：chrt 切到 FIFO，看实时任务抢占一切。</strong></p>
+<pre><code>$ sudo chrt -f 50 yes &gt;/dev/null &amp;
+$ ps -o pid,ni,rtprio,policy,comm -C yes
+  PID  NI RTPRIO POL COMMAND
+ 6201   0     50 FF  yes
+$ top -b -n1 | grep yes      # 你会看到它 100% 占着一个 CPU
+$ sudo chrt -o 0 -p 0 6201   # 切回 SCHED_OTHER（pid 换成实际的）
+$ kill 6201
+</code></pre>
+
+<p>注意：FIFO 任务不主动让出 CPU 的话会一直跑（除非被更高优先级 RT 抢占）。生产环境慎用，否则可能饿死内核线程导致系统卡死。</p>
+
+<p><strong>实验五：用 perf 看调度延迟与迁移。</strong></p>
+<pre><code>$ perf sched record -- sleep 1
+$ perf sched latency | head -15
+$ perf sched map | head -10
+</code></pre>
+
+<p><code>perf sched latency</code> 列出每个 task 的“等待被调度”的最大/平均延迟以及运行时间；<code>perf sched map</code> 画成横向时间轴，能看到哪个 task 在哪个 CPU 上、什么时候迁移。需要 <code>perf</code> 可用且有 <code>perf_event_paranoid</code> 权限。</p>
+
+<p><strong>实验六：cgroup cpu 控制器限制份额。</strong></p>
+<pre><code>$ sudo mkdir -p /sys/fs/cgroup/cpu/demo
+$ echo 20000 &gt; /sys/fs/cgroup/cpu/demo/cpu.cfs_quota_us   # 20ms / 100ms = 0.2 CPU
+$ echo $$ &gt; /sys/fs/cgroup/cpu/demo/cgroup.procs
+$ cat /sys/fs/cgroup/cpu/demo/cpu.stat
+nr_periods 0
+nr_throttled 0
+throttled_time 0
+$ yes &gt;/dev/null &amp; sleep 3; cat /sys/fs/cgroup/cpu/demo/cpu.stat
+nr_periods 30
+nr_throttled 30
+throttled_time 2400000000
+</code></pre>
+
+<p>开 CFS bandwidth 后，这个 cgroup 每 100ms 只有 20ms 配额，用完就被 throttle（<code>throttled_time</code> 增长），对应源码里 <code>account_cfs_rq_runtime</code> / <code>check_cfs_rq_runtime</code> 那条路径。<strong>如果不确定你的机器是否开了 cgroup v1，这个实验可能路径不同，可跳过。</strong></p>
+
+<p><strong>实验七：确认源代码里的 5.10 CFS。</strong></p>
+<pre><code>$ grep -n "tasks_timeline" kernel/sched/sched.h
+531:	struct rb_root_cached		tasks_timeline;
+$ grep -n "vruntime" include/linux/sched.h | head -3
+471:	u64				vruntime;
+$ grep -n "sysctl_sched_latency" kernel/sched/fair.c | head -2
+66:unsigned int sysctl_sched_latency			= 6000000ULL;
+</code></pre>
+
+<p>三处印证：cfs_rq 用红黑树、sched_entity 有 vruntime、周期是 6ms。5.10 的 fair 类就是 CFS，不存在 EEVDF 那套“按 lag 选任务”的算法。</p>
+
+<h2>6. 自测</h2>
+
+<div class="qa"><b>Q1. 为什么比较的是 vruntime 而不是实际运行时间？</b>因为“公平”要按权重比例分配。如果比实际时间，nice -20 和 nice 19 会各拿一半，那 nice 就没意义了。把实际时间按 <code>NICE_0_LOAD/weight</code> 折算成 vruntime 后，“vruntime 最小者优先”自动等价于“CPU 份额与权重成正比”。</div>
+
+<div class="qa"><b>Q2. 为什么 CFS 用红黑树而不是数组或链表？</b>需要频繁的“按 key 插入/删除/查最小”操作。链表查最小是 O(n)，任务多时不可接受；堆的“任意删除”代价高且需要附加索引；红黑树提供 O(log n) 的插入/删除，并用 <code>rb_leftmost</code> 缓存把“取最小”降到 O(1)。</div>
+
+<div class="qa"><b>Q3. 正在运行的 task 在红黑树里吗？</b>不在。<code>set_next_entity()</code> 选中它时调用 <code>__dequeue_entity()</code> 把它摘掉，<code>put_prev_entity()</code> 在换出时再 <code>__enqueue_entity()</code> 放回去。所以 <code>pick_next_entity()</code> 拿到的“最左节点”一定是等待中的 task，不会选中自己。curr 另外由 <code>cfs_rq-&gt;curr</code> 指着。</div>
+
+<div class="qa"><b>Q4. <code>need_resched</code> 置位后立刻会切换吗？</b>不会。它只是一个标志，真正的切换要等“抢占点”：中断/异常返回、系统调用返回、<code>preempt_enable()</code>（且 <code>preempt_count == 0</code>）、<code>cond_resched()</code>、或显式 <code>schedule()</code>。在持锁、关抢占、中断上下文里，即使标志置位也不能切——这正是“安全点”的意义。</div>
+
+<div class="qa"><b>Q5. 5.10 的 <code>pick_next_task()</code> 快路径为什么要求 <code>prev-&gt;sched_class &lt;= &amp;fair_sched_class</code>？</b>因为如果 prev 是 rt/dl/stop 类的任务，可能还有同类的高优先级任务等着跑，直接走 fair 的快路径会漏掉它们（也失去从别的 CPU 拉活的机会）。只有当 prev 本身就在 fair 或更低、且 rq 里全是 fair 任务时，才可以安全地只问 CFS。</div>
+
+<footer>
+  <p>上一篇：<a href="06-fork-exit.html">06 fork 与 exit</a> · 返回<a href="index.html">主题目录</a></p>
+  <p>下一篇：<a href="08-syscall.html">08 系统调用</a></p>
+</footer>
+
+</body>
+</html>
